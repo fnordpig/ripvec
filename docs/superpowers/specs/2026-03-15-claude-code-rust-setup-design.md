@@ -18,23 +18,27 @@ Configuration design for an optimal Claude Code development environment for ripv
 
 ### 1. `CLAUDE.md` — Project conventions
 
+Note: This CLAUDE.md describes the target workspace architecture. Until the
+workspace is restructured, per-crate commands (e.g. `cargo test -p ripvec-core`)
+won't work. Update this file as the project structure evolves.
+
 ```markdown
 # ripvec
 
 Semantic search CLI — like ripgrep but for meaning, not text. Searches code,
 structured text (SQL, Jinja2, etc.), and plain text using ONNX embeddings,
-tree-sitter chunking, and cosine similarity.
+tree-sitter chunking, and cosine similarity. Rust 2024 edition.
 
 ## Commands
 - `cargo check --workspace`              # Fast compilation check (prefer over build)
 - `cargo test --workspace`               # All tests
 - `cargo test -p ripvec-core`            # Core library tests only
-- `cargo nextest run`                    # Faster test runner
+- `cargo nextest run`                    # Faster test runner (requires cargo-nextest)
 - `cargo clippy --all-targets -- -D warnings`  # Lint (zero warnings)
 - `cargo fmt` / `cargo fmt --check`      # Format
 
 ## Architecture
-Cargo workspace with three crates:
+Cargo workspace with three crates (target structure):
 - `ripvec-core` — shared library (model, chunking, embedding, search)
 - `ripvec` — CLI binary (clap)
 - `ripvec-mcp` — MCP server binary (rmcp)
@@ -74,24 +78,21 @@ Run: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo te
         "hooks": [
           {
             "type": "command",
-            "command": "file_path=$(echo $CLAUDE_TOOL_INPUT | jq -r '.file_path // empty'); if [ -n \"$file_path\" ] && echo \"$file_path\" | rg -q '\\.rs$'; then cargo fmt --quiet 2>&1 && echo '{\"decision\": \"approve\", \"suppressOutput\": true}'; fi",
+            "command": "file_path=$(jq -r '.tool_input.file_path // empty'); if [ -n \"$file_path\" ] && echo \"$file_path\" | rg -q '\\.rs$'; then cargo fmt --quiet 2>&1; fi",
             "timeout": 30
           }
         ],
-        "description": "Auto-format Rust files after edits"
       }
     ],
     "Stop": [
       {
-        "matcher": "",
         "hooks": [
           {
             "type": "command",
             "command": "cargo check --workspace --quiet 2>&1",
             "timeout": 120
           }
-        ],
-        "description": "Verify workspace compiles when Claude stops"
+        ]
       }
     ]
   }
@@ -99,10 +100,13 @@ Run: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo te
 ```
 
 Design notes:
+- Hook reads tool input from stdin via `jq`, extracting `tool_input.file_path`
 - Uses `rg` instead of `grep` per user's shell alias convention
 - 120s timeout on Stop accounts for ort/tree-sitter native compilation
 - No clippy-on-edit — bacon in split terminal covers this
 - No commit gating — CLAUDE.md documents pre-commit command
+- Stop hook has no matcher — the event fires on all stops
+- Requires `jq` on PATH (standard on macOS with Homebrew; install if missing)
 
 ### 3. `.mcp.json` — Rust MCP servers
 
@@ -125,7 +129,7 @@ Design notes:
 
 Server capabilities:
 - **rust-mcp-server** — 25+ cargo tools including `cargo-check`, `cargo-test`, `cargo-clippy`, `cargo-fmt`, `cargo-add`, `cargo-machete`, `rustc-explain`
-- **rust-analyzer-mcp** — 10 tools: `definition`, `references`, `hover`, `diagnostics`, `workspace_diagnostics`, `code_actions`
+- **rust-analyzer-mcp** — code intelligence tools including `definition`, `references`, `hover`, `diagnostics`, `workspace_diagnostics`, `code_actions`
 - **crates-mcp** — `search_crates`, `get_crate_info`, `get_crate_versions`, `get_crate_documentation`
 
 context7 is already configured globally and not duplicated here.
@@ -155,17 +159,17 @@ command = ["cargo", "doc", "--workspace", "--no-deps", "--color", "always"]
 set -euo pipefail
 
 echo "=== Rust toolchain components ==="
+# rust-src is required by rust-analyzer for std library analysis
 rustup component add rust-analyzer rust-src rustfmt clippy
 
 echo "=== Cargo development tools ==="
 cargo install --locked bacon cargo-nextest cargo-insta cargo-machete cargo-audit
 
 echo "=== Cargo MCP servers ==="
-cargo install rust-mcp-server rust-analyzer-mcp crates-mcp
+cargo install --locked rust-mcp-server rust-analyzer-mcp crates-mcp
 
 echo "=== Claude Code LSP plugin ==="
 claude plugin install rust-analyzer-lsp
-claude plugin enable rust-analyzer-lsp
 
 echo "=== Done! ==="
 echo "Restart Claude Code to activate LSP and MCP servers."
