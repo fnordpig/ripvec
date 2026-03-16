@@ -81,7 +81,7 @@ Run: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo te
             "command": "file_path=$(jq -r '.tool_input.file_path // empty'); if [ -n \"$file_path\" ] && echo \"$file_path\" | rg -q '\\.rs$'; then cargo fmt --quiet 2>&1; fi",
             "timeout": 30
           }
-        ],
+        ]
       }
     ],
     "Stop": [
