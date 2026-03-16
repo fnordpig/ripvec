@@ -46,7 +46,7 @@ pub fn config_for_extension(ext: &str) -> Option<LangConfig> {
             tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             concat!(
                 "(function_declaration name: (identifier) @name) @def\n",
-                "(class_declaration name: (identifier) @name) @def\n",
+                "(class_declaration name: (type_identifier) @name) @def\n",
                 "(method_definition name: (property_identifier) @name) @def\n",
                 "(interface_declaration name: (type_identifier) @name) @def",
             ),
@@ -55,7 +55,7 @@ pub fn config_for_extension(ext: &str) -> Option<LangConfig> {
             tree_sitter_typescript::LANGUAGE_TSX.into(),
             concat!(
                 "(function_declaration name: (identifier) @name) @def\n",
-                "(class_declaration name: (identifier) @name) @def\n",
+                "(class_declaration name: (type_identifier) @name) @def\n",
                 "(method_definition name: (property_identifier) @name) @def\n",
                 "(interface_declaration name: (type_identifier) @name) @def",
             ),
