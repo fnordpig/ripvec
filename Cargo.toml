@@ -1,6 +1,57 @@
-[package]
-name = "ripvec"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+members = ["crates/ripvec-core", "crates/ripvec", "crates/ripvec-mcp"]
+resolver = "2"
 
-[dependencies]
+[workspace.package]
+edition = "2024"
+rust-version = "1.85.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/fnordpig/repvec"
+
+[workspace.dependencies]
+# Core inference
+ort = "2.0.0-rc.12"
+hf-hub = { version = "0.5.0", default-features = false, features = ["ureq", "rustls-tls"] }
+tokenizers = { version = "0.22.2", default-features = false }
+ndarray = "0.16"
+
+# Code parsing
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-c = "0.23"
+tree-sitter-cpp = "0.23"
+
+# Parallelism and file traversal
+rayon = "1.10"
+ignore = "0.4"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# MCP server
+rmcp = { version = "1.2", features = ["server", "transport-io", "macros"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+schemars = "1.0"
+
+# Testing
+assert_cmd = "2.1"
+predicates = "3"
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

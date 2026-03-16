@@ -1,0 +1,24 @@
+[package]
+name = "ripvec-mcp"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "MCP server wrapping ripvec for Claude Code / Cursor integration"
+publish = false
+
+[[bin]]
+name = "ripvec-mcp"
+path = "src/main.rs"
+
+[dependencies]
+ripvec-core = { path = "../ripvec-core" }
+rmcp.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+anyhow.workspace = true
+tokenizers.workspace = true
+
+[lints]
+workspace = true

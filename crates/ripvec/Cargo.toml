@@ -1,0 +1,24 @@
+[package]
+name = "ripvec"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Semantic code search CLI — like ripgrep but for meaning"
+
+[[bin]]
+name = "ripvec"
+path = "src/main.rs"
+
+[dependencies]
+ripvec-core = { path = "../ripvec-core" }
+clap.workspace = true
+anyhow.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+predicates.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
