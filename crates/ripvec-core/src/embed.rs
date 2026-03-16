@@ -35,6 +35,11 @@ pub struct SearchResult {
 ///
 /// The model is wrapped in a [`Mutex`] because [`EmbeddingModel::embed`]
 /// requires mutable access; chunking and file reads remain parallel.
+///
+/// # Errors
+///
+/// Returns an error if the query cannot be tokenized or embedded, or if the
+/// model mutex is poisoned.
 pub fn search(
     root: &Path,
     query: &str,
@@ -50,13 +55,11 @@ pub fn search(
         .par_iter()
         .flat_map(|path| {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            let config = match crate::languages::config_for_extension(ext) {
-                Some(c) => c,
-                None => return vec![],
+            let Some(config) = crate::languages::config_for_extension(ext) else {
+                return vec![];
             };
-            let source = match std::fs::read_to_string(path) {
-                Ok(s) => s,
-                Err(_) => return vec![],
+            let Ok(source) = std::fs::read_to_string(path) else {
+                return vec![];
             };
             crate::chunk::chunk_file(path, &source, &config)
         })

@@ -1,14 +1,18 @@
-//! HuggingFace tokenizer wrapper.
+//! `HuggingFace` tokenizer wrapper.
 //!
-//! Downloads and caches the tokenizer.json from a HuggingFace model
+//! Downloads and caches the tokenizer.json from a `HuggingFace` model
 //! repository using hf-hub, then loads it for fast encoding.
 
 use hf_hub::api::sync::Api;
 use tokenizers::Tokenizer;
 
-/// Load a tokenizer from a HuggingFace model repository.
+/// Load a tokenizer from a `HuggingFace` model repository.
 ///
 /// Downloads `tokenizer.json` on first call; subsequent calls use the cache.
+///
+/// # Errors
+///
+/// Returns an error if the tokenizer file cannot be downloaded or parsed.
 pub fn load_tokenizer(model_repo: &str) -> crate::Result<Tokenizer> {
     let api = Api::new().map_err(|e| crate::Error::Download(e.to_string()))?;
     let repo = api.model(model_repo.to_string());

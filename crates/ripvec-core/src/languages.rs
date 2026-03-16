@@ -16,6 +16,7 @@ pub struct LangConfig {
 /// Look up the language configuration for a file extension.
 ///
 /// Returns `None` for unsupported extensions.
+#[must_use]
 pub fn config_for_extension(ext: &str) -> Option<LangConfig> {
     let (lang, query_str): (Language, &str) = match ext {
         "rs" => (

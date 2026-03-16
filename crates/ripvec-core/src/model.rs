@@ -1,6 +1,6 @@
 //! ONNX embedding model loading and inference.
 //!
-//! Downloads model weights from HuggingFace, creates an ONNX Runtime
+//! Downloads model weights from `HuggingFace` (<https://huggingface.co>), creates an ONNX Runtime
 //! session, and provides embedding inference with CLS pooling and
 //! L2 normalization.
 
@@ -15,10 +15,15 @@ pub struct EmbeddingModel {
 }
 
 impl EmbeddingModel {
-    /// Load an ONNX embedding model from a HuggingFace repository.
+    /// Load an ONNX embedding model from a `HuggingFace` repository.
     ///
     /// Downloads the model file on first call; subsequent calls use the cache.
     /// The OS page cache keeps weights hot between invocations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model cannot be downloaded or if the ONNX
+    /// session fails to initialize.
     pub fn load(model_repo: &str, model_file: &str) -> crate::Result<Self> {
         let api = Api::new().map_err(|e| crate::Error::Download(e.to_string()))?;
         let repo = api.model(model_repo.to_string());
@@ -41,6 +46,11 @@ impl EmbeddingModel {
     ///
     /// Uses CLS pooling (first token) suitable for BGE models.
     /// Input arrays must all have the same length (token count).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the ONNX inference session fails or if the output
+    /// tensor cannot be extracted.
     pub fn embed(
         &mut self,
         input_ids: &[i64],

@@ -21,7 +21,7 @@ use serde::Deserialize;
 pub struct RipvecServer {
     /// The ONNX embedding model, guarded by a mutex because `embed` requires `&mut self`.
     model: Arc<Mutex<ripvec_core::model::EmbeddingModel>>,
-    /// The HuggingFace tokenizer, `Send + Sync` so it can be shared across tasks.
+    /// The `HuggingFace` tokenizer, `Send + Sync` so it can be shared across tasks.
     tokenizer: Arc<tokenizers::Tokenizer>,
     /// The generated tool router mapping tool names to handlers.
     tool_router: ToolRouter<Self>,
@@ -34,18 +34,18 @@ pub struct SearchRequest {
     pub query: String,
     /// Root directory to search (defaults to current directory).
     #[serde(default = "default_path")]
-    pub path: Option<String>,
+    pub path: String,
     /// Maximum number of results to return (defaults to 10).
     #[serde(default = "default_top_k")]
-    pub top_k: Option<usize>,
+    pub top_k: usize,
 }
 
-fn default_path() -> Option<String> {
-    Some(".".to_string())
+fn default_path() -> String {
+    ".".to_string()
 }
 
-fn default_top_k() -> Option<usize> {
-    Some(10)
+fn default_top_k() -> usize {
+    10
 }
 
 #[tool_router]
@@ -71,8 +71,8 @@ impl RipvecServer {
         &self,
         Parameters(req): Parameters<SearchRequest>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
-        let path = req.path.unwrap_or_else(|| ".".to_string());
-        let top_k = req.top_k.unwrap_or(10);
+        let path = req.path;
+        let top_k = req.top_k;
         let model = Arc::clone(&self.model);
         let tokenizer = Arc::clone(&self.tokenizer);
         let query = req.query.clone();

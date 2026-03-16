@@ -4,6 +4,7 @@
 //! the dot product — no square roots needed at query time.
 
 /// Cosine similarity between two L2-normalized vectors (= dot product).
+#[must_use]
 pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }

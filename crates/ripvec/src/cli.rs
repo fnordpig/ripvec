@@ -17,7 +17,7 @@ pub struct Args {
     #[arg(short = 'n', long, default_value_t = 10)]
     pub top_k: usize,
 
-    /// HuggingFace model repository.
+    /// `HuggingFace` model repository.
     #[arg(long, default_value = "BAAI/bge-small-en-v1.5")]
     pub model_repo: String,
 

@@ -15,7 +15,7 @@ pub struct CodeChunk {
     pub file_path: String,
     /// Name of the definition (function name, class name, etc.).
     pub name: String,
-    /// Kind of syntax node (e.g., "function_item", "class_definition").
+    /// Kind of syntax node (e.g., `function_item`, `class_definition`).
     pub kind: String,
     /// 1-based start line number.
     pub start_line: usize,
@@ -30,6 +30,7 @@ pub struct CodeChunk {
 /// Uses tree-sitter to parse the file and extract definitions matching
 /// the language's query patterns. Falls back to a single whole-file
 /// chunk if no semantic boundaries are found.
+#[must_use]
 pub fn chunk_file(
     path: &Path,
     source: &str,
@@ -40,9 +41,8 @@ pub fn chunk_file(
         return vec![];
     }
 
-    let tree = match parser.parse(source, None) {
-        Some(t) => t,
-        None => return vec![],
+    let Some(tree) = parser.parse(source, None) else {
+        return vec![];
     };
 
     let mut cursor = QueryCursor::new();
