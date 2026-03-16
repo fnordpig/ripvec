@@ -7,7 +7,7 @@
 use std::sync::{Arc, Mutex};
 
 use rmcp::{
-    ServerHandler,
+    ServerHandler, ServiceExt,
     handler::server::tool::ToolRouter,
     handler::server::wrapper::Parameters,
     model::{Content, ServerCapabilities, ServerInfo},

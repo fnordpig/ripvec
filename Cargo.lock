@@ -1951,6 +1951,7 @@ dependencies = [
  "predicates",
  "rayon",
  "ripvec-core",
+ "serde_json",
  "tempfile",
 ]
 
