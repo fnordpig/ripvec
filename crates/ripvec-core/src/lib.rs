@@ -3,10 +3,14 @@
 //! Provides ONNX embedding model loading, tree-sitter code chunking,
 //! parallel embedding, and cosine similarity ranking.
 
+pub mod chunk;
+pub mod embed;
 pub mod error;
 pub mod languages;
 pub mod model;
+pub mod similarity;
 pub mod tokenize;
+pub mod walk;
 
 pub use error::Error;
 
