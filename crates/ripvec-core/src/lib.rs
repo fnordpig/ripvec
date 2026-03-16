@@ -4,6 +4,9 @@
 //! parallel embedding, and cosine similarity ranking.
 
 pub mod error;
+pub mod languages;
+pub mod model;
+pub mod tokenize;
 
 pub use error::Error;
 
