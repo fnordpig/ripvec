@@ -5,6 +5,7 @@
 //! chunks when no semantic boundaries are found.
 
 use std::path::Path;
+use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, QueryCursor};
 
 /// A semantic chunk extracted from a source file.
@@ -46,15 +47,16 @@ pub fn chunk_file(
 
     let mut cursor = QueryCursor::new();
     let mut chunks = Vec::new();
+    let mut matches = cursor.matches(&config.query, tree.root_node(), source.as_bytes());
 
-    for m in cursor.matches(&config.query, tree.root_node(), source.as_bytes()) {
+    while let Some(m) = matches.next() {
         let mut name = String::new();
         let mut def_node = None;
         for cap in m.captures {
             let cap_name = &config.query.capture_names()[cap.index as usize];
-            if cap_name == "name" {
+            if *cap_name == "name" {
                 name = source[cap.node.start_byte()..cap.node.end_byte()].to_string();
-            } else if cap_name == "def" {
+            } else if *cap_name == "def" {
                 def_node = Some(cap.node);
             }
         }

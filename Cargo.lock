@@ -1964,6 +1964,7 @@ dependencies = [
  "ndarray",
  "ort",
  "rayon",
+ "streaming-iterator",
  "thiserror",
  "tokenizers",
  "tree-sitter",
