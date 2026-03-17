@@ -16,11 +16,16 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+use memmap2::Mmap;
 use rayon::prelude::*;
 
 use crate::chunk::CodeChunk;
 use crate::model::{EmbeddingModel, Encoding};
 use crate::similarity;
+
+/// Files larger than this are memory-mapped instead of read into a String.
+/// Mmap avoids heap allocation and lets the OS page cache handle I/O.
+const MMAP_THRESHOLD: u64 = 32 * 1024; // 32 KB
 
 /// Default batch size for embedding inference.
 pub const DEFAULT_BATCH_SIZE: usize = 32;
@@ -67,7 +72,8 @@ pub fn search(
         files
     };
 
-    // Phase 2: Chunk all files in parallel
+    // Phase 2: Chunk all files in parallel.
+    // Large files are mmap'd to avoid heap allocation; small files use read_to_string.
     let chunk_start = Instant::now();
     let chunks: Vec<CodeChunk> = files
         .par_iter()
@@ -76,7 +82,7 @@ pub fn search(
             let Some(config) = crate::languages::config_for_extension(ext) else {
                 return vec![];
             };
-            let Ok(source) = std::fs::read_to_string(path) else {
+            let Some(source) = read_source(path) else {
                 return vec![];
             };
             let chunks = crate::chunk::chunk_file(path, &source, &config);
@@ -168,6 +174,47 @@ pub fn search(
     }
 
     Ok(results)
+}
+
+/// Source text either owned (from `read_to_string`) or mmap'd.
+enum SourceText {
+    Owned(String),
+    Mapped(Mmap),
+}
+
+impl std::ops::Deref for SourceText {
+    type Target = str;
+    fn deref(&self) -> &str {
+        match self {
+            Self::Owned(s) => s,
+            Self::Mapped(m) => {
+                // SAFETY: we only construct Mapped from files that passed UTF-8 validation
+                #[expect(
+                    unsafe_code,
+                    reason = "validated UTF-8 before constructing Mapped variant"
+                )]
+                unsafe {
+                    std::str::from_utf8_unchecked(m)
+                }
+            }
+        }
+    }
+}
+
+/// Read a source file, using mmap for large files and `read_to_string` for small ones.
+#[expect(unsafe_code, reason = "mmap of read-only source file")]
+fn read_source(path: &Path) -> Option<SourceText> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if metadata.len() >= MMAP_THRESHOLD {
+        let file = std::fs::File::open(path).ok()?;
+        // SAFETY: file is read-only, not modified while mapped
+        let mmap = unsafe { Mmap::map(&file) }.ok()?;
+        // Validate UTF-8 before wrapping
+        std::str::from_utf8(&mmap).ok()?;
+        Some(SourceText::Mapped(mmap))
+    } else {
+        std::fs::read_to_string(path).ok().map(SourceText::Owned)
+    }
 }
 
 /// Tokenize text into an [`Encoding`] ready for ONNX inference.
