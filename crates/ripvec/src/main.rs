@@ -3,7 +3,6 @@ mod output;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::sync::Mutex;
 
 fn main() -> Result<()> {
     let args = cli::Args::parse();
@@ -14,18 +13,21 @@ fn main() -> Result<()> {
         std::time::Duration::from_secs_f64(args.profile_interval),
     );
 
-    // Configure thread pool
-    if args.threads > 0 {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(args.threads)
-            .build_global()
-            .context("failed to configure thread pool")?;
-    }
+    // Configure thread pool — over-subscribe by default (2x cores)
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let threads = if args.threads > 0 {
+        args.threads
+    } else {
+        cores * 2
+    };
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global()
+        .context("failed to configure thread pool")?;
 
     // Print profiler header
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
     profiler.header(
         env!("CARGO_PKG_VERSION"),
         &args.model_repo,
@@ -33,17 +35,16 @@ fn main() -> Result<()> {
         cores,
     );
 
-    // Load model and tokenizer
+    // Load model (mmap'd, no Mutex needed)
     let model = {
         let _guard = profiler.phase("model_load");
         ripvec_core::model::EmbeddingModel::load(&args.model_repo, &args.model_file)
             .context("failed to load embedding model")?
     };
-    let model = Mutex::new(model);
     let tokenizer = ripvec_core::tokenize::load_tokenizer(&args.model_repo)
         .context("failed to load tokenizer")?;
 
-    // Run search
+    // Run search (fully parallel — per-thread sessions, no Mutex)
     let results = ripvec_core::embed::search(
         std::path::Path::new(&args.path),
         &args.query,

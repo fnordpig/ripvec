@@ -4,7 +4,7 @@
 //! The embedding model and tokenizer are loaded once at startup and shared
 //! across all tool calls via [`Arc`] and [`Mutex`].
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use rmcp::{
     ServerHandler, ServiceExt,
@@ -19,8 +19,8 @@ use serde::Deserialize;
 /// The ripvec MCP server, holding shared model and tokenizer state.
 #[derive(Clone)]
 pub struct RipvecServer {
-    /// The ONNX embedding model, guarded by a mutex because `embed` requires `&mut self`.
-    model: Arc<Mutex<ripvec_core::model::EmbeddingModel>>,
+    /// The ONNX embedding model (mmap'd, thread-safe without mutex).
+    model: Arc<ripvec_core::model::EmbeddingModel>,
     /// The `HuggingFace` tokenizer, `Send + Sync` so it can be shared across tasks.
     tokenizer: Arc<tokenizers::Tokenizer>,
     /// The generated tool router mapping tool names to handlers.
@@ -52,7 +52,7 @@ fn default_top_k() -> usize {
 impl RipvecServer {
     /// Create a new server with an already-loaded model and tokenizer.
     fn new(
-        model: Arc<Mutex<ripvec_core::model::EmbeddingModel>>,
+        model: Arc<ripvec_core::model::EmbeddingModel>,
         tokenizer: Arc<tokenizers::Tokenizer>,
     ) -> Self {
         Self {
@@ -157,10 +157,10 @@ impl ServerHandler for RipvecServer {
 /// Load the model and tokenizer, start the MCP server over stdin/stdout.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let model = Arc::new(Mutex::new(
+    let model = Arc::new(
         ripvec_core::model::EmbeddingModel::load("BAAI/bge-small-en-v1.5", "onnx/model.onnx")
             .map_err(|e| anyhow::anyhow!("failed to load embedding model: {e}"))?,
-    ));
+    );
     let tokenizer = Arc::new(
         ripvec_core::tokenize::load_tokenizer("BAAI/bge-small-en-v1.5")
             .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))?,

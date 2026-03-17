@@ -1,5 +1,7 @@
 # ripvec
 
+**CRITICAL** ALWAYS PREFER YOUR LSP / MCP / Rust SKILLS!
+
 Semantic search CLI — like ripgrep but for meaning, not text. Searches code,
 structured text (SQL, Jinja2, etc.), and plain text using ONNX embeddings,
 tree-sitter chunking, and cosine similarity. Rust 2024 edition.

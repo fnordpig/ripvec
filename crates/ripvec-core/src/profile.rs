@@ -81,8 +81,7 @@ impl Profiler {
     pub fn header(&self, version: &str, model_repo: &str, threads: usize, cores: usize) {
         if let Self::Active { .. } = self {
             eprintln!(
-                "[profile] ripvec {} | {}-core | rayon: {} threads | model: {}",
-                version, cores, threads, model_repo,
+                "[profile] ripvec {version} | {cores}-core | rayon: {threads} threads | model: {model_repo}",
             );
         }
     }
@@ -100,14 +99,14 @@ impl Profiler {
 
     /// Record that a rayon thread produced `n` chunks during the chunk phase.
     pub fn chunk_thread_report(&self, n: usize) {
-        if let Self::Active { chunk_counts, .. } = self {
-            if let Ok(mut counts) = chunk_counts.lock() {
-                let idx = rayon::current_thread_index().unwrap_or(0);
-                if counts.len() <= idx {
-                    counts.resize(idx + 1, 0);
-                }
-                counts[idx] += n;
+        if let Self::Active { chunk_counts, .. } = self
+            && let Ok(mut counts) = chunk_counts.lock()
+        {
+            let idx = rayon::current_thread_index().unwrap_or(0);
+            if counts.len() <= idx {
+                counts.resize(idx + 1, 0);
             }
+            counts[idx] += n;
         }
     }
 
@@ -158,20 +157,24 @@ impl Profiler {
 
     /// Begin the embed phase. Call before the embedding loop.
     pub fn embed_begin(&self, total: usize) {
-        if let Self::Active { embed, .. } = self {
-            if let Ok(mut state) = embed.lock() {
-                let now = Instant::now();
-                state.phase_start = now;
-                state.last_report = now;
-                state.chunks_at_last_report = 0;
-                state.total_lock_wait = Duration::ZERO;
-                state.total_inference = Duration::ZERO;
-                state.total_chunks = total;
-            }
+        if let Self::Active { embed, .. } = self
+            && let Ok(mut state) = embed.lock()
+        {
+            let now = Instant::now();
+            state.phase_start = now;
+            state.last_report = now;
+            state.chunks_at_last_report = 0;
+            state.total_lock_wait = Duration::ZERO;
+            state.total_inference = Duration::ZERO;
+            state.total_chunks = total;
         }
     }
 
     /// Called after each chunk is embedded. Prints periodic progress.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "display-only rate/percentage calculations; sub-1% precision loss is acceptable"
+    )]
     pub fn embed_tick(&self, done: usize) {
         if let Self::Active {
             start,
@@ -179,79 +182,21 @@ impl Profiler {
             embed,
             ..
         } = self
+            && let Ok(mut state) = embed.lock()
         {
-            if let Ok(mut state) = embed.lock() {
-                let now = Instant::now();
-                if now.duration_since(state.last_report) >= *interval {
-                    let wall = start.elapsed();
-                    let overall_elapsed = now.duration_since(state.phase_start).as_secs_f64();
-                    let window_elapsed = now.duration_since(state.last_report).as_secs_f64();
-                    let window_chunks = done - state.chunks_at_last_report;
-                    let overall_rate = if overall_elapsed > 0.0 {
-                        done as f64 / overall_elapsed
-                    } else {
-                        0.0
-                    };
-                    let window_rate = if window_elapsed > 0.0 {
-                        window_chunks as f64 / window_elapsed
-                    } else {
-                        0.0
-                    };
-                    let total_timing = state.total_lock_wait + state.total_inference;
-                    let lock_pct = if total_timing.as_nanos() > 0 {
-                        state.total_lock_wait.as_nanos() as f64 / total_timing.as_nanos() as f64
-                            * 100.0
-                    } else {
-                        0.0
-                    };
-                    eprintln!(
-                        "[{:.1}s]  embed: {}/{} (last {:.0}s: {:.1}/s, overall: {:.1}/s) lock_wait: {:.0}% inference: {:.0}%",
-                        wall.as_secs_f64(),
-                        done,
-                        state.total_chunks,
-                        window_elapsed,
-                        window_rate,
-                        overall_rate,
-                        lock_pct,
-                        100.0 - lock_pct,
-                    );
-                    state.last_report = now;
-                    state.chunks_at_last_report = done;
-                }
-            }
-        }
-    }
-
-    /// Accumulate time spent waiting for the model mutex lock.
-    pub fn embed_lock_wait(&self, duration: Duration) {
-        if let Self::Active { embed, .. } = self {
-            if let Ok(mut state) = embed.lock() {
-                state.total_lock_wait += duration;
-            }
-        }
-    }
-
-    /// Accumulate time spent in ONNX inference.
-    pub fn embed_inference(&self, duration: Duration) {
-        if let Self::Active { embed, .. } = self {
-            if let Ok(mut state) = embed.lock() {
-                state.total_inference += duration;
-            }
-        }
-    }
-
-    /// Print the final embed phase summary.
-    pub fn embed_done(&self) {
-        if let Self::Active { start, embed, .. } = self {
-            let wall = start.elapsed();
-            if let Ok(state) = embed.lock() {
-                if state.total_chunks == 0 {
-                    eprintln!("[{:.1}s]  embed: skipped (0 chunks)", wall.as_secs_f64());
-                    return;
-                }
-                let elapsed = Instant::now().duration_since(state.phase_start);
-                let rate = if elapsed.as_secs_f64() > 0.0 {
-                    state.total_chunks as f64 / elapsed.as_secs_f64()
+            let now = Instant::now();
+            if now.duration_since(state.last_report) >= *interval {
+                let wall = start.elapsed();
+                let overall_elapsed = now.duration_since(state.phase_start).as_secs_f64();
+                let window_elapsed = now.duration_since(state.last_report).as_secs_f64();
+                let window_chunks = done - state.chunks_at_last_report;
+                let overall_rate = if overall_elapsed > 0.0 {
+                    done as f64 / overall_elapsed
+                } else {
+                    0.0
+                };
+                let window_rate = if window_elapsed > 0.0 {
+                    window_chunks as f64 / window_elapsed
                 } else {
                     0.0
                 };
@@ -262,16 +207,76 @@ impl Profiler {
                     0.0
                 };
                 eprintln!(
-                    "[{:.1}s]  embed: {}/{} done in {:.1}s ({:.1}/s) lock_wait: {:.0}% inference: {:.0}%",
+                    "[{:.1}s]  embed: {}/{} (last {:.0}s: {:.1}/s, overall: {:.1}/s) lock_wait: {:.0}% inference: {:.0}%",
                     wall.as_secs_f64(),
+                    done,
                     state.total_chunks,
-                    state.total_chunks,
-                    elapsed.as_secs_f64(),
-                    rate,
+                    window_elapsed,
+                    window_rate,
+                    overall_rate,
                     lock_pct,
                     100.0 - lock_pct,
                 );
+                state.last_report = now;
+                state.chunks_at_last_report = done;
             }
+        }
+    }
+
+    /// Accumulate time spent waiting for the model mutex lock.
+    pub fn embed_lock_wait(&self, duration: Duration) {
+        if let Self::Active { embed, .. } = self
+            && let Ok(mut state) = embed.lock()
+        {
+            state.total_lock_wait += duration;
+        }
+    }
+
+    /// Accumulate time spent in ONNX inference.
+    pub fn embed_inference(&self, duration: Duration) {
+        if let Self::Active { embed, .. } = self
+            && let Ok(mut state) = embed.lock()
+        {
+            state.total_inference += duration;
+        }
+    }
+
+    /// Print the final embed phase summary.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "display-only rate/percentage calculations; sub-1% precision loss is acceptable"
+    )]
+    pub fn embed_done(&self) {
+        if let Self::Active { start, embed, .. } = self
+            && let Ok(state) = embed.lock()
+        {
+            let wall = start.elapsed();
+            if state.total_chunks == 0 {
+                eprintln!("[{:.1}s]  embed: skipped (0 chunks)", wall.as_secs_f64());
+                return;
+            }
+            let elapsed = Instant::now().duration_since(state.phase_start);
+            let rate = if elapsed.as_secs_f64() > 0.0 {
+                state.total_chunks as f64 / elapsed.as_secs_f64()
+            } else {
+                0.0
+            };
+            let total_timing = state.total_lock_wait + state.total_inference;
+            let lock_pct = if total_timing.as_nanos() > 0 {
+                state.total_lock_wait.as_nanos() as f64 / total_timing.as_nanos() as f64 * 100.0
+            } else {
+                0.0
+            };
+            eprintln!(
+                "[{:.1}s]  embed: {}/{} done in {:.1}s ({:.1}/s) lock_wait: {:.0}% inference: {:.0}%",
+                wall.as_secs_f64(),
+                state.total_chunks,
+                state.total_chunks,
+                elapsed.as_secs_f64(),
+                rate,
+                lock_pct,
+                100.0 - lock_pct,
+            );
         }
     }
 
