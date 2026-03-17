@@ -84,7 +84,7 @@ impl RipvecServer {
                 &model,
                 &tokenizer,
                 top_k,
-                ripvec_core::embed::DEFAULT_BATCH_SIZE,
+                &ripvec_core::embed::SearchConfig::default(),
                 &ripvec_core::profile::Profiler::noop(),
             )
         })

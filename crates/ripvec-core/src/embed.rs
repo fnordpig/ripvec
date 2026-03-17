@@ -27,7 +27,7 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use tracing::{info_span, instrument};
 
-use crate::chunk::CodeChunk;
+use crate::chunk::{ChunkConfig, CodeChunk};
 use crate::model::{EmbeddingModel, Encoding};
 use crate::similarity;
 
@@ -37,6 +37,52 @@ const MMAP_THRESHOLD: u64 = 32 * 1024; // 32 KB
 
 /// Default batch size for embedding inference.
 pub const DEFAULT_BATCH_SIZE: usize = 32;
+
+/// Chunk scheduling order for the embedding pipeline.
+///
+/// Controls how chunks are sorted before batching. Sorting longest-first
+/// (`Descending`) is the classic longest-job-first heuristic for optimal
+/// load balancing across rayon threads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortOrder {
+    /// Longest chunks first (default — best load balance).
+    #[default]
+    Descending,
+    /// Shortest chunks first.
+    Ascending,
+    /// No sorting — process chunks in file-walk order.
+    None,
+}
+
+/// Runtime configuration for the search pipeline.
+///
+/// All tuning parameters that were previously compile-time constants are
+/// gathered here so they can be set from CLI arguments without recompiling.
+#[derive(Debug, Clone)]
+pub struct SearchConfig {
+    /// Chunks per ONNX inference call. Larger values amortize call overhead
+    /// but consume more memory. Default: 32.
+    pub batch_size: usize,
+    /// Maximum tokens fed to the model per chunk. `0` means no limit.
+    /// Capping tokens controls inference cost for minified or dense source.
+    /// Default: 256 (CLS pooling makes early tokens most important).
+    pub max_tokens: usize,
+    /// Chunking parameters forwarded to the chunking phase.
+    pub chunk: ChunkConfig,
+    /// Sort order for chunks before batching.
+    pub sort_order: SortOrder,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: DEFAULT_BATCH_SIZE,
+            max_tokens: 256,
+            chunk: ChunkConfig::default(),
+            sort_order: SortOrder::Descending,
+        }
+    }
+}
 
 /// A search result pairing a code chunk with its similarity score.
 #[derive(Debug, Clone)]
@@ -52,8 +98,8 @@ pub struct SearchResult {
 /// Walks the directory, chunks all supported files, embeds everything
 /// in parallel batches, and returns the top-k results ranked by similarity.
 ///
-/// `batch_size` controls how many chunks are embedded per ONNX inference call.
-/// Larger batches amortize overhead but use more memory. Default is 32.
+/// All tuning parameters (batch size, token limit, chunk sizing, sort order)
+/// are controlled via [`SearchConfig`].
 ///
 /// # Errors
 ///
@@ -67,14 +113,14 @@ pub struct SearchResult {
     clippy::too_many_lines,
     reason = "multi-phase pipeline is inherently sequential"
 )]
-#[instrument(skip_all, fields(root = %root.display(), top_k, batch_size))]
+#[instrument(skip_all, fields(root = %root.display(), top_k, batch_size = cfg.batch_size))]
 pub fn search(
     root: &Path,
     query: &str,
     model: &EmbeddingModel,
     tokenizer: &tokenizers::Tokenizer,
     top_k: usize,
-    batch_size: usize,
+    cfg: &SearchConfig,
     profiler: &crate::profile::Profiler,
 ) -> crate::Result<Vec<SearchResult>> {
     // Phase 1: Collect files (respects .gitignore, filters by extension)
@@ -95,13 +141,13 @@ pub fn search(
             .par_iter()
             .flat_map(|path| {
                 let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                let Some(config) = crate::languages::config_for_extension(ext) else {
+                let Some(lang_config) = crate::languages::config_for_extension(ext) else {
                     return vec![];
                 };
                 let Some(source) = read_source(path) else {
                     return vec![];
                 };
-                let chunks = crate::chunk::chunk_file(path, &source, &config);
+                let chunks = crate::chunk::chunk_file(path, &source, &lang_config, &cfg.chunk);
                 profiler.chunk_thread_report(chunks.len());
                 chunks
             })
@@ -115,17 +161,27 @@ pub fn search(
         let _span = info_span!("embed_query").entered();
         let _guard = profiler.phase("embed_query");
         let mut session = model.create_session()?;
-        let enc = tokenize(query, tokenizer)?;
+        let enc = tokenize(query, tokenizer, cfg.max_tokens)?;
         let mut results = crate::model::embed_batch(&mut session, &[enc])?;
         results.pop().unwrap_or_default()
     };
 
     // Phase 4: Embed all chunks in parallel batches.
-    // Sort DESCENDING by content length (longest first) for optimal scheduling:
-    // heavy batches run first while all threads are busy, short chunks fill gaps.
+    // Sort order is configurable: Descending (longest first) is the classic
+    // longest-job-first heuristic for optimal load balancing across rayon threads.
     let mut indexed_chunks: Vec<(usize, &CodeChunk)> = chunks.iter().enumerate().collect();
-    indexed_chunks.sort_unstable_by(|(_, a), (_, b)| b.content.len().cmp(&a.content.len()));
+    match cfg.sort_order {
+        SortOrder::Descending => {
+            indexed_chunks.sort_unstable_by(|(_, a), (_, b)| b.content.len().cmp(&a.content.len()));
+        }
+        SortOrder::Ascending => {
+            indexed_chunks.sort_unstable_by(|(_, a), (_, b)| a.content.len().cmp(&b.content.len()));
+        }
+        SortOrder::None => {}
+    }
 
+    let batch_size = cfg.batch_size;
+    let max_tokens_cfg = cfg.max_tokens;
     let _span = info_span!("embed_chunks", chunk_count = chunks.len(), batch_size).entered();
     profiler.embed_begin(chunks.len());
     let done_counter = AtomicUsize::new(0);
@@ -152,25 +208,25 @@ pub fn search(
                 let _entered = batch_span.enter();
 
                 // Tokenize entire batch
-                let (indices, encodings, max_tokens) = {
+                let (indices, encodings, max_tok) = {
                     let _tok_span = info_span!("tokenize_batch").entered();
                     let mut indices = Vec::with_capacity(batch.len());
                     let mut encodings = Vec::with_capacity(batch.len());
-                    let mut max_tokens = 0usize;
+                    let mut max_tok = 0usize;
                     for &(idx, chunk) in batch {
-                        if let Ok(enc) = tokenize(&chunk.content, tokenizer) {
-                            max_tokens = max_tokens.max(enc.input_ids.len());
+                        if let Ok(enc) = tokenize(&chunk.content, tokenizer, max_tokens_cfg) {
+                            max_tok = max_tok.max(enc.input_ids.len());
                             indices.push(idx);
                             encodings.push(enc);
                         }
                     }
-                    (indices, encodings, max_tokens)
+                    (indices, encodings, max_tok)
                 };
 
                 // Run batch inference
                 let embeddings = {
                     let _inf_span =
-                        info_span!("inference", batch_len = encodings.len(), max_tokens).entered();
+                        info_span!("inference", batch_len = encodings.len(), max_tok).entered();
                     match crate::model::embed_batch(session, &encodings) {
                         Ok(e) => e,
                         Err(_) => return vec![],
@@ -260,19 +316,37 @@ fn read_source(path: &Path) -> Option<SourceText> {
 }
 
 /// Tokenize text into an [`Encoding`] ready for ONNX inference.
-fn tokenize(text: &str, tokenizer: &tokenizers::Tokenizer) -> crate::Result<Encoding> {
+///
+/// When `max_tokens` is non-zero, truncates to that many tokens to cap
+/// inference cost regardless of text density (minified JS can have 3-4x more
+/// tokens per byte than formatted code). CLS pooling only uses the first
+/// token's representation, so the beginning of a definition carries most
+/// semantic weight. Pass `0` for no limit.
+fn tokenize(
+    text: &str,
+    tokenizer: &tokenizers::Tokenizer,
+    max_tokens: usize,
+) -> crate::Result<Encoding> {
     let encoding = tokenizer
         .encode(text, true)
         .map_err(|e| crate::Error::Tokenization(e.to_string()))?;
+
+    let full_len = encoding.get_ids().len();
+    let len = if max_tokens == 0 {
+        full_len
+    } else {
+        full_len.min(max_tokens)
+    };
     Ok(Encoding {
-        input_ids: encoding.get_ids().iter().map(|&x| i64::from(x)).collect(),
-        attention_mask: encoding
-            .get_attention_mask()
+        input_ids: encoding.get_ids()[..len]
             .iter()
             .map(|&x| i64::from(x))
             .collect(),
-        token_type_ids: encoding
-            .get_type_ids()
+        attention_mask: encoding.get_attention_mask()[..len]
+            .iter()
+            .map(|&x| i64::from(x))
+            .collect(),
+        token_type_ids: encoding.get_type_ids()[..len]
             .iter()
             .map(|&x| i64::from(x))
             .collect(),

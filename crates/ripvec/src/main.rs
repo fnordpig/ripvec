@@ -59,6 +59,22 @@ fn main() -> Result<()> {
     let tokenizer = ripvec_core::tokenize::load_tokenizer(&args.model_repo)
         .context("failed to load tokenizer")?;
 
+    // Build runtime search config from CLI args
+    let search_cfg = ripvec_core::embed::SearchConfig {
+        batch_size: args.batch_size,
+        max_tokens: args.max_tokens,
+        chunk: ripvec_core::chunk::ChunkConfig {
+            max_chunk_bytes: args.max_chunk_bytes,
+            window_size: args.window_size,
+            window_overlap: args.window_overlap,
+        },
+        sort_order: match args.sort_order {
+            cli::SortOrderArg::Desc => ripvec_core::embed::SortOrder::Descending,
+            cli::SortOrderArg::Asc => ripvec_core::embed::SortOrder::Ascending,
+            cli::SortOrderArg::None => ripvec_core::embed::SortOrder::None,
+        },
+    };
+
     // Run search (fully parallel — per-thread sessions, no Mutex)
     let results = ripvec_core::embed::search(
         std::path::Path::new(&args.path),
@@ -66,7 +82,7 @@ fn main() -> Result<()> {
         &model,
         &tokenizer,
         args.top_k,
-        args.batch_size,
+        &search_cfg,
         &profiler,
     )
     .context("search failed")?;

@@ -41,6 +41,29 @@ pub struct Args {
     #[arg(short = 'b', long, default_value_t = 32)]
     pub batch_size: usize,
 
+    /// Maximum tokens per chunk fed to the model (0 = unlimited).
+    ///
+    /// Capping tokens controls inference cost for minified or dense source.
+    /// CLS pooling means early tokens carry the most semantic weight.
+    #[arg(long, default_value_t = 256)]
+    pub max_tokens: usize,
+
+    /// Maximum chunk size in bytes before splitting into windows.
+    #[arg(long, default_value_t = 4096)]
+    pub max_chunk_bytes: usize,
+
+    /// Sliding-window size in bytes for the fallback chunker.
+    #[arg(long, default_value_t = 2048)]
+    pub window_size: usize,
+
+    /// Overlap between adjacent sliding windows in bytes.
+    #[arg(long, default_value_t = 512)]
+    pub window_overlap: usize,
+
+    /// Chunk scheduling order for parallel embedding batches.
+    #[arg(long, default_value = "desc")]
+    pub sort_order: SortOrderArg,
+
     /// Enable pipeline profiling output to stderr.
     #[arg(long)]
     pub profile: bool,
@@ -63,4 +86,15 @@ pub enum OutputFormat {
     Json,
     /// Colored terminal output (default).
     Color,
+}
+
+/// Chunk scheduling order for the embedding pipeline.
+#[derive(clap::ValueEnum, Clone, Debug)]
+pub enum SortOrderArg {
+    /// Longest chunks first (best load balance — default).
+    Desc,
+    /// Shortest chunks first.
+    Asc,
+    /// No sorting — process chunks in file-walk order.
+    None,
 }
