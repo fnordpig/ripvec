@@ -8,6 +8,7 @@ pub mod embed;
 pub mod error;
 pub mod languages;
 pub mod model;
+pub mod profile;
 pub mod similarity;
 pub mod tokenize;
 pub mod walk;
