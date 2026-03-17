@@ -28,14 +28,14 @@ fn main() -> Result<()> {
         std::time::Duration::from_secs_f64(args.profile_interval),
     );
 
-    // Configure thread pool — over-subscribe by default (2x cores)
+    // Configure thread pool — default to physical core count (empirically optimal)
     let cores = std::thread::available_parallelism()
         .map(std::num::NonZero::get)
         .unwrap_or(1);
     let threads = if args.threads > 0 {
         args.threads
     } else {
-        cores * 2
+        cores
     };
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)

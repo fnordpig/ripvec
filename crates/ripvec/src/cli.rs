@@ -45,7 +45,7 @@ pub struct Args {
     ///
     /// Capping tokens controls inference cost for minified or dense source.
     /// CLS pooling means early tokens carry the most semantic weight.
-    #[arg(long, default_value_t = 256)]
+    #[arg(long, default_value_t = 0)]
     pub max_tokens: usize,
 
     /// Maximum chunk size in bytes before splitting into windows.
@@ -61,7 +61,7 @@ pub struct Args {
     pub window_overlap: usize,
 
     /// Chunk scheduling order for parallel embedding batches.
-    #[arg(long, default_value = "desc")]
+    #[arg(long, default_value = "none")]
     pub sort_order: SortOrderArg,
 
     /// Enable pipeline profiling output to stderr.
