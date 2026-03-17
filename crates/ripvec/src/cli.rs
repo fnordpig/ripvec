@@ -36,6 +36,14 @@ pub struct Args {
     /// Number of threads for parallel processing (0 = auto).
     #[arg(short = 'j', long, default_value_t = 0)]
     pub threads: usize,
+
+    /// Enable pipeline profiling output to stderr.
+    #[arg(long)]
+    pub profile: bool,
+
+    /// Profiling report interval in seconds.
+    #[arg(long, default_value_t = 10.0)]
+    pub profile_interval: f64,
 }
 
 /// Output format for search results.

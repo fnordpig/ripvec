@@ -84,6 +84,7 @@ impl RipvecServer {
                 &model,
                 &tokenizer,
                 top_k,
+                &ripvec_core::profile::Profiler::noop(),
             )
         })
         .await
