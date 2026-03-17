@@ -12,7 +12,6 @@
 //! Each thread gets its own session, enabling fully parallel inference.
 
 use std::fs::File;
-use std::path::PathBuf;
 
 use hf_hub::api::sync::Api;
 use memmap2::Mmap;
@@ -22,7 +21,8 @@ use ort::session::builder::GraphOptimizationLevel;
 use ort::value::TensorRef;
 
 /// Get a platform-appropriate cache directory for ripvec data.
-fn dirs_path(app: &str, sub: &str) -> Option<PathBuf> {
+#[cfg(feature = "coreml")]
+fn dirs_path(app: &str, sub: &str) -> Option<std::path::PathBuf> {
     let base = dirs_base()?;
     let path = base.join(app).join(sub);
     std::fs::create_dir_all(&path).ok()?;
@@ -30,7 +30,8 @@ fn dirs_path(app: &str, sub: &str) -> Option<PathBuf> {
 }
 
 /// Platform cache base directory.
-fn dirs_base() -> Option<PathBuf> {
+#[cfg(feature = "coreml")]
+fn dirs_base() -> Option<std::path::PathBuf> {
     #[cfg(target_os = "macos")]
     {
         dirs_macos()
@@ -38,7 +39,7 @@ fn dirs_base() -> Option<PathBuf> {
     #[cfg(not(target_os = "macos"))]
     {
         std::env::var("XDG_CACHE_HOME")
-            .map(PathBuf::from)
+            .map(std::path::PathBuf::from)
             .ok()
             .or_else(|| {
                 std::env::var("HOME")
@@ -48,10 +49,10 @@ fn dirs_base() -> Option<PathBuf> {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn dirs_macos() -> Option<PathBuf> {
+#[cfg(all(feature = "coreml", target_os = "macos"))]
+fn dirs_macos() -> Option<std::path::PathBuf> {
     std::env::var("HOME")
-        .map(|h| PathBuf::from(h).join("Library").join("Caches"))
+        .map(|h| std::path::PathBuf::from(h).join("Library").join("Caches"))
         .ok()
 }
 
@@ -139,9 +140,12 @@ impl EmbeddingModel {
             .with_intra_threads(1)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        // Configure execution provider based on device
+        // Configure execution provider based on device.
+        // Each EP is gated behind a cargo feature that builds ORT from source
+        // with that backend compiled in.
         match self.device {
             Device::Cpu => {} // default CPU EP, no config needed
+            #[cfg(feature = "coreml")]
             Device::CoreML => {
                 let cache_dir = dirs_path("ripvec", "coreml-cache");
                 let mut ep = ort::ep::CoreML::default()
@@ -154,10 +158,23 @@ impl EmbeddingModel {
                     .with_execution_providers([ep.build()])
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
             }
+            #[cfg(not(feature = "coreml"))]
+            Device::CoreML => {
+                return Err(crate::Error::Other(anyhow::anyhow!(
+                    "CoreML support requires building with: cargo build --features coreml"
+                )));
+            }
+            #[cfg(feature = "cuda")]
             Device::Cuda => {
                 builder = builder
                     .with_execution_providers([ort::ep::CUDA::default().build()])
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            #[cfg(not(feature = "cuda"))]
+            Device::Cuda => {
+                return Err(crate::Error::Other(anyhow::anyhow!(
+                    "CUDA support requires building with: cargo build --features cuda"
+                )));
             }
         }
 

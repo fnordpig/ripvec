@@ -27,5 +27,10 @@ thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 
+[features]
+default = []
+coreml = ["ort/coreml"]
+cuda = ["ort/cuda"]
+
 [lints]
 workspace = true
