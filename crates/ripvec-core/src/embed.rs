@@ -95,12 +95,18 @@ pub fn search(
         results.pop().unwrap_or_default()
     };
 
-    // Phase 4: Embed all chunks in parallel batches
+    // Phase 4: Embed all chunks in parallel batches.
+    // Sort by content length so similar-sized chunks batch together,
+    // minimizing padding waste (short chunks don't get padded to max-length).
+    // We track original indices to maintain chunk identity.
+    let mut indexed_chunks: Vec<(usize, &CodeChunk)> = chunks.iter().enumerate().collect();
+    indexed_chunks.sort_unstable_by_key(|(_, c)| c.content.len());
+
     profiler.embed_begin(chunks.len());
     let done_counter = AtomicUsize::new(0);
     let bs = batch_size.max(1);
 
-    let mut results: Vec<SearchResult> = chunks
+    let mut results: Vec<SearchResult> = indexed_chunks
         .par_chunks(bs)
         .map_init(
             || {
@@ -109,11 +115,15 @@ pub fn search(
                     .expect("failed to create ONNX session")
             },
             |session, batch| {
-                // Tokenize entire batch
-                let encodings: Vec<Encoding> = batch
-                    .iter()
-                    .filter_map(|chunk| tokenize(&chunk.content, tokenizer).ok())
-                    .collect();
+                // Collect (original_index, encoding) pairs
+                let mut indices = Vec::with_capacity(batch.len());
+                let mut encodings = Vec::with_capacity(batch.len());
+                for &(idx, chunk) in batch {
+                    if let Ok(enc) = tokenize(&chunk.content, tokenizer) {
+                        indices.push(idx);
+                        encodings.push(enc);
+                    }
+                }
 
                 // Run batch inference
                 let Ok(embeddings) = crate::model::embed_batch(session, &encodings) else {
@@ -123,14 +133,14 @@ pub fn search(
                 let done = done_counter.fetch_add(batch.len(), Ordering::Relaxed) + batch.len();
                 profiler.embed_tick(done);
 
-                // Pair embeddings with chunks and compute similarity
-                batch
+                // Pair embeddings with original chunks and compute similarity
+                indices
                     .iter()
                     .zip(embeddings)
-                    .map(|(chunk, emb)| {
+                    .map(|(&idx, emb)| {
                         let sim = similarity::dot_product(&query_embedding, &emb);
                         SearchResult {
-                            chunk: chunk.clone(),
+                            chunk: chunks[idx].clone(),
                             similarity: sim,
                         }
                     })
