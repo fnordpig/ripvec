@@ -94,24 +94,58 @@ impl EmbeddingModel {
     }
 }
 
-/// Produce an L2-normalized embedding vector from tokenized input.
+/// Pre-tokenized encoding ready for ONNX inference.
+pub struct Encoding {
+    /// Token IDs.
+    pub input_ids: Vec<i64>,
+    /// Attention mask (1 for real tokens, 0 for padding).
+    pub attention_mask: Vec<i64>,
+    /// Token type IDs (0 for single-sequence models).
+    pub token_type_ids: Vec<i64>,
+}
+
+/// Produce L2-normalized embedding vectors for a batch of tokenized inputs.
 ///
-/// Uses CLS pooling (first token) suitable for BGE models.
+/// Pads all sequences to the longest in the batch, runs a single ONNX
+/// inference call with shape `[batch_size, max_seq_len]`, then extracts
+/// per-sequence CLS embeddings. This amortizes per-call overhead and
+/// enables SIMD across the batch dimension.
 ///
 /// # Errors
 ///
 /// Returns an error if the ONNX inference fails or the output tensor
 /// cannot be extracted.
-pub fn embed(
+pub fn embed_batch(
     session: &mut InMemorySession<'_>,
-    input_ids: &[i64],
-    attention_mask: &[i64],
-    token_type_ids: &[i64],
-) -> crate::Result<Vec<f32>> {
-    let len = input_ids.len();
-    let ids = ndarray::Array2::from_shape_vec((1, len), input_ids.to_vec())?;
-    let mask = ndarray::Array2::from_shape_vec((1, len), attention_mask.to_vec())?;
-    let types = ndarray::Array2::from_shape_vec((1, len), token_type_ids.to_vec())?;
+    encodings: &[Encoding],
+) -> crate::Result<Vec<Vec<f32>>> {
+    if encodings.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let batch_size = encodings.len();
+    let max_len = encodings
+        .iter()
+        .map(|e| e.input_ids.len())
+        .max()
+        .unwrap_or(0);
+
+    // Build padded [batch_size, max_len] tensors
+    let mut ids_flat = vec![0i64; batch_size * max_len];
+    let mut mask_flat = vec![0i64; batch_size * max_len];
+    let mut types_flat = vec![0i64; batch_size * max_len];
+
+    for (i, enc) in encodings.iter().enumerate() {
+        let offset = i * max_len;
+        let len = enc.input_ids.len();
+        ids_flat[offset..offset + len].copy_from_slice(&enc.input_ids);
+        mask_flat[offset..offset + len].copy_from_slice(&enc.attention_mask);
+        types_flat[offset..offset + len].copy_from_slice(&enc.token_type_ids);
+    }
+
+    let ids = ndarray::Array2::from_shape_vec((batch_size, max_len), ids_flat)?;
+    let mask = ndarray::Array2::from_shape_vec((batch_size, max_len), mask_flat)?;
+    let types = ndarray::Array2::from_shape_vec((batch_size, max_len), types_flat)?;
 
     let ids_ref = TensorRef::from_array_view(&ids)?;
     let mask_ref = TensorRef::from_array_view(&mask)?;
@@ -123,15 +157,42 @@ pub fn embed(
         "token_type_ids" => types_ref,
     ])?;
 
-    // Model output shape: [1, seq_len, hidden_dim]
-    // CLS pooling: take first token embedding
+    // Output shape: [batch_size, seq_len, hidden_dim]
+    // CLS pooling: take first token (index 0) of each sequence
     let output = &outputs[0];
     let array = output.try_extract_array::<f32>()?;
-    let cls = array.index_axis(Axis(1), 0);
-    let embedding: Vec<f32> = cls.iter().copied().collect();
 
-    // L2 normalize — required for cosine similarity = dot product
-    Ok(l2_normalize(&embedding))
+    let mut results = Vec::with_capacity(batch_size);
+    for i in 0..batch_size {
+        let seq = array.index_axis(Axis(0), i);
+        let cls = seq.index_axis(Axis(0), 0); // first token = CLS
+        let embedding: Vec<f32> = cls.iter().copied().collect();
+        results.push(l2_normalize(&embedding));
+    }
+
+    Ok(results)
+}
+
+/// Produce a single L2-normalized embedding vector from tokenized input.
+///
+/// Convenience wrapper around [`embed_batch`] for single-sequence use.
+///
+/// # Errors
+///
+/// Returns an error if the ONNX inference fails.
+pub fn embed(
+    session: &mut InMemorySession<'_>,
+    input_ids: &[i64],
+    attention_mask: &[i64],
+    token_type_ids: &[i64],
+) -> crate::Result<Vec<f32>> {
+    let enc = Encoding {
+        input_ids: input_ids.to_vec(),
+        attention_mask: attention_mask.to_vec(),
+        token_type_ids: token_type_ids.to_vec(),
+    };
+    let mut results = embed_batch(session, &[enc])?;
+    Ok(results.pop().unwrap_or_default())
 }
 
 /// L2-normalize a vector. Returns zero vector if norm is zero.

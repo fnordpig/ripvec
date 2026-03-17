@@ -51,6 +51,7 @@ fn main() -> Result<()> {
         &model,
         &tokenizer,
         args.top_k,
+        args.batch_size,
         &profiler,
     )
     .context("search failed")?;

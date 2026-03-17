@@ -1,15 +1,16 @@
-//! Parallel embedding pipeline.
+//! Parallel batch embedding pipeline.
 //!
 //! Three-phase architecture: discover files (I/O-bound via `ignore`),
 //! chunk in parallel (CPU-bound via `rayon`), then embed in parallel
-//! with per-thread ONNX sessions sharing the same memory-mapped model.
+//! batches with per-thread ONNX sessions sharing the same memory-mapped model.
 //!
-//! # Thread safety
+//! # Batch inference
 //!
-//! Each rayon thread creates its own [`ort::session::InMemorySession`] via
-//! [`EmbeddingModel::create_session`]. Sessions share the underlying mmap
-//! memory — only execution metadata is per-thread. This enables fully
-//! parallel inference without any mutexes.
+//! Instead of one `session.run()` per chunk, chunks are grouped into batches
+//! of configurable size (default 32). Each batch is tokenized, padded to
+//! the longest sequence, and run as a single ONNX call with shape
+//! `[batch_size, max_seq_len]`. This amortizes per-call overhead and enables
+//! SIMD across the batch dimension.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,8 +19,11 @@ use std::time::Instant;
 use rayon::prelude::*;
 
 use crate::chunk::CodeChunk;
-use crate::model::EmbeddingModel;
+use crate::model::{EmbeddingModel, Encoding};
 use crate::similarity;
+
+/// Default batch size for embedding inference.
+pub const DEFAULT_BATCH_SIZE: usize = 32;
 
 /// A search result pairing a code chunk with its similarity score.
 #[derive(Debug, Clone)]
@@ -33,13 +37,10 @@ pub struct SearchResult {
 /// Search a directory for code chunks semantically similar to a query.
 ///
 /// Walks the directory, chunks all supported files, embeds everything
-/// in parallel, and returns the top-k results ranked by similarity.
+/// in parallel batches, and returns the top-k results ranked by similarity.
 ///
-/// Per-thread ONNX sessions are created via [`EmbeddingModel::create_session`],
-/// sharing the memory-mapped model weights. No mutexes are needed.
-///
-/// Pass a [`crate::profile::Profiler`] to collect per-phase timing; use
-/// [`crate::profile::Profiler::noop`] when profiling is not needed.
+/// `batch_size` controls how many chunks are embedded per ONNX inference call.
+/// Larger batches amortize overhead but use more memory. Default is 32.
 ///
 /// # Errors
 ///
@@ -55,6 +56,7 @@ pub fn search(
     model: &EmbeddingModel,
     tokenizer: &tokenizers::Tokenizer,
     top_k: usize,
+    batch_size: usize,
     profiler: &crate::profile::Profiler,
 ) -> crate::Result<Vec<SearchResult>> {
     // Phase 1: Collect files (respects .gitignore, filters by extension)
@@ -88,32 +90,51 @@ pub fn search(
     let query_embedding = {
         let _guard = profiler.phase("embed_query");
         let mut session = model.create_session()?;
-        embed_text(query, &mut session, tokenizer)?
+        let enc = tokenize(query, tokenizer)?;
+        let mut results = crate::model::embed_batch(&mut session, &[enc])?;
+        results.pop().unwrap_or_default()
     };
 
-    // Phase 4: Embed all chunks in parallel with per-thread sessions
+    // Phase 4: Embed all chunks in parallel batches
     profiler.embed_begin(chunks.len());
     let done_counter = AtomicUsize::new(0);
+    let bs = batch_size.max(1);
 
     let mut results: Vec<SearchResult> = chunks
-        .par_iter()
+        .par_chunks(bs)
         .map_init(
             || {
                 model
                     .create_session()
                     .expect("failed to create ONNX session")
             },
-            |session, chunk| {
-                let Ok(emb) = embed_text(&chunk.content, session, tokenizer) else {
-                    return None;
+            |session, batch| {
+                // Tokenize entire batch
+                let encodings: Vec<Encoding> = batch
+                    .iter()
+                    .filter_map(|chunk| tokenize(&chunk.content, tokenizer).ok())
+                    .collect();
+
+                // Run batch inference
+                let Ok(embeddings) = crate::model::embed_batch(session, &encodings) else {
+                    return vec![];
                 };
-                let done = done_counter.fetch_add(1, Ordering::Relaxed) + 1;
+
+                let done = done_counter.fetch_add(batch.len(), Ordering::Relaxed) + batch.len();
                 profiler.embed_tick(done);
-                let sim = similarity::dot_product(&query_embedding, &emb);
-                Some(SearchResult {
-                    chunk: chunk.clone(),
-                    similarity: sim,
-                })
+
+                // Pair embeddings with chunks and compute similarity
+                batch
+                    .iter()
+                    .zip(embeddings)
+                    .map(|(chunk, emb)| {
+                        let sim = similarity::dot_product(&query_embedding, &emb);
+                        SearchResult {
+                            chunk: chunk.clone(),
+                            similarity: sim,
+                        }
+                    })
+                    .collect::<Vec<_>>()
             },
         )
         .flatten()
@@ -139,26 +160,22 @@ pub fn search(
     Ok(results)
 }
 
-/// Tokenize `text` and run it through an ONNX session.
-fn embed_text(
-    text: &str,
-    session: &mut ort::session::InMemorySession<'_>,
-    tokenizer: &tokenizers::Tokenizer,
-) -> crate::Result<Vec<f32>> {
+/// Tokenize text into an [`Encoding`] ready for ONNX inference.
+fn tokenize(text: &str, tokenizer: &tokenizers::Tokenizer) -> crate::Result<Encoding> {
     let encoding = tokenizer
         .encode(text, true)
         .map_err(|e| crate::Error::Tokenization(e.to_string()))?;
-    let ids: Vec<i64> = encoding.get_ids().iter().map(|&x| i64::from(x)).collect();
-    let mask: Vec<i64> = encoding
-        .get_attention_mask()
-        .iter()
-        .map(|&x| i64::from(x))
-        .collect();
-    let type_ids: Vec<i64> = encoding
-        .get_type_ids()
-        .iter()
-        .map(|&x| i64::from(x))
-        .collect();
-
-    crate::model::embed(session, &ids, &mask, &type_ids)
+    Ok(Encoding {
+        input_ids: encoding.get_ids().iter().map(|&x| i64::from(x)).collect(),
+        attention_mask: encoding
+            .get_attention_mask()
+            .iter()
+            .map(|&x| i64::from(x))
+            .collect(),
+        token_type_ids: encoding
+            .get_type_ids()
+            .iter()
+            .map(|&x| i64::from(x))
+            .collect(),
+    })
 }

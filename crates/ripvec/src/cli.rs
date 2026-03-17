@@ -33,9 +33,13 @@ pub struct Args {
     #[arg(short = 't', long, default_value_t = 0.0)]
     pub threshold: f32,
 
-    /// Number of threads for parallel processing (0 = auto).
+    /// Number of threads for parallel processing (0 = 2x cores).
     #[arg(short = 'j', long, default_value_t = 0)]
     pub threads: usize,
+
+    /// Batch size for embedding inference (chunks per ONNX call).
+    #[arg(short = 'b', long, default_value_t = 32)]
+    pub batch_size: usize,
 
     /// Enable pipeline profiling output to stderr.
     #[arg(long)]
