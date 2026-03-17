@@ -48,6 +48,10 @@ pub struct Args {
     /// Profiling report interval in seconds.
     #[arg(long, default_value_t = 10.0)]
     pub profile_interval: f64,
+
+    /// Write a Chrome trace JSON file (open in `chrome://tracing` or Perfetto).
+    #[arg(long, value_name = "FILE")]
+    pub trace: Option<String>,
 }
 
 /// Output format for search results.

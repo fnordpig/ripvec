@@ -3,9 +3,24 @@ mod output;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use tracing_subscriber::layer::SubscriberExt;
 
 fn main() -> Result<()> {
     let args = cli::Args::parse();
+
+    // Set up Chrome tracing if `--trace <file>` is specified.
+    // The guard must be held until the end of main — dropping it flushes the trace file.
+    // We flush explicitly before returning to avoid TLS destruction ordering issues
+    // with rayon threads.
+    let trace_guard = args.trace.as_ref().map(|trace_path| {
+        let (chrome_layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
+            .file(trace_path)
+            .include_args(true)
+            .build();
+        tracing::subscriber::set_global_default(tracing_subscriber::registry().with(chrome_layer))
+            .expect("failed to set tracing subscriber");
+        guard
+    });
 
     // Create profiler
     let profiler = ripvec_core::profile::Profiler::new(
@@ -64,6 +79,9 @@ fn main() -> Result<()> {
         .filter(|r| r.similarity >= args.threshold)
         .collect();
     output::print_results(&filtered, &args.format);
+
+    // Explicitly drop the trace guard before rayon's TLS is destroyed
+    drop(trace_guard);
 
     Ok(())
 }

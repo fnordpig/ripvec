@@ -11,6 +11,13 @@
 //! the longest sequence, and run as a single ONNX call with shape
 //! `[batch_size, max_seq_len]`. This amortizes per-call overhead and enables
 //! SIMD across the batch dimension.
+//!
+//! # Scheduling
+//!
+//! Chunks are sorted by content length **descending** (longest first) before
+//! batching. This ensures the heaviest batches run first while all threads
+//! are busy, and short chunks fill in the gaps at the end — classic
+//! longest-job-first scheduling for optimal load balancing.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,6 +25,7 @@ use std::time::Instant;
 
 use memmap2::Mmap;
 use rayon::prelude::*;
+use tracing::{info_span, instrument};
 
 use crate::chunk::CodeChunk;
 use crate::model::{EmbeddingModel, Encoding};
@@ -55,6 +63,11 @@ pub struct SearchResult {
 ///
 /// Panics if a per-thread ONNX session cannot be created during parallel
 /// embedding (should not happen if the model loaded successfully).
+#[expect(
+    clippy::too_many_lines,
+    reason = "multi-phase pipeline is inherently sequential"
+)]
+#[instrument(skip_all, fields(root = %root.display(), top_k, batch_size))]
 pub fn search(
     root: &Path,
     query: &str,
@@ -66,6 +79,7 @@ pub fn search(
 ) -> crate::Result<Vec<SearchResult>> {
     // Phase 1: Collect files (respects .gitignore, filters by extension)
     let files = {
+        let _span = info_span!("walk").entered();
         let guard = profiler.phase("walk");
         let files = crate::walk::collect_files(root);
         guard.set_detail(format!("{} files", files.len()));
@@ -74,26 +88,31 @@ pub fn search(
 
     // Phase 2: Chunk all files in parallel.
     // Large files are mmap'd to avoid heap allocation; small files use read_to_string.
-    let chunk_start = Instant::now();
-    let chunks: Vec<CodeChunk> = files
-        .par_iter()
-        .flat_map(|path| {
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            let Some(config) = crate::languages::config_for_extension(ext) else {
-                return vec![];
-            };
-            let Some(source) = read_source(path) else {
-                return vec![];
-            };
-            let chunks = crate::chunk::chunk_file(path, &source, &config);
-            profiler.chunk_thread_report(chunks.len());
-            chunks
-        })
-        .collect();
-    profiler.chunk_summary(chunks.len(), files.len(), chunk_start.elapsed());
+    let chunks: Vec<CodeChunk> = {
+        let _span = info_span!("chunk", file_count = files.len()).entered();
+        let chunk_start = Instant::now();
+        let result: Vec<CodeChunk> = files
+            .par_iter()
+            .flat_map(|path| {
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                let Some(config) = crate::languages::config_for_extension(ext) else {
+                    return vec![];
+                };
+                let Some(source) = read_source(path) else {
+                    return vec![];
+                };
+                let chunks = crate::chunk::chunk_file(path, &source, &config);
+                profiler.chunk_thread_report(chunks.len());
+                chunks
+            })
+            .collect();
+        profiler.chunk_summary(result.len(), files.len(), chunk_start.elapsed());
+        result
+    };
 
     // Phase 3: Embed the query
     let query_embedding = {
+        let _span = info_span!("embed_query").entered();
         let _guard = profiler.phase("embed_query");
         let mut session = model.create_session()?;
         let enc = tokenize(query, tokenizer)?;
@@ -102,12 +121,12 @@ pub fn search(
     };
 
     // Phase 4: Embed all chunks in parallel batches.
-    // Sort by content length so similar-sized chunks batch together,
-    // minimizing padding waste (short chunks don't get padded to max-length).
-    // We track original indices to maintain chunk identity.
+    // Sort DESCENDING by content length (longest first) for optimal scheduling:
+    // heavy batches run first while all threads are busy, short chunks fill gaps.
     let mut indexed_chunks: Vec<(usize, &CodeChunk)> = chunks.iter().enumerate().collect();
-    indexed_chunks.sort_unstable_by_key(|(_, c)| c.content.len());
+    indexed_chunks.sort_unstable_by(|(_, a), (_, b)| b.content.len().cmp(&a.content.len()));
 
+    let _span = info_span!("embed_chunks", chunk_count = chunks.len(), batch_size).entered();
     profiler.embed_begin(chunks.len());
     let done_counter = AtomicUsize::new(0);
     let bs = batch_size.max(1);
@@ -121,19 +140,41 @@ pub fn search(
                     .expect("failed to create ONNX session")
             },
             |session, batch| {
-                // Collect (original_index, encoding) pairs
-                let mut indices = Vec::with_capacity(batch.len());
-                let mut encodings = Vec::with_capacity(batch.len());
-                for &(idx, chunk) in batch {
-                    if let Ok(enc) = tokenize(&chunk.content, tokenizer) {
-                        indices.push(idx);
-                        encodings.push(enc);
+                let batch_span = info_span!(
+                    "batch",
+                    size = batch.len(),
+                    max_content_len = batch
+                        .iter()
+                        .map(|(_, c)| c.content.len())
+                        .max()
+                        .unwrap_or(0),
+                );
+                let _entered = batch_span.enter();
+
+                // Tokenize entire batch
+                let (indices, encodings, max_tokens) = {
+                    let _tok_span = info_span!("tokenize_batch").entered();
+                    let mut indices = Vec::with_capacity(batch.len());
+                    let mut encodings = Vec::with_capacity(batch.len());
+                    let mut max_tokens = 0usize;
+                    for &(idx, chunk) in batch {
+                        if let Ok(enc) = tokenize(&chunk.content, tokenizer) {
+                            max_tokens = max_tokens.max(enc.input_ids.len());
+                            indices.push(idx);
+                            encodings.push(enc);
+                        }
                     }
-                }
+                    (indices, encodings, max_tokens)
+                };
 
                 // Run batch inference
-                let Ok(embeddings) = crate::model::embed_batch(session, &encodings) else {
-                    return vec![];
+                let embeddings = {
+                    let _inf_span =
+                        info_span!("inference", batch_len = encodings.len(), max_tokens).entered();
+                    match crate::model::embed_batch(session, &encodings) {
+                        Ok(e) => e,
+                        Err(_) => return vec![],
+                    }
                 };
 
                 let done = done_counter.fetch_add(batch.len(), Ordering::Relaxed) + batch.len();
@@ -159,6 +200,7 @@ pub fn search(
 
     // Phase 5: Rank by similarity (descending) and keep top-k
     {
+        let _span = info_span!("rank", result_count = results.len()).entered();
         let guard = profiler.phase("rank");
         results.sort_unstable_by(|a, b| {
             b.similarity

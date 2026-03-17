@@ -25,6 +25,7 @@ rayon.workspace = true
 ignore.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true
