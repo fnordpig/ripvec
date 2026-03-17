@@ -159,8 +159,12 @@ impl ServerHandler for RipvecServer {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let model = Arc::new(
-        ripvec_core::model::EmbeddingModel::load("BAAI/bge-small-en-v1.5", "onnx/model.onnx")
-            .map_err(|e| anyhow::anyhow!("failed to load embedding model: {e}"))?,
+        ripvec_core::model::EmbeddingModel::load(
+            "BAAI/bge-small-en-v1.5",
+            "onnx/model.onnx",
+            ripvec_core::model::Device::Cpu,
+        )
+        .map_err(|e| anyhow::anyhow!("failed to load embedding model: {e}"))?,
     );
     let tokenizer = Arc::new(
         ripvec_core::tokenize::load_tokenizer("BAAI/bge-small-en-v1.5")

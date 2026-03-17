@@ -33,9 +33,13 @@ pub struct Args {
     #[arg(short = 't', long, default_value_t = 0.0)]
     pub threshold: f32,
 
-    /// Number of threads for parallel processing (0 = 2x cores).
+    /// Number of threads for parallel processing (0 = cores).
     #[arg(short = 'j', long, default_value_t = 0)]
     pub threads: usize,
+
+    /// Inference device: cpu, coreml (macOS), or cuda (NVIDIA GPU).
+    #[arg(long, default_value = "cpu")]
+    pub device: DeviceArg,
 
     /// Batch size for embedding inference (chunks per ONNX call).
     #[arg(short = 'b', long, default_value_t = 32)]
@@ -86,6 +90,17 @@ pub enum OutputFormat {
     Json,
     /// Colored terminal output (default).
     Color,
+}
+
+/// Inference device for ONNX Runtime execution.
+#[derive(clap::ValueEnum, Clone, Debug)]
+pub enum DeviceArg {
+    /// CPU inference (default, works everywhere).
+    Cpu,
+    /// Apple `CoreML` (Neural Engine + GPU on macOS).
+    Coreml,
+    /// NVIDIA CUDA GPU.
+    Cuda,
 }
 
 /// Chunk scheduling order for the embedding pipeline.

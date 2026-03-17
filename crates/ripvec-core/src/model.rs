@@ -12,6 +12,7 @@
 //! Each thread gets its own session, enabling fully parallel inference.
 
 use std::fs::File;
+use std::path::PathBuf;
 
 use hf_hub::api::sync::Api;
 use memmap2::Mmap;
@@ -20,12 +21,59 @@ use ort::session::InMemorySession;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::value::TensorRef;
 
+/// Get a platform-appropriate cache directory for ripvec data.
+fn dirs_path(app: &str, sub: &str) -> Option<PathBuf> {
+    let base = dirs_base()?;
+    let path = base.join(app).join(sub);
+    std::fs::create_dir_all(&path).ok()?;
+    Some(path)
+}
+
+/// Platform cache base directory.
+fn dirs_base() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        dirs_macos()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::env::var("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .ok()
+            .or_else(|| {
+                std::env::var("HOME")
+                    .map(|h| PathBuf::from(h).join(".cache"))
+                    .ok()
+            })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn dirs_macos() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .map(|h| PathBuf::from(h).join("Library").join("Caches"))
+        .ok()
+}
+
+/// Inference device for ONNX Runtime execution providers.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum Device {
+    /// CPU inference (works everywhere).
+    #[default]
+    Cpu,
+    /// Apple `CoreML` (Neural Engine + GPU on macOS).
+    CoreML,
+    /// NVIDIA CUDA GPU.
+    Cuda,
+}
+
 /// An embedding model backed by a memory-mapped ONNX file.
 ///
 /// The model file is mmap'd once; per-thread sessions read directly from
 /// the mapped memory (zero-copy via `commit_from_memory_directly`).
 pub struct EmbeddingModel {
     mmap: Mmap,
+    device: Device,
 }
 
 // SAFETY: Mmap is Send + Sync. The model struct holds no mutable state.
@@ -50,7 +98,7 @@ impl EmbeddingModel {
     /// # Errors
     ///
     /// Returns an error if the model cannot be downloaded or memory-mapped.
-    pub fn load(model_repo: &str, model_file: &str) -> crate::Result<Self> {
+    pub fn load(model_repo: &str, model_file: &str, device: Device) -> crate::Result<Self> {
         let api = Api::new().map_err(|e| crate::Error::Download(e.to_string()))?;
         let repo = api.model(model_repo.to_string());
         let model_path = repo
@@ -70,7 +118,7 @@ impl EmbeddingModel {
             source: e,
         })?;
 
-        Ok(Self { mmap })
+        Ok(Self { mmap, device })
     }
 
     /// Create an ONNX Runtime session that reads directly from the mmap.
@@ -83,13 +131,37 @@ impl EmbeddingModel {
     ///
     /// Returns an error if the ONNX session fails to initialize.
     pub fn create_session(&self) -> crate::Result<InMemorySession<'_>> {
-        let session = ort::session::Session::builder()
-            .map_err(|e| anyhow::anyhow!("{e}"))?
+        let mut builder = ort::session::Session::builder().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        builder = builder
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| anyhow::anyhow!("{e}"))?
-            .with_intra_threads(1) // one ORT thread per session; parallelism via rayon
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .commit_from_memory_directly(&self.mmap)?;
+            .with_intra_threads(1)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        // Configure execution provider based on device
+        match self.device {
+            Device::Cpu => {} // default CPU EP, no config needed
+            Device::CoreML => {
+                let cache_dir = dirs_path("ripvec", "coreml-cache");
+                let mut ep = ort::ep::CoreML::default()
+                    .with_compute_units(ort::ep::coreml::ComputeUnits::All)
+                    .with_model_format(ort::ep::coreml::ModelFormat::MLProgram);
+                if let Some(dir) = &cache_dir {
+                    ep = ep.with_model_cache_dir(dir.display().to_string());
+                }
+                builder = builder
+                    .with_execution_providers([ep.build()])
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            Device::Cuda => {
+                builder = builder
+                    .with_execution_providers([ort::ep::CUDA::default().build()])
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+        }
+
+        let session = builder.commit_from_memory_directly(&self.mmap)?;
         Ok(session)
     }
 }

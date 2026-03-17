@@ -53,7 +53,12 @@ fn main() -> Result<()> {
     // Load model (mmap'd, no Mutex needed)
     let model = {
         let _guard = profiler.phase("model_load");
-        ripvec_core::model::EmbeddingModel::load(&args.model_repo, &args.model_file)
+        let device = match args.device {
+            cli::DeviceArg::Cpu => ripvec_core::model::Device::Cpu,
+            cli::DeviceArg::Coreml => ripvec_core::model::Device::CoreML,
+            cli::DeviceArg::Cuda => ripvec_core::model::Device::Cuda,
+        };
+        ripvec_core::model::EmbeddingModel::load(&args.model_repo, &args.model_file, device)
             .context("failed to load embedding model")?
     };
     let tokenizer = ripvec_core::tokenize::load_tokenizer(&args.model_repo)
