@@ -254,10 +254,12 @@ fn embed_cpu_parallel(
         .collect()
 }
 
-/// GPU embedding: pre-tokenize all, then feed batches sequentially.
+/// GPU embedding with bounded producer-consumer pipeline.
 ///
-/// Pre-tokenizes all chunks in parallel on CPU, then feeds fixed-size
-/// batches to the GPU. The GPU parallelizes internally via Metal/CUDA.
+/// A producer thread tokenizes batches on CPU (rayon-parallel) and sends
+/// them through a bounded channel. The main thread feeds tokenized
+/// batches to the GPU. When the buffer is full the producer blocks,
+/// bounding peak memory for tokenized data to `O(RING_SIZE * gpu_bs)`.
 ///
 /// For candle Metal/CUDA, each `embed_batch` call does:
 ///   1. `Tensor::from_vec` — CPU→device transfer
@@ -271,57 +273,70 @@ fn embed_gpu_pipelined(
     batch_size: usize,
     profiler: &crate::profile::Profiler,
 ) -> Vec<Vec<f32>> {
-    // Pre-tokenize ALL chunks (CPU-parallel)
-    let all_encodings: Vec<Option<Encoding>> = {
-        let _tok_span = info_span!("tokenize_all", count = chunks.len()).entered();
-        chunks
-            .par_iter()
-            .map(|chunk| tokenize(&chunk.content, tokenizer, max_tokens).ok())
-            .collect()
-    };
+    use std::sync::mpsc;
+
+    /// Max tokenized batches buffered ahead of GPU consumption.
+    const RING_SIZE: usize = 4;
+
+    type BatchMsg = (Vec<Encoding>, Vec<bool>);
+
+    let gpu_bs = batch_size * 4;
+    let (tx, rx) = mpsc::sync_channel::<BatchMsg>(RING_SIZE);
 
     let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
     let mut done = 0usize;
-    let gpu_bs = batch_size * 4;
 
-    for batch in all_encodings.chunks(gpu_bs) {
-        // Separate valid encodings, tracking positions
-        let mut valid: Vec<Encoding> = Vec::with_capacity(batch.len());
-        let mut valid_mask: Vec<bool> = Vec::with_capacity(batch.len());
-        for enc in batch {
-            if let Some(e) = enc {
-                valid.push(Encoding {
-                    input_ids: e.input_ids.clone(),
-                    attention_mask: e.attention_mask.clone(),
-                    token_type_ids: e.token_type_ids.clone(),
-                });
-                valid_mask.push(true);
-            } else {
-                valid_mask.push(false);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            for chunk_batch in chunks.chunks(gpu_bs) {
+                let encodings: Vec<Option<Encoding>> = chunk_batch
+                    .par_iter()
+                    .map(|chunk| tokenize(&chunk.content, tokenizer, max_tokens).ok())
+                    .collect();
+
+                let mut valid = Vec::with_capacity(encodings.len());
+                let mut mask = Vec::with_capacity(encodings.len());
+                for enc in encodings {
+                    if let Some(e) = enc {
+                        valid.push(e);
+                        mask.push(true);
+                    } else {
+                        mask.push(false);
+                    }
+                }
+
+                if tx.send((valid, mask)).is_err() {
+                    break;
+                }
             }
-        }
+            drop(tx);
+        });
 
-        if valid.is_empty() {
-            embeddings.extend(valid_mask.iter().map(|_| vec![]));
-            done += batch.len();
+        for (valid, mask) in rx {
+            let batch_len = mask.len();
+
+            if valid.is_empty() {
+                embeddings.extend(mask.iter().map(|_| vec![]));
+                done += batch_len;
+                profiler.embed_tick(done);
+                continue;
+            }
+
+            let batch_embeddings = crate::model::embed_batch(model, &valid).unwrap_or_default();
+
+            let mut emb_iter = batch_embeddings.into_iter();
+            for ok in &mask {
+                if *ok {
+                    embeddings.push(emb_iter.next().unwrap_or_default());
+                } else {
+                    embeddings.push(vec![]);
+                }
+            }
+
+            done += batch_len;
             profiler.embed_tick(done);
-            continue;
         }
-
-        let batch_embeddings = crate::model::embed_batch(model, &valid).unwrap_or_default();
-
-        let mut emb_iter = batch_embeddings.into_iter();
-        for ok in &valid_mask {
-            if *ok {
-                embeddings.push(emb_iter.next().unwrap_or_default());
-            } else {
-                embeddings.push(vec![]);
-            }
-        }
-
-        done += batch.len();
-        profiler.embed_tick(done);
-    }
+    });
 
     embeddings
 }
