@@ -35,5 +35,13 @@ accelerate = ["candle-core/accelerate"]
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tokenizers = "0.22.2"
+
+[[bench]]
+name = "pipeline"
+harness = false
+
 [lints]
 workspace = true

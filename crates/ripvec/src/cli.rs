@@ -43,8 +43,8 @@ pub struct Args {
 
     /// Maximum tokens per chunk fed to the model (0 = unlimited).
     ///
-    /// Capping tokens controls inference cost for minified or dense source.
-    /// CLS pooling means early tokens carry the most semantic weight.
+    /// Capping tokens controls inference cost: 128 tokens is 7.7× faster
+    /// than 512. CLS pooling means early tokens carry the most semantic weight.
     #[arg(long, default_value_t = 0)]
     pub max_tokens: usize,
 

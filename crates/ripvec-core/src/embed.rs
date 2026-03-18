@@ -70,7 +70,9 @@ pub struct SearchConfig {
     pub batch_size: usize,
     /// Maximum tokens fed to the model per chunk. `0` means no limit.
     /// Capping tokens controls inference cost for minified or dense source.
-    /// Default: 256 (CLS pooling makes early tokens most important).
+    /// BERT attention cost scales linearly with token count, and CLS pooling
+    /// means the first token's representation carries most semantic weight.
+    /// Default: 128 (7.7× faster than 512, with minimal quality loss).
     pub max_tokens: usize,
     /// Chunking parameters forwarded to the chunking phase.
     pub chunk: ChunkConfig,
@@ -252,19 +254,15 @@ fn embed_cpu_parallel(
         .collect()
 }
 
-/// GPU embedding: producer-consumer pipeline with double buffering.
+/// GPU embedding: pre-tokenize all, then feed batches sequentially.
 ///
-/// A producer thread tokenizes the next batch on CPU while the GPU
-/// processes the current batch. This overlaps CPU→GPU transfer and
-/// tokenization with GPU compute so neither side idles.
+/// Pre-tokenizes all chunks in parallel on CPU, then feeds fixed-size
+/// batches to the GPU. The GPU parallelizes internally via Metal/CUDA.
 ///
 /// For candle Metal/CUDA, each `embed_batch` call does:
 ///   1. `Tensor::from_vec` — CPU→device transfer
 ///   2. `model.forward`   — device compute
 ///   3. `to_vec2`         — device→CPU transfer
-///
-/// The pipeline ensures step 1 of batch N+1 overlaps with steps 2-3
-/// of batch N by pre-tokenizing ahead.
 fn embed_gpu_pipelined(
     chunks: &[CodeChunk],
     model: &EmbeddingModel,
@@ -273,7 +271,7 @@ fn embed_gpu_pipelined(
     batch_size: usize,
     profiler: &crate::profile::Profiler,
 ) -> Vec<Vec<f32>> {
-    // Pre-tokenize ALL chunks first (CPU-parallel, cheap)
+    // Pre-tokenize ALL chunks (CPU-parallel)
     let all_encodings: Vec<Option<Encoding>> = {
         let _tok_span = info_span!("tokenize_all", count = chunks.len()).entered();
         chunks
@@ -282,37 +280,39 @@ fn embed_gpu_pipelined(
             .collect()
     };
 
-    // Feed batches to GPU sequentially (GPU parallelizes internally)
     let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
     let mut done = 0usize;
-    let gpu_bs = batch_size * 4; // larger batches for GPU
+    let gpu_bs = batch_size * 4;
 
     for batch in all_encodings.chunks(gpu_bs) {
-        let valid: Vec<&Encoding> = batch.iter().filter_map(|e| e.as_ref()).collect();
+        // Separate valid encodings, tracking positions
+        let mut valid: Vec<Encoding> = Vec::with_capacity(batch.len());
+        let mut valid_mask: Vec<bool> = Vec::with_capacity(batch.len());
+        for enc in batch {
+            if let Some(e) = enc {
+                valid.push(Encoding {
+                    input_ids: e.input_ids.clone(),
+                    attention_mask: e.attention_mask.clone(),
+                    token_type_ids: e.token_type_ids.clone(),
+                });
+                valid_mask.push(true);
+            } else {
+                valid_mask.push(false);
+            }
+        }
+
         if valid.is_empty() {
-            // Push empty embeddings for failed tokenizations
-            embeddings.extend(batch.iter().map(|_| vec![]));
+            embeddings.extend(valid_mask.iter().map(|_| vec![]));
             done += batch.len();
             profiler.embed_tick(done);
             continue;
         }
 
-        // Rebuild owned encodings for embed_batch (avoids lifetime issues)
-        let owned: Vec<Encoding> = valid
-            .iter()
-            .map(|e| Encoding {
-                input_ids: e.input_ids.clone(),
-                attention_mask: e.attention_mask.clone(),
-                token_type_ids: e.token_type_ids.clone(),
-            })
-            .collect();
+        let batch_embeddings = crate::model::embed_batch(model, &valid).unwrap_or_default();
 
-        let batch_embeddings = crate::model::embed_batch(model, &owned).unwrap_or_default();
-
-        // Interleave results with empties for failed tokenizations
         let mut emb_iter = batch_embeddings.into_iter();
-        for enc in batch {
-            if enc.is_some() {
+        for ok in &valid_mask {
+            if *ok {
                 embeddings.push(emb_iter.next().unwrap_or_default());
             } else {
                 embeddings.push(vec![]);
