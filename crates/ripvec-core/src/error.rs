@@ -13,6 +13,10 @@ pub enum Error {
     #[error("candle inference failed")]
     Candle(#[from] candle_core::Error),
 
+    /// ONNX Runtime inference failed.
+    #[error("ORT inference failed: {0}")]
+    Ort(String),
+
     /// Tokenization of input text failed.
     #[error("tokenization failed: {0}")]
     Tokenization(String),

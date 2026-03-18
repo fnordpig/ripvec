@@ -28,12 +28,15 @@ serde_json.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+ort = { version = "2.0.0-rc.12", optional = true }
+ndarray = { version = "0.17", optional = true }
 
 [features]
 default = ["accelerate"]
 accelerate = ["candle-core/accelerate"]
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+ort = ["dep:ort", "dep:ndarray"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
