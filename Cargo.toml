@@ -10,11 +10,12 @@ repository = "https://github.com/fnordpig/repvec"
 
 [workspace.dependencies]
 # Core inference
+candle-core = "0.9"
+candle-nn = "0.9"
+candle-transformers = "0.9"
 memmap2 = "0.9"
-ort = "2.0.0-rc.12"
 hf-hub = { version = "0.5.0", default-features = false, features = ["ureq", "rustls-tls"] }
 tokenizers = "0.22.2"
-ndarray = "0.17"
 
 # Code parsing
 streaming-iterator = "0.1"

@@ -1,6 +1,6 @@
 //! Core library for ripvec semantic code search.
 //!
-//! Provides ONNX embedding model loading, tree-sitter code chunking,
+//! Provides candle-based BERT embedding model loading, tree-sitter code chunking,
 //! parallel embedding, and cosine similarity ranking.
 
 pub mod chunk;

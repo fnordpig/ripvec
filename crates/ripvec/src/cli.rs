@@ -21,10 +21,6 @@ pub struct Args {
     #[arg(long, default_value = "BAAI/bge-small-en-v1.5")]
     pub model_repo: String,
 
-    /// ONNX model filename within the repository.
-    #[arg(long, default_value = "onnx/model.onnx")]
-    pub model_file: String,
-
     /// Output format.
     #[arg(short, long, default_value = "color")]
     pub format: OutputFormat,
@@ -37,11 +33,11 @@ pub struct Args {
     #[arg(short = 'j', long, default_value_t = 0)]
     pub threads: usize,
 
-    /// Inference device: cpu, coreml (macOS), or cuda (NVIDIA GPU).
+    /// Inference device: cpu, metal (macOS GPU), or cuda (NVIDIA GPU).
     #[arg(long, default_value = "cpu")]
     pub device: DeviceArg,
 
-    /// Batch size for embedding inference (chunks per ONNX call).
+    /// Batch size for embedding inference (chunks per model forward pass).
     #[arg(short = 'b', long, default_value_t = 32)]
     pub batch_size: usize,
 
@@ -92,13 +88,13 @@ pub enum OutputFormat {
     Color,
 }
 
-/// Inference device for ONNX Runtime execution.
+/// Inference device selection.
 #[derive(clap::ValueEnum, Clone, Debug)]
 pub enum DeviceArg {
     /// CPU inference (default, works everywhere).
     Cpu,
-    /// Apple `CoreML` (Neural Engine + GPU on macOS).
-    Coreml,
+    /// Apple Metal GPU (macOS).
+    Metal,
     /// NVIDIA CUDA GPU.
     Cuda,
 }

@@ -9,9 +9,9 @@ pub enum Error {
     #[error("model download failed: {0}")]
     Download(String),
 
-    /// ONNX Runtime inference failed.
-    #[error("ONNX inference failed")]
-    Inference(#[from] ort::Error),
+    /// Candle model inference failed.
+    #[error("candle inference failed")]
+    Candle(#[from] candle_core::Error),
 
     /// Tokenization of input text failed.
     #[error("tokenization failed: {0}")]
@@ -30,10 +30,6 @@ pub enum Error {
     /// Unsupported source file language.
     #[error("unsupported language: {0}")]
     UnsupportedLanguage(String),
-
-    /// ndarray shape mismatch.
-    #[error("array shape error")]
-    Shape(#[from] ndarray::ShapeError),
 
     /// Catch-all for other errors.
     #[error(transparent)]

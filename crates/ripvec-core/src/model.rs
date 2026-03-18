@@ -1,189 +1,116 @@
-//! ONNX embedding model loading and inference.
+//! Embedding model using candle (pure Rust ML framework).
 //!
-//! Downloads model weights from `HuggingFace` (<https://huggingface.co>),
-//! memory-maps the ONNX file for zero-copy access, and provides thread-safe
-//! embedding inference with CLS pooling and L2 normalization.
-//!
-//! # Thread safety
-//!
-//! [`EmbeddingModel`] stores a memory-mapped model file. Call
-//! [`create_session`](EmbeddingModel::create_session) to obtain a per-thread
-//! [`ort::session::InMemorySession`] that reads directly from the mmap.
-//! Each thread gets its own session, enabling fully parallel inference.
+//! Loads BERT/BGE models from `HuggingFace` in safetensors format.
+//! Supports CPU, Metal (macOS GPU), and CUDA (NVIDIA GPU) via feature flags.
 
-use std::fs::File;
+use std::sync::Arc;
 
+use candle_core::{DType, Device, Tensor};
+use candle_nn::VarBuilder;
+use candle_transformers::models::bert::{BertModel, Config};
 use hf_hub::api::sync::Api;
-use memmap2::Mmap;
-use ndarray::Axis;
-use ort::session::InMemorySession;
-use ort::session::builder::GraphOptimizationLevel;
-use ort::value::TensorRef;
 
-/// Get a platform-appropriate cache directory for ripvec data.
-#[cfg(feature = "coreml")]
-fn dirs_path(app: &str, sub: &str) -> Option<std::path::PathBuf> {
-    let base = dirs_base()?;
-    let path = base.join(app).join(sub);
-    std::fs::create_dir_all(&path).ok()?;
-    Some(path)
-}
-
-/// Platform cache base directory.
-#[cfg(feature = "coreml")]
-fn dirs_base() -> Option<std::path::PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        dirs_macos()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        std::env::var("XDG_CACHE_HOME")
-            .map(std::path::PathBuf::from)
-            .ok()
-            .or_else(|| {
-                std::env::var("HOME")
-                    .map(|h| PathBuf::from(h).join(".cache"))
-                    .ok()
-            })
-    }
-}
-
-#[cfg(all(feature = "coreml", target_os = "macos"))]
-fn dirs_macos() -> Option<std::path::PathBuf> {
-    std::env::var("HOME")
-        .map(|h| std::path::PathBuf::from(h).join("Library").join("Caches"))
-        .ok()
-}
-
-/// Inference device for ONNX Runtime execution providers.
+/// Inference device selection.
 #[derive(Debug, Clone, Copy, Default)]
-pub enum Device {
+pub enum DeviceKind {
     /// CPU inference (works everywhere).
     #[default]
     Cpu,
-    /// Apple `CoreML` (Neural Engine + GPU on macOS).
-    CoreML,
+    /// Apple Metal GPU (macOS).
+    Metal,
     /// NVIDIA CUDA GPU.
     Cuda,
 }
 
-/// An embedding model backed by a memory-mapped ONNX file.
+/// Select the candle [`Device`] based on the requested kind.
 ///
-/// The model file is mmap'd once; per-thread sessions read directly from
-/// the mapped memory (zero-copy via `commit_from_memory_directly`).
+/// # Errors
+///
+/// Returns an error if the requested device is not available or
+/// the required feature flag was not enabled at compile time.
+pub fn select_device(kind: DeviceKind) -> crate::Result<Device> {
+    match kind {
+        DeviceKind::Cpu => Ok(Device::Cpu),
+        #[cfg(feature = "metal")]
+        DeviceKind::Metal => Ok(Device::new_metal(0)?),
+        #[cfg(not(feature = "metal"))]
+        DeviceKind::Metal => Err(crate::Error::Other(anyhow::anyhow!(
+            "Metal support requires: cargo build --features metal"
+        ))),
+        #[cfg(feature = "cuda")]
+        DeviceKind::Cuda => Ok(Device::new_cuda(0)?),
+        #[cfg(not(feature = "cuda"))]
+        DeviceKind::Cuda => Err(crate::Error::Other(anyhow::anyhow!(
+            "CUDA support requires: cargo build --features cuda"
+        ))),
+    }
+}
+
+/// An embedding model backed by candle's BERT implementation.
+///
+/// The inner [`BertModel`] is wrapped in [`Arc`] so that [`Clone`] is cheap
+/// (shared weights, no data copy). CPU parallelism clones one model per
+/// rayon thread.
+#[derive(Clone)]
 pub struct EmbeddingModel {
-    mmap: Mmap,
+    /// The candle BERT model (shared via Arc for cheap cloning).
+    model: Arc<BertModel>,
+    /// The device the model lives on.
     device: Device,
 }
 
-// SAFETY: Mmap is Send + Sync. The model struct holds no mutable state.
-// Sessions are created per-thread and are not shared.
-#[expect(
-    unsafe_code,
-    reason = "Mmap is Send+Sync; model holds no mutable state"
-)]
-unsafe impl Send for EmbeddingModel {}
-#[expect(
-    unsafe_code,
-    reason = "Mmap is Send+Sync; model holds no mutable state"
-)]
-unsafe impl Sync for EmbeddingModel {}
-
 impl EmbeddingModel {
-    /// Load an ONNX embedding model from a `HuggingFace` repository.
+    /// Load a BERT/BGE embedding model from `HuggingFace`.
     ///
-    /// Downloads the model file on first call; subsequent calls use the cache.
-    /// The file is memory-mapped for zero-copy session creation.
+    /// Downloads `model.safetensors` and `config.json` on first call;
+    /// subsequent calls use the `hf-hub` cache.
     ///
     /// # Errors
     ///
-    /// Returns an error if the model cannot be downloaded or memory-mapped.
-    pub fn load(model_repo: &str, model_file: &str, device: Device) -> crate::Result<Self> {
+    /// Returns an error if the model cannot be downloaded, the config
+    /// cannot be parsed, or the weights fail to load.
+    pub fn load(model_repo: &str, device: &Device) -> crate::Result<Self> {
         let api = Api::new().map_err(|e| crate::Error::Download(e.to_string()))?;
         let repo = api.model(model_repo.to_string());
-        let model_path = repo
-            .get(model_file)
+
+        // Download config and weights
+        let config_path = repo
+            .get("config.json")
+            .map_err(|e| crate::Error::Download(e.to_string()))?;
+        let weights_path = repo
+            .get("model.safetensors")
             .map_err(|e| crate::Error::Download(e.to_string()))?;
 
-        let file = File::open(&model_path).map_err(|e| crate::Error::Io {
-            path: model_path.display().to_string(),
+        // Parse config
+        let config_str = std::fs::read_to_string(&config_path).map_err(|e| crate::Error::Io {
+            path: config_path.display().to_string(),
             source: e,
         })?;
+        let config: Config = serde_json::from_str(&config_str)
+            .map_err(|e| crate::Error::Other(anyhow::anyhow!("config parse error: {e}")))?;
 
-        // SAFETY: The file is read-only and not modified while mapped.
-        #[expect(unsafe_code, reason = "mmap of read-only model file")]
-        // Safety: file is read-only, not modified while mapped
-        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| crate::Error::Io {
-            path: model_path.display().to_string(),
-            source: e,
-        })?;
+        // Load weights via mmap (zero-copy, handled by candle internally).
+        // SAFETY: The safetensors file is read-only and not modified while mapped.
+        #[expect(unsafe_code, reason = "mmap of read-only safetensors model file")]
+        let vb =
+            unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, device)? };
 
-        Ok(Self { mmap, device })
+        let model = BertModel::load(vb, &config)?;
+
+        Ok(Self {
+            model: Arc::new(model),
+            device: device.clone(),
+        })
     }
 
-    /// Create an ONNX Runtime session that reads directly from the mmap.
-    ///
-    /// Each rayon thread should create its own session via
-    /// [`rayon::iter::ParallelIterator::map_init`]. Sessions share the
-    /// underlying mmap memory — only execution metadata is per-session.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the ONNX session fails to initialize.
-    pub fn create_session(&self) -> crate::Result<InMemorySession<'_>> {
-        let mut builder = ort::session::Session::builder().map_err(|e| anyhow::anyhow!("{e}"))?;
-
-        builder = builder
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .with_intra_threads(1)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-        // Configure execution provider based on device.
-        // Each EP is gated behind a cargo feature that builds ORT from source
-        // with that backend compiled in.
-        match self.device {
-            Device::Cpu => {} // default CPU EP, no config needed
-            #[cfg(feature = "coreml")]
-            Device::CoreML => {
-                let cache_dir = dirs_path("ripvec", "coreml-cache");
-                let mut ep = ort::ep::CoreML::default()
-                    .with_compute_units(ort::ep::coreml::ComputeUnits::All)
-                    .with_model_format(ort::ep::coreml::ModelFormat::MLProgram);
-                if let Some(dir) = &cache_dir {
-                    ep = ep.with_model_cache_dir(dir.display().to_string());
-                }
-                builder = builder
-                    .with_execution_providers([ep.build()])
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-            }
-            #[cfg(not(feature = "coreml"))]
-            Device::CoreML => {
-                return Err(crate::Error::Other(anyhow::anyhow!(
-                    "CoreML support requires building with: cargo build --features coreml"
-                )));
-            }
-            #[cfg(feature = "cuda")]
-            Device::Cuda => {
-                builder = builder
-                    .with_execution_providers([ort::ep::CUDA::default().build()])
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-            }
-            #[cfg(not(feature = "cuda"))]
-            Device::Cuda => {
-                return Err(crate::Error::Other(anyhow::anyhow!(
-                    "CUDA support requires building with: cargo build --features cuda"
-                )));
-            }
-        }
-
-        let session = builder.commit_from_memory_directly(&self.mmap)?;
-        Ok(session)
+    /// Get a reference to the device.
+    #[must_use]
+    pub fn device(&self) -> &Device {
+        &self.device
     }
 }
 
-/// Pre-tokenized encoding ready for ONNX inference.
+/// Pre-tokenized encoding ready for inference.
 pub struct Encoding {
     /// Token IDs.
     pub input_ids: Vec<i64>,
@@ -193,21 +120,19 @@ pub struct Encoding {
     pub token_type_ids: Vec<i64>,
 }
 
-/// Produce L2-normalized embedding vectors for a batch of tokenized inputs.
+/// Embed a batch of tokenized inputs, returning L2-normalized vectors.
 ///
-/// Pads all sequences to the longest in the batch, runs a single ONNX
-/// inference call with shape `[batch_size, max_seq_len]`, then extracts
-/// per-sequence CLS embeddings. This amortizes per-call overhead and
-/// enables SIMD across the batch dimension.
+/// Uses CLS pooling (first token embedding) for BGE models.
 ///
 /// # Errors
 ///
-/// Returns an error if the ONNX inference fails or the output tensor
-/// cannot be extracted.
-pub fn embed_batch(
-    session: &mut InMemorySession<'_>,
-    encodings: &[Encoding],
-) -> crate::Result<Vec<Vec<f32>>> {
+/// Returns an error if tensor construction or the forward pass fails.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "token IDs from tokenizer are always non-negative and fit in u32"
+)]
+pub fn embed_batch(model: &EmbeddingModel, encodings: &[Encoding]) -> crate::Result<Vec<Vec<f32>>> {
     if encodings.is_empty() {
         return Ok(vec![]);
     }
@@ -219,58 +144,51 @@ pub fn embed_batch(
         .max()
         .unwrap_or(0);
 
-    // Build padded [batch_size, max_len] tensors
-    let mut ids_flat = vec![0i64; batch_size * max_len];
-    let mut mask_flat = vec![0i64; batch_size * max_len];
-    let mut types_flat = vec![0i64; batch_size * max_len];
+    // Build padded tensors [batch_size, max_len]
+    let mut ids_flat = vec![0u32; batch_size * max_len];
+    let mut mask_flat = vec![0u32; batch_size * max_len];
+    let mut types_flat = vec![0u32; batch_size * max_len];
 
     for (i, enc) in encodings.iter().enumerate() {
         let offset = i * max_len;
         let len = enc.input_ids.len();
-        ids_flat[offset..offset + len].copy_from_slice(&enc.input_ids);
-        mask_flat[offset..offset + len].copy_from_slice(&enc.attention_mask);
-        types_flat[offset..offset + len].copy_from_slice(&enc.token_type_ids);
+        for j in 0..len {
+            ids_flat[offset + j] = enc.input_ids[j] as u32;
+            mask_flat[offset + j] = enc.attention_mask[j] as u32;
+            types_flat[offset + j] = enc.token_type_ids[j] as u32;
+        }
     }
 
-    let ids = ndarray::Array2::from_shape_vec((batch_size, max_len), ids_flat)?;
-    let mask = ndarray::Array2::from_shape_vec((batch_size, max_len), mask_flat)?;
-    let types = ndarray::Array2::from_shape_vec((batch_size, max_len), types_flat)?;
+    let device = &model.device;
+    let input_ids = Tensor::from_vec(ids_flat, (batch_size, max_len), device)?;
+    let token_type_ids = Tensor::from_vec(types_flat, (batch_size, max_len), device)?;
+    let attention_mask = Tensor::from_vec(mask_flat, (batch_size, max_len), device)?;
 
-    let ids_ref = TensorRef::from_array_view(&ids)?;
-    let mask_ref = TensorRef::from_array_view(&mask)?;
-    let types_ref = TensorRef::from_array_view(&types)?;
+    // Forward pass through BERT
+    let embeddings = model
+        .model
+        .forward(&input_ids, &token_type_ids, Some(&attention_mask))?;
 
-    let outputs = session.run(ort::inputs![
-        "input_ids" => ids_ref,
-        "attention_mask" => mask_ref,
-        "token_type_ids" => types_ref,
-    ])?;
+    // CLS pooling: take first token [batch_size, hidden_dim]
+    let cls = embeddings.narrow(1, 0, 1)?.squeeze(1)?;
 
-    // Output shape: [batch_size, seq_len, hidden_dim]
-    // CLS pooling: take first token (index 0) of each sequence
-    let output = &outputs[0];
-    let array = output.try_extract_array::<f32>()?;
+    // L2 normalize
+    let norms = cls.sqr()?.sum_keepdim(1)?.sqrt()?;
+    let normalized = cls.broadcast_div(&norms)?;
 
-    let mut results = Vec::with_capacity(batch_size);
-    for i in 0..batch_size {
-        let seq = array.index_axis(Axis(0), i);
-        let cls = seq.index_axis(Axis(0), 0); // first token = CLS
-        let embedding: Vec<f32> = cls.iter().copied().collect();
-        results.push(l2_normalize(&embedding));
-    }
+    // Extract to Vec<Vec<f32>>
+    let data = normalized.to_vec2::<f32>()?;
 
-    Ok(results)
+    Ok(data)
 }
 
-/// Produce a single L2-normalized embedding vector from tokenized input.
-///
-/// Convenience wrapper around [`embed_batch`] for single-sequence use.
+/// Embed a single input (convenience wrapper).
 ///
 /// # Errors
 ///
-/// Returns an error if the ONNX inference fails.
+/// Returns an error if tensor construction or the forward pass fails.
 pub fn embed(
-    session: &mut InMemorySession<'_>,
+    model: &EmbeddingModel,
     input_ids: &[i64],
     attention_mask: &[i64],
     token_type_ids: &[i64],
@@ -280,43 +198,25 @@ pub fn embed(
         attention_mask: attention_mask.to_vec(),
         token_type_ids: token_type_ids.to_vec(),
     };
-    let mut results = embed_batch(session, &[enc])?;
+    let mut results = embed_batch(model, &[enc])?;
     Ok(results.pop().unwrap_or_default())
-}
-
-/// L2-normalize a vector. Returns zero vector if norm is zero.
-fn l2_normalize(v: &[f32]) -> Vec<f32> {
-    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        v.iter().map(|x| x / norm).collect()
-    } else {
-        v.to_vec()
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn l2_normalize_unit_vector() {
-        let v = vec![1.0, 0.0, 0.0];
-        let n = l2_normalize(&v);
-        assert!((n[0] - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn l2_normalize_arbitrary_vector() {
-        let v = vec![3.0, 4.0];
-        let n = l2_normalize(&v);
-        let norm: f32 = n.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let v = [1.0f32, 0.0, 0.0];
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-6);
     }
 
     #[test]
-    fn l2_normalize_zero_vector() {
-        let v = vec![0.0, 0.0, 0.0];
-        let n = l2_normalize(&v);
-        assert_eq!(n, vec![0.0, 0.0, 0.0]);
+    fn l2_normalize_arbitrary_vector() {
+        let v = [3.0f32, 4.0];
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let normalized: Vec<f32> = v.iter().map(|x| x / norm).collect();
+        let result_norm: f32 = normalized.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((result_norm - 1.0).abs() < 1e-6);
     }
 }

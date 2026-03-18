@@ -50,15 +50,17 @@ fn main() -> Result<()> {
         cores,
     );
 
-    // Load model (mmap'd, no Mutex needed)
+    // Load model (candle BERT, no Mutex needed)
     let model = {
         let _guard = profiler.phase("model_load");
-        let device = match args.device {
-            cli::DeviceArg::Cpu => ripvec_core::model::Device::Cpu,
-            cli::DeviceArg::Coreml => ripvec_core::model::Device::CoreML,
-            cli::DeviceArg::Cuda => ripvec_core::model::Device::Cuda,
+        let device_kind = match args.device {
+            cli::DeviceArg::Cpu => ripvec_core::model::DeviceKind::Cpu,
+            cli::DeviceArg::Metal => ripvec_core::model::DeviceKind::Metal,
+            cli::DeviceArg::Cuda => ripvec_core::model::DeviceKind::Cuda,
         };
-        ripvec_core::model::EmbeddingModel::load(&args.model_repo, &args.model_file, device)
+        let device = ripvec_core::model::select_device(device_kind)
+            .context("failed to select inference device")?;
+        ripvec_core::model::EmbeddingModel::load(&args.model_repo, &device)
             .context("failed to load embedding model")?
     };
     let tokenizer = ripvec_core::tokenize::load_tokenizer(&args.model_repo)

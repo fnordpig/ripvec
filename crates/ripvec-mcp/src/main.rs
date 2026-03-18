@@ -2,7 +2,7 @@
 //!
 //! Exposes a `semantic_search` tool over stdin/stdout using the MCP protocol.
 //! The embedding model and tokenizer are loaded once at startup and shared
-//! across all tool calls via [`Arc`] and [`Mutex`].
+//! across all tool calls via [`Arc`].
 
 use std::sync::Arc;
 
@@ -19,7 +19,7 @@ use serde::Deserialize;
 /// The ripvec MCP server, holding shared model and tokenizer state.
 #[derive(Clone)]
 pub struct RipvecServer {
-    /// The ONNX embedding model (mmap'd, thread-safe without mutex).
+    /// The candle BERT embedding model (thread-safe without mutex).
     model: Arc<ripvec_core::model::EmbeddingModel>,
     /// The `HuggingFace` tokenizer, `Send + Sync` so it can be shared across tasks.
     tokenizer: Arc<tokenizers::Tokenizer>,
@@ -161,8 +161,7 @@ async fn main() -> anyhow::Result<()> {
     let model = Arc::new(
         ripvec_core::model::EmbeddingModel::load(
             "BAAI/bge-small-en-v1.5",
-            "onnx/model.onnx",
-            ripvec_core::model::Device::Cpu,
+            &candle_core::Device::Cpu,
         )
         .map_err(|e| anyhow::anyhow!("failed to load embedding model: {e}"))?,
     );

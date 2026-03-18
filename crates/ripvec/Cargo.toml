@@ -21,7 +21,7 @@ tracing-chrome.workspace = true
 
 [features]
 default = []
-coreml = ["ripvec-core/coreml"]
+metal = ["ripvec-core/metal"]
 cuda = ["ripvec-core/cuda"]
 
 [dev-dependencies]

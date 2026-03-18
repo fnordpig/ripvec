@@ -2,13 +2,13 @@
 //!
 //! Three-phase architecture: discover files (I/O-bound via `ignore`),
 //! chunk in parallel (CPU-bound via `rayon`), then embed in parallel
-//! batches with per-thread ONNX sessions sharing the same memory-mapped model.
+//! batches using candle BERT models.
 //!
 //! # Batch inference
 //!
-//! Instead of one `session.run()` per chunk, chunks are grouped into batches
+//! Instead of one forward pass per chunk, chunks are grouped into batches
 //! of configurable size (default 32). Each batch is tokenized, padded to
-//! the longest sequence, and run as a single ONNX call with shape
+//! the longest sequence, and run as a single forward pass with shape
 //! `[batch_size, max_seq_len]`. This amortizes per-call overhead and enables
 //! SIMD across the batch dimension.
 //!
@@ -18,6 +18,12 @@
 //! batching. This ensures the heaviest batches run first while all threads
 //! are busy, and short chunks fill in the gaps at the end — classic
 //! longest-job-first scheduling for optimal load balancing.
+//!
+//! # Parallelism
+//!
+//! On CPU, each rayon thread gets its own model clone (cheap — `BertModel`
+//! uses `Arc`'d weights internally). On GPU, batches run sequentially from
+//! Rust while the device parallelizes internally.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -60,7 +66,7 @@ pub enum SortOrder {
 /// gathered here so they can be set from CLI arguments without recompiling.
 #[derive(Debug, Clone)]
 pub struct SearchConfig {
-    /// Chunks per ONNX inference call. Larger values amortize call overhead
+    /// Chunks per inference call. Larger values amortize call overhead
     /// but consume more memory. Default: 32.
     pub batch_size: usize,
     /// Maximum tokens fed to the model per chunk. `0` means no limit.
@@ -107,8 +113,8 @@ pub struct SearchResult {
 ///
 /// # Panics
 ///
-/// Panics if a per-thread ONNX session cannot be created during parallel
-/// embedding (should not happen if the model loaded successfully).
+/// Panics if a per-thread model clone fails during parallel embedding
+/// (should not happen if the model loaded successfully).
 #[expect(
     clippy::too_many_lines,
     reason = "multi-phase pipeline is inherently sequential"
@@ -160,9 +166,8 @@ pub fn search(
     let query_embedding = {
         let _span = info_span!("embed_query").entered();
         let _guard = profiler.phase("embed_query");
-        let mut session = model.create_session()?;
         let enc = tokenize(query, tokenizer, cfg.max_tokens)?;
-        let mut results = crate::model::embed_batch(&mut session, &[enc])?;
+        let mut results = crate::model::embed_batch(model, &[enc])?;
         results.pop().unwrap_or_default()
     };
 
@@ -187,71 +192,125 @@ pub fn search(
     let done_counter = AtomicUsize::new(0);
     let bs = batch_size.max(1);
 
-    let mut results: Vec<SearchResult> = indexed_chunks
-        .par_chunks(bs)
-        .map_init(
-            || {
-                model
-                    .create_session()
-                    .expect("failed to create ONNX session")
-            },
-            |session, batch| {
-                let batch_span = info_span!(
-                    "batch",
-                    size = batch.len(),
-                    max_content_len = batch
-                        .iter()
-                        .map(|(_, c)| c.content.len())
-                        .max()
-                        .unwrap_or(0),
-                );
-                let _entered = batch_span.enter();
+    let is_gpu = !matches!(model.device(), candle_core::Device::Cpu);
 
-                // Tokenize entire batch
-                let (indices, encodings, max_tok) = {
-                    let _tok_span = info_span!("tokenize_batch").entered();
-                    let mut indices = Vec::with_capacity(batch.len());
-                    let mut encodings = Vec::with_capacity(batch.len());
-                    let mut max_tok = 0usize;
-                    for &(idx, chunk) in batch {
-                        if let Ok(enc) = tokenize(&chunk.content, tokenizer, max_tokens_cfg) {
-                            max_tok = max_tok.max(enc.input_ids.len());
-                            indices.push(idx);
-                            encodings.push(enc);
-                        }
-                    }
-                    (indices, encodings, max_tok)
-                };
-
-                // Run batch inference
-                let embeddings = {
-                    let _inf_span =
-                        info_span!("inference", batch_len = encodings.len(), max_tok).entered();
-                    match crate::model::embed_batch(session, &encodings) {
-                        Ok(e) => e,
-                        Err(_) => return vec![],
-                    }
-                };
-
-                let done = done_counter.fetch_add(batch.len(), Ordering::Relaxed) + batch.len();
-                profiler.embed_tick(done);
-
-                // Pair embeddings with original chunks and compute similarity
-                indices
+    let mut results: Vec<SearchResult> = if is_gpu {
+        // GPU: sequential from Rust, device parallelizes internally.
+        // Use larger batch size to keep the GPU busy.
+        let gpu_bs = bs * 4;
+        let mut all_results = Vec::new();
+        for batch in indexed_chunks.chunks(gpu_bs) {
+            let batch_span = info_span!(
+                "batch",
+                size = batch.len(),
+                max_content_len = batch
                     .iter()
-                    .zip(embeddings)
-                    .map(|(&idx, emb)| {
-                        let sim = similarity::dot_product(&query_embedding, &emb);
-                        SearchResult {
-                            chunk: chunks[idx].clone(),
-                            similarity: sim,
+                    .map(|(_, c)| c.content.len())
+                    .max()
+                    .unwrap_or(0),
+            );
+            let _entered = batch_span.enter();
+
+            let (indices, encodings, max_tok) = {
+                let _tok_span = info_span!("tokenize_batch").entered();
+                let mut indices = Vec::with_capacity(batch.len());
+                let mut encodings = Vec::with_capacity(batch.len());
+                let mut max_tok = 0usize;
+                for &(idx, chunk) in batch {
+                    if let Ok(enc) = tokenize(&chunk.content, tokenizer, max_tokens_cfg) {
+                        max_tok = max_tok.max(enc.input_ids.len());
+                        indices.push(idx);
+                        encodings.push(enc);
+                    }
+                }
+                (indices, encodings, max_tok)
+            };
+
+            let embeddings = {
+                let _inf_span =
+                    info_span!("inference", batch_len = encodings.len(), max_tok).entered();
+                match crate::model::embed_batch(model, &encodings) {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                }
+            };
+
+            let done = done_counter.fetch_add(batch.len(), Ordering::Relaxed) + batch.len();
+            profiler.embed_tick(done);
+
+            all_results.extend(indices.iter().zip(embeddings).map(|(&idx, emb)| {
+                let sim = similarity::dot_product(&query_embedding, &emb);
+                SearchResult {
+                    chunk: chunks[idx].clone(),
+                    similarity: sim,
+                }
+            }));
+        }
+        all_results
+    } else {
+        // CPU: parallel with model clones per thread (Arc'd weights, cheap clone).
+        indexed_chunks
+            .par_chunks(bs)
+            .map_init(
+                || model.clone(),
+                |thread_model, batch| {
+                    let batch_span = info_span!(
+                        "batch",
+                        size = batch.len(),
+                        max_content_len = batch
+                            .iter()
+                            .map(|(_, c)| c.content.len())
+                            .max()
+                            .unwrap_or(0),
+                    );
+                    let _entered = batch_span.enter();
+
+                    // Tokenize entire batch
+                    let (indices, encodings, max_tok) = {
+                        let _tok_span = info_span!("tokenize_batch").entered();
+                        let mut indices = Vec::with_capacity(batch.len());
+                        let mut encodings = Vec::with_capacity(batch.len());
+                        let mut max_tok = 0usize;
+                        for &(idx, chunk) in batch {
+                            if let Ok(enc) = tokenize(&chunk.content, tokenizer, max_tokens_cfg) {
+                                max_tok = max_tok.max(enc.input_ids.len());
+                                indices.push(idx);
+                                encodings.push(enc);
+                            }
                         }
-                    })
-                    .collect::<Vec<_>>()
-            },
-        )
-        .flatten()
-        .collect();
+                        (indices, encodings, max_tok)
+                    };
+
+                    // Run batch inference
+                    let embeddings = {
+                        let _inf_span =
+                            info_span!("inference", batch_len = encodings.len(), max_tok).entered();
+                        match crate::model::embed_batch(thread_model, &encodings) {
+                            Ok(e) => e,
+                            Err(_) => return vec![],
+                        }
+                    };
+
+                    let done = done_counter.fetch_add(batch.len(), Ordering::Relaxed) + batch.len();
+                    profiler.embed_tick(done);
+
+                    // Pair embeddings with original chunks and compute similarity
+                    indices
+                        .iter()
+                        .zip(embeddings)
+                        .map(|(&idx, emb)| {
+                            let sim = similarity::dot_product(&query_embedding, &emb);
+                            SearchResult {
+                                chunk: chunks[idx].clone(),
+                                similarity: sim,
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                },
+            )
+            .flatten()
+            .collect()
+    };
     profiler.embed_done();
 
     // Phase 5: Rank by similarity (descending) and keep top-k
@@ -315,7 +374,7 @@ fn read_source(path: &Path) -> Option<SourceText> {
     }
 }
 
-/// Tokenize text into an [`Encoding`] ready for ONNX inference.
+/// Tokenize text into an [`Encoding`] ready for model inference.
 ///
 /// When `max_tokens` is non-zero, truncates to that many tokens to cap
 /// inference cost regardless of text density (minified JS can have 3-4x more
