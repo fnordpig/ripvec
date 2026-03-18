@@ -37,6 +37,10 @@ pub struct Args {
     #[arg(long, default_value = "cpu")]
     pub device: DeviceArg,
 
+    /// Embedding backend implementation.
+    #[arg(long, default_value = "candle")]
+    pub backend: BackendArg,
+
     /// Batch size for embedding inference (chunks per model forward pass).
     #[arg(short = 'b', long, default_value_t = 32)]
     pub batch_size: usize,
@@ -97,6 +101,17 @@ pub enum DeviceArg {
     Metal,
     /// NVIDIA CUDA GPU.
     Cuda,
+}
+
+/// Embedding backend implementation.
+#[derive(clap::ValueEnum, Clone, Debug)]
+pub enum BackendArg {
+    /// Candle (pure-Rust, CPU + Metal + CUDA).
+    Candle,
+    /// MLX (Apple Silicon, macOS only).
+    Mlx,
+    /// ONNX Runtime (cross-platform, CPU + GPU).
+    Ort,
 }
 
 /// Chunk scheduling order for the embedding pipeline.

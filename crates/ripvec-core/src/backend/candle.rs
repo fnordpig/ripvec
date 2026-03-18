@@ -234,8 +234,8 @@ mod tests {
             token_type_ids: vec![0, 0, 0],
         };
 
-        let results_orig = backend.embed_batch(&[enc.clone()]).unwrap();
-        let results_cloned = cloned.embed_batch(&[enc]).unwrap();
+        let results_orig = backend.embed_batch(std::slice::from_ref(&enc)).unwrap();
+        let results_cloned = cloned.embed_batch(std::slice::from_ref(&enc)).unwrap();
 
         assert_eq!(results_orig.len(), results_cloned.len());
         for (a, b) in results_orig[0].iter().zip(results_cloned[0].iter()) {

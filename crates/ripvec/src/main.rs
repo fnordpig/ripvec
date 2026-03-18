@@ -50,18 +50,20 @@ fn main() -> Result<()> {
         cores,
     );
 
-    // Load model (candle BERT, no Mutex needed)
-    let model = {
+    // Load embedding backend via trait abstraction
+    let backend = {
         let _guard = profiler.phase("model_load");
-        let device_kind = match args.device {
-            cli::DeviceArg::Cpu => ripvec_core::model::DeviceKind::Cpu,
-            cli::DeviceArg::Metal => ripvec_core::model::DeviceKind::Metal,
-            cli::DeviceArg::Cuda => ripvec_core::model::DeviceKind::Cuda,
+        let kind = match args.backend {
+            cli::BackendArg::Candle => ripvec_core::backend::BackendKind::Candle,
+            cli::BackendArg::Mlx => ripvec_core::backend::BackendKind::Mlx,
+            cli::BackendArg::Ort => ripvec_core::backend::BackendKind::Ort,
         };
-        let device = ripvec_core::model::select_device(device_kind)
-            .context("failed to select inference device")?;
-        ripvec_core::model::EmbeddingModel::load(&args.model_repo, &device)
-            .context("failed to load embedding model")?
+        let device_hint = match args.device {
+            cli::DeviceArg::Cpu => ripvec_core::backend::DeviceHint::Cpu,
+            cli::DeviceArg::Metal | cli::DeviceArg::Cuda => ripvec_core::backend::DeviceHint::Gpu,
+        };
+        ripvec_core::backend::load_backend(kind, &args.model_repo, device_hint)
+            .context("failed to load embedding backend")?
     };
     let tokenizer = ripvec_core::tokenize::load_tokenizer(&args.model_repo)
         .context("failed to load tokenizer")?;
@@ -86,7 +88,7 @@ fn main() -> Result<()> {
     let results = ripvec_core::embed::search(
         std::path::Path::new(&args.path),
         &args.query,
-        &model,
+        backend.as_ref(),
         &tokenizer,
         args.top_k,
         &search_cfg,

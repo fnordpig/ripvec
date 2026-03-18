@@ -1,5 +1,11 @@
 //! Dump token length distribution for chunks in a directory.
 
+#![expect(
+    clippy::stable_sort_primitive,
+    clippy::cast_precision_loss,
+    reason = "example utility — clarity over micro-optimization"
+)]
+
 use std::path::Path;
 
 fn main() {

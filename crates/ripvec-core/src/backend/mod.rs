@@ -144,22 +144,22 @@ mod tests {
     /// Verify that `Box<dyn EmbedBackend>` is `Send`.
     #[test]
     fn trait_object_is_send() {
-        fn _assert_send<T: Send>() {}
-        _assert_send::<Box<dyn EmbedBackend>>();
+        fn assert_send<T: Send>() {}
+        assert_send::<Box<dyn EmbedBackend>>();
     }
 
     /// Verify that `Box<dyn EmbedBackend>` is `Sync` (needed for `&dyn` across threads).
     #[test]
     fn trait_object_is_sync() {
-        fn _assert_sync<T: Sync>() {}
-        _assert_sync::<Box<dyn EmbedBackend>>();
+        fn assert_sync<T: Sync>() {}
+        assert_sync::<Box<dyn EmbedBackend>>();
     }
 
     /// Verify that `Arc<dyn EmbedBackend>` is `Send` (needed for ring-buffer pipeline).
     #[test]
     fn arc_trait_object_is_send() {
-        fn _assert_send<T: Send>() {}
-        _assert_send::<std::sync::Arc<dyn EmbedBackend>>();
+        fn assert_send<T: Send>() {}
+        assert_send::<std::sync::Arc<dyn EmbedBackend>>();
     }
 
     #[test]

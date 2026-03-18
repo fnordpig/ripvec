@@ -2,7 +2,7 @@
 //!
 //! Three-phase architecture: discover files (I/O-bound via `ignore`),
 //! chunk in parallel (CPU-bound via `rayon`), then embed in parallel
-//! batches using candle BERT models.
+//! batches using any [`EmbedBackend`] implementation.
 //!
 //! # Batch inference
 //!
@@ -21,9 +21,9 @@
 //!
 //! # Parallelism
 //!
-//! On CPU, each rayon thread gets its own model clone (cheap — `BertModel`
-//! uses `Arc`'d weights internally). On GPU, batches run sequentially from
-//! Rust while the device parallelizes internally.
+//! On CPU, each rayon thread gets its own backend clone (cheap — most
+//! backends use `Arc`'d weights internally). On GPU, batches run sequentially
+//! from Rust while the device parallelizes internally.
 
 use std::path::Path;
 use std::time::Instant;
@@ -32,8 +32,8 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use tracing::{info_span, instrument};
 
+use crate::backend::{EmbedBackend, Encoding};
 use crate::chunk::{ChunkConfig, CodeChunk};
-use crate::model::{EmbeddingModel, Encoding};
 use crate::similarity;
 
 /// Files larger than this are memory-mapped instead of read into a String.
@@ -114,13 +114,13 @@ pub struct SearchResult {
 ///
 /// # Panics
 ///
-/// Panics if a per-thread model clone fails during parallel embedding
-/// (should not happen if the model loaded successfully).
+/// Panics if a per-thread backend clone fails during parallel embedding
+/// (should not happen if the backend loaded successfully).
 #[instrument(skip_all, fields(root = %root.display(), top_k, batch_size = cfg.batch_size))]
 pub fn search(
     root: &Path,
     query: &str,
-    model: &EmbeddingModel,
+    backend: &dyn EmbedBackend,
     tokenizer: &tokenizers::Tokenizer,
     top_k: usize,
     cfg: &SearchConfig,
@@ -164,7 +164,7 @@ pub fn search(
         let _span = info_span!("embed_query").entered();
         let _guard = profiler.phase("embed_query");
         let enc = tokenize(query, tokenizer, cfg.max_tokens)?;
-        let mut results = crate::model::embed_batch(model, &[enc])?;
+        let mut results = backend.embed_batch(&[enc])?;
         results.pop().unwrap_or_default()
     };
 
@@ -174,11 +174,11 @@ pub fn search(
     let _span = info_span!("embed_chunks", chunk_count = chunks.len(), batch_size = bs).entered();
     profiler.embed_begin(chunks.len());
 
-    let is_gpu = !matches!(model.device(), candle_core::Device::Cpu);
+    let is_gpu = backend.is_gpu();
     let embeddings: Vec<Vec<f32>> = if is_gpu {
-        embed_gpu_pipelined(&chunks, model, tokenizer, max_tokens_cfg, bs, profiler)?
+        embed_gpu_pipelined(&chunks, backend, tokenizer, max_tokens_cfg, bs, profiler)?
     } else {
-        embed_cpu_parallel(&chunks, model, tokenizer, max_tokens_cfg, bs, profiler)?
+        embed_cpu_parallel(&chunks, backend, tokenizer, max_tokens_cfg, bs, profiler)?
     };
     profiler.embed_done();
 
@@ -214,14 +214,15 @@ pub fn search(
     Ok(results)
 }
 
-/// CPU embedding: rayon-parallel, one model clone per thread.
+/// CPU embedding: rayon-parallel, one backend clone per thread.
 ///
-/// Each rayon thread gets a cheap Arc-clone of the model and runs
-/// independent BLAS calls. Accelerate/MKL handles per-call SIMD but
-/// multiple concurrent calls saturate all cores.
+/// Each rayon thread gets a cheap clone of the backend (via
+/// [`EmbedBackend::clone_backend`]) and runs independent BLAS calls.
+/// Accelerate/MKL handles per-call SIMD but multiple concurrent calls
+/// saturate all cores.
 fn embed_cpu_parallel(
     chunks: &[CodeChunk],
-    model: &EmbeddingModel,
+    backend: &dyn EmbedBackend,
     tokenizer: &tokenizers::Tokenizer,
     max_tokens: usize,
     batch_size: usize,
@@ -233,8 +234,8 @@ fn embed_cpu_parallel(
     let results: Vec<Vec<f32>> = chunks
         .par_chunks(batch_size)
         .map_init(
-            || model.clone(),
-            |thread_model, batch| {
+            || backend.clone_backend(),
+            |thread_backend, batch| {
                 // Skip remaining batches if we already hit an error
                 if first_error.lock().ok().is_some_and(|e| e.is_some()) {
                     return vec![vec![]; batch.len()];
@@ -245,7 +246,7 @@ fn embed_cpu_parallel(
                     .filter_map(|chunk| tokenize(&chunk.content, tokenizer, max_tokens).ok())
                     .collect();
 
-                match crate::model::embed_batch(thread_model, &encodings) {
+                match thread_backend.embed_batch(&encodings) {
                     Ok(batch_embeddings) => {
                         let done = done_counter
                             .fetch_add(batch.len(), std::sync::atomic::Ordering::Relaxed)
@@ -282,13 +283,13 @@ fn embed_cpu_parallel(
 /// batches to the GPU. When the buffer is full the producer blocks,
 /// bounding peak memory for tokenized data to `O(RING_SIZE * gpu_bs)`.
 ///
-/// For candle Metal/CUDA, each `embed_batch` call does:
-///   1. `Tensor::from_vec` — CPU→device transfer
-///   2. `model.forward`   — device compute
-///   3. `to_vec2`         — device→CPU transfer
+/// Each `embed_batch` call does:
+///   1. CPU→device transfer
+///   2. device compute (forward pass)
+///   3. device→CPU transfer
 fn embed_gpu_pipelined(
     chunks: &[CodeChunk],
-    model: &EmbeddingModel,
+    backend: &dyn EmbedBackend,
     tokenizer: &tokenizers::Tokenizer,
     max_tokens: usize,
     batch_size: usize,
@@ -344,7 +345,7 @@ fn embed_gpu_pipelined(
                 continue;
             }
 
-            match crate::model::embed_batch(model, &valid) {
+            match backend.embed_batch(&valid) {
                 Ok(batch_embeddings) => {
                     let mut emb_iter = batch_embeddings.into_iter();
                     for ok in &mask {
@@ -452,4 +453,34 @@ fn tokenize(
             .map(|&x| i64::from(x))
             .collect(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_with_backend_trait() {
+        let backend = crate::backend::load_backend(
+            crate::backend::BackendKind::Candle,
+            "BAAI/bge-small-en-v1.5",
+            crate::backend::DeviceHint::Cpu,
+        )
+        .unwrap();
+        let tokenizer = crate::tokenize::load_tokenizer("BAAI/bge-small-en-v1.5").unwrap();
+        let cfg = SearchConfig::default();
+        let profiler = crate::profile::Profiler::noop();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let results = search(
+            &dir,
+            "embedding model",
+            backend.as_ref(),
+            &tokenizer,
+            1,
+            &cfg,
+            &profiler,
+        );
+        assert!(results.is_ok());
+        assert!(!results.unwrap().is_empty());
+    }
 }

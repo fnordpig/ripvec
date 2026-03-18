@@ -3,19 +3,25 @@
 //! Covers: tokenization, embedding (single + batch), chunking,
 //! similarity, and the full search pipeline.
 
+#![expect(
+    clippy::format_collect,
+    clippy::cast_precision_loss,
+    reason = "benchmark helper code — clarity over micro-optimization"
+)]
+
 use std::path::Path;
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use ripvec_core::backend::{BackendKind, DeviceHint, EmbedBackend, Encoding};
 use ripvec_core::chunk::ChunkConfig;
 use ripvec_core::embed::{DEFAULT_BATCH_SIZE, SearchConfig};
-use ripvec_core::model::{self, DeviceKind, EmbeddingModel, Encoding};
 use ripvec_core::profile::Profiler;
 
 const MODEL_REPO: &str = "BAAI/bge-small-en-v1.5";
 
 /// Shared test fixtures loaded once per benchmark group.
 struct Fixtures {
-    model: EmbeddingModel,
+    backend: Box<dyn EmbedBackend>,
     tokenizer: tokenizers::Tokenizer,
     /// A batch of pre-tokenized encodings (short sequences ~64 tokens).
     short_encodings: Vec<Encoding>,
@@ -27,8 +33,9 @@ struct Fixtures {
 
 impl Fixtures {
     fn load() -> Self {
-        let device = model::select_device(DeviceKind::Cpu).expect("CPU device");
-        let model = EmbeddingModel::load(MODEL_REPO, &device).expect("model load");
+        let backend =
+            ripvec_core::backend::load_backend(BackendKind::Candle, MODEL_REPO, DeviceHint::Cpu)
+                .expect("backend load");
         let tokenizer = ripvec_core::tokenize::load_tokenizer(MODEL_REPO).expect("tokenizer");
 
         // Generate short and long text samples
@@ -81,7 +88,7 @@ impl Fixtures {
             .collect::<String>();
 
         Self {
-            model,
+            backend,
             tokenizer,
             short_encodings,
             long_encodings,
@@ -103,7 +110,7 @@ fn bench_embed_batch(c: &mut Criterion) {
         ("long_x32", &f.long_encodings[..]),
     ] {
         group.bench_with_input(BenchmarkId::new("cpu", name), encodings, |b, encs| {
-            b.iter(|| model::embed_batch(&f.model, black_box(encs)).expect("embed"));
+            b.iter(|| f.backend.embed_batch(black_box(encs)).expect("embed"));
         });
     }
 
@@ -175,8 +182,9 @@ fn bench_dot_product(c: &mut Criterion) {
 // --- Token length sweep: cost curve for max_tokens ---
 
 fn bench_max_tokens_sweep(c: &mut Criterion) {
-    let device = model::select_device(DeviceKind::Cpu).expect("CPU device");
-    let model = EmbeddingModel::load(MODEL_REPO, &device).expect("model load");
+    let backend =
+        ripvec_core::backend::load_backend(BackendKind::Candle, MODEL_REPO, DeviceHint::Cpu)
+            .expect("backend load");
     let tokenizer = ripvec_core::tokenize::load_tokenizer(MODEL_REPO).expect("tokenizer");
 
     // Generate a long source text that tokenizes to 512+ tokens
@@ -216,7 +224,7 @@ fn bench_max_tokens_sweep(c: &mut Criterion) {
             BenchmarkId::new("batch32", max_tokens),
             &batch,
             |b, batch| {
-                b.iter(|| model::embed_batch(&model, black_box(batch)).expect("embed"));
+                b.iter(|| backend.embed_batch(black_box(batch)).expect("embed"));
             },
         );
     }
@@ -239,7 +247,7 @@ fn bench_search(c: &mut Criterion) {
             ripvec_core::embed::search(
                 black_box(&src_dir),
                 black_box("embedding model inference"),
-                black_box(&f.model),
+                black_box(f.backend.as_ref()),
                 black_box(&f.tokenizer),
                 black_box(5),
                 black_box(&cfg),

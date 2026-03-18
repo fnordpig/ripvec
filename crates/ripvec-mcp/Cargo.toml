@@ -12,7 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 ripvec-core = { path = "../ripvec-core" }
-candle-core.workspace = true
 rmcp.workspace = true
 tokio.workspace = true
 serde.workspace = true

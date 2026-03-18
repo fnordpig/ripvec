@@ -16,11 +16,11 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-/// The ripvec MCP server, holding shared model and tokenizer state.
+/// The ripvec MCP server, holding shared backend and tokenizer state.
 #[derive(Clone)]
 pub struct RipvecServer {
-    /// The candle BERT embedding model (thread-safe without mutex).
-    model: Arc<ripvec_core::model::EmbeddingModel>,
+    /// The embedding backend (trait object, thread-safe).
+    backend: Arc<dyn ripvec_core::backend::EmbedBackend>,
     /// The `HuggingFace` tokenizer, `Send + Sync` so it can be shared across tasks.
     tokenizer: Arc<tokenizers::Tokenizer>,
     /// The generated tool router mapping tool names to handlers.
@@ -50,13 +50,13 @@ fn default_top_k() -> usize {
 
 #[tool_router]
 impl RipvecServer {
-    /// Create a new server with an already-loaded model and tokenizer.
+    /// Create a new server with an already-loaded backend and tokenizer.
     fn new(
-        model: Arc<ripvec_core::model::EmbeddingModel>,
+        backend: Arc<dyn ripvec_core::backend::EmbedBackend>,
         tokenizer: Arc<tokenizers::Tokenizer>,
     ) -> Self {
         Self {
-            model,
+            backend,
             tokenizer,
             tool_router: Self::tool_router(),
         }
@@ -73,7 +73,7 @@ impl RipvecServer {
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let path = req.path;
         let top_k = req.top_k;
-        let model = Arc::clone(&self.model);
+        let backend = Arc::clone(&self.backend);
         let tokenizer = Arc::clone(&self.tokenizer);
         let query = req.query.clone();
 
@@ -81,7 +81,7 @@ impl RipvecServer {
             ripvec_core::embed::search(
                 std::path::Path::new(&path),
                 &query,
-                &model,
+                backend.as_ref(),
                 &tokenizer,
                 top_k,
                 &ripvec_core::embed::SearchConfig::default(),
@@ -155,22 +155,23 @@ impl ServerHandler for RipvecServer {
     }
 }
 
-/// Load the model and tokenizer, start the MCP server over stdin/stdout.
+/// Load the backend and tokenizer, start the MCP server over stdin/stdout.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let model = Arc::new(
-        ripvec_core::model::EmbeddingModel::load(
+    let backend: Arc<dyn ripvec_core::backend::EmbedBackend> = Arc::from(
+        ripvec_core::backend::load_backend(
+            ripvec_core::backend::BackendKind::Candle,
             "BAAI/bge-small-en-v1.5",
-            &candle_core::Device::Cpu,
+            ripvec_core::backend::DeviceHint::Cpu,
         )
-        .map_err(|e| anyhow::anyhow!("failed to load embedding model: {e}"))?,
+        .map_err(|e| anyhow::anyhow!("failed to load embedding backend: {e}"))?,
     );
     let tokenizer = Arc::new(
         ripvec_core::tokenize::load_tokenizer("BAAI/bge-small-en-v1.5")
             .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))?,
     );
 
-    let server = RipvecServer::new(model, tokenizer);
+    let server = RipvecServer::new(backend, tokenizer);
     let service = server
         .serve(rmcp::transport::stdio())
         .await
