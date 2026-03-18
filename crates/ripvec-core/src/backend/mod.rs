@@ -4,6 +4,8 @@
 //! ORT) implement, plus the [`Encoding`] input type and [`BackendKind`]
 //! discriminant. Use [`load_backend`] to construct a backend by kind.
 
+pub mod candle;
+
 /// Pre-tokenized encoding ready for inference.
 ///
 /// Token IDs, attention mask, and token type IDs must all have the same length.
@@ -114,12 +116,11 @@ pub fn load_backend(
     model_repo: &str,
     device_hint: DeviceHint,
 ) -> crate::Result<Box<dyn EmbedBackend>> {
-    // These parameters will be forwarded to real backends once implemented.
-    let _ = (model_repo, device_hint);
     match kind {
-        BackendKind::Candle => Err(crate::Error::Other(anyhow::anyhow!(
-            "candle backend not yet implemented in new trait system"
-        ))),
+        BackendKind::Candle => {
+            let backend = candle::CandleBackend::load(model_repo, &device_hint)?;
+            Ok(Box::new(backend))
+        }
         BackendKind::Mlx => Err(crate::Error::Other(anyhow::anyhow!(
             "mlx backend not yet implemented"
         ))),
@@ -197,11 +198,13 @@ mod tests {
     }
 
     #[test]
-    fn load_backend_returns_not_implemented() {
-        let result = load_backend(BackendKind::Candle, "test/model", DeviceHint::Cpu);
-        assert!(result.is_err());
+    fn load_backend_mlx_not_implemented() {
         let result = load_backend(BackendKind::Mlx, "test/model", DeviceHint::Cpu);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_backend_ort_not_implemented() {
         let result = load_backend(BackendKind::Ort, "test/model", DeviceHint::Cpu);
         assert!(result.is_err());
     }
