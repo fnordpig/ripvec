@@ -5,6 +5,8 @@
 //! discriminant. Use [`load_backend`] to construct a backend by kind.
 
 pub mod candle;
+#[cfg(feature = "mlx")]
+pub mod mlx;
 #[cfg(feature = "ort")]
 pub mod ort;
 
@@ -123,8 +125,14 @@ pub fn load_backend(
             let backend = candle::CandleBackend::load(model_repo, &device_hint)?;
             Ok(Box::new(backend))
         }
+        #[cfg(feature = "mlx")]
+        BackendKind::Mlx => {
+            let backend = mlx::MlxBackend::load(model_repo, &device_hint)?;
+            Ok(Box::new(backend))
+        }
+        #[cfg(not(feature = "mlx"))]
         BackendKind::Mlx => Err(crate::Error::Other(anyhow::anyhow!(
-            "mlx backend not yet implemented"
+            "mlx backend requires building with: cargo build --features mlx"
         ))),
         #[cfg(feature = "ort")]
         BackendKind::Ort => {
@@ -205,8 +213,9 @@ mod tests {
         assert_eq!(BackendKind::Ort.to_string(), "ort");
     }
 
+    #[cfg(not(feature = "mlx"))]
     #[test]
-    fn load_backend_mlx_not_implemented() {
+    fn load_backend_mlx_not_compiled() {
         let result = load_backend(BackendKind::Mlx, "test/model", DeviceHint::Cpu);
         assert!(result.is_err());
     }
