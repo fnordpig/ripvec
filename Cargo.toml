@@ -57,6 +57,10 @@ assert_cmd = "2.1"
 predicates = "3"
 tempfile = "3"
 
+[profile.release]
+debug = 2              # full DWARF for profiling (samply, Instruments)
+split-debuginfo = "off"  # keep symbols in binary, not dSYM
+
 [workspace.lints.rust]
 unsafe_code = "warn"
 
