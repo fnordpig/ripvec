@@ -176,9 +176,9 @@ pub fn search(
 
     let is_gpu = !matches!(model.device(), candle_core::Device::Cpu);
     let embeddings: Vec<Vec<f32>> = if is_gpu {
-        embed_gpu_pipelined(&chunks, model, tokenizer, max_tokens_cfg, bs, profiler)
+        embed_gpu_pipelined(&chunks, model, tokenizer, max_tokens_cfg, bs, profiler)?
     } else {
-        embed_cpu_parallel(&chunks, model, tokenizer, max_tokens_cfg, bs, profiler)
+        embed_cpu_parallel(&chunks, model, tokenizer, max_tokens_cfg, bs, profiler)?
     };
     profiler.embed_done();
 
@@ -226,32 +226,53 @@ fn embed_cpu_parallel(
     max_tokens: usize,
     batch_size: usize,
     profiler: &crate::profile::Profiler,
-) -> Vec<Vec<f32>> {
+) -> crate::Result<Vec<Vec<f32>>> {
     let done_counter = std::sync::atomic::AtomicUsize::new(0);
+    let first_error: std::sync::Mutex<Option<crate::Error>> = std::sync::Mutex::new(None);
 
-    chunks
+    let results: Vec<Vec<f32>> = chunks
         .par_chunks(batch_size)
         .map_init(
             || model.clone(),
             |thread_model, batch| {
+                // Skip remaining batches if we already hit an error
+                if first_error.lock().ok().is_some_and(|e| e.is_some()) {
+                    return vec![vec![]; batch.len()];
+                }
+
                 let encodings: Vec<Encoding> = batch
                     .iter()
                     .filter_map(|chunk| tokenize(&chunk.content, tokenizer, max_tokens).ok())
                     .collect();
 
-                let batch_embeddings =
-                    crate::model::embed_batch(thread_model, &encodings).unwrap_or_default();
-
-                let done = done_counter
-                    .fetch_add(batch.len(), std::sync::atomic::Ordering::Relaxed)
-                    + batch.len();
-                profiler.embed_tick(done);
-
-                batch_embeddings
+                match crate::model::embed_batch(thread_model, &encodings) {
+                    Ok(batch_embeddings) => {
+                        let done = done_counter
+                            .fetch_add(batch.len(), std::sync::atomic::Ordering::Relaxed)
+                            + batch.len();
+                        profiler.embed_tick(done);
+                        batch_embeddings
+                    }
+                    Err(e) => {
+                        if let Ok(mut guard) = first_error.lock()
+                            && guard.is_none()
+                        {
+                            *guard = Some(e);
+                        }
+                        vec![vec![]; batch.len()]
+                    }
+                }
             },
         )
         .flatten()
-        .collect()
+        .collect();
+
+    // If any batch failed, return the first error
+    if let Some(err) = first_error.into_inner().ok().flatten() {
+        return Err(err);
+    }
+
+    Ok(results)
 }
 
 /// GPU embedding with bounded producer-consumer pipeline.
@@ -272,7 +293,7 @@ fn embed_gpu_pipelined(
     max_tokens: usize,
     batch_size: usize,
     profiler: &crate::profile::Profiler,
-) -> Vec<Vec<f32>> {
+) -> crate::Result<Vec<Vec<f32>>> {
     use std::sync::mpsc;
 
     /// Max tokenized batches buffered ahead of GPU consumption.
@@ -285,6 +306,7 @@ fn embed_gpu_pipelined(
 
     let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
     let mut done = 0usize;
+    let mut first_error: Option<crate::Error> = None;
 
     std::thread::scope(|s| {
         s.spawn(|| {
@@ -322,14 +344,20 @@ fn embed_gpu_pipelined(
                 continue;
             }
 
-            let batch_embeddings = crate::model::embed_batch(model, &valid).unwrap_or_default();
-
-            let mut emb_iter = batch_embeddings.into_iter();
-            for ok in &mask {
-                if *ok {
-                    embeddings.push(emb_iter.next().unwrap_or_default());
-                } else {
-                    embeddings.push(vec![]);
+            match crate::model::embed_batch(model, &valid) {
+                Ok(batch_embeddings) => {
+                    let mut emb_iter = batch_embeddings.into_iter();
+                    for ok in &mask {
+                        if *ok {
+                            embeddings.push(emb_iter.next().unwrap_or_default());
+                        } else {
+                            embeddings.push(vec![]);
+                        }
+                    }
+                }
+                Err(e) => {
+                    first_error = Some(e);
+                    break;
                 }
             }
 
@@ -338,7 +366,11 @@ fn embed_gpu_pipelined(
         }
     });
 
-    embeddings
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+
+    Ok(embeddings)
 }
 
 /// Source text either owned (from `read_to_string`) or mmap'd.
