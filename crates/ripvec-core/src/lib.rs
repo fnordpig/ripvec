@@ -3,6 +3,7 @@
 //! Provides candle-based BERT embedding model loading, tree-sitter code chunking,
 //! parallel embedding, and cosine similarity ranking.
 
+pub mod backend;
 pub mod chunk;
 pub mod embed;
 pub mod error;
