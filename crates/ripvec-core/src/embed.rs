@@ -414,13 +414,16 @@ fn read_source(path: &Path) -> Option<SourceText> {
     }
 }
 
+/// Hard limit matching bge-small-en-v1.5 `max_position_embeddings`.
+/// Sequences at or above this length cause an OOB error in the model.
+const MODEL_MAX_TOKENS: usize = 512;
+
 /// Tokenize text into an [`Encoding`] ready for model inference.
 ///
-/// When `max_tokens` is non-zero, truncates to that many tokens to cap
-/// inference cost regardless of text density (minified JS can have 3-4x more
-/// tokens per byte than formatted code). CLS pooling only uses the first
-/// token's representation, so the beginning of a definition carries most
-/// semantic weight. Pass `0` for no limit.
+/// Always truncates to [`MODEL_MAX_TOKENS`] (the model's position embedding
+/// limit). When `max_tokens` is non-zero, further truncates to that value.
+/// CLS pooling means the first token's representation carries most semantic
+/// weight, so truncation has minimal quality impact.
 fn tokenize(
     text: &str,
     tokenizer: &tokenizers::Tokenizer,
@@ -431,11 +434,10 @@ fn tokenize(
         .map_err(|e| crate::Error::Tokenization(e.to_string()))?;
 
     let full_len = encoding.get_ids().len();
-    let len = if max_tokens == 0 {
-        full_len
-    } else {
-        full_len.min(max_tokens)
-    };
+    let mut len = full_len.min(MODEL_MAX_TOKENS);
+    if max_tokens > 0 {
+        len = len.min(max_tokens);
+    }
     Ok(Encoding {
         input_ids: encoding.get_ids()[..len]
             .iter()
