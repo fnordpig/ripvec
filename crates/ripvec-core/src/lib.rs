@@ -1,14 +1,14 @@
 //! Core library for ripvec semantic code search.
 //!
-//! Provides candle-based BERT embedding model loading, tree-sitter code chunking,
-//! parallel embedding, and cosine similarity ranking.
+//! Provides pluggable embedding backends ([`backend::EmbedBackend`] trait with
+//! Candle, MLX, and ORT implementations), tree-sitter code chunking, parallel
+//! embedding, and cosine similarity ranking.
 
 pub mod backend;
 pub mod chunk;
 pub mod embed;
 pub mod error;
 pub mod languages;
-pub mod model;
 pub mod profile;
 pub mod similarity;
 pub mod tokenize;
