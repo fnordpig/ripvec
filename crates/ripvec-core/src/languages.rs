@@ -1,11 +1,17 @@
 //! Language registry mapping file extensions to tree-sitter grammars.
 //!
 //! Each supported language has a grammar and a tree-sitter query that
-//! extracts function, class, and method definitions.
+//! extracts function, class, and method definitions. Compiled queries
+//! are cached so that repeated calls for the same extension are free.
+
+use std::sync::{Arc, OnceLock};
 
 use tree_sitter::{Language, Query};
 
 /// Configuration for a supported source language.
+///
+/// Wrapped in [`Arc`] so it can be shared across threads and returned
+/// from the cache without cloning the compiled [`Query`].
 pub struct LangConfig {
     /// The tree-sitter Language grammar.
     pub language: Language,
@@ -15,9 +21,32 @@ pub struct LangConfig {
 
 /// Look up the language configuration for a file extension.
 ///
+/// Compiled queries are cached per extension so repeated calls are free.
 /// Returns `None` for unsupported extensions.
 #[must_use]
-pub fn config_for_extension(ext: &str) -> Option<LangConfig> {
+pub fn config_for_extension(ext: &str) -> Option<Arc<LangConfig>> {
+    // Cache of compiled configs, keyed by canonical extension.
+    static CACHE: OnceLock<std::collections::HashMap<&'static str, Arc<LangConfig>>> =
+        OnceLock::new();
+
+    let cache = CACHE.get_or_init(|| {
+        let mut m = std::collections::HashMap::new();
+        // Pre-compile all supported extensions
+        for &ext in &[
+            "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "c", "h", "cpp", "cc", "cxx", "hpp",
+        ] {
+            if let Some(cfg) = compile_config(ext) {
+                m.insert(ext, Arc::new(cfg));
+            }
+        }
+        m
+    });
+
+    cache.get(ext).cloned()
+}
+
+/// Compile a [`LangConfig`] for the given extension (uncached).
+fn compile_config(ext: &str) -> Option<LangConfig> {
     let (lang, query_str): (Language, &str) = match ext {
         // Rust: standalone functions, structs, and methods INSIDE impl/trait blocks.
         // impl_item and trait_item are NOT captured as wholes — we extract their
