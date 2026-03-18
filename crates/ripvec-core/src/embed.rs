@@ -83,9 +83,9 @@ impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             batch_size: DEFAULT_BATCH_SIZE,
-            max_tokens: 256,
+            max_tokens: 0,
             chunk: ChunkConfig::default(),
-            sort_order: SortOrder::Descending,
+            sort_order: SortOrder::None,
         }
     }
 }

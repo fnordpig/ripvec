@@ -30,7 +30,8 @@ anyhow.workspace = true
 tracing.workspace = true
 
 [features]
-default = []
+default = ["accelerate"]
+accelerate = ["candle-core/accelerate"]
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 
