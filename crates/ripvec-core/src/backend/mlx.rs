@@ -543,12 +543,23 @@ impl EmbedBackend for MlxBackend {
     }
 }
 
+// NOTE: MLX tests must run single-threaded (`--test-threads=1`) because
+// MLX's Metal runtime segfaults when multiple model instances run in
+// parallel across test threads. This is fine for production (GPU backend
+// uses single-threaded pipelined scheduler).
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::backend::Encoding;
 
     const BGE_SMALL: &str = "BAAI/bge-small-en-v1.5";
+
+    #[test]
+    fn mlx_backend_loads_model() {
+        // Isolate: does model loading segfault?
+        let _backend = MlxBackend::load(BGE_SMALL, &DeviceHint::Auto).unwrap();
+    }
 
     #[test]
     fn mlx_backend_loads_and_embeds() {
