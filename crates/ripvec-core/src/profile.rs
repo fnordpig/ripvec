@@ -283,11 +283,8 @@ impl Profiler {
     /// Print the total wall-clock time.
     pub fn finish(&self) {
         if let Self::Active { start, .. } = self {
-            eprintln!(
-                "[{:.1}s]  total: {:.1}s",
-                start.elapsed().as_secs_f64(),
-                start.elapsed().as_secs_f64()
-            );
+            let elapsed = start.elapsed().as_secs_f64();
+            eprintln!("[{elapsed:.1}s]  total: {elapsed:.1}s");
         }
     }
 }

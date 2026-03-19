@@ -6,6 +6,7 @@
 /// Cosine similarity between two L2-normalized vectors (= dot product).
 #[must_use]
 pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "dot_product: vector length mismatch");
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 

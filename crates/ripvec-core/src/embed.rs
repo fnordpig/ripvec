@@ -30,7 +30,7 @@ use std::time::Instant;
 
 use memmap2::Mmap;
 use rayon::prelude::*;
-use tracing::{info_span, instrument};
+use tracing::{info_span, instrument, warn};
 
 use crate::backend::{EmbedBackend, Encoding};
 use crate::chunk::{ChunkConfig, CodeChunk};
@@ -173,16 +173,18 @@ pub fn search(
         result
     };
 
-    // Phase 2: Embed query
+    // Phase 3: Embed query
     let query_embedding = {
         let _span = info_span!("embed_query").entered();
         let _guard = profiler.phase("embed_query");
         let enc = tokenize(query, tokenizer, cfg.max_tokens)?;
         let mut results = backend.embed_batch(&[enc])?;
-        results.pop().unwrap_or_default()
+        results.pop().ok_or_else(|| {
+            crate::Error::Other(anyhow::anyhow!("backend returned no embedding for query"))
+        })?
     };
 
-    // Phase 3: Embed all chunks — strategy depends on device
+    // Phase 4: Embed all chunks — strategy depends on device
     let bs = cfg.batch_size.max(1);
     let max_tokens_cfg = cfg.max_tokens;
     let _span = info_span!("embed_chunks", chunk_count = chunks.len(), batch_size = bs).entered();
@@ -196,7 +198,7 @@ pub fn search(
     };
     profiler.embed_done();
 
-    // Phase 4: Parallel similarity ranking (rayon — just dot products)
+    // Phase 5: Parallel similarity ranking (rayon — just dot products)
     let mut results: Vec<SearchResult> = {
         let _span = info_span!("rank", chunk_count = chunks.len()).entered();
         let guard = profiler.phase("rank");
@@ -257,18 +259,47 @@ fn embed_cpu_parallel(
                     return vec![vec![]; batch.len()];
                 }
 
-                let encodings: Vec<Encoding> = batch
+                // Tokenize all chunks, tracking which succeeded
+                let tok_results: Vec<Option<Encoding>> = batch
                     .iter()
-                    .filter_map(|chunk| tokenize(&chunk.content, tokenizer, max_tokens).ok())
+                    .map(|chunk| {
+                        tokenize(&chunk.content, tokenizer, max_tokens)
+                            .inspect_err(|e| {
+                                warn!(file = %chunk.file_path, err = %e, "tokenization failed, skipping chunk");
+                            })
+                            .ok()
+                    })
                     .collect();
 
-                match thread_backend.embed_batch(&encodings) {
+                let valid: Vec<Encoding> = tok_results
+                    .iter()
+                    .filter_map(|e| {
+                        e.as_ref().map(|enc| Encoding {
+                            input_ids: enc.input_ids.clone(),
+                            attention_mask: enc.attention_mask.clone(),
+                            token_type_ids: enc.token_type_ids.clone(),
+                        })
+                    })
+                    .collect();
+
+                match thread_backend.embed_batch(&valid) {
                     Ok(batch_embeddings) => {
                         let done = done_counter
                             .fetch_add(batch.len(), std::sync::atomic::Ordering::Relaxed)
                             + batch.len();
                         profiler.embed_tick(done);
-                        batch_embeddings
+                        // Interleave embeddings with empties for failed tokenizations
+                        let mut emb_iter = batch_embeddings.into_iter();
+                        tok_results
+                            .iter()
+                            .map(|enc| {
+                                if enc.is_some() {
+                                    emb_iter.next().unwrap_or_default()
+                                } else {
+                                    vec![]
+                                }
+                            })
+                            .collect()
                     }
                     Err(e) => {
                         if let Ok(mut guard) = first_error.lock()
@@ -330,7 +361,13 @@ fn embed_gpu_pipelined(
             for chunk_batch in chunks.chunks(gpu_bs) {
                 let encodings: Vec<Option<Encoding>> = chunk_batch
                     .par_iter()
-                    .map(|chunk| tokenize(&chunk.content, tokenizer, max_tokens).ok())
+                    .map(|chunk| {
+                        tokenize(&chunk.content, tokenizer, max_tokens)
+                            .inspect_err(|e| {
+                                warn!(file = %chunk.file_path, err = %e, "tokenization failed, skipping chunk");
+                            })
+                            .ok()
+                    })
                     .collect();
 
                 let mut valid = Vec::with_capacity(encodings.len());
