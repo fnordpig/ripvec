@@ -4,6 +4,7 @@
 //! the user types a query and sees ranked results update live. Uses
 //! [`ratatui`] with a [`crossterm`] backend.
 
+pub mod index;
 pub mod input;
 pub mod ui;
 
@@ -20,8 +21,8 @@ use ratatui::Terminal;
 use ratatui::prelude::CrosstermBackend;
 
 use ripvec_core::backend::{EmbedBackend, Encoding};
-use ripvec_core::chunk::CodeChunk;
-use ripvec_core::similarity;
+
+use index::SearchIndex;
 
 /// TUI application state.
 pub struct App {
@@ -31,21 +32,14 @@ pub struct App {
     pub selected: usize,
     /// Scroll offset for the preview pane.
     pub preview_scroll: u16,
-    /// All chunks (from `embed_all`).
-    pub chunks: Vec<CodeChunk>,
-    /// Raw embedding vectors — one `Vec<f32>` per chunk.
-    pub embeddings: Vec<Vec<f32>>,
+    /// Pre-computed search index for BLAS-accelerated re-ranking.
+    pub index: SearchIndex,
     /// Current ranked results: `(chunk_index, similarity_score)`.
     pub results: Vec<(usize, f32)>,
     /// Embedding backend for re-embedding queries.
     pub backend: Box<dyn EmbedBackend>,
     /// Tokenizer for query encoding.
     pub tokenizer: tokenizers::Tokenizer,
-    /// Hidden dimension of the embedding model.
-    ///
-    /// Reserved for Task 6 (ndarray BLAS ranking with `rank_all`).
-    #[expect(dead_code, reason = "used in Task 6 for ndarray matrix-vector ranking")]
-    pub hidden_dim: usize,
     /// Minimum similarity threshold.
     pub threshold: f32,
     /// Duration of the last ranking pass (for status display).
@@ -84,20 +78,10 @@ impl App {
             Err(_) => return,
         };
 
-        // Dot-product similarity (all embeddings are L2-normalized)
-        let mut scored: Vec<(usize, f32)> = self
-            .embeddings
-            .iter()
-            .enumerate()
-            .filter(|(_, emb)| !emb.is_empty())
-            .map(|(idx, emb)| (idx, similarity::dot_product(&query_emb, emb)))
-            .filter(|(_, score)| *score >= self.threshold)
-            .collect();
-
-        scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // BLAS matrix-vector multiply for ranking
+        self.results = self.index.rank(&query_emb, self.threshold);
 
         self.rank_time_ms = start.elapsed().as_secs_f64() * 1000.0;
-        self.results = scored;
         self.selected = 0;
         self.preview_scroll = 0;
     }

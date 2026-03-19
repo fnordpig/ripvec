@@ -88,7 +88,7 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .enumerate()
         .map(|(i, (chunk_idx, score))| {
-            let chunk = &app.chunks[*chunk_idx];
+            let chunk = &app.index.chunks[*chunk_idx];
             let marker = if i == app.selected { "\u{25b8} " } else { "  " };
             let text = format!(
                 "{marker}{}. [{:.2}] {}",
@@ -134,7 +134,7 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::default().fg(Color::Blue));
 
     let content = if let Some((chunk_idx, _)) = app.results.get(app.selected) {
-        app.chunks[*chunk_idx].content.clone()
+        app.index.chunks[*chunk_idx].content.clone()
     } else {
         String::from("No result selected")
     };
@@ -150,7 +150,7 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
 /// Draw the status bar with file location and help text.
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let location = if let Some((chunk_idx, _)) = app.results.get(app.selected) {
-        let chunk = &app.chunks[*chunk_idx];
+        let chunk = &app.index.chunks[*chunk_idx];
         format!(
             "{}:{}-{}",
             chunk.file_path, chunk.start_line, chunk.end_line
@@ -159,7 +159,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         String::new()
     };
 
-    let chunks_info = format!("{} chunks indexed", app.chunks.len());
+    let chunks_info = format!("{} chunks indexed", app.index.chunks.len());
 
     let line = Line::from(vec![
         Span::styled(format!(" {location}"), Style::default().fg(Color::Cyan)),

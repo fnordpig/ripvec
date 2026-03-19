@@ -23,6 +23,7 @@ indicatif = "0.17"
 ratatui = "0.29"
 crossterm = "0.28"
 tokenizers.workspace = true
+ndarray = "0.17"
 
 [features]
 default = []

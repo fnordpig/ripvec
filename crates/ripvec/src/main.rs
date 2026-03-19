@@ -155,22 +155,16 @@ fn run_interactive(
     }
     profiler.finish();
 
-    // Determine hidden dimension from first non-empty embedding
-    let hidden_dim = embeddings
-        .iter()
-        .find(|e| !e.is_empty())
-        .map_or(384, Vec::len);
+    let index = tui::index::SearchIndex::new(chunks, &embeddings);
 
     let app = tui::App {
         query: String::new(),
         selected: 0,
         preview_scroll: 0,
-        chunks,
-        embeddings,
+        index,
         results: Vec::new(),
         backend,
         tokenizer,
-        hidden_dim,
         threshold: args.threshold,
         rank_time_ms: 0.0,
         should_quit: false,
