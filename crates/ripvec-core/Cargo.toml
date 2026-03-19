@@ -28,8 +28,8 @@ serde_json.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+ndarray = "0.17"
 ort = { version = "2.0.0-rc.12", optional = true }
-ndarray = { version = "0.17", optional = true }
 mlx-rs = { version = "0.25", optional = true, features = ["safetensors"] }
 
 [features]
@@ -37,7 +37,7 @@ default = ["accelerate"]
 accelerate = ["candle-core/accelerate"]
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
-ort = ["dep:ort", "dep:ndarray"]
+ort = ["dep:ort"]
 mlx = ["dep:mlx-rs"]
 
 [dev-dependencies]
