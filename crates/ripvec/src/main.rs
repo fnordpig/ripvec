@@ -8,7 +8,14 @@ use clap::Parser;
 use tracing_subscriber::layer::SubscriberExt;
 
 fn main() -> Result<()> {
-    let args = cli::Args::parse();
+    let mut args = cli::Args::parse();
+
+    // In interactive mode the query is typed in the TUI, so the first
+    // positional arg is the path, not the query.  Clap sees it as
+    // `query` because that's the first positional — swap them.
+    if args.interactive && !args.query.is_empty() && args.path == "." {
+        args.path = std::mem::take(&mut args.query);
+    }
 
     // Set up Chrome tracing if `--trace <file>` is specified.
     // The guard must be held until the end of main — dropping it flushes the trace file.
@@ -151,7 +158,16 @@ fn run_interactive(
     )
     .context("embedding failed")?;
     if let Some(pb) = pb_embed {
-        pb.finish_and_clear();
+        pb.finish_with_message(format!(
+            "Indexed {} chunks from {} files",
+            chunks.len(),
+            // Deduplicate file paths to count unique files
+            chunks
+                .iter()
+                .map(|c| &c.file_path)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+        ));
     }
     profiler.finish();
 
