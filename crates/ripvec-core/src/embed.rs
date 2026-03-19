@@ -78,6 +78,10 @@ pub struct SearchConfig {
     pub chunk: ChunkConfig,
     /// Sort order for chunks before batching.
     pub sort_order: SortOrder,
+    /// Force all files to be chunked as plain text (sliding windows only).
+    /// When `false` (default), files with recognized extensions use tree-sitter
+    /// semantic chunking, and unrecognized extensions fall back to sliding windows.
+    pub text_mode: bool,
 }
 
 impl Default for SearchConfig {
@@ -87,6 +91,7 @@ impl Default for SearchConfig {
             max_tokens: 0,
             chunk: ChunkConfig::default(),
             sort_order: SortOrder::None,
+            text_mode: false,
         }
     }
 }
@@ -140,17 +145,26 @@ pub fn search(
     let chunks: Vec<CodeChunk> = {
         let _span = info_span!("chunk", file_count = files.len()).entered();
         let chunk_start = Instant::now();
+        let text_mode = cfg.text_mode;
         let result: Vec<CodeChunk> = files
             .par_iter()
             .flat_map(|path| {
-                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                let Some(lang_config) = crate::languages::config_for_extension(ext) else {
-                    return vec![];
-                };
                 let Some(source) = read_source(path) else {
                     return vec![];
                 };
-                let chunks = crate::chunk::chunk_file(path, &source, &lang_config, &cfg.chunk);
+                let chunks = if text_mode {
+                    // Force plain-text sliding windows for all files
+                    crate::chunk::chunk_text(path, &source, &cfg.chunk)
+                } else {
+                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    match crate::languages::config_for_extension(ext) {
+                        Some(lang_config) => {
+                            crate::chunk::chunk_file(path, &source, &lang_config, &cfg.chunk)
+                        }
+                        // Unrecognized extension: fall back to plain-text windows
+                        None => crate::chunk::chunk_text(path, &source, &cfg.chunk),
+                    }
+                };
                 profiler.chunk_thread_report(chunks.len());
                 chunks
             })

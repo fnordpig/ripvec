@@ -68,6 +68,12 @@ pub struct Args {
     #[arg(long, default_value = "none")]
     pub sort_order: SortOrderArg,
 
+    /// Treat all files as plain text (sliding-window chunking only).
+    /// By default, recognized source files use tree-sitter semantic chunking
+    /// and unrecognized files fall back to plain-text windows.
+    #[arg(long)]
+    pub text_mode: bool,
+
     /// Enable pipeline profiling output to stderr.
     #[arg(long)]
     pub profile: bool,

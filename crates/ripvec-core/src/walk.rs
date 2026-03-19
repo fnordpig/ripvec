@@ -8,9 +8,12 @@ use ignore::WalkBuilder;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-/// Walk a directory tree in parallel and collect paths to supported source files.
+/// Walk a directory tree in parallel and collect file paths.
 ///
 /// Respects `.gitignore` rules and skips hidden files and directories.
+/// Collects all files — the chunking phase decides whether to use
+/// tree-sitter (known extensions) or sliding-window fallback (unknown).
+///
 /// Uses the `ignore` crate's parallel walker for multi-threaded traversal.
 #[must_use]
 pub fn collect_files(root: &Path) -> Vec<PathBuf> {
@@ -26,16 +29,7 @@ pub fn collect_files(root: &Path) -> Vec<PathBuf> {
                 let Ok(entry) = entry else {
                     return ignore::WalkState::Continue;
                 };
-                let dominated_file = entry.file_type().is_some_and(|ft| ft.is_file());
-                if !dominated_file {
-                    return ignore::WalkState::Continue;
-                }
-                let dominated_ext = entry
-                    .path()
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| crate::languages::config_for_extension(ext).is_some());
-                if !dominated_ext {
+                if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                     return ignore::WalkState::Continue;
                 }
                 if let Ok(mut files) = files.lock() {

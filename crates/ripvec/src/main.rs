@@ -82,6 +82,7 @@ fn main() -> Result<()> {
             cli::SortOrderArg::Asc => ripvec_core::embed::SortOrder::Ascending,
             cli::SortOrderArg::None => ripvec_core::embed::SortOrder::None,
         },
+        text_mode: args.text_mode,
     };
 
     // Run search (fully parallel — per-thread sessions, no Mutex)

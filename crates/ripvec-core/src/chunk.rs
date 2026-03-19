@@ -134,6 +134,16 @@ pub fn chunk_file(
 /// Each window is `chunk_config.window_size` bytes with `chunk_config.window_overlap` bytes of
 /// overlap. Window boundaries are adjusted to line breaks to avoid
 /// splitting mid-line.
+///
+/// This is used as the fallback for files without tree-sitter support
+/// (plain text, unknown extensions) and for large semantic chunks that
+/// exceed `max_chunk_bytes`.
+#[must_use]
+pub fn chunk_text(path: &Path, source: &str, chunk_config: &ChunkConfig) -> Vec<CodeChunk> {
+    sliding_windows(path, source, chunk_config)
+}
+
+/// Internal sliding-window implementation.
 fn sliding_windows(path: &Path, source: &str, chunk_config: &ChunkConfig) -> Vec<CodeChunk> {
     if source.trim().is_empty() {
         return vec![];
