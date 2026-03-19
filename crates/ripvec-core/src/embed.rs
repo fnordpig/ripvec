@@ -223,7 +223,9 @@ pub fn search(
             .partial_cmp(&a.similarity)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    results.truncate(top_k);
+    if top_k > 0 {
+        results.truncate(top_k);
+    }
 
     Ok(results)
 }

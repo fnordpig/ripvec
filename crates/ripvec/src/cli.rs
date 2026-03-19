@@ -13,8 +13,8 @@ pub struct Args {
     #[arg(default_value = ".")]
     pub path: String,
 
-    /// Number of results to show.
-    #[arg(short = 'n', long, default_value_t = 10)]
+    /// Number of results to show (0 = all matches above threshold).
+    #[arg(short = 'n', long, default_value_t = 0)]
     pub top_k: usize,
 
     /// `HuggingFace` model repository.
@@ -26,7 +26,7 @@ pub struct Args {
     pub format: OutputFormat,
 
     /// Minimum similarity threshold (0.0 to 1.0).
-    #[arg(short = 't', long, default_value_t = 0.0)]
+    #[arg(short = 't', long, default_value_t = 0.5)]
     pub threshold: f32,
 
     /// Number of threads for parallel processing (0 = cores).
