@@ -51,6 +51,8 @@ pub struct App {
     pub should_quit: bool,
     /// If set, suspend TUI and open this `(file_path, line_number)` in `$EDITOR`.
     pub open_editor: Option<(String, usize)>,
+    /// Summary of indexed files by extension (e.g. "208 chunks │ 15 rs, 8 py, 6 js").
+    pub index_summary: String,
 }
 
 impl App {

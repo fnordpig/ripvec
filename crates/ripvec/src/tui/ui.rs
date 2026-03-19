@@ -39,9 +39,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
 /// Draw the query input bar with match count and timing.
 fn draw_query_bar(frame: &mut Frame, app: &App, area: Rect) {
     let status_text = if app.query.is_empty() {
-        String::from("type to search")
+        app.index_summary.clone()
     } else {
-        format!("{} matches, {:.1}ms", app.results.len(), app.rank_time_ms,)
+        format!("{} matches, {:.1}ms", app.results.len(), app.rank_time_ms)
     };
 
     let line = Line::from(vec![

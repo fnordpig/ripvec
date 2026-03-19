@@ -171,6 +171,25 @@ fn run_interactive(
     }
     profiler.finish();
 
+    // Build index summary: count chunks by file extension
+    let index_summary = {
+        let mut ext_counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for chunk in &chunks {
+            let ext = std::path::Path::new(&chunk.file_path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("other");
+            *ext_counts.entry(ext.to_string()).or_default() += 1;
+        }
+        let breakdown: Vec<String> = ext_counts
+            .iter()
+            .rev() // largest extensions first (BTreeMap is sorted)
+            .map(|(ext, count)| format!("{count} .{ext}"))
+            .collect();
+        format!("{} chunks \u{2502} {}", chunks.len(), breakdown.join(", "))
+    };
+
     let index = tui::index::SearchIndex::new(chunks, &embeddings);
 
     let app = tui::App {
@@ -186,6 +205,7 @@ fn run_interactive(
         highlighter: tui::highlight::Highlighter::new(),
         should_quit: false,
         open_editor: None,
+        index_summary,
     };
 
     tui::run(app)
