@@ -4,6 +4,7 @@
 //! the user types a query and sees ranked results update live. Uses
 //! [`ratatui`] with a [`crossterm`] backend.
 
+pub mod highlight;
 pub mod index;
 pub mod input;
 pub mod ui;
@@ -44,6 +45,8 @@ pub struct App {
     pub threshold: f32,
     /// Duration of the last ranking pass (for status display).
     pub rank_time_ms: f64,
+    /// Syntax highlighter for the preview pane.
+    pub highlighter: highlight::Highlighter,
     /// Set to `true` to exit the event loop.
     pub should_quit: bool,
 }

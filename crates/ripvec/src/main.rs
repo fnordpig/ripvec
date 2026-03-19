@@ -167,6 +167,7 @@ fn run_interactive(
         tokenizer,
         threshold: args.threshold,
         rank_time_ms: 0.0,
+        highlighter: tui::highlight::Highlighter::new(),
         should_quit: false,
     };
 

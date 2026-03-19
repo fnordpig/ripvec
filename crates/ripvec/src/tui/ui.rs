@@ -126,20 +126,25 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-/// Draw the preview pane showing the selected chunk's content.
+/// Draw the preview pane showing the selected chunk's content with syntax highlighting.
 fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .title(" Preview ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Blue));
 
-    let content = if let Some((chunk_idx, _)) = app.results.get(app.selected) {
-        app.index.chunks[*chunk_idx].content.clone()
+    let lines: Vec<Line<'_>> = if let Some((chunk_idx, _)) = app.results.get(app.selected) {
+        let chunk = &app.index.chunks[*chunk_idx];
+        let extension = std::path::Path::new(&chunk.file_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        app.highlighter.highlight(&chunk.content, extension)
     } else {
-        String::from("No result selected")
+        vec![Line::raw("No result selected")]
     };
 
-    let paragraph = Paragraph::new(content)
+    let paragraph = Paragraph::new(lines)
         .block(block)
         .wrap(Wrap { trim: false })
         .scroll((app.preview_scroll, 0));
