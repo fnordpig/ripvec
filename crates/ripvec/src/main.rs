@@ -1,5 +1,6 @@
 mod cli;
 mod output;
+mod progress;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -42,6 +43,9 @@ fn main() -> Result<()> {
         .build_global()
         .context("failed to configure thread pool")?;
 
+    // Whether to show indicatif progress bars: TTY stderr and no --profile flag.
+    let use_progress = !args.profile && std::io::IsTerminal::is_terminal(&std::io::stderr());
+
     // Print profiler header
     profiler.header(
         env!("CARGO_PKG_VERSION"),
@@ -53,6 +57,7 @@ fn main() -> Result<()> {
     // Load embedding backend via trait abstraction
     let backend = {
         let _guard = profiler.phase("model_load");
+        let pb = use_progress.then(|| progress::spinner("Loading model…"));
         let kind = match args.backend {
             cli::BackendArg::Candle => ripvec_core::backend::BackendKind::Candle,
             cli::BackendArg::Mlx => ripvec_core::backend::BackendKind::Mlx,
@@ -62,8 +67,12 @@ fn main() -> Result<()> {
             cli::DeviceArg::Cpu => ripvec_core::backend::DeviceHint::Cpu,
             cli::DeviceArg::Metal | cli::DeviceArg::Cuda => ripvec_core::backend::DeviceHint::Gpu,
         };
-        ripvec_core::backend::load_backend(kind, &args.model_repo, device_hint)
-            .context("failed to load embedding backend")?
+        let result = ripvec_core::backend::load_backend(kind, &args.model_repo, device_hint)
+            .context("failed to load embedding backend")?;
+        if let Some(pb) = pb {
+            pb.finish_and_clear();
+        }
+        result
     };
     let tokenizer = ripvec_core::tokenize::load_tokenizer(&args.model_repo)
         .context("failed to load tokenizer")?;
@@ -86,6 +95,7 @@ fn main() -> Result<()> {
     };
 
     // Run search (fully parallel — per-thread sessions, no Mutex)
+    let pb_search = use_progress.then(|| progress::spinner("Embedding…"));
     let results = ripvec_core::embed::search(
         std::path::Path::new(&args.path),
         &args.query,
@@ -96,6 +106,9 @@ fn main() -> Result<()> {
         &profiler,
     )
     .context("search failed")?;
+    if let Some(pb) = pb_search {
+        pb.finish_and_clear();
+    }
 
     profiler.finish();
 

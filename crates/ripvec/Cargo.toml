@@ -19,6 +19,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-chrome.workspace = true
 owo-colors = "4"
+indicatif = "0.17"
 
 [features]
 default = []
