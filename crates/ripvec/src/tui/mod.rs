@@ -49,6 +49,8 @@ pub struct App {
     pub highlighter: highlight::Highlighter,
     /// Set to `true` to exit the event loop.
     pub should_quit: bool,
+    /// If set, suspend TUI and open this `(file_path, line_number)` in `$EDITOR`.
+    pub open_editor: Option<(String, usize)>,
 }
 
 impl App {
@@ -153,7 +155,9 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut A
             return Ok(());
         }
 
-        // Poll at 50 ms for responsive input
+        // Poll at 50 ms for responsive input.
+        // Non-key events (resize, mouse, etc.) are consumed and ignored;
+        // ratatui re-queries terminal size on every draw.
         if event::poll(Duration::from_millis(50)).context("event poll failed")?
             && let Event::Key(key) = event::read().context("event read failed")?
         {
@@ -161,6 +165,25 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut A
             if needs_rerank {
                 app.rerank();
             }
+        }
+
+        // If Enter was pressed on a result, suspend TUI, open editor, resume.
+        if let Some((file, line)) = app.open_editor.take() {
+            execute!(terminal.backend_mut(), LeaveAlternateScreen)
+                .context("failed to leave alternate screen")?;
+            disable_raw_mode().context("failed to disable raw mode")?;
+
+            let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+            std::process::Command::new(&editor)
+                .arg(format!("+{line}"))
+                .arg(&file)
+                .status()
+                .with_context(|| format!("failed to launch editor '{editor}'"))?;
+
+            enable_raw_mode().context("failed to re-enable raw mode")?;
+            execute!(terminal.backend_mut(), EnterAlternateScreen)
+                .context("failed to re-enter alternate screen")?;
+            terminal.clear().context("failed to clear terminal")?;
         }
     }
 }

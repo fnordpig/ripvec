@@ -152,29 +152,31 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-/// Draw the status bar with file location and help text.
+/// Keybinding hints shown right-aligned in the status bar.
+const STATUS_HINTS: &str = "ESC quit \u{2502} ENTER open \u{2502} \u{2191}\u{2193} navigate ";
+
+/// Draw the status bar with file location left-aligned and keybinding hints right-aligned.
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let location = if let Some((chunk_idx, _)) = app.results.get(app.selected) {
         let chunk = &app.index.chunks[*chunk_idx];
         format!(
-            "{}:{}-{}",
+            " {}:{}-{}",
             chunk.file_path, chunk.start_line, chunk.end_line
         )
     } else {
         String::new()
     };
 
-    let chunks_info = format!("{} chunks indexed", app.index.chunks.len());
+    // Pad the location string with spaces so the hints appear flush-right.
+    let width = area.width as usize;
+    let hints_len = STATUS_HINTS.chars().count();
+    let loc_len = location.chars().count();
+    let pad = width.saturating_sub(loc_len + hints_len);
 
     let line = Line::from(vec![
-        Span::styled(format!(" {location}"), Style::default().fg(Color::Cyan)),
-        Span::raw("  "),
-        Span::styled(chunks_info, Style::default().fg(Color::DarkGray)),
-        Span::raw("  "),
-        Span::styled(
-            "ESC quit  \u{2191}\u{2193} navigate  PgUp/PgDn scroll ",
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(&*location, Style::default().fg(Color::Cyan)),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(STATUS_HINTS, Style::default().fg(Color::DarkGray)),
     ]);
 
     let paragraph =

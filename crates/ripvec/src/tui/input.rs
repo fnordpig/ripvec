@@ -71,8 +71,33 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             false
         }
 
-        // Enter — placeholder for editor integration (Task 8)
-        // All other keys are ignored.
+        // Jump to first / last result
+        KeyCode::Home => {
+            if !app.results.is_empty() {
+                app.selected = 0;
+                app.preview_scroll = 0;
+            }
+            false
+        }
+        KeyCode::End => {
+            if !app.results.is_empty() {
+                app.selected = app.results.len() - 1;
+                app.preview_scroll = 0;
+            }
+            false
+        }
+
+        // Open selected result in $EDITOR
+        KeyCode::Enter => {
+            if let Some(&(chunk_idx, _)) = app.results.get(app.selected) {
+                let chunk = &app.index.chunks[chunk_idx];
+                app.open_editor = Some((chunk.file_path.clone(), chunk.start_line));
+            }
+            false
+        }
+
+        // Tab and all other unrecognised keys are ignored.
+        // Tab is listed here as a placeholder for future focus switching.
         _ => false,
     }
 }

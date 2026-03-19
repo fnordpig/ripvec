@@ -169,6 +169,7 @@ fn run_interactive(
         rank_time_ms: 0.0,
         highlighter: tui::highlight::Highlighter::new(),
         should_quit: false,
+        open_editor: None,
     };
 
     tui::run(app)
