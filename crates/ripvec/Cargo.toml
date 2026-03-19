@@ -18,6 +18,7 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-chrome.workspace = true
+owo-colors = "4"
 
 [features]
 default = []

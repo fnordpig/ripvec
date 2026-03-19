@@ -1,6 +1,7 @@
 //! Result formatting for different output modes.
 
 use crate::cli::OutputFormat;
+use owo_colors::OwoColorize as _;
 use ripvec_core::embed::SearchResult;
 
 /// Format and print search results according to the chosen output format.
@@ -50,14 +51,18 @@ fn print_json(results: &[SearchResult]) {
 
 fn print_color(results: &[SearchResult]) {
     for (i, r) in results.iter().enumerate() {
+        let index = format!("{}.", i + 1);
+        let location = format!(
+            "{}:{}-{}",
+            r.chunk.file_path, r.chunk.start_line, r.chunk.end_line
+        );
+        let score = format!("[{:.3}]", r.similarity);
         println!(
-            "\x1b[1;32m{}.\x1b[0m \x1b[1m{}\x1b[0m \x1b[36m{}:{}-{}\x1b[0m \x1b[33m[{:.3}]\x1b[0m",
-            i + 1,
-            r.chunk.name,
-            r.chunk.file_path,
-            r.chunk.start_line,
-            r.chunk.end_line,
-            r.similarity,
+            "{} {} {} {}",
+            index.green().bold(),
+            r.chunk.name.bold(),
+            location.cyan(),
+            score.yellow(),
         );
         println!("{}", r.chunk.content);
         println!();
