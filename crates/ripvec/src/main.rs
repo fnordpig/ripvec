@@ -146,30 +146,45 @@ fn run_interactive(
     search_cfg: &ripvec_core::embed::SearchConfig,
     args: &cli::Args,
     use_progress: bool,
-    profiler: &ripvec_core::profile::Profiler,
+    _profiler: &ripvec_core::profile::Profiler,
 ) -> Result<()> {
-    let pb_embed = use_progress.then(|| progress::spinner("Embedding codebase\u{2026}"));
+    // Create a profiler that drives the spinner with live stats
+    let pb = if use_progress {
+        Some(progress::spinner("Indexing\u{2026}"))
+    } else {
+        None
+    };
+    let live_profiler = if let Some(ref pb) = pb {
+        let pb = pb.clone();
+        ripvec_core::profile::Profiler::with_callback(
+            std::time::Duration::from_millis(500),
+            move |msg| pb.set_message(msg.to_string()),
+        )
+    } else {
+        ripvec_core::profile::Profiler::noop()
+    };
+
     let (chunks, embeddings) = ripvec_core::embed::embed_all(
         std::path::Path::new(&args.path),
         backend.as_ref(),
         &tokenizer,
         search_cfg,
-        profiler,
+        &live_profiler,
     )
     .context("embedding failed")?;
-    if let Some(pb) = pb_embed {
+
+    if let Some(pb) = pb {
+        let n_files = chunks
+            .iter()
+            .map(|c| &c.file_path)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
         pb.finish_with_message(format!(
             "Indexed {} chunks from {} files",
             chunks.len(),
-            // Deduplicate file paths to count unique files
-            chunks
-                .iter()
-                .map(|c| &c.file_path)
-                .collect::<std::collections::HashSet<_>>()
-                .len(),
+            n_files,
         ));
     }
-    profiler.finish();
 
     // Build index summary: count chunks by file extension
     let index_summary = {

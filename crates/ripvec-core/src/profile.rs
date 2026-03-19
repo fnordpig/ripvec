@@ -12,6 +12,12 @@ use std::time::{Duration, Instant};
 ///
 /// Use [`Profiler::new`] to create an active or noop profiler based on
 /// whether `--profile` was passed.
+/// Callback for live progress updates (e.g. driving a progress bar).
+///
+/// Called with a formatted status string whenever the profiler would
+/// normally print to stderr. Set via [`Profiler::with_callback`].
+type ProgressCallback = Box<dyn Fn(&str) + Send + Sync>;
+
 pub enum Profiler {
     /// Actively collects timing and prints to stderr.
     #[expect(
@@ -27,6 +33,8 @@ pub enum Profiler {
         embed: Mutex<EmbedState>,
         /// Per-rayon-thread chunk counts (parallel access during chunk phase).
         chunk_counts: Mutex<Vec<usize>>,
+        /// Optional callback for live progress updates.
+        on_progress: Option<ProgressCallback>,
     },
     /// No-op profiler. All methods are empty.
     Noop,
@@ -65,9 +73,24 @@ impl Profiler {
                 interval,
                 embed: Mutex::new(EmbedState::new()),
                 chunk_counts: Mutex::new(Vec::new()),
+                on_progress: None,
             }
         } else {
             Self::Noop
+        }
+    }
+
+    /// Create an active profiler that drives a progress callback instead of
+    /// printing to stderr. The callback receives formatted status messages
+    /// at each pipeline phase transition and embed progress tick.
+    #[must_use]
+    pub fn with_callback(interval: Duration, cb: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        Self::Active {
+            start: Instant::now(),
+            interval,
+            embed: Mutex::new(EmbedState::new()),
+            chunk_counts: Mutex::new(Vec::new()),
+            on_progress: Some(Box::new(cb)),
         }
     }
 
@@ -77,12 +100,23 @@ impl Profiler {
         Self::Noop
     }
 
+    /// Send a progress message: calls the callback if set, otherwise prints to stderr.
+    fn report(&self, msg: &str) {
+        if let Self::Active { on_progress, .. } = self {
+            if let Some(cb) = on_progress {
+                cb(msg);
+            } else {
+                eprintln!("{msg}");
+            }
+        }
+    }
+
     /// Print the system info header line.
     pub fn header(&self, version: &str, model_repo: &str, threads: usize, cores: usize) {
         if let Self::Active { .. } = self {
-            eprintln!(
+            self.report(&format!(
                 "[profile] ripvec {version} | {cores}-core | rayon: {threads} threads | model: {model_repo}",
-            );
+            ));
         }
     }
 
@@ -130,7 +164,7 @@ impl Profiler {
                         .copied()
                         .unwrap_or(0);
                     let max = counts.iter().max().copied().unwrap_or(0);
-                    eprintln!(
+                    self.report(&format!(
                         "[{:.1}s]  chunk: {} chunks from {} files in {:.0?} ({} threads, {} active, skew: {}-{} chunks/thread)",
                         wall.as_secs_f64(),
                         total_chunks,
@@ -140,16 +174,16 @@ impl Profiler {
                         active,
                         min,
                         max,
-                    );
+                    ));
                 } else {
-                    eprintln!(
+                    self.report(&format!(
                         "[{:.1}s]  chunk: {} chunks from {} files in {:.0?} ({} threads)",
                         wall.as_secs_f64(),
                         total_chunks,
                         total_files,
                         elapsed,
                         pool_size,
-                    );
+                    ));
                 }
             }
         }
@@ -206,7 +240,7 @@ impl Profiler {
                 } else {
                     0.0
                 };
-                eprintln!(
+                self.report(&format!(
                     "[{:.1}s]  embed: {}/{} (last {:.0}s: {:.1}/s, overall: {:.1}/s) lock_wait: {:.0}% inference: {:.0}%",
                     wall.as_secs_f64(),
                     done,
@@ -216,7 +250,7 @@ impl Profiler {
                     overall_rate,
                     lock_pct,
                     100.0 - lock_pct,
-                );
+                ));
                 state.last_report = now;
                 state.chunks_at_last_report = done;
             }
@@ -252,7 +286,10 @@ impl Profiler {
         {
             let wall = start.elapsed();
             if state.total_chunks == 0 {
-                eprintln!("[{:.1}s]  embed: skipped (0 chunks)", wall.as_secs_f64());
+                self.report(&format!(
+                    "[{:.1}s]  embed: skipped (0 chunks)",
+                    wall.as_secs_f64()
+                ));
                 return;
             }
             let elapsed = Instant::now().duration_since(state.phase_start);
@@ -267,7 +304,7 @@ impl Profiler {
             } else {
                 0.0
             };
-            eprintln!(
+            self.report(&format!(
                 "[{:.1}s]  embed: {}/{} done in {:.1}s ({:.1}/s) lock_wait: {:.0}% inference: {:.0}%",
                 wall.as_secs_f64(),
                 state.total_chunks,
@@ -276,7 +313,7 @@ impl Profiler {
                 rate,
                 lock_pct,
                 100.0 - lock_pct,
-            );
+            ));
         }
     }
 
@@ -284,7 +321,7 @@ impl Profiler {
     pub fn finish(&self) {
         if let Self::Active { start, .. } = self {
             let elapsed = start.elapsed().as_secs_f64();
-            eprintln!("[{elapsed:.1}s]  total: {elapsed:.1}s");
+            self.report(&format!("[{elapsed:.1}s]  total: {elapsed:.1}s"));
         }
     }
 }
@@ -309,22 +346,23 @@ impl Drop for PhaseGuard<'_> {
         if let Profiler::Active { start, .. } = self.profiler {
             let elapsed = self.start.elapsed();
             let wall = start.elapsed();
-            if let Some(detail) = self.detail.take() {
-                eprintln!(
+            let msg = if let Some(detail) = self.detail.take() {
+                format!(
                     "[{:.3}s] {}: {} in {:.1?}",
                     wall.as_secs_f64(),
                     self.name,
                     detail,
                     elapsed,
-                );
+                )
             } else {
-                eprintln!(
+                format!(
                     "[{:.3}s] {}: {:.1?}",
                     wall.as_secs_f64(),
                     self.name,
                     elapsed,
-                );
-            }
+                )
+            };
+            self.profiler.report(&msg);
         }
     }
 }
