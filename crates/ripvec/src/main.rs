@@ -1,6 +1,7 @@
 mod cli;
 mod output;
 mod progress;
+mod tui;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -11,8 +12,6 @@ fn main() -> Result<()> {
 
     // Set up Chrome tracing if `--trace <file>` is specified.
     // The guard must be held until the end of main — dropping it flushes the trace file.
-    // We flush explicitly before returning to avoid TLS destruction ordering issues
-    // with rayon threads.
     let trace_guard = args.trace.as_ref().map(|trace_path| {
         let (chrome_layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
             .file(trace_path)
@@ -54,10 +53,47 @@ fn main() -> Result<()> {
         cores,
     );
 
-    // Load embedding backend via trait abstraction
+    // Load embedding backend + tokenizer (shared by both modes)
+    let (backend, tokenizer, search_cfg) = load_pipeline(&args, use_progress, &profiler)?;
+
+    if args.interactive {
+        drop(trace_guard);
+        run_interactive(
+            backend,
+            tokenizer,
+            &search_cfg,
+            &args,
+            use_progress,
+            &profiler,
+        )?;
+    } else {
+        run_oneshot(
+            &*backend,
+            &tokenizer,
+            &search_cfg,
+            &args,
+            use_progress,
+            &profiler,
+        )?;
+        drop(trace_guard);
+    }
+
+    Ok(())
+}
+
+/// Load the embedding backend, tokenizer, and build the search config.
+fn load_pipeline(
+    args: &cli::Args,
+    use_progress: bool,
+    profiler: &ripvec_core::profile::Profiler,
+) -> Result<(
+    Box<dyn ripvec_core::backend::EmbedBackend>,
+    tokenizers::Tokenizer,
+    ripvec_core::embed::SearchConfig,
+)> {
     let backend = {
         let _guard = profiler.phase("model_load");
-        let pb = use_progress.then(|| progress::spinner("Loading model…"));
+        let pb = use_progress.then(|| progress::spinner("Loading model\u{2026}"));
         let kind = match args.backend {
             cli::BackendArg::Candle => ripvec_core::backend::BackendKind::Candle,
             cli::BackendArg::Mlx => ripvec_core::backend::BackendKind::Mlx,
@@ -77,7 +113,6 @@ fn main() -> Result<()> {
     let tokenizer = ripvec_core::tokenize::load_tokenizer(&args.model_repo)
         .context("failed to load tokenizer")?;
 
-    // Build runtime search config from CLI args
     let search_cfg = ripvec_core::embed::SearchConfig {
         batch_size: args.batch_size,
         max_tokens: args.max_tokens,
@@ -94,16 +129,79 @@ fn main() -> Result<()> {
         text_mode: args.text_mode,
     };
 
-    // Run search (fully parallel — per-thread sessions, no Mutex)
-    let pb_search = use_progress.then(|| progress::spinner("Embedding…"));
+    Ok((backend, tokenizer, search_cfg))
+}
+
+/// Interactive TUI mode: embed the codebase once, then launch the search UI.
+fn run_interactive(
+    backend: Box<dyn ripvec_core::backend::EmbedBackend>,
+    tokenizer: tokenizers::Tokenizer,
+    search_cfg: &ripvec_core::embed::SearchConfig,
+    args: &cli::Args,
+    use_progress: bool,
+    profiler: &ripvec_core::profile::Profiler,
+) -> Result<()> {
+    let pb_embed = use_progress.then(|| progress::spinner("Embedding codebase\u{2026}"));
+    let (chunks, embeddings) = ripvec_core::embed::embed_all(
+        std::path::Path::new(&args.path),
+        backend.as_ref(),
+        &tokenizer,
+        search_cfg,
+        profiler,
+    )
+    .context("embedding failed")?;
+    if let Some(pb) = pb_embed {
+        pb.finish_and_clear();
+    }
+    profiler.finish();
+
+    // Determine hidden dimension from first non-empty embedding
+    let hidden_dim = embeddings
+        .iter()
+        .find(|e| !e.is_empty())
+        .map_or(384, Vec::len);
+
+    let app = tui::App {
+        query: String::new(),
+        selected: 0,
+        preview_scroll: 0,
+        chunks,
+        embeddings,
+        results: Vec::new(),
+        backend,
+        tokenizer,
+        hidden_dim,
+        threshold: args.threshold,
+        rank_time_ms: 0.0,
+        should_quit: false,
+    };
+
+    tui::run(app)
+}
+
+/// One-shot search mode: embed, rank, print results, exit.
+fn run_oneshot(
+    backend: &dyn ripvec_core::backend::EmbedBackend,
+    tokenizer: &tokenizers::Tokenizer,
+    search_cfg: &ripvec_core::embed::SearchConfig,
+    args: &cli::Args,
+    use_progress: bool,
+    profiler: &ripvec_core::profile::Profiler,
+) -> Result<()> {
+    anyhow::ensure!(
+        !args.query.is_empty(),
+        "query is required (or use --interactive)"
+    );
+
+    let pb_search = use_progress.then(|| progress::spinner("Embedding\u{2026}"));
     let results = ripvec_core::embed::search(
         std::path::Path::new(&args.path),
         &args.query,
-        backend.as_ref(),
-        &tokenizer,
+        backend,
+        tokenizer,
         args.top_k,
-        &search_cfg,
-        &profiler,
+        search_cfg,
+        profiler,
     )
     .context("search failed")?;
     if let Some(pb) = pb_search {
@@ -112,15 +210,11 @@ fn main() -> Result<()> {
 
     profiler.finish();
 
-    // Filter by threshold and print
     let filtered: Vec<_> = results
         .into_iter()
         .filter(|r| r.similarity >= args.threshold)
         .collect();
     output::print_results(&filtered, &args.format);
-
-    // Explicitly drop the trace guard before rayon's TLS is destroyed
-    drop(trace_guard);
 
     Ok(())
 }

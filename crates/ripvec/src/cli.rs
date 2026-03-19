@@ -7,11 +7,18 @@ use clap::Parser;
 #[command(name = "ripvec", version, about)]
 pub struct Args {
     /// Natural language query to search for.
+    ///
+    /// Required for one-shot mode; ignored when `--interactive` is set.
+    #[arg(default_value = "")]
     pub query: String,
 
     /// Root directory to search (defaults to current directory).
     #[arg(default_value = ".")]
     pub path: String,
+
+    /// Launch interactive TUI mode (embed once, then search as you type).
+    #[arg(short = 'i', long)]
+    pub interactive: bool,
 
     /// Number of results to show (0 = all matches above threshold).
     #[arg(short = 'n', long, default_value_t = 0)]
