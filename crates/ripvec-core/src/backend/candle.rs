@@ -146,8 +146,10 @@ impl EmbedBackend for CandleBackend {
         // CLS pooling: take first token [batch_size, hidden_dim]
         let cls = embeddings.narrow(1, 0, 1)?.squeeze(1)?;
 
-        // L2 normalize
+        // L2 normalize (clamp norm to avoid NaN on zero vectors)
         let norms = cls.sqr()?.sum_keepdim(1)?.sqrt()?;
+        let eps = Tensor::new(&[1e-12_f32], &self.device)?.broadcast_as(norms.shape())?;
+        let norms = norms.maximum(&eps)?;
         let normalized = cls.broadcast_div(&norms)?;
 
         // Extract to Vec<Vec<f32>>

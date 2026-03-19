@@ -498,13 +498,15 @@ impl EmbedBackend for MlxBackend {
         // Slice hidden[:, 0:1, :] then squeeze
         let cls = hidden.try_index((.., 0, ..)).map_err(mlx_err)?;
 
-        // L2 normalize each vector
+        // L2 normalize each vector (clamp norm to avoid NaN on zero vectors)
         let sq = cls.square().map_err(mlx_err)?;
         let norms = sq
             .sum_axis(-1, true)
             .map_err(mlx_err)?
             .sqrt()
             .map_err(mlx_err)?;
+        let eps = Array::from_slice(&[1e-12_f32], &[1]);
+        let norms = mlx_rs::ops::maximum(&norms, &eps).map_err(mlx_err)?;
         let normalized = mlx_rs::ops::divide(&cls, &norms).map_err(mlx_err)?;
 
         // Evaluate and extract to Vec<Vec<f32>>

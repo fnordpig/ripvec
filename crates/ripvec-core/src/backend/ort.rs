@@ -5,7 +5,7 @@
 //! thread gets its own [`ort::session::Session`] reading from the same
 //! in-memory model.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use hf_hub::api::sync::Api;
 use ndarray::Axis;
@@ -34,6 +34,9 @@ pub struct OrtBackend {
     model_bytes: Arc<Vec<u8>>,
     /// Device hint for configuring execution providers.
     device_hint: DeviceHint,
+    /// Cached session, lazily created on first `embed_batch` call.
+    /// Wrapped in `Mutex` because `Session` is not `Sync`.
+    session: Mutex<Option<Session>>,
 }
 
 impl OrtBackend {
@@ -60,6 +63,7 @@ impl OrtBackend {
         Ok(Self {
             model_bytes: Arc::new(model_bytes),
             device_hint: *device_hint,
+            session: Mutex::new(None),
         })
     }
 
@@ -124,7 +128,14 @@ impl EmbedBackend for OrtBackend {
             return Ok(vec![]);
         }
 
-        let mut session = self.create_session()?;
+        let mut guard = self
+            .session
+            .lock()
+            .map_err(|e| crate::Error::Ort(format!("session mutex poisoned: {e}")))?;
+        if guard.is_none() {
+            *guard = Some(self.create_session()?);
+        }
+        let session = guard.as_mut().expect("just initialized");
 
         let batch_size = encodings.len();
         let max_len = encodings
@@ -191,6 +202,7 @@ impl EmbedBackend for OrtBackend {
         Box::new(Self {
             model_bytes: Arc::clone(&self.model_bytes),
             device_hint: self.device_hint,
+            session: Mutex::new(None), // each clone gets its own session
         })
     }
 
