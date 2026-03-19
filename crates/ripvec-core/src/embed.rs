@@ -105,32 +105,23 @@ pub struct SearchResult {
     pub similarity: f32,
 }
 
-/// Search a directory for code chunks semantically similar to a query.
+/// Walk, chunk, and embed all files in a directory.
 ///
-/// Walks the directory, chunks all supported files, embeds everything
-/// in parallel batches, and returns the top-k results ranked by similarity.
-///
-/// All tuning parameters (batch size, token limit, chunk sizing, sort order)
-/// are controlled via [`SearchConfig`].
+/// Returns the chunks and their corresponding embedding vectors.
+/// This is the building block for both one-shot search and interactive mode.
+/// The caller handles query embedding and ranking.
 ///
 /// # Errors
 ///
-/// Returns an error if the query cannot be tokenized or embedded.
-///
-/// # Panics
-///
-/// Panics if a per-thread backend clone fails during parallel embedding
-/// (should not happen if the backend loaded successfully).
-#[instrument(skip_all, fields(root = %root.display(), top_k, batch_size = cfg.batch_size))]
-pub fn search(
+/// Returns an error if file walking, chunking, or embedding fails.
+#[instrument(skip_all, fields(root = %root.display(), batch_size = cfg.batch_size))]
+pub fn embed_all(
     root: &Path,
-    query: &str,
     backend: &dyn EmbedBackend,
     tokenizer: &tokenizers::Tokenizer,
-    top_k: usize,
     cfg: &SearchConfig,
     profiler: &crate::profile::Profiler,
-) -> crate::Result<Vec<SearchResult>> {
+) -> crate::Result<(Vec<CodeChunk>, Vec<Vec<f32>>)> {
     // Phase 1: Collect files (respects .gitignore, filters by extension)
     let files = {
         let _span = info_span!("walk").entered();
@@ -173,18 +164,7 @@ pub fn search(
         result
     };
 
-    // Phase 3: Embed query
-    let query_embedding = {
-        let _span = info_span!("embed_query").entered();
-        let _guard = profiler.phase("embed_query");
-        let enc = tokenize(query, tokenizer, cfg.max_tokens)?;
-        let mut results = backend.embed_batch(&[enc])?;
-        results.pop().ok_or_else(|| {
-            crate::Error::Other(anyhow::anyhow!("backend returned no embedding for query"))
-        })?
-    };
-
-    // Phase 4: Embed all chunks — strategy depends on device
+    // Phase 3: Embed all chunks — strategy depends on device
     let bs = cfg.batch_size.max(1);
     let max_tokens_cfg = cfg.max_tokens;
     let _span = info_span!("embed_chunks", chunk_count = chunks.len(), batch_size = bs).entered();
@@ -197,6 +177,49 @@ pub fn search(
         embed_cpu_parallel(&chunks, backend, tokenizer, max_tokens_cfg, bs, profiler)?
     };
     profiler.embed_done();
+
+    Ok((chunks, embeddings))
+}
+
+/// Search a directory for code chunks semantically similar to a query.
+///
+/// Walks the directory, chunks all supported files, embeds everything
+/// in parallel batches, and returns the top-k results ranked by similarity.
+///
+/// All tuning parameters (batch size, token limit, chunk sizing, sort order)
+/// are controlled via [`SearchConfig`].
+///
+/// # Errors
+///
+/// Returns an error if the query cannot be tokenized or embedded.
+///
+/// # Panics
+///
+/// Panics if a per-thread backend clone fails during parallel embedding
+/// (should not happen if the backend loaded successfully).
+#[instrument(skip_all, fields(root = %root.display(), top_k, batch_size = cfg.batch_size))]
+pub fn search(
+    root: &Path,
+    query: &str,
+    backend: &dyn EmbedBackend,
+    tokenizer: &tokenizers::Tokenizer,
+    top_k: usize,
+    cfg: &SearchConfig,
+    profiler: &crate::profile::Profiler,
+) -> crate::Result<Vec<SearchResult>> {
+    // Phases 1, 2, 4: walk, chunk, embed all files
+    let (chunks, embeddings) = embed_all(root, backend, tokenizer, cfg, profiler)?;
+
+    // Phase 3: Embed query
+    let query_embedding = {
+        let _span = info_span!("embed_query").entered();
+        let _guard = profiler.phase("embed_query");
+        let enc = tokenize(query, tokenizer, cfg.max_tokens)?;
+        let mut results = backend.embed_batch(&[enc])?;
+        results.pop().ok_or_else(|| {
+            crate::Error::Other(anyhow::anyhow!("backend returned no embedding for query"))
+        })?
+    };
 
     // Phase 5: Parallel similarity ranking (rayon — just dot products)
     let mut results: Vec<SearchResult> = {
