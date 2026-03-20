@@ -150,36 +150,68 @@ impl BertConfig {
 // Rotary position embeddings (RoPE)
 // ---------------------------------------------------------------------------
 
-/// Apply rotary position embeddings to query and key tensors.
+/// Pre-computed cosine and sine tables for rotary position embeddings.
 ///
-/// Computes frequency table `theta_i = base^(-2i/d)`, multiplies by position
-/// indices to get angles, then applies the rotation:
+/// Built once at model load time for the full `max_position_embeddings`
+/// length, then sliced to the actual sequence length during each forward
+/// pass. This avoids recomputing the frequency table on every call.
+///
+/// Each table has shape `[max_seq, half_dim]`.
+#[derive(Debug, Clone)]
+struct RopeCache {
+    /// `cos(pos * theta)` table, shape `[max_seq, half_dim]`.
+    cos: Array,
+    /// `sin(pos * theta)` table, shape `[max_seq, half_dim]`.
+    sin: Array,
+}
+
+impl RopeCache {
+    /// Build the RoPE cache for the given head dimension, base, and max
+    /// sequence length.
+    fn new(head_dim: i32, base: f32, max_seq: i32) -> crate::Result<Self> {
+        let half_dim = head_dim / 2;
+
+        // theta_i = base^(-2i / head_dim) for i in [0, half_dim)
+        let exponents = Array::arange::<_, f32>(None, half_dim, None).map_err(mlx_err)?;
+        let neg_two_over_d = Array::from_slice(&[-2.0_f32 / head_dim as f32], &[1]);
+        let exponents = mlx_rs::ops::multiply(&exponents, &neg_two_over_d).map_err(mlx_err)?;
+        let base_arr = Array::from_slice(&[base], &[1]);
+        let theta = base_arr.power(&exponents).map_err(mlx_err)?; // [half_dim]
+
+        // Position indices: [0, 1, ..., max_seq-1]
+        let positions = Array::arange::<_, f32>(None, max_seq, None).map_err(mlx_err)?;
+        let positions = mlx_rs::ops::reshape(&positions, &[max_seq, 1]).map_err(mlx_err)?;
+        let theta = mlx_rs::ops::reshape(&theta, &[1, half_dim]).map_err(mlx_err)?;
+
+        // Outer product: [max_seq, half_dim]
+        let angles = mlx_rs::ops::multiply(&positions, &theta).map_err(mlx_err)?;
+
+        let cos = angles.cos().map_err(mlx_err)?;
+        let sin = angles.sin().map_err(mlx_err)?;
+
+        // Eagerly evaluate so the tables are materialized once
+        cos.eval().map_err(mlx_err)?;
+        sin.eval().map_err(mlx_err)?;
+
+        Ok(Self { cos, sin })
+    }
+}
+
+/// Apply rotary position embeddings using pre-computed cos/sin tables.
+///
+/// Slices the cached tables to `seq_len`, reshapes to
+/// `[1, 1, seq_len, half_dim]` for broadcasting, then applies the rotation:
 /// `[x1*cos - x2*sin, x1*sin + x2*cos]` to each (first half, second half)
 /// pair of the head dimension.
 ///
 /// Inputs `q` and `k` are `[batch, num_heads, seq_len, head_dim]`.
-fn apply_rope(q: &Array, k: &Array, head_dim: i32, base: f32) -> crate::Result<(Array, Array)> {
+fn apply_rope(q: &Array, k: &Array, cache: &RopeCache) -> crate::Result<(Array, Array)> {
     let seq_len = q.shape()[2];
-    let half_dim = head_dim / 2;
+    let half_dim = cache.cos.shape()[1];
 
-    // theta_i = base^(-2i / head_dim) for i in [0, half_dim)
-    // exponents: [0, -2/d, -4/d, ..., -(d-2)/d]
-    let exponents = Array::arange::<_, f32>(None, half_dim, None).map_err(mlx_err)?;
-    let neg_two_over_d = Array::from_slice(&[-2.0_f32 / head_dim as f32], &[1]);
-    let exponents = mlx_rs::ops::multiply(&exponents, &neg_two_over_d).map_err(mlx_err)?;
-    let base_arr = Array::from_slice(&[base], &[1]);
-    let theta = base_arr.power(&exponents).map_err(mlx_err)?; // [half_dim]
-
-    // Position indices: [0, 1, ..., seq_len-1] as float
-    let positions = Array::arange::<_, f32>(None, seq_len, None).map_err(mlx_err)?; // [seq_len]
-
-    // Outer product: positions [seq_len, 1] * theta [1, half_dim] = [seq_len, half_dim]
-    let positions = mlx_rs::ops::reshape(&positions, &[seq_len, 1]).map_err(mlx_err)?;
-    let theta = mlx_rs::ops::reshape(&theta, &[1, half_dim]).map_err(mlx_err)?;
-    let angles = mlx_rs::ops::multiply(&positions, &theta).map_err(mlx_err)?; // [seq_len, half_dim]
-
-    let cos_vals = angles.cos().map_err(mlx_err)?; // [seq_len, half_dim]
-    let sin_vals = angles.sin().map_err(mlx_err)?; // [seq_len, half_dim]
+    // Slice cached tables to actual sequence length: [seq_len, half_dim]
+    let cos_vals = cache.cos.try_index(..seq_len).map_err(mlx_err)?;
+    let sin_vals = cache.sin.try_index(..seq_len).map_err(mlx_err)?;
 
     // Broadcast to [1, 1, seq_len, half_dim] for batch/head broadcasting
     let cos_vals = mlx_rs::ops::reshape(&cos_vals, &[1, 1, seq_len, half_dim]).map_err(mlx_err)?;
@@ -188,20 +220,20 @@ fn apply_rope(q: &Array, k: &Array, head_dim: i32, base: f32) -> crate::Result<(
     let rotate = |x: &Array| -> crate::Result<Array> {
         // Split x [..., head_dim] into two halves [..., half_dim] each
         let parts = mlx_rs::ops::split(x, 2, -1).map_err(mlx_err)?;
-        let x1 = &parts[0]; // [batch, heads, seq, half_dim]
-        let x2 = &parts[1];
+        let first = &parts[0]; // [batch, heads, seq, half_dim]
+        let second = &parts[1];
 
-        // rotated_x1 = x1 * cos - x2 * sin
-        let a = mlx_rs::ops::multiply(x1, &cos_vals).map_err(mlx_err)?;
-        let b = mlx_rs::ops::multiply(x2, &sin_vals).map_err(mlx_err)?;
-        let rotated_x1 = mlx_rs::ops::subtract(&a, &b).map_err(mlx_err)?;
+        // rotated_first = first * cos - second * sin
+        let fc = mlx_rs::ops::multiply(first, &cos_vals).map_err(mlx_err)?;
+        let ss = mlx_rs::ops::multiply(second, &sin_vals).map_err(mlx_err)?;
+        let rotated_first = mlx_rs::ops::subtract(&fc, &ss).map_err(mlx_err)?;
 
-        // rotated_x2 = x1 * sin + x2 * cos
-        let c = mlx_rs::ops::multiply(x1, &sin_vals).map_err(mlx_err)?;
-        let d = mlx_rs::ops::multiply(x2, &cos_vals).map_err(mlx_err)?;
-        let rotated_x2 = mlx_rs::ops::add(&c, &d).map_err(mlx_err)?;
+        // rotated_second = first * sin + second * cos
+        let fs = mlx_rs::ops::multiply(first, &sin_vals).map_err(mlx_err)?;
+        let sc = mlx_rs::ops::multiply(second, &cos_vals).map_err(mlx_err)?;
+        let rotated_second = mlx_rs::ops::add(&fs, &sc).map_err(mlx_err)?;
 
-        mlx_rs::ops::concatenate_axis(&[&rotated_x1, &rotated_x2], -1).map_err(mlx_err)
+        mlx_rs::ops::concatenate_axis(&[&rotated_first, &rotated_second], -1).map_err(mlx_err)
     };
 
     let q_rot = rotate(q)?;
@@ -285,10 +317,8 @@ struct BertSelfAttention {
     num_heads: i32,
     head_dim: i32,
     layer_norm_eps: f32,
-    /// Model variant (determines whether to apply RoPE).
-    variant: ModelVariant,
-    /// RoPE base frequency (only used by `NomicBert`).
-    rotary_emb_base: f32,
+    /// Pre-computed RoPE cos/sin tables (`NomicBert` only).
+    rope_cache: Option<RopeCache>,
 }
 
 /// Compute a linear projection, optionally adding a bias.
@@ -330,9 +360,9 @@ impl BertSelfAttention {
             .map_err(mlx_err)?;
         let v = mlx_rs::ops::transpose_axes(&v, &[0, 2, 1, 3]).map_err(mlx_err)?;
 
-        // Apply RoPE for NomicBert
-        if self.variant == ModelVariant::NomicBert {
-            let (q_rot, k_rot) = apply_rope(&q, &k, self.head_dim, self.rotary_emb_base)?;
+        // Apply RoPE for NomicBert (using pre-computed tables)
+        if let Some(ref cache) = self.rope_cache {
+            let (q_rot, k_rot) = apply_rope(&q, &k, cache)?;
             q = q_rot;
             k = k_rot;
         }
@@ -445,6 +475,16 @@ impl BertLayer {
     }
 }
 
+/// Remove a weight from the map by name, returning an error if missing.
+///
+/// Uses `HashMap::remove` to move the `Array` out instead of cloning,
+/// avoiding unnecessary GPU buffer copies.
+fn take_weight(weights: &mut HashMap<String, Array>, name: &str) -> crate::Result<Array> {
+    weights
+        .remove(name)
+        .ok_or_else(|| crate::Error::Other(anyhow::anyhow!("missing weight: {name}")))
+}
+
 /// Complete BERT model for embedding extraction.
 #[derive(Debug)]
 struct BertModel {
@@ -462,8 +502,9 @@ impl BertModel {
     ) -> crate::Result<Array> {
         let mut hidden = self.embeddings.forward(input_ids, token_type_ids)?;
 
-        // Build causal-style attention mask for BERT.
-        // BERT uses: mask = (1.0 - mask) * -1e9 broadcast to [batch, 1, 1, seq]
+        // Build padding attention mask for BERT (bidirectional, not causal).
+        // Converts 0/1 mask to additive bias: mask = (1.0 - mask) * -1e9
+        // broadcast to [batch, 1, 1, seq] so padding tokens get ~-inf scores.
         let ones = Array::ones::<f32>(attention_mask.shape()).map_err(mlx_err)?;
         let inverted = mlx_rs::ops::subtract(&ones, attention_mask).map_err(mlx_err)?;
         let large_neg = Array::from_slice(&[-1e9_f32], &[1]);
@@ -481,33 +522,57 @@ impl BertModel {
     }
 
     /// Load model weights from a safetensors `HashMap`.
-    fn from_weights(weights: HashMap<String, Array>, config: &BertConfig) -> crate::Result<Self> {
-        let get = |name: &str| -> crate::Result<Array> {
-            weights
-                .get(name)
-                .cloned()
-                .ok_or_else(|| crate::Error::Other(anyhow::anyhow!("missing weight: {name}")))
-        };
-
-        let try_get = |name: &str| -> Option<Array> { weights.get(name).cloned() };
+    ///
+    /// Uses [`take_weight`] to move arrays out of the map instead of cloning,
+    /// avoiding unnecessary GPU buffer copies.
+    fn from_weights(
+        mut weights: HashMap<String, Array>,
+        config: &BertConfig,
+    ) -> crate::Result<Self> {
+        let w = &mut weights;
 
         let embeddings = match config.variant {
             ModelVariant::ClassicBert => BertEmbeddings {
-                word_embeddings: get("embeddings.word_embeddings.weight")?,
-                position_embeddings: Some(get("embeddings.position_embeddings.weight")?),
-                token_type_embeddings: Some(get("embeddings.token_type_embeddings.weight")?),
-                layer_norm_weight: get("embeddings.LayerNorm.weight")?,
-                layer_norm_bias: get("embeddings.LayerNorm.bias")?,
+                word_embeddings: take_weight(w, "embeddings.word_embeddings.weight")?,
+                position_embeddings: Some(take_weight(w, "embeddings.position_embeddings.weight")?),
+                token_type_embeddings: Some(take_weight(
+                    w,
+                    "embeddings.token_type_embeddings.weight",
+                )?),
+                layer_norm_weight: take_weight(w, "embeddings.LayerNorm.weight")?,
+                layer_norm_bias: take_weight(w, "embeddings.LayerNorm.bias")?,
                 layer_norm_eps: config.layer_norm_eps,
             },
             ModelVariant::NomicBert => BertEmbeddings {
-                word_embeddings: get("embeddings.word_embeddings.weight")?,
+                word_embeddings: take_weight(w, "embeddings.word_embeddings.weight")?,
                 position_embeddings: None,
-                token_type_embeddings: try_get("embeddings.token_type_embeddings.weight"),
-                layer_norm_weight: get("emb_ln.weight")?,
-                layer_norm_bias: get("emb_ln.bias")?,
+                token_type_embeddings: w.remove("embeddings.token_type_embeddings.weight"),
+                layer_norm_weight: take_weight(w, "emb_ln.weight")?,
+                layer_norm_bias: take_weight(w, "emb_ln.bias")?,
                 layer_norm_eps: config.layer_norm_eps,
             },
+        };
+
+        // Validate embedding dimension matches config
+        let emb_dim = embeddings.word_embeddings.shape()[1] as i32;
+        if emb_dim != config.hidden_size {
+            return Err(crate::Error::Other(anyhow::anyhow!(
+                "model hidden_size mismatch: config says {} but word_embeddings has dim {}",
+                config.hidden_size,
+                emb_dim
+            )));
+        }
+
+        // Pre-compute RoPE cache once for all NomicBert layers (shared params)
+        let rope_cache = if config.variant == ModelVariant::NomicBert {
+            let head_dim = config.hidden_size / config.num_attention_heads;
+            Some(RopeCache::new(
+                head_dim,
+                config.rotary_emb_base,
+                config.max_position_embeddings,
+            )?)
+        } else {
+            None
         };
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers as usize);
@@ -516,31 +581,49 @@ impl BertModel {
                 ModelVariant::ClassicBert => {
                     let prefix = format!("encoder.layer.{i}");
                     let attention = BertSelfAttention {
-                        query_weight: get(&format!("{prefix}.attention.self.query.weight"))?,
-                        query_bias: try_get(&format!("{prefix}.attention.self.query.bias")),
-                        key_weight: get(&format!("{prefix}.attention.self.key.weight"))?,
-                        key_bias: try_get(&format!("{prefix}.attention.self.key.bias")),
-                        value_weight: get(&format!("{prefix}.attention.self.value.weight"))?,
-                        value_bias: try_get(&format!("{prefix}.attention.self.value.bias")),
-                        output_weight: get(&format!("{prefix}.attention.output.dense.weight"))?,
-                        output_bias: try_get(&format!("{prefix}.attention.output.dense.bias")),
-                        output_ln_weight: get(&format!(
-                            "{prefix}.attention.output.LayerNorm.weight"
-                        ))?,
-                        output_ln_bias: get(&format!("{prefix}.attention.output.LayerNorm.bias"))?,
+                        query_weight: take_weight(
+                            w,
+                            &format!("{prefix}.attention.self.query.weight"),
+                        )?,
+                        query_bias: w.remove(&format!("{prefix}.attention.self.query.bias")),
+                        key_weight: take_weight(w, &format!("{prefix}.attention.self.key.weight"))?,
+                        key_bias: w.remove(&format!("{prefix}.attention.self.key.bias")),
+                        value_weight: take_weight(
+                            w,
+                            &format!("{prefix}.attention.self.value.weight"),
+                        )?,
+                        value_bias: w.remove(&format!("{prefix}.attention.self.value.bias")),
+                        output_weight: take_weight(
+                            w,
+                            &format!("{prefix}.attention.output.dense.weight"),
+                        )?,
+                        output_bias: w.remove(&format!("{prefix}.attention.output.dense.bias")),
+                        output_ln_weight: take_weight(
+                            w,
+                            &format!("{prefix}.attention.output.LayerNorm.weight"),
+                        )?,
+                        output_ln_bias: take_weight(
+                            w,
+                            &format!("{prefix}.attention.output.LayerNorm.bias"),
+                        )?,
                         num_heads: config.num_attention_heads,
                         head_dim: config.hidden_size / config.num_attention_heads,
                         layer_norm_eps: config.layer_norm_eps,
-                        variant: config.variant,
-                        rotary_emb_base: config.rotary_emb_base,
+                        rope_cache: None,
                     };
                     let ffn = BertFfn {
-                        intermediate_weight: get(&format!("{prefix}.intermediate.dense.weight"))?,
-                        intermediate_bias: try_get(&format!("{prefix}.intermediate.dense.bias")),
-                        output_weight: get(&format!("{prefix}.output.dense.weight"))?,
-                        output_bias: try_get(&format!("{prefix}.output.dense.bias")),
-                        output_ln_weight: get(&format!("{prefix}.output.LayerNorm.weight"))?,
-                        output_ln_bias: get(&format!("{prefix}.output.LayerNorm.bias"))?,
+                        intermediate_weight: take_weight(
+                            w,
+                            &format!("{prefix}.intermediate.dense.weight"),
+                        )?,
+                        intermediate_bias: w.remove(&format!("{prefix}.intermediate.dense.bias")),
+                        output_weight: take_weight(w, &format!("{prefix}.output.dense.weight"))?,
+                        output_bias: w.remove(&format!("{prefix}.output.dense.bias")),
+                        output_ln_weight: take_weight(
+                            w,
+                            &format!("{prefix}.output.LayerNorm.weight"),
+                        )?,
+                        output_ln_bias: take_weight(w, &format!("{prefix}.output.LayerNorm.bias"))?,
                         layer_norm_eps: config.layer_norm_eps,
                         variant: config.variant,
                     };
@@ -550,7 +633,7 @@ impl BertModel {
                     let prefix = format!("encoder.layers.{i}");
                     // NomicBert uses fused QKV: Wqkv is [3*hidden, hidden]
                     // Split into three [hidden, hidden] chunks along dim 0
-                    let wqkv = get(&format!("{prefix}.attn.Wqkv.weight"))?;
+                    let wqkv = take_weight(w, &format!("{prefix}.attn.Wqkv.weight"))?;
                     let hidden = config.hidden_size;
                     let qkv_chunks = wqkv.split(3, 0).map_err(mlx_err)?;
 
@@ -561,32 +644,31 @@ impl BertModel {
                         key_bias: None,
                         value_weight: qkv_chunks[2].clone(),
                         value_bias: None,
-                        output_weight: get(&format!("{prefix}.attn.out_proj.weight"))?,
+                        output_weight: take_weight(w, &format!("{prefix}.attn.out_proj.weight"))?,
                         output_bias: None,
-                        // NomicBert uses pre-norm: norm1 is before attention
-                        output_ln_weight: get(&format!("{prefix}.norm1.weight"))?,
-                        output_ln_bias: get(&format!("{prefix}.norm1.bias"))?,
+                        // NomicBert uses post-norm (prenorm: false): norm1 is after attention
+                        output_ln_weight: take_weight(w, &format!("{prefix}.norm1.weight"))?,
+                        output_ln_bias: take_weight(w, &format!("{prefix}.norm1.bias"))?,
                         num_heads: config.num_attention_heads,
                         head_dim: hidden / config.num_attention_heads,
                         layer_norm_eps: config.layer_norm_eps,
-                        variant: config.variant,
-                        rotary_emb_base: config.rotary_emb_base,
+                        rope_cache: rope_cache.clone(),
                     };
-                    // NomicBert SwiGLU: fc11 = gate, fc12 = up, fc2 = down
-                    // We store fc11 as intermediate_weight (gate) and handle
-                    // fc12 (up) by concatenating: [fc11; fc12] → [2*inter, hidden]
-                    let fc11 = get(&format!("{prefix}.mlp.fc11.weight"))?;
-                    let fc12 = get(&format!("{prefix}.mlp.fc12.weight"))?;
+                    // NomicBert SwiGLU: fc11 = value/up, fc12 = gate, fc2 = down
+                    // Concatenate [fc11; fc12] -> [2*inter, hidden]; split in forward
+                    // to compute fc11(x) * SiLU(fc12(x))
+                    let fc11 = take_weight(w, &format!("{prefix}.mlp.fc11.weight"))?;
+                    let fc12 = take_weight(w, &format!("{prefix}.mlp.fc12.weight"))?;
                     let gate_up =
                         mlx_rs::ops::concatenate_axis(&[&fc11, &fc12], 0).map_err(mlx_err)?;
 
                     let ffn = BertFfn {
                         intermediate_weight: gate_up,
                         intermediate_bias: None,
-                        output_weight: get(&format!("{prefix}.mlp.fc2.weight"))?,
+                        output_weight: take_weight(w, &format!("{prefix}.mlp.fc2.weight"))?,
                         output_bias: None,
-                        output_ln_weight: get(&format!("{prefix}.norm2.weight"))?,
-                        output_ln_bias: get(&format!("{prefix}.norm2.bias"))?,
+                        output_ln_weight: take_weight(w, &format!("{prefix}.norm2.weight"))?,
+                        output_ln_bias: take_weight(w, &format!("{prefix}.norm2.bias"))?,
                         layer_norm_eps: config.layer_norm_eps,
                         variant: config.variant,
                     };
@@ -623,7 +705,7 @@ pub struct MlxBackend {
     /// Hidden dimension for output vector size validation.
     hidden_size: i32,
     /// Maximum sequence length supported by the model.
-    pub max_position_embeddings: i32,
+    max_position_embeddings: i32,
 }
 
 impl std::fmt::Debug for MlxBackend {
@@ -786,7 +868,7 @@ impl EmbedBackend for MlxBackend {
     ///
     /// Always panics -- callers must check [`supports_clone`](EmbedBackend::supports_clone) first.
     fn clone_backend(&self) -> Box<dyn EmbedBackend> {
-        panic!("clone_backend() called on MlxBackend -- MLX manages its own parallelism");
+        unimplemented!("clone_backend() called on MlxBackend -- MLX manages its own parallelism")
     }
 
     /// MLX always runs on the GPU via Metal.
@@ -895,5 +977,27 @@ mod tests {
         let backend = MlxBackend::load(BGE_SMALL, &DeviceHint::Auto).unwrap();
         // ClassicBert max_position_embeddings is 512
         assert_eq!(backend.max_position_embeddings, 512);
+    }
+
+    #[test]
+    #[ignore = "loads CodeRankEmbed model; run with `cargo test -- --ignored`"]
+    fn nomic_bert_loads_and_embeds() {
+        let backend = MlxBackend::load("nomic-ai/CodeRankEmbed", &DeviceHint::Auto).unwrap();
+        assert_eq!(backend.max_tokens(), 8192);
+        let enc = Encoding {
+            input_ids: vec![101, 7592, 102], // [CLS] hello [SEP]
+            attention_mask: vec![1, 1, 1],
+            token_type_ids: vec![0, 0, 0],
+        };
+        let results = backend.embed_batch(&[enc]).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].len(), 768); // CodeRankEmbed hidden size
+
+        // Verify L2 norm
+        let norm: f32 = results[0].iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-4,
+            "L2 norm should be ~1.0, got {norm}"
+        );
     }
 }
