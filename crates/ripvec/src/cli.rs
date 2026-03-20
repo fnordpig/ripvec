@@ -24,9 +24,18 @@ pub struct Args {
     #[arg(short = 'n', long, default_value_t = 0)]
     pub top_k: usize,
 
-    /// `HuggingFace` model repository.
-    #[arg(long, default_value = "BAAI/bge-small-en-v1.5")]
-    pub model_repo: String,
+    /// Use code-optimized model (nomic-ai/CodeRankEmbed).
+    /// Adds the required query prefix automatically.
+    #[arg(long, conflicts_with = "text")]
+    pub code: bool,
+
+    /// Use general text model (BAAI/bge-small-en-v1.5). This is the default.
+    #[arg(long)]
+    pub text: bool,
+
+    /// Override `HuggingFace` model repository (advanced).
+    #[arg(long)]
+    pub model_repo: Option<String>,
 
     /// Output format.
     #[arg(short, long, default_value = "color")]

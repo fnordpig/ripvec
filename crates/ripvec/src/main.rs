@@ -17,6 +17,24 @@ fn main() -> Result<()> {
         args.path = std::mem::take(&mut args.query);
     }
 
+    // Resolve model repo: --code → CodeRankEmbed, --text/default → BGE-small
+    let use_code_model = args.code;
+    let model_repo = args.model_repo.clone().unwrap_or_else(|| {
+        if use_code_model {
+            "nomic-ai/CodeRankEmbed".to_string()
+        } else {
+            "BAAI/bge-small-en-v1.5".to_string()
+        }
+    });
+
+    // For --code mode, prepend the required query prefix (non-interactive only)
+    if use_code_model && !args.interactive && !args.query.is_empty() {
+        args.query = format!(
+            "Represent this query for searching relevant code: {}",
+            args.query
+        );
+    }
+
     // Set up Chrome tracing if `--trace <file>` is specified.
     // The guard must be held until the end of main — dropping it flushes the trace file.
     let trace_guard = args.trace.as_ref().map(|trace_path| {
@@ -55,13 +73,14 @@ fn main() -> Result<()> {
     // Print profiler header
     profiler.header(
         env!("CARGO_PKG_VERSION"),
-        &args.model_repo,
+        &model_repo,
         rayon::current_num_threads(),
         cores,
     );
 
     // Load embedding backend(s) + tokenizer (shared by both modes)
-    let (backends, tokenizer, search_cfg) = load_pipeline(&args, use_progress, &profiler)?;
+    let (backends, tokenizer, search_cfg) =
+        load_pipeline(&args, &model_repo, use_progress, &profiler)?;
 
     if args.interactive {
         drop(trace_guard);
@@ -72,6 +91,7 @@ fn main() -> Result<()> {
             &args,
             use_progress,
             &profiler,
+            use_code_model,
         )?;
     } else {
         run_oneshot(
@@ -96,6 +116,7 @@ fn main() -> Result<()> {
 #[expect(clippy::type_complexity, reason = "tuple return is clear in context")]
 fn load_pipeline(
     args: &cli::Args,
+    model_repo: &str,
     use_progress: bool,
     profiler: &ripvec_core::profile::Profiler,
 ) -> Result<(
@@ -107,7 +128,7 @@ fn load_pipeline(
         let _guard = profiler.phase("model_load");
         let pb = use_progress.then(|| progress::spinner("Loading model\u{2026}"));
         let result = match args.backend {
-            cli::BackendArg::Auto => ripvec_core::backend::detect_backends(&args.model_repo)
+            cli::BackendArg::Auto => ripvec_core::backend::detect_backends(&model_repo)
                 .context("failed to detect available backends")?,
             ref specific => {
                 let kind = match specific {
@@ -123,7 +144,7 @@ fn load_pipeline(
                     }
                 };
                 vec![
-                    ripvec_core::backend::load_backend(kind, &args.model_repo, device_hint)
+                    ripvec_core::backend::load_backend(kind, &model_repo, device_hint)
                         .context("failed to load embedding backend")?,
                 ]
             }
@@ -133,8 +154,8 @@ fn load_pipeline(
         }
         result
     };
-    let tokenizer = ripvec_core::tokenize::load_tokenizer(&args.model_repo)
-        .context("failed to load tokenizer")?;
+    let tokenizer =
+        ripvec_core::tokenize::load_tokenizer(&model_repo).context("failed to load tokenizer")?;
 
     let search_cfg = ripvec_core::embed::SearchConfig {
         batch_size: args.batch_size,
@@ -163,6 +184,7 @@ fn run_interactive(
     args: &cli::Args,
     use_progress: bool,
     _profiler: &ripvec_core::profile::Profiler,
+    use_code_model: bool,
 ) -> Result<()> {
     // Create a profiler that drives the spinner with live stats
     let pb = if use_progress {
@@ -239,6 +261,11 @@ fn run_interactive(
         should_quit: false,
         open_editor: None,
         index_summary,
+        query_prefix: if use_code_model {
+            "Represent this query for searching relevant code: ".to_string()
+        } else {
+            String::new()
+        },
     };
 
     tui::run(app)

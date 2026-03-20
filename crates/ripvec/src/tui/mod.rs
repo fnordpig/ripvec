@@ -53,6 +53,8 @@ pub struct App {
     pub open_editor: Option<(String, usize)>,
     /// Summary of indexed files by extension (e.g. "208 chunks │ 15 rs, 8 py, 6 js").
     pub index_summary: String,
+    /// Query prefix for code models (e.g. "Represent this query for searching relevant code: ").
+    pub query_prefix: String,
 }
 
 impl App {
@@ -73,7 +75,8 @@ impl App {
 
         // Tokenize + embed the query
         let model_max = self.backends[0].max_tokens();
-        let Ok(enc) = tokenize_query(&self.query, &self.tokenizer, model_max) else {
+        let full_query = format!("{}{}", self.query_prefix, self.query);
+        let Ok(enc) = tokenize_query(&full_query, &self.tokenizer, model_max) else {
             self.results.clear();
             self.rank_time_ms = 0.0;
             return;
