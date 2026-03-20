@@ -39,5 +39,7 @@ pub fn collect_files(root: &Path) -> Vec<PathBuf> {
             })
         });
 
-    files.into_inner().unwrap_or_default()
+    let mut files = files.into_inner().unwrap_or_default();
+    files.sort();
+    files
 }

@@ -99,6 +99,12 @@ pub fn embed_all(
     cfg: &SearchConfig,
     profiler: &crate::profile::Profiler,
 ) -> crate::Result<(Vec<CodeChunk>, Vec<Vec<f32>>)> {
+    if backends.is_empty() {
+        return Err(crate::Error::Other(anyhow::anyhow!(
+            "no embedding backends provided"
+        )));
+    }
+
     // Phase 1: Collect files (respects .gitignore, filters by extension)
     let files = {
         let _span = info_span!("walk").entered();
@@ -163,6 +169,13 @@ pub fn embed_all(
     let embeddings = embed_distributed(&all_encodings, backends, bs, profiler)?;
     profiler.embed_done();
 
+    // Filter out chunks whose tokenization failed (empty embedding vectors).
+    let (chunks, embeddings): (Vec<_>, Vec<_>) = chunks
+        .into_iter()
+        .zip(embeddings)
+        .filter(|(_, emb)| !emb.is_empty())
+        .unzip();
+
     Ok((chunks, embeddings))
 }
 
@@ -195,6 +208,12 @@ pub fn search(
     cfg: &SearchConfig,
     profiler: &crate::profile::Profiler,
 ) -> crate::Result<Vec<SearchResult>> {
+    if backends.is_empty() {
+        return Err(crate::Error::Other(anyhow::anyhow!(
+            "no embedding backends provided"
+        )));
+    }
+
     // Phases 1, 2, 3, 4: walk, chunk, pre-tokenize, embed all files
     let (chunks, embeddings) = embed_all(root, backends, tokenizer, cfg, profiler)?;
 
@@ -214,11 +233,11 @@ pub fn search(
         let _span = info_span!("rank", chunk_count = chunks.len()).entered();
         let guard = profiler.phase("rank");
 
-        let scored: Vec<SearchResult> = embeddings
+        let scored: Vec<SearchResult> = chunks
             .into_par_iter()
-            .zip(chunks.par_iter())
-            .map(|(emb, chunk)| SearchResult {
-                chunk: chunk.clone(),
+            .zip(embeddings.into_par_iter())
+            .map(|(chunk, emb)| SearchResult {
+                chunk,
                 similarity: similarity::dot_product(&query_embedding, &emb),
             })
             .collect();
@@ -478,40 +497,24 @@ fn read_source(path: &Path) -> Option<SourceText> {
 
 /// Tokenize text into an [`Encoding`] ready for model inference.
 ///
-/// Always truncates to `model_max_tokens` (the model's position embedding
-/// limit — 512 for BERT, 8192 for `NomicBert`). When `max_tokens` is non-zero,
-/// further truncates to that value. CLS pooling means the first token's
-/// representation carries most semantic weight, so truncation has minimal
-/// quality impact.
+/// Delegates to [`crate::tokenize::tokenize_query`] for the core encoding,
+/// then applies an additional `max_tokens` truncation when non-zero.
+/// CLS pooling means the first token's representation carries most semantic
+/// weight, so truncation has minimal quality impact.
 fn tokenize(
     text: &str,
     tokenizer: &tokenizers::Tokenizer,
     max_tokens: usize,
     model_max_tokens: usize,
 ) -> crate::Result<Encoding> {
-    let encoding = tokenizer
-        .encode(text, true)
-        .map_err(|e| crate::Error::Tokenization(e.to_string()))?;
-
-    let full_len = encoding.get_ids().len();
-    let mut len = full_len.min(model_max_tokens);
+    let mut enc = crate::tokenize::tokenize_query(text, tokenizer, model_max_tokens)?;
     if max_tokens > 0 {
-        len = len.min(max_tokens);
+        let len = enc.input_ids.len().min(max_tokens);
+        enc.input_ids.truncate(len);
+        enc.attention_mask.truncate(len);
+        enc.token_type_ids.truncate(len);
     }
-    Ok(Encoding {
-        input_ids: encoding.get_ids()[..len]
-            .iter()
-            .map(|&x| i64::from(x))
-            .collect(),
-        attention_mask: encoding.get_attention_mask()[..len]
-            .iter()
-            .map(|&x| i64::from(x))
-            .collect(),
-        token_type_ids: encoding.get_type_ids()[..len]
-            .iter()
-            .map(|&x| i64::from(x))
-            .collect(),
-    })
+    Ok(enc)
 }
 
 #[cfg(test)]

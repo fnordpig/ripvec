@@ -4,6 +4,10 @@
 //! the dot product — no square roots needed at query time.
 
 /// Cosine similarity between two L2-normalized vectors (= dot product).
+///
+/// Both slices must have the same length. A `debug_assert` fires on mismatch
+/// in debug builds; in release builds, mismatched lengths silently produce a
+/// truncated (and therefore incorrect) result.
 #[must_use]
 pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "dot_product: vector length mismatch");

@@ -170,6 +170,36 @@ fn sliding_windows(path: &Path, source: &str, chunk_config: &ChunkConfig) -> Vec
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
+    sliding_window_chunks(source, path, &file_name, 1, chunk_config)
+}
+
+/// Split a named definition into overlapping windows.
+///
+/// Used when a single tree-sitter match (e.g., a large function) exceeds
+/// `chunk_config.max_chunk_bytes`. Windows carry the definition name for search context.
+fn sliding_windows_with_name(
+    path: &Path,
+    content: &str,
+    name: &str,
+    base_line: usize,
+    chunk_config: &ChunkConfig,
+) -> Vec<CodeChunk> {
+    sliding_window_chunks(content, path, name, base_line, chunk_config)
+}
+
+/// Shared sliding-window loop used by both [`sliding_windows`] and
+/// [`sliding_windows_with_name`].
+///
+/// Splits `source` into overlapping windows of `chunk_config.window_size` bytes,
+/// snapping boundaries to line breaks. Each chunk is tagged with `name_prefix`
+/// and an index suffix (e.g., `"main[0]"`, `"main[1]"`).
+fn sliding_window_chunks(
+    source: &str,
+    file_path: &Path,
+    name_prefix: &str,
+    base_line: usize,
+    chunk_config: &ChunkConfig,
+) -> Vec<CodeChunk> {
     let step = chunk_config
         .window_size
         .saturating_sub(chunk_config.window_overlap)
@@ -196,65 +226,12 @@ fn sliding_windows(path: &Path, source: &str, chunk_config: &ChunkConfig) -> Vec
         if let Ok(window) = std::str::from_utf8(&bytes[offset..end])
             && !window.trim().is_empty()
         {
-            let start_line = source[..offset].matches('\n').count() + 1;
-            let end_line = start_line + window.matches('\n').count();
+            let start_line = base_line + source[..offset].matches('\n').count();
+            let content_lines = window.lines().count().max(1);
+            let end_line = start_line + content_lines - 1;
             chunks.push(CodeChunk {
-                file_path: path.display().to_string(),
-                name: format!("{file_name}[{window_idx}]"),
-                kind: "window".to_string(),
-                start_line,
-                end_line,
-                content: window.to_string(),
-            });
-            window_idx += 1;
-        }
-
-        offset += step;
-    }
-
-    chunks
-}
-
-/// Split a named definition into overlapping windows.
-///
-/// Used when a single tree-sitter match (e.g., a large function) exceeds
-/// `chunk_config.max_chunk_bytes`. Windows carry the definition name for search context.
-fn sliding_windows_with_name(
-    path: &Path,
-    content: &str,
-    name: &str,
-    base_line: usize,
-    chunk_config: &ChunkConfig,
-) -> Vec<CodeChunk> {
-    let step = chunk_config
-        .window_size
-        .saturating_sub(chunk_config.window_overlap)
-        .max(1);
-    let bytes = content.as_bytes();
-    let mut chunks = Vec::new();
-    let mut offset = 0;
-    let mut window_idx = 0;
-
-    while offset < bytes.len() {
-        let raw_end = (offset + chunk_config.window_size).min(bytes.len());
-
-        let end = if raw_end < bytes.len() {
-            match bytes[offset..raw_end].iter().rposition(|&b| b == b'\n') {
-                Some(pos) => offset + pos + 1,
-                None => raw_end,
-            }
-        } else {
-            raw_end
-        };
-
-        if let Ok(window) = std::str::from_utf8(&bytes[offset..end])
-            && !window.trim().is_empty()
-        {
-            let start_line = base_line + content[..offset].matches('\n').count();
-            let end_line = start_line + window.matches('\n').count();
-            chunks.push(CodeChunk {
-                file_path: path.display().to_string(),
-                name: format!("{name}[{window_idx}]"),
+                file_path: file_path.display().to_string(),
+                name: format!("{name_prefix}[{window_idx}]"),
                 kind: "window".to_string(),
                 start_line,
                 end_line,
