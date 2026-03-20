@@ -20,7 +20,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::prelude::CrosstermBackend;
 
-use ripvec_core::backend::{EmbedBackend, Encoding};
+use ripvec_core::backend::EmbedBackend;
 use ripvec_core::index::SearchIndex;
 
 /// TUI application state.
@@ -74,7 +74,9 @@ impl App {
         // Tokenize + embed the query
         let model_max = self.backends[0].max_tokens();
         let full_query = format!("{}{}", self.query_prefix, self.query);
-        let Ok(enc) = tokenize_query(&full_query, &self.tokenizer, model_max) else {
+        let Ok(enc) =
+            ripvec_core::tokenize::tokenize_query(&full_query, &self.tokenizer, model_max)
+        else {
             self.results.clear();
             self.rank_time_ms = 0.0;
             return;
@@ -94,33 +96,6 @@ impl App {
         self.selected = 0;
         self.preview_scroll = 0;
     }
-}
-
-/// Tokenize a query string into an [`Encoding`] for inference.
-fn tokenize_query(
-    text: &str,
-    tokenizer: &tokenizers::Tokenizer,
-    model_max_tokens: usize,
-) -> Result<Encoding> {
-    let encoding = tokenizer
-        .encode(text, true)
-        .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
-
-    let len = encoding.get_ids().len().min(model_max_tokens);
-    Ok(Encoding {
-        input_ids: encoding.get_ids()[..len]
-            .iter()
-            .map(|&x| i64::from(x))
-            .collect(),
-        attention_mask: encoding.get_attention_mask()[..len]
-            .iter()
-            .map(|&x| i64::from(x))
-            .collect(),
-        token_type_ids: encoding.get_type_ids()[..len]
-            .iter()
-            .map(|&x| i64::from(x))
-            .collect(),
-    })
 }
 
 /// Run the interactive TUI event loop.
