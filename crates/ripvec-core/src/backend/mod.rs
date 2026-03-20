@@ -172,6 +172,10 @@ pub fn detect_backends(model_repo: &str) -> crate::Result<Vec<Box<dyn EmbedBacke
     // On Apple Silicon, running CPU + MLX concurrently is slower than
     // MLX alone because they share the same physical cores and memory.
     // On discrete GPU systems (CUDA), CPU would be a useful helper.
+    // Add CPU as fallback only when no GPU backend was loaded.
+    // On Apple Silicon, even 1 CPU thread causes 3.87% __ulock_wait
+    // contention with Metal due to shared memory bus. Profiled via
+    // tracemeld: hybrid 115/s vs MLX-only 166/s.
     let has_gpu = backends.iter().any(|b| b.is_gpu());
     if !has_gpu && let Ok(b) = candle::CandleBackend::load(model_repo, &DeviceHint::Cpu) {
         backends.push(Box::new(b));
