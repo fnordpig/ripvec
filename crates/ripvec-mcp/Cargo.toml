@@ -17,7 +17,10 @@ tokio.workspace = true
 serde.workspace = true
 schemars.workspace = true
 anyhow.workspace = true
+serde_json.workspace = true
 tokenizers.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

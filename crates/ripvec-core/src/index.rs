@@ -25,6 +25,12 @@ impl SearchIndex {
     ///
     /// Flattens the per-chunk embedding vectors into a contiguous `Array2`
     /// for BLAS-accelerated matrix-vector products at query time.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the flattened embedding data cannot form a valid
+    /// `[num_chunks, hidden_dim]` matrix (should never happen when
+    /// embeddings come from `embed_all`).
     pub fn new(chunks: Vec<CodeChunk>, raw_embeddings: &[Vec<f32>]) -> Self {
         let hidden_dim = raw_embeddings.first().map_or(384, Vec::len);
         let n = chunks.len();
@@ -55,6 +61,7 @@ impl SearchIndex {
     ///
     /// Returns `(chunk_index, similarity_score)` pairs sorted by descending
     /// score, filtered by `threshold`.
+    #[must_use]
     pub fn rank(&self, query_embedding: &[f32], threshold: f32) -> Vec<(usize, f32)> {
         if query_embedding.len() != self.hidden_dim || self.chunks.is_empty() {
             return vec![];
@@ -71,12 +78,25 @@ impl SearchIndex {
         results
     }
 
+    /// Return a clone of the embedding vector for chunk `idx`.
+    ///
+    /// Returns `None` if `idx` is out of bounds.
+    #[must_use]
+    pub fn embedding(&self, idx: usize) -> Option<Vec<f32>> {
+        if idx >= self.chunks.len() {
+            return None;
+        }
+        Some(self.embeddings.row(idx).to_vec())
+    }
+
     /// Number of chunks in the index.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.chunks.len()
     }
 
     /// Whether the index is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.chunks.is_empty()
     }
