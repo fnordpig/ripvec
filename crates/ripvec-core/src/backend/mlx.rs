@@ -498,43 +498,94 @@ impl BertModel {
                 word_embeddings: get("embeddings.word_embeddings.weight")?,
                 position_embeddings: None,
                 token_type_embeddings: try_get("embeddings.token_type_embeddings.weight"),
-                layer_norm_weight: get("embeddings.LayerNorm.weight")?,
-                layer_norm_bias: get("embeddings.LayerNorm.bias")?,
+                layer_norm_weight: get("emb_ln.weight")?,
+                layer_norm_bias: get("emb_ln.bias")?,
                 layer_norm_eps: config.layer_norm_eps,
             },
         };
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers as usize);
         for i in 0..config.num_hidden_layers {
-            let prefix = format!("encoder.layer.{i}");
+            let (attention, ffn) = match config.variant {
+                ModelVariant::ClassicBert => {
+                    let prefix = format!("encoder.layer.{i}");
+                    let attention = BertSelfAttention {
+                        query_weight: get(&format!("{prefix}.attention.self.query.weight"))?,
+                        query_bias: try_get(&format!("{prefix}.attention.self.query.bias")),
+                        key_weight: get(&format!("{prefix}.attention.self.key.weight"))?,
+                        key_bias: try_get(&format!("{prefix}.attention.self.key.bias")),
+                        value_weight: get(&format!("{prefix}.attention.self.value.weight"))?,
+                        value_bias: try_get(&format!("{prefix}.attention.self.value.bias")),
+                        output_weight: get(&format!("{prefix}.attention.output.dense.weight"))?,
+                        output_bias: try_get(&format!("{prefix}.attention.output.dense.bias")),
+                        output_ln_weight: get(&format!(
+                            "{prefix}.attention.output.LayerNorm.weight"
+                        ))?,
+                        output_ln_bias: get(&format!("{prefix}.attention.output.LayerNorm.bias"))?,
+                        num_heads: config.num_attention_heads,
+                        head_dim: config.hidden_size / config.num_attention_heads,
+                        layer_norm_eps: config.layer_norm_eps,
+                        variant: config.variant,
+                        rotary_emb_base: config.rotary_emb_base,
+                    };
+                    let ffn = BertFfn {
+                        intermediate_weight: get(&format!("{prefix}.intermediate.dense.weight"))?,
+                        intermediate_bias: try_get(&format!("{prefix}.intermediate.dense.bias")),
+                        output_weight: get(&format!("{prefix}.output.dense.weight"))?,
+                        output_bias: try_get(&format!("{prefix}.output.dense.bias")),
+                        output_ln_weight: get(&format!("{prefix}.output.LayerNorm.weight"))?,
+                        output_ln_bias: get(&format!("{prefix}.output.LayerNorm.bias"))?,
+                        layer_norm_eps: config.layer_norm_eps,
+                        variant: config.variant,
+                    };
+                    (attention, ffn)
+                }
+                ModelVariant::NomicBert => {
+                    let prefix = format!("encoder.layers.{i}");
+                    // NomicBert uses fused QKV: Wqkv is [3*hidden, hidden]
+                    // Split into three [hidden, hidden] chunks along dim 0
+                    let wqkv = get(&format!("{prefix}.attn.Wqkv.weight"))?;
+                    let hidden = config.hidden_size;
+                    let qkv_chunks = wqkv.split(3, 0).map_err(mlx_err)?;
 
-            let attention = BertSelfAttention {
-                query_weight: get(&format!("{prefix}.attention.self.query.weight"))?,
-                query_bias: try_get(&format!("{prefix}.attention.self.query.bias")),
-                key_weight: get(&format!("{prefix}.attention.self.key.weight"))?,
-                key_bias: try_get(&format!("{prefix}.attention.self.key.bias")),
-                value_weight: get(&format!("{prefix}.attention.self.value.weight"))?,
-                value_bias: try_get(&format!("{prefix}.attention.self.value.bias")),
-                output_weight: get(&format!("{prefix}.attention.output.dense.weight"))?,
-                output_bias: try_get(&format!("{prefix}.attention.output.dense.bias")),
-                output_ln_weight: get(&format!("{prefix}.attention.output.LayerNorm.weight"))?,
-                output_ln_bias: get(&format!("{prefix}.attention.output.LayerNorm.bias"))?,
-                num_heads: config.num_attention_heads,
-                head_dim: config.hidden_size / config.num_attention_heads,
-                layer_norm_eps: config.layer_norm_eps,
-                variant: config.variant,
-                rotary_emb_base: config.rotary_emb_base,
-            };
+                    let attention = BertSelfAttention {
+                        query_weight: qkv_chunks[0].clone(),
+                        query_bias: None,
+                        key_weight: qkv_chunks[1].clone(),
+                        key_bias: None,
+                        value_weight: qkv_chunks[2].clone(),
+                        value_bias: None,
+                        output_weight: get(&format!("{prefix}.attn.out_proj.weight"))?,
+                        output_bias: None,
+                        // NomicBert uses pre-norm: norm1 is before attention
+                        output_ln_weight: get(&format!("{prefix}.norm1.weight"))?,
+                        output_ln_bias: get(&format!("{prefix}.norm1.bias"))?,
+                        num_heads: config.num_attention_heads,
+                        head_dim: hidden / config.num_attention_heads,
+                        layer_norm_eps: config.layer_norm_eps,
+                        variant: config.variant,
+                        rotary_emb_base: config.rotary_emb_base,
+                    };
+                    // NomicBert SwiGLU: fc11 = gate, fc12 = up, fc2 = down
+                    // We store fc11 as intermediate_weight (gate) and handle
+                    // fc12 (up) by concatenating: [fc11; fc12] → [2*inter, hidden]
+                    let fc11 = get(&format!("{prefix}.mlp.fc11.weight"))?;
+                    let fc12 = get(&format!("{prefix}.mlp.fc12.weight"))?;
+                    let gate_up =
+                        mlx_rs::ops::concatenate_axis(&[&fc11, &fc12], 0).map_err(mlx_err)?;
 
-            let ffn = BertFfn {
-                intermediate_weight: get(&format!("{prefix}.intermediate.dense.weight"))?,
-                intermediate_bias: try_get(&format!("{prefix}.intermediate.dense.bias")),
-                output_weight: get(&format!("{prefix}.output.dense.weight"))?,
-                output_bias: try_get(&format!("{prefix}.output.dense.bias")),
-                output_ln_weight: get(&format!("{prefix}.output.LayerNorm.weight"))?,
-                output_ln_bias: get(&format!("{prefix}.output.LayerNorm.bias"))?,
-                layer_norm_eps: config.layer_norm_eps,
-                variant: config.variant,
+                    let ffn = BertFfn {
+                        intermediate_weight: gate_up,
+                        intermediate_bias: None,
+                        output_weight: get(&format!("{prefix}.mlp.fc2.weight"))?,
+                        output_bias: None,
+                        output_ln_weight: get(&format!("{prefix}.norm2.weight"))?,
+                        output_ln_bias: get(&format!("{prefix}.norm2.bias"))?,
+                        layer_norm_eps: config.layer_norm_eps,
+                        variant: config.variant,
+                    };
+                    (attention, ffn)
+                }
             };
 
             layers.push(BertLayer { attention, ffn });
