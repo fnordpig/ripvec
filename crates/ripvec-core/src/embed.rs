@@ -424,6 +424,175 @@ fn embed_gpu_pipelined(
     Ok(embeddings)
 }
 
+/// Shared state for [`embed_distributed`] workers.
+#[allow(
+    dead_code,
+    reason = "used by tests now, wired into embed_all in task 3"
+)]
+struct DistributedState<'a> {
+    tokenized: &'a [Option<Encoding>],
+    cursor: std::sync::atomic::AtomicUsize,
+    error_flag: std::sync::atomic::AtomicBool,
+    first_error: std::sync::Mutex<Option<crate::Error>>,
+    done_counter: std::sync::atomic::AtomicUsize,
+    batch_size: usize,
+    profiler: &'a crate::profile::Profiler,
+}
+
+impl DistributedState<'_> {
+    /// Worker loop: claim batches from the shared cursor, embed, collect results.
+    fn run_worker(&self, backend: &dyn EmbedBackend) -> Vec<(usize, Vec<f32>)> {
+        use std::sync::atomic::Ordering;
+
+        let n = self.tokenized.len();
+        let grab_size = if backend.is_gpu() {
+            self.batch_size * 4
+        } else {
+            self.batch_size
+        };
+        let mut results = Vec::new();
+
+        loop {
+            if self.error_flag.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let start = self.cursor.fetch_add(grab_size, Ordering::Relaxed);
+            if start >= n {
+                break;
+            }
+            let end = (start + grab_size).min(n);
+            let batch = &self.tokenized[start..end];
+
+            // Separate valid encodings from Nones, tracking which indices succeeded
+            let mut valid = Vec::with_capacity(batch.len());
+            let mut valid_indices = Vec::with_capacity(batch.len());
+            for (i, enc) in batch.iter().enumerate() {
+                if let Some(e) = enc {
+                    valid.push(e.clone());
+                    valid_indices.push(start + i);
+                } else {
+                    results.push((start + i, vec![]));
+                }
+            }
+
+            if valid.is_empty() {
+                let done =
+                    self.done_counter.fetch_add(batch.len(), Ordering::Relaxed) + batch.len();
+                self.profiler.embed_tick(done);
+                continue;
+            }
+
+            match backend.embed_batch(&valid) {
+                Ok(batch_embeddings) => {
+                    for (idx, emb) in valid_indices.into_iter().zip(batch_embeddings) {
+                        results.push((idx, emb));
+                    }
+                    let done =
+                        self.done_counter.fetch_add(batch.len(), Ordering::Relaxed) + batch.len();
+                    self.profiler.embed_tick(done);
+                }
+                Err(e) => {
+                    self.error_flag.store(true, Ordering::Relaxed);
+                    if let Ok(mut guard) = self.first_error.lock()
+                        && guard.is_none()
+                    {
+                        *guard = Some(e);
+                    }
+                    break;
+                }
+            }
+        }
+
+        results
+    }
+}
+
+/// Distribute pre-tokenized chunks across multiple backends using work-stealing.
+///
+/// Each backend gets a dedicated worker thread. Workers compete on a shared
+/// `AtomicUsize` cursor to claim batches of chunks. GPU backends grab larger
+/// batches (`batch_size * 4`), CPU backends grab smaller ones (`batch_size`).
+/// Results are written by original chunk index — no merge step needed.
+///
+/// When `backends` has a single entry, no extra threads are spawned.
+///
+/// # Errors
+///
+/// Returns the first error from any backend. Other workers exit early
+/// when an error is detected.
+#[allow(
+    dead_code,
+    reason = "used by tests now, wired into embed_all in task 3"
+)]
+fn embed_distributed(
+    tokenized: &[Option<Encoding>],
+    backends: &[&dyn EmbedBackend],
+    batch_size: usize,
+    profiler: &crate::profile::Profiler,
+) -> crate::Result<Vec<Vec<f32>>> {
+    let n = tokenized.len();
+    let state = DistributedState {
+        tokenized,
+        cursor: std::sync::atomic::AtomicUsize::new(0),
+        error_flag: std::sync::atomic::AtomicBool::new(false),
+        first_error: std::sync::Mutex::new(None),
+        done_counter: std::sync::atomic::AtomicUsize::new(0),
+        batch_size: batch_size.max(1),
+        profiler,
+    };
+
+    // Collect (index, embedding) pairs from all workers
+    let all_pairs: Vec<(usize, Vec<f32>)> = if backends.len() == 1 {
+        // Single backend: run directly on the main thread, no spawning overhead
+        state.run_worker(backends[0])
+    } else {
+        // Multiple backends: one thread per backend via std::thread::scope
+        std::thread::scope(|s| {
+            let handles: Vec<_> = backends
+                .iter()
+                .map(|&backend| {
+                    s.spawn(|| {
+                        // CPU backends that support cloning get a thread-local copy
+                        if backend.supports_clone() {
+                            let cloned = backend.clone_backend();
+                            state.run_worker(cloned.as_ref())
+                        } else {
+                            state.run_worker(backend)
+                        }
+                    })
+                })
+                .collect();
+
+            let mut all = Vec::new();
+            for handle in handles {
+                if let Ok(pairs) = handle.join() {
+                    all.extend(pairs);
+                } else {
+                    warn!("worker thread panicked");
+                    state
+                        .error_flag
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            all
+        })
+    };
+
+    // Check for errors before assembling results
+    if let Some(err) = state.first_error.into_inner().ok().flatten() {
+        return Err(err);
+    }
+
+    // Scatter results into output vec by original index
+    let mut embeddings: Vec<Vec<f32>> = vec![vec![]; n];
+    for (idx, emb) in all_pairs {
+        embeddings[idx] = emb;
+    }
+
+    Ok(embeddings)
+}
+
 /// Source text either owned (from `read_to_string`) or mmap'd.
 enum SourceText {
     Owned(String),
@@ -532,5 +701,33 @@ mod tests {
         );
         assert!(results.is_ok());
         assert!(!results.unwrap().is_empty());
+    }
+
+    #[test]
+    fn embed_distributed_produces_correct_count() {
+        let backend = crate::backend::load_backend(
+            crate::backend::BackendKind::Candle,
+            "BAAI/bge-small-en-v1.5",
+            crate::backend::DeviceHint::Cpu,
+        )
+        .unwrap();
+        let tokenizer = crate::tokenize::load_tokenizer("BAAI/bge-small-en-v1.5").unwrap();
+        let profiler = crate::profile::Profiler::noop();
+
+        // Tokenize a few strings
+        let texts = ["fn hello() {}", "class Foo:", "func main() {}"];
+        let encoded: Vec<Option<Encoding>> = texts
+            .iter()
+            .map(|t| super::tokenize(t, &tokenizer, 0).ok())
+            .collect();
+
+        let results =
+            super::embed_distributed(&encoded, &[backend.as_ref()], 32, &profiler).unwrap();
+
+        assert_eq!(results.len(), 3);
+        // All should be 384-dim (bge-small hidden size)
+        for (i, emb) in results.iter().enumerate() {
+            assert_eq!(emb.len(), 384, "embedding {i} should be 384-dim");
+        }
     }
 }
