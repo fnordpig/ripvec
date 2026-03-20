@@ -2,8 +2,12 @@
 //!
 //! Implements BERT inference using Apple's MLX framework via [`mlx_rs`].
 //! MLX uses unified memory and Metal compute shaders, avoiding the CPU
-//! bottlenecks (software GELU, allocation overhead, CPU↔GPU copies) that
+//! bottlenecks (software GELU, allocation overhead, CPU-GPU copies) that
 //! limit the Candle backend on Apple Silicon.
+//!
+//! Supports two model families:
+//! - **`ClassicBert`** (BGE models): learned position embeddings, GELU, QKV with bias.
+//! - **`NomicBert`** (CodeRankEmbed, nomic-embed-text): RoPE, SwiGLU, no bias.
 //!
 //! Weights are loaded from safetensors files downloaded via `hf-hub` and
 //! manually assigned to a hand-rolled BERT model. The model is wrapped in
@@ -24,27 +28,63 @@ fn mlx_err(e: impl std::fmt::Display) -> crate::Error {
 }
 
 // ---------------------------------------------------------------------------
+// Model variant detection
+// ---------------------------------------------------------------------------
+
+/// Which BERT variant the loaded weights correspond to.
+///
+/// `ClassicBert` uses learned position embeddings, GELU activation, and
+/// biased QKV projections. `NomicBert` uses RoPE, SwiGLU, and unbiased
+/// projections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelVariant {
+    /// Standard BERT / BGE models (e.g. `BAAI/bge-small-en-v1.5`).
+    ClassicBert,
+    /// NomicBert models (e.g. `nomic-ai/CodeRankEmbed`, `nomic-embed-text-v1.5`).
+    NomicBert,
+}
+
+/// Detect the model variant by inspecting weight names.
+///
+/// `ClassicBert` has `embeddings.position_embeddings.weight`; `NomicBert`
+/// does not (it uses rotary position encoding instead).
+fn detect_variant(weights: &HashMap<String, Array>) -> ModelVariant {
+    if weights.contains_key("embeddings.position_embeddings.weight") {
+        ModelVariant::ClassicBert
+    } else {
+        ModelVariant::NomicBert
+    }
+}
+
+// ---------------------------------------------------------------------------
 // BERT model configuration
 // ---------------------------------------------------------------------------
 
 /// Configuration for a BERT-style encoder model.
 ///
 /// Matches the `config.json` schema from HuggingFace model repos.
+/// Supports both `ClassicBert` and `NomicBert` config key names.
 #[derive(Debug, Clone)]
 struct BertConfig {
-    /// Hidden dimension (384 for bge-small).
+    /// Which variant this config describes.
+    variant: ModelVariant,
+    /// Hidden dimension (384 for bge-small, 768 for nomic).
     hidden_size: i32,
     /// Number of transformer layers.
     num_hidden_layers: i32,
     /// Number of attention heads.
     num_attention_heads: i32,
+    /// Maximum sequence length (512 for classic, 8192 for nomic).
+    max_position_embeddings: i32,
+    /// Base for rotary embeddings (only used by `NomicBert`).
+    rotary_emb_base: f32,
     /// Layer norm epsilon.
     layer_norm_eps: f32,
 }
 
 impl BertConfig {
-    /// Parse from a `config.json` value.
-    fn from_json(v: &serde_json::Value) -> crate::Result<Self> {
+    /// Parse from a `config.json` value, dispatching on `variant`.
+    fn from_json(v: &serde_json::Value, variant: ModelVariant) -> crate::Result<Self> {
         let get_i32 = |key: &str| -> crate::Result<i32> {
             v.get(key)
                 .and_then(serde_json::Value::as_i64)
@@ -64,25 +104,127 @@ impl BertConfig {
         let layer_norm_eps =
             get_f64("layer_norm_epsilon").or_else(|_| get_f64("layer_norm_eps"))? as f32;
 
-        Ok(Self {
-            hidden_size: get_i32("hidden_size")?,
-            num_hidden_layers: get_i32("num_hidden_layers")?,
-            num_attention_heads: get_i32("num_attention_heads")?,
-            layer_norm_eps,
-        })
+        match variant {
+            ModelVariant::ClassicBert => Ok(Self {
+                variant,
+                hidden_size: get_i32("hidden_size")?,
+                num_hidden_layers: get_i32("num_hidden_layers")?,
+                num_attention_heads: get_i32("num_attention_heads")?,
+                max_position_embeddings: get_i32("max_position_embeddings").unwrap_or(512),
+                rotary_emb_base: 10000.0,
+                layer_norm_eps,
+            }),
+            ModelVariant::NomicBert => {
+                // NomicBert uses different config key names
+                let hidden_size = get_i32("n_embd").or_else(|_| get_i32("hidden_size"))?;
+                let num_hidden_layers =
+                    get_i32("n_layer").or_else(|_| get_i32("num_hidden_layers"))?;
+                let num_attention_heads =
+                    get_i32("n_head").or_else(|_| get_i32("num_attention_heads"))?;
+                let max_position_embeddings = get_i32("n_positions")
+                    .or_else(|_| get_i32("max_position_embeddings"))
+                    .unwrap_or(8192);
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "rotary_emb_base is a moderate float"
+                )]
+                let rotary_emb_base = get_f64("rotary_emb_base")
+                    .map(|v| v as f32)
+                    .unwrap_or(10000.0);
+
+                Ok(Self {
+                    variant,
+                    hidden_size,
+                    num_hidden_layers,
+                    num_attention_heads,
+                    max_position_embeddings,
+                    rotary_emb_base,
+                    layer_norm_eps,
+                })
+            }
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Rotary position embeddings (RoPE)
+// ---------------------------------------------------------------------------
+
+/// Apply rotary position embeddings to query and key tensors.
+///
+/// Computes frequency table `theta_i = base^(-2i/d)`, multiplies by position
+/// indices to get angles, then applies the rotation:
+/// `[x1*cos - x2*sin, x1*sin + x2*cos]` to each (first half, second half)
+/// pair of the head dimension.
+///
+/// Inputs `q` and `k` are `[batch, num_heads, seq_len, head_dim]`.
+fn apply_rope(q: &Array, k: &Array, head_dim: i32, base: f32) -> crate::Result<(Array, Array)> {
+    let seq_len = q.shape()[2];
+    let half_dim = head_dim / 2;
+
+    // theta_i = base^(-2i / head_dim) for i in [0, half_dim)
+    // exponents: [0, -2/d, -4/d, ..., -(d-2)/d]
+    let exponents = Array::arange::<_, f32>(None, half_dim, None).map_err(mlx_err)?;
+    let neg_two_over_d = Array::from_slice(&[-2.0_f32 / head_dim as f32], &[1]);
+    let exponents = mlx_rs::ops::multiply(&exponents, &neg_two_over_d).map_err(mlx_err)?;
+    let base_arr = Array::from_slice(&[base], &[1]);
+    let theta = base_arr.power(&exponents).map_err(mlx_err)?; // [half_dim]
+
+    // Position indices: [0, 1, ..., seq_len-1] as float
+    let positions = Array::arange::<_, f32>(None, seq_len, None).map_err(mlx_err)?; // [seq_len]
+
+    // Outer product: positions [seq_len, 1] * theta [1, half_dim] = [seq_len, half_dim]
+    let positions = mlx_rs::ops::reshape(&positions, &[seq_len, 1]).map_err(mlx_err)?;
+    let theta = mlx_rs::ops::reshape(&theta, &[1, half_dim]).map_err(mlx_err)?;
+    let angles = mlx_rs::ops::multiply(&positions, &theta).map_err(mlx_err)?; // [seq_len, half_dim]
+
+    let cos_vals = angles.cos().map_err(mlx_err)?; // [seq_len, half_dim]
+    let sin_vals = angles.sin().map_err(mlx_err)?; // [seq_len, half_dim]
+
+    // Broadcast to [1, 1, seq_len, half_dim] for batch/head broadcasting
+    let cos_vals = mlx_rs::ops::reshape(&cos_vals, &[1, 1, seq_len, half_dim]).map_err(mlx_err)?;
+    let sin_vals = mlx_rs::ops::reshape(&sin_vals, &[1, 1, seq_len, half_dim]).map_err(mlx_err)?;
+
+    let rotate = |x: &Array| -> crate::Result<Array> {
+        // Split x [..., head_dim] into two halves [..., half_dim] each
+        let parts = mlx_rs::ops::split(x, 2, -1).map_err(mlx_err)?;
+        let x1 = &parts[0]; // [batch, heads, seq, half_dim]
+        let x2 = &parts[1];
+
+        // rotated_x1 = x1 * cos - x2 * sin
+        let a = mlx_rs::ops::multiply(x1, &cos_vals).map_err(mlx_err)?;
+        let b = mlx_rs::ops::multiply(x2, &sin_vals).map_err(mlx_err)?;
+        let rotated_x1 = mlx_rs::ops::subtract(&a, &b).map_err(mlx_err)?;
+
+        // rotated_x2 = x1 * sin + x2 * cos
+        let c = mlx_rs::ops::multiply(x1, &sin_vals).map_err(mlx_err)?;
+        let d = mlx_rs::ops::multiply(x2, &cos_vals).map_err(mlx_err)?;
+        let rotated_x2 = mlx_rs::ops::add(&c, &d).map_err(mlx_err)?;
+
+        mlx_rs::ops::concatenate_axis(&[&rotated_x1, &rotated_x2], -1).map_err(mlx_err)
+    };
+
+    let q_rot = rotate(q)?;
+    let k_rot = rotate(k)?;
+    Ok((q_rot, k_rot))
 }
 
 // ---------------------------------------------------------------------------
 // BERT building blocks (manual weight assignment, no derive macros)
 // ---------------------------------------------------------------------------
 
-/// BERT embeddings layer: word + position + token_type + LayerNorm.
+/// BERT embeddings layer: word + optional(position + token_type) + LayerNorm.
+///
+/// For `ClassicBert`, position and token_type embeddings are summed with word
+/// embeddings. For `NomicBert`, only word embeddings + LayerNorm are used
+/// (positions are handled by RoPE in each attention layer).
 #[derive(Debug)]
 struct BertEmbeddings {
     word_embeddings: Array,
-    position_embeddings: Array,
-    token_type_embeddings: Array,
+    /// Learned position embeddings (`ClassicBert` only).
+    position_embeddings: Option<Array>,
+    /// Token type embeddings (`ClassicBert` only).
+    token_type_embeddings: Option<Array>,
     layer_norm_weight: Array,
     layer_norm_bias: Array,
     layer_norm_eps: f32,
@@ -93,23 +235,22 @@ impl BertEmbeddings {
     fn forward(&self, input_ids: &Array, token_type_ids: &Array) -> crate::Result<Array> {
         let seq_len = input_ids.shape()[1];
 
-        // Position IDs: [0, 1, ..., seq_len-1]
-        let position_ids = Array::from_slice(&(0..seq_len).collect::<Vec<i32>>(), &[1, seq_len]);
-
         // Embedding lookups via indexing
-        let word_emb = self.word_embeddings.try_index(input_ids).map_err(mlx_err)?;
-        let pos_emb = self
-            .position_embeddings
-            .try_index(&position_ids)
-            .map_err(mlx_err)?;
-        let tok_emb = self
-            .token_type_embeddings
-            .try_index(token_type_ids)
-            .map_err(mlx_err)?;
+        let mut sum = self.word_embeddings.try_index(input_ids).map_err(mlx_err)?;
 
-        // Sum embeddings
-        let sum = mlx_rs::ops::add(&word_emb, &pos_emb).map_err(mlx_err)?;
-        let sum = mlx_rs::ops::add(&sum, &tok_emb).map_err(mlx_err)?;
+        // Add position embeddings if present (ClassicBert)
+        if let Some(ref pos_emb_table) = self.position_embeddings {
+            let position_ids =
+                Array::from_slice(&(0..seq_len).collect::<Vec<i32>>(), &[1, seq_len]);
+            let pos_emb = pos_emb_table.try_index(&position_ids).map_err(mlx_err)?;
+            sum = mlx_rs::ops::add(&sum, &pos_emb).map_err(mlx_err)?;
+        }
+
+        // Add token type embeddings if present (ClassicBert)
+        if let Some(ref tok_emb_table) = self.token_type_embeddings {
+            let tok_emb = tok_emb_table.try_index(token_type_ids).map_err(mlx_err)?;
+            sum = mlx_rs::ops::add(&sum, &tok_emb).map_err(mlx_err)?;
+        }
 
         // Layer norm
         let normed = mlx_rs::fast::layer_norm(
@@ -125,21 +266,40 @@ impl BertEmbeddings {
 }
 
 /// Self-attention sub-layer within a BERT encoder layer.
+///
+/// For `ClassicBert`, QKV projections include bias terms and no rotary
+/// encoding. For `NomicBert`, projections are unbiased and RoPE is applied
+/// to Q and K after reshaping to head layout.
 #[derive(Debug)]
 struct BertSelfAttention {
     query_weight: Array,
-    query_bias: Array,
+    query_bias: Option<Array>,
     key_weight: Array,
-    key_bias: Array,
+    key_bias: Option<Array>,
     value_weight: Array,
-    value_bias: Array,
+    value_bias: Option<Array>,
     output_weight: Array,
-    output_bias: Array,
+    output_bias: Option<Array>,
     output_ln_weight: Array,
     output_ln_bias: Array,
     num_heads: i32,
     head_dim: i32,
     layer_norm_eps: f32,
+    /// Model variant (determines whether to apply RoPE).
+    variant: ModelVariant,
+    /// RoPE base frequency (only used by `NomicBert`).
+    rotary_emb_base: f32,
+}
+
+/// Compute a linear projection, optionally adding a bias.
+///
+/// With bias: `addmm(bias, input, weight.T)`.
+/// Without bias: `matmul(input, weight.T)`.
+fn linear(input: &Array, weight: &Array, bias: Option<&Array>) -> crate::Result<Array> {
+    match bias {
+        Some(b) => mlx_rs::ops::addmm(b, input, weight.t(), None, None).map_err(mlx_err),
+        None => mlx_rs::ops::matmul(input, weight.t()).map_err(mlx_err),
+    }
 }
 
 impl BertSelfAttention {
@@ -148,26 +308,30 @@ impl BertSelfAttention {
         let batch = hidden.shape()[0];
         let seq_len = hidden.shape()[1];
 
-        // Q, K, V projections: [batch, seq, hidden] × [hidden, hidden]^T + bias
-        let q = mlx_rs::ops::addmm(&self.query_bias, hidden, self.query_weight.t(), None, None)
-            .map_err(mlx_err)?;
-        let k = mlx_rs::ops::addmm(&self.key_bias, hidden, self.key_weight.t(), None, None)
-            .map_err(mlx_err)?;
-        let v = mlx_rs::ops::addmm(&self.value_bias, hidden, self.value_weight.t(), None, None)
-            .map_err(mlx_err)?;
+        // Q, K, V projections
+        let q = linear(hidden, &self.query_weight, self.query_bias.as_ref())?;
+        let k = linear(hidden, &self.key_weight, self.key_bias.as_ref())?;
+        let v = linear(hidden, &self.value_weight, self.value_bias.as_ref())?;
 
         // Reshape to [batch, seq, num_heads, head_dim] then transpose to [batch, num_heads, seq, head_dim]
         let q = mlx_rs::ops::reshape(&q, &[batch, seq_len, self.num_heads, self.head_dim])
             .map_err(mlx_err)?;
-        let q = mlx_rs::ops::transpose_axes(&q, &[0, 2, 1, 3]).map_err(mlx_err)?;
+        let mut q = mlx_rs::ops::transpose_axes(&q, &[0, 2, 1, 3]).map_err(mlx_err)?;
 
         let k = mlx_rs::ops::reshape(&k, &[batch, seq_len, self.num_heads, self.head_dim])
             .map_err(mlx_err)?;
-        let k = mlx_rs::ops::transpose_axes(&k, &[0, 2, 1, 3]).map_err(mlx_err)?;
+        let mut k = mlx_rs::ops::transpose_axes(&k, &[0, 2, 1, 3]).map_err(mlx_err)?;
 
         let v = mlx_rs::ops::reshape(&v, &[batch, seq_len, self.num_heads, self.head_dim])
             .map_err(mlx_err)?;
         let v = mlx_rs::ops::transpose_axes(&v, &[0, 2, 1, 3]).map_err(mlx_err)?;
+
+        // Apply RoPE for NomicBert
+        if self.variant == ModelVariant::NomicBert {
+            let (q_rot, k_rot) = apply_rope(&q, &k, self.head_dim, self.rotary_emb_base)?;
+            q = q_rot;
+            k = k_rot;
+        }
 
         // Scaled dot-product attention with mask
         // MLX's fast SDPA dispatches to optimized Metal kernels.
@@ -176,21 +340,14 @@ impl BertSelfAttention {
             mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, scale, attention_mask)
                 .map_err(mlx_err)?;
 
-        // Reshape back: [batch, num_heads, seq, head_dim] → [batch, seq, hidden]
+        // Reshape back: [batch, num_heads, seq, head_dim] -> [batch, seq, hidden]
         let attn_out = mlx_rs::ops::transpose_axes(&attn_out, &[0, 2, 1, 3]).map_err(mlx_err)?;
         let hidden_dim = self.num_heads * self.head_dim;
         let attn_out =
             mlx_rs::ops::reshape(&attn_out, &[batch, seq_len, hidden_dim]).map_err(mlx_err)?;
 
         // Output projection
-        let projected = mlx_rs::ops::addmm(
-            &self.output_bias,
-            &attn_out,
-            self.output_weight.t(),
-            None,
-            None,
-        )
-        .map_err(mlx_err)?;
+        let projected = linear(&attn_out, &self.output_weight, self.output_bias.as_ref())?;
 
         // Residual + LayerNorm
         let residual = mlx_rs::ops::add(hidden, &projected).map_err(mlx_err)?;
@@ -207,42 +364,52 @@ impl BertSelfAttention {
 }
 
 /// Feed-forward network sub-layer within a BERT encoder layer.
+///
+/// `ClassicBert`: Linear -> GELU -> Linear (all with bias).
+/// `NomicBert`: Linear -> SwiGLU split -> Linear (no bias).
+/// The intermediate weight for `NomicBert` is `[hidden, 2*intermediate]`;
+/// the output is split into gate and value, then `SiLU(gate) * value`.
 #[derive(Debug)]
 struct BertFfn {
     intermediate_weight: Array,
-    intermediate_bias: Array,
+    intermediate_bias: Option<Array>,
     output_weight: Array,
-    output_bias: Array,
+    output_bias: Option<Array>,
     output_ln_weight: Array,
     output_ln_bias: Array,
     layer_norm_eps: f32,
+    /// Model variant (determines GELU vs SwiGLU activation).
+    variant: ModelVariant,
 }
 
 impl BertFfn {
-    /// FFN: Linear → GELU → Linear → residual → LayerNorm.
+    /// FFN forward pass, dispatching on variant for activation function.
     fn forward(&self, hidden: &Array) -> crate::Result<Array> {
-        // Intermediate: [batch, seq, hidden] → [batch, seq, intermediate]
-        let intermediate = mlx_rs::ops::addmm(
-            &self.intermediate_bias,
+        // Intermediate projection
+        let intermediate = linear(
             hidden,
-            self.intermediate_weight.t(),
-            None,
-            None,
-        )
-        .map_err(mlx_err)?;
+            &self.intermediate_weight,
+            self.intermediate_bias.as_ref(),
+        )?;
 
-        // GELU activation (Metal compute shader, not software erff)
-        let activated = mlx_rs::nn::gelu(&intermediate).map_err(mlx_err)?;
+        // Activation
+        let activated = match self.variant {
+            ModelVariant::ClassicBert => {
+                // GELU activation (Metal compute shader, not software erff)
+                mlx_rs::nn::gelu(&intermediate).map_err(mlx_err)?
+            }
+            ModelVariant::NomicBert => {
+                // SwiGLU: split into gate + value, then SiLU(gate) * value
+                let parts = mlx_rs::ops::split(&intermediate, 2, -1).map_err(mlx_err)?;
+                let gate = &parts[0];
+                let up = &parts[1];
+                let gate_activated = mlx_rs::nn::silu(gate).map_err(mlx_err)?;
+                mlx_rs::ops::multiply(&gate_activated, up).map_err(mlx_err)?
+            }
+        };
 
-        // Output: [batch, seq, intermediate] → [batch, seq, hidden]
-        let output = mlx_rs::ops::addmm(
-            &self.output_bias,
-            &activated,
-            self.output_weight.t(),
-            None,
-            None,
-        )
-        .map_err(mlx_err)?;
+        // Output projection
+        let output = linear(&activated, &self.output_weight, self.output_bias.as_ref())?;
 
         // Residual + LayerNorm
         let residual = mlx_rs::ops::add(hidden, &output).map_err(mlx_err)?;
@@ -316,13 +483,25 @@ impl BertModel {
                 .ok_or_else(|| crate::Error::Other(anyhow::anyhow!("missing weight: {name}")))
         };
 
-        let embeddings = BertEmbeddings {
-            word_embeddings: get("embeddings.word_embeddings.weight")?,
-            position_embeddings: get("embeddings.position_embeddings.weight")?,
-            token_type_embeddings: get("embeddings.token_type_embeddings.weight")?,
-            layer_norm_weight: get("embeddings.LayerNorm.weight")?,
-            layer_norm_bias: get("embeddings.LayerNorm.bias")?,
-            layer_norm_eps: config.layer_norm_eps,
+        let try_get = |name: &str| -> Option<Array> { weights.get(name).cloned() };
+
+        let embeddings = match config.variant {
+            ModelVariant::ClassicBert => BertEmbeddings {
+                word_embeddings: get("embeddings.word_embeddings.weight")?,
+                position_embeddings: Some(get("embeddings.position_embeddings.weight")?),
+                token_type_embeddings: Some(get("embeddings.token_type_embeddings.weight")?),
+                layer_norm_weight: get("embeddings.LayerNorm.weight")?,
+                layer_norm_bias: get("embeddings.LayerNorm.bias")?,
+                layer_norm_eps: config.layer_norm_eps,
+            },
+            ModelVariant::NomicBert => BertEmbeddings {
+                word_embeddings: get("embeddings.word_embeddings.weight")?,
+                position_embeddings: None,
+                token_type_embeddings: try_get("embeddings.token_type_embeddings.weight"),
+                layer_norm_weight: get("embeddings.LayerNorm.weight")?,
+                layer_norm_bias: get("embeddings.LayerNorm.bias")?,
+                layer_norm_eps: config.layer_norm_eps,
+            },
         };
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers as usize);
@@ -331,28 +510,31 @@ impl BertModel {
 
             let attention = BertSelfAttention {
                 query_weight: get(&format!("{prefix}.attention.self.query.weight"))?,
-                query_bias: get(&format!("{prefix}.attention.self.query.bias"))?,
+                query_bias: try_get(&format!("{prefix}.attention.self.query.bias")),
                 key_weight: get(&format!("{prefix}.attention.self.key.weight"))?,
-                key_bias: get(&format!("{prefix}.attention.self.key.bias"))?,
+                key_bias: try_get(&format!("{prefix}.attention.self.key.bias")),
                 value_weight: get(&format!("{prefix}.attention.self.value.weight"))?,
-                value_bias: get(&format!("{prefix}.attention.self.value.bias"))?,
+                value_bias: try_get(&format!("{prefix}.attention.self.value.bias")),
                 output_weight: get(&format!("{prefix}.attention.output.dense.weight"))?,
-                output_bias: get(&format!("{prefix}.attention.output.dense.bias"))?,
+                output_bias: try_get(&format!("{prefix}.attention.output.dense.bias")),
                 output_ln_weight: get(&format!("{prefix}.attention.output.LayerNorm.weight"))?,
                 output_ln_bias: get(&format!("{prefix}.attention.output.LayerNorm.bias"))?,
                 num_heads: config.num_attention_heads,
                 head_dim: config.hidden_size / config.num_attention_heads,
                 layer_norm_eps: config.layer_norm_eps,
+                variant: config.variant,
+                rotary_emb_base: config.rotary_emb_base,
             };
 
             let ffn = BertFfn {
                 intermediate_weight: get(&format!("{prefix}.intermediate.dense.weight"))?,
-                intermediate_bias: get(&format!("{prefix}.intermediate.dense.bias"))?,
+                intermediate_bias: try_get(&format!("{prefix}.intermediate.dense.bias")),
                 output_weight: get(&format!("{prefix}.output.dense.weight"))?,
-                output_bias: get(&format!("{prefix}.output.dense.bias"))?,
+                output_bias: try_get(&format!("{prefix}.output.dense.bias")),
                 output_ln_weight: get(&format!("{prefix}.output.LayerNorm.weight"))?,
                 output_ln_bias: get(&format!("{prefix}.output.LayerNorm.bias"))?,
                 layer_norm_eps: config.layer_norm_eps,
+                variant: config.variant,
             };
 
             layers.push(BertLayer { attention, ffn });
@@ -372,6 +554,9 @@ impl BertModel {
 /// unified memory and Metal compute shaders, avoiding the CPU bottlenecks
 /// (software GELU, allocation overhead, explicit copies) seen with Candle.
 ///
+/// Supports both `ClassicBert` (BGE) and `NomicBert` (CodeRankEmbed) model
+/// families, detected automatically from weight names.
+///
 /// The inner [`BertModel`] is wrapped in `Arc<Mutex<_>>` because MLX's
 /// [`Array`] type is `Send` but not `Sync`. The mutex ensures safe access
 /// from the `&self` methods required by [`EmbedBackend`].
@@ -380,23 +565,28 @@ pub struct MlxBackend {
     model: Arc<Mutex<BertModel>>,
     /// Hidden dimension for output vector size validation.
     hidden_size: i32,
+    /// Maximum sequence length supported by the model.
+    pub max_position_embeddings: i32,
 }
 
 impl std::fmt::Debug for MlxBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MlxBackend")
             .field("hidden_size", &self.hidden_size)
+            .field("max_position_embeddings", &self.max_position_embeddings)
             .finish()
     }
 }
 
 impl MlxBackend {
-    /// Load a BERT/BGE embedding model from `HuggingFace`.
+    /// Load a BERT/BGE/NomicBert embedding model from `HuggingFace`.
     ///
     /// Downloads `model.safetensors` and `config.json` on first call;
-    /// subsequent calls use the `hf-hub` cache. MLX always runs on the
-    /// GPU via Metal — the `device_hint` is accepted for API compatibility
-    /// but ignored (MLX manages its own device placement).
+    /// subsequent calls use the `hf-hub` cache. The model variant
+    /// (`ClassicBert` or `NomicBert`) is auto-detected from weight names.
+    ///
+    /// MLX always runs on the GPU via Metal -- the `device_hint` is accepted
+    /// for API compatibility but ignored (MLX manages its own device placement).
     ///
     /// # Errors
     ///
@@ -414,24 +604,27 @@ impl MlxBackend {
             .get("model.safetensors")
             .map_err(|e| crate::Error::Download(e.to_string()))?;
 
-        // Parse config
+        // Load safetensors weights into MLX arrays (before config, to detect variant)
+        let weights = Array::load_safetensors(weights_path).map_err(mlx_err)?;
+        let variant = detect_variant(&weights);
+
+        // Parse config with variant awareness
         let config_str = std::fs::read_to_string(&config_path).map_err(|e| crate::Error::Io {
             path: config_path.display().to_string(),
             source: e,
         })?;
         let config_json: serde_json::Value = serde_json::from_str(&config_str)
             .map_err(|e| crate::Error::Other(anyhow::anyhow!("config parse error: {e}")))?;
-        let config = BertConfig::from_json(&config_json)?;
-
-        // Load safetensors weights into MLX arrays
-        let weights = Array::load_safetensors(weights_path).map_err(mlx_err)?;
+        let config = BertConfig::from_json(&config_json, variant)?;
 
         let hidden_size = config.hidden_size;
+        let max_position_embeddings = config.max_position_embeddings;
         let model = BertModel::from_weights(weights, &config)?;
 
         Ok(Self {
             model: Arc::new(Mutex::new(model)),
             hidden_size,
+            max_position_embeddings,
         })
     }
 }
@@ -525,7 +718,7 @@ impl EmbedBackend for MlxBackend {
         Ok(results)
     }
 
-    /// MLX manages its own parallelism — cloning is not needed.
+    /// MLX manages its own parallelism -- cloning is not needed.
     fn supports_clone(&self) -> bool {
         false
     }
@@ -534,9 +727,9 @@ impl EmbedBackend for MlxBackend {
     ///
     /// # Panics
     ///
-    /// Always panics — callers must check [`supports_clone`](EmbedBackend::supports_clone) first.
+    /// Always panics -- callers must check [`supports_clone`](EmbedBackend::supports_clone) first.
     fn clone_backend(&self) -> Box<dyn EmbedBackend> {
-        panic!("clone_backend() called on MlxBackend — MLX manages its own parallelism");
+        panic!("clone_backend() called on MlxBackend -- MLX manages its own parallelism");
     }
 
     /// MLX always runs on the GPU via Metal.
@@ -632,5 +825,13 @@ mod tests {
             dot < 0.999,
             "different inputs should produce different embeddings, dot={dot}"
         );
+    }
+
+    #[test]
+    fn detect_variant_classic_bert() {
+        // BGE model should detect as ClassicBert
+        let backend = MlxBackend::load(BGE_SMALL, &DeviceHint::Auto).unwrap();
+        // ClassicBert max_position_embeddings is 512
+        assert_eq!(backend.max_position_embeddings, 512);
     }
 }
