@@ -168,9 +168,15 @@ pub fn detect_backends(model_repo: &str) -> crate::Result<Vec<Box<dyn EmbedBacke
     // #[cfg(feature = "cuda")]
     // for device_id in 0..cuda_device_count() { ... }
 
-    // Always add CPU (Candle with Accelerate/MKL) as helper/fallback
-    if let Ok(b) = candle::CandleBackend::load(model_repo, &DeviceHint::Cpu) {
-        backends.push(Box::new(b));
+    // Add CPU as fallback only when no GPU backend was loaded.
+    // On Apple Silicon, running CPU + MLX concurrently is slower than
+    // MLX alone because they share the same physical cores and memory.
+    // On discrete GPU systems (CUDA), CPU would be a useful helper.
+    let has_gpu = backends.iter().any(|b| b.is_gpu());
+    if !has_gpu {
+        if let Ok(b) = candle::CandleBackend::load(model_repo, &DeviceHint::Cpu) {
+            backends.push(Box::new(b));
+        }
     }
 
     if backends.is_empty() {
