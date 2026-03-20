@@ -44,8 +44,8 @@ pub struct Args {
     #[arg(long, default_value = "cpu")]
     pub device: DeviceArg,
 
-    /// Embedding backend implementation.
-    #[arg(long, default_value = "candle")]
+    /// Embedding backend implementation (auto = detect all available).
+    #[arg(long, default_value = "auto")]
     pub backend: BackendArg,
 
     /// Batch size for embedding inference (chunks per model forward pass).
@@ -117,8 +117,11 @@ pub enum DeviceArg {
 }
 
 /// Embedding backend implementation.
-#[derive(clap::ValueEnum, Clone, Debug)]
+#[derive(clap::ValueEnum, Clone, Debug, Default)]
 pub enum BackendArg {
+    /// Auto-detect all available backends (default).
+    #[default]
+    Auto,
     /// Candle (pure-Rust, CPU + Metal + CUDA).
     Candle,
     /// MLX (Apple Silicon, macOS only).

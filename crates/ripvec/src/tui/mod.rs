@@ -37,8 +37,8 @@ pub struct App {
     pub index: SearchIndex,
     /// Current ranked results: `(chunk_index, similarity_score)`.
     pub results: Vec<(usize, f32)>,
-    /// Embedding backend for re-embedding queries.
-    pub backend: Box<dyn EmbedBackend>,
+    /// Embedding backends (primary first, used for query re-embedding).
+    pub backends: Vec<Box<dyn EmbedBackend>>,
     /// Tokenizer for query encoding.
     pub tokenizer: tokenizers::Tokenizer,
     /// Minimum similarity threshold.
@@ -77,7 +77,7 @@ impl App {
             self.rank_time_ms = 0.0;
             return;
         };
-        let query_emb = match self.backend.embed_batch(&[enc]) {
+        let query_emb = match self.backends[0].embed_batch(&[enc]) {
             Ok(mut vecs) => match vecs.pop() {
                 Some(v) => v,
                 None => return,

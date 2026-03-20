@@ -60,13 +60,13 @@ fn main() -> Result<()> {
         cores,
     );
 
-    // Load embedding backend + tokenizer (shared by both modes)
-    let (backend, tokenizer, search_cfg) = load_pipeline(&args, use_progress, &profiler)?;
+    // Load embedding backend(s) + tokenizer (shared by both modes)
+    let (backends, tokenizer, search_cfg) = load_pipeline(&args, use_progress, &profiler)?;
 
     if args.interactive {
         drop(trace_guard);
         run_interactive(
-            backend,
+            backends,
             tokenizer,
             &search_cfg,
             &args,
@@ -75,7 +75,7 @@ fn main() -> Result<()> {
         )?;
     } else {
         run_oneshot(
-            &*backend,
+            &backends,
             &tokenizer,
             &search_cfg,
             &args,
@@ -88,30 +88,46 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Load the embedding backend, tokenizer, and build the search config.
+/// Load the embedding backend(s), tokenizer, and build the search config.
+///
+/// When `--backend auto` (the default), probes for all available backends
+/// via [`ripvec_core::backend::detect_backends`]. When a specific backend
+/// is requested, loads just that one.
+#[expect(clippy::type_complexity, reason = "tuple return is clear in context")]
 fn load_pipeline(
     args: &cli::Args,
     use_progress: bool,
     profiler: &ripvec_core::profile::Profiler,
 ) -> Result<(
-    Box<dyn ripvec_core::backend::EmbedBackend>,
+    Vec<Box<dyn ripvec_core::backend::EmbedBackend>>,
     tokenizers::Tokenizer,
     ripvec_core::embed::SearchConfig,
 )> {
-    let backend = {
+    let backends = {
         let _guard = profiler.phase("model_load");
         let pb = use_progress.then(|| progress::spinner("Loading model\u{2026}"));
-        let kind = match args.backend {
-            cli::BackendArg::Candle => ripvec_core::backend::BackendKind::Candle,
-            cli::BackendArg::Mlx => ripvec_core::backend::BackendKind::Mlx,
-            cli::BackendArg::Ort => ripvec_core::backend::BackendKind::Ort,
+        let result = match args.backend {
+            cli::BackendArg::Auto => ripvec_core::backend::detect_backends(&args.model_repo)
+                .context("failed to detect available backends")?,
+            ref specific => {
+                let kind = match specific {
+                    cli::BackendArg::Candle => ripvec_core::backend::BackendKind::Candle,
+                    cli::BackendArg::Mlx => ripvec_core::backend::BackendKind::Mlx,
+                    cli::BackendArg::Ort => ripvec_core::backend::BackendKind::Ort,
+                    cli::BackendArg::Auto => unreachable!(),
+                };
+                let device_hint = match args.device {
+                    cli::DeviceArg::Cpu => ripvec_core::backend::DeviceHint::Cpu,
+                    cli::DeviceArg::Metal | cli::DeviceArg::Cuda => {
+                        ripvec_core::backend::DeviceHint::Gpu
+                    }
+                };
+                vec![
+                    ripvec_core::backend::load_backend(kind, &args.model_repo, device_hint)
+                        .context("failed to load embedding backend")?,
+                ]
+            }
         };
-        let device_hint = match args.device {
-            cli::DeviceArg::Cpu => ripvec_core::backend::DeviceHint::Cpu,
-            cli::DeviceArg::Metal | cli::DeviceArg::Cuda => ripvec_core::backend::DeviceHint::Gpu,
-        };
-        let result = ripvec_core::backend::load_backend(kind, &args.model_repo, device_hint)
-            .context("failed to load embedding backend")?;
         if let Some(pb) = pb {
             pb.finish_and_clear();
         }
@@ -136,12 +152,12 @@ fn load_pipeline(
         text_mode: args.text_mode,
     };
 
-    Ok((backend, tokenizer, search_cfg))
+    Ok((backends, tokenizer, search_cfg))
 }
 
 /// Interactive TUI mode: embed the codebase once, then launch the search UI.
 fn run_interactive(
-    backend: Box<dyn ripvec_core::backend::EmbedBackend>,
+    backends: Vec<Box<dyn ripvec_core::backend::EmbedBackend>>,
     tokenizer: tokenizers::Tokenizer,
     search_cfg: &ripvec_core::embed::SearchConfig,
     args: &cli::Args,
@@ -164,9 +180,11 @@ fn run_interactive(
         ripvec_core::profile::Profiler::noop()
     };
 
+    let backend_refs: Vec<&dyn ripvec_core::backend::EmbedBackend> =
+        backends.iter().map(|b| &**b).collect();
     let (chunks, embeddings) = ripvec_core::embed::embed_all(
         std::path::Path::new(&args.path),
-        &[backend.as_ref()],
+        &backend_refs,
         &tokenizer,
         search_cfg,
         &live_profiler,
@@ -213,7 +231,7 @@ fn run_interactive(
         preview_scroll: 0,
         index,
         results: Vec::new(),
-        backend,
+        backends,
         tokenizer,
         threshold: args.threshold,
         rank_time_ms: 0.0,
@@ -228,7 +246,7 @@ fn run_interactive(
 
 /// One-shot search mode: embed, rank, print results, exit.
 fn run_oneshot(
-    backend: &dyn ripvec_core::backend::EmbedBackend,
+    backends: &[Box<dyn ripvec_core::backend::EmbedBackend>],
     tokenizer: &tokenizers::Tokenizer,
     search_cfg: &ripvec_core::embed::SearchConfig,
     args: &cli::Args,
@@ -240,11 +258,13 @@ fn run_oneshot(
         "query is required (or use --interactive)"
     );
 
+    let backend_refs: Vec<&dyn ripvec_core::backend::EmbedBackend> =
+        backends.iter().map(|b| &**b).collect();
     let pb_search = use_progress.then(|| progress::spinner("Embedding\u{2026}"));
     let results = ripvec_core::embed::search(
         std::path::Path::new(&args.path),
         &args.query,
-        &[backend],
+        &backend_refs,
         tokenizer,
         args.top_k,
         search_cfg,
