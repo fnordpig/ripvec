@@ -166,7 +166,7 @@ fn run_interactive(
 
     let (chunks, embeddings) = ripvec_core::embed::embed_all(
         std::path::Path::new(&args.path),
-        backend.as_ref(),
+        &[backend.as_ref()],
         &tokenizer,
         search_cfg,
         &live_profiler,
@@ -244,7 +244,7 @@ fn run_oneshot(
     let results = ripvec_core::embed::search(
         std::path::Path::new(&args.path),
         &args.query,
-        backend,
+        &[backend],
         tokenizer,
         args.top_k,
         search_cfg,

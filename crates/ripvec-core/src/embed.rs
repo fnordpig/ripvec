@@ -111,13 +111,16 @@ pub struct SearchResult {
 /// This is the building block for both one-shot search and interactive mode.
 /// The caller handles query embedding and ranking.
 ///
+/// Accepts multiple backends for hybrid scheduling — chunks are distributed
+/// across all backends via work-stealing (see [`embed_distributed`]).
+///
 /// # Errors
 ///
 /// Returns an error if file walking, chunking, or embedding fails.
 #[instrument(skip_all, fields(root = %root.display(), batch_size = cfg.batch_size))]
 pub fn embed_all(
     root: &Path,
-    backend: &dyn EmbedBackend,
+    backends: &[&dyn EmbedBackend],
     tokenizer: &tokenizers::Tokenizer,
     cfg: &SearchConfig,
     profiler: &crate::profile::Profiler,
@@ -164,18 +167,25 @@ pub fn embed_all(
         result
     };
 
-    // Phase 3: Embed all chunks — strategy depends on device
+    // Phase 3: Pre-tokenize all chunks in parallel (CPU-bound, all rayon threads)
     let bs = cfg.batch_size.max(1);
     let max_tokens_cfg = cfg.max_tokens;
     let _span = info_span!("embed_chunks", chunk_count = chunks.len(), batch_size = bs).entered();
     profiler.embed_begin(chunks.len());
 
-    let is_gpu = backend.is_gpu();
-    let embeddings: Vec<Vec<f32>> = if is_gpu {
-        embed_gpu_pipelined(&chunks, backend, tokenizer, max_tokens_cfg, bs, profiler)?
-    } else {
-        embed_cpu_parallel(&chunks, backend, tokenizer, max_tokens_cfg, bs, profiler)?
-    };
+    let all_encodings: Vec<Option<Encoding>> = chunks
+        .par_iter()
+        .map(|chunk| {
+            tokenize(&chunk.content, tokenizer, max_tokens_cfg)
+                .inspect_err(|e| {
+                    warn!(file = %chunk.file_path, err = %e, "tokenization failed, skipping chunk");
+                })
+                .ok()
+        })
+        .collect();
+
+    // Phase 4: Distribute pre-tokenized batches across all backends
+    let embeddings = embed_distributed(&all_encodings, backends, bs, profiler)?;
     profiler.embed_done();
 
     Ok((chunks, embeddings))
@@ -185,6 +195,9 @@ pub fn embed_all(
 ///
 /// Walks the directory, chunks all supported files, embeds everything
 /// in parallel batches, and returns the top-k results ranked by similarity.
+///
+/// Accepts multiple backends for hybrid scheduling — the first backend
+/// (`backends[0]`) is used for query embedding.
 ///
 /// All tuning parameters (batch size, token limit, chunk sizing, sort order)
 /// are controlled via [`SearchConfig`].
@@ -201,21 +214,21 @@ pub fn embed_all(
 pub fn search(
     root: &Path,
     query: &str,
-    backend: &dyn EmbedBackend,
+    backends: &[&dyn EmbedBackend],
     tokenizer: &tokenizers::Tokenizer,
     top_k: usize,
     cfg: &SearchConfig,
     profiler: &crate::profile::Profiler,
 ) -> crate::Result<Vec<SearchResult>> {
-    // Phases 1, 2, 4: walk, chunk, embed all files
-    let (chunks, embeddings) = embed_all(root, backend, tokenizer, cfg, profiler)?;
+    // Phases 1, 2, 3, 4: walk, chunk, pre-tokenize, embed all files
+    let (chunks, embeddings) = embed_all(root, backends, tokenizer, cfg, profiler)?;
 
-    // Phase 3: Embed query
+    // Phase 5: Embed query (using the primary backend)
     let query_embedding = {
         let _span = info_span!("embed_query").entered();
         let _guard = profiler.phase("embed_query");
         let enc = tokenize(query, tokenizer, cfg.max_tokens)?;
-        let mut results = backend.embed_batch(&[enc])?;
+        let mut results = backends[0].embed_batch(&[enc])?;
         results.pop().ok_or_else(|| {
             crate::Error::Other(anyhow::anyhow!("backend returned no embedding for query"))
         })?
@@ -261,6 +274,10 @@ pub fn search(
 /// [`EmbedBackend::clone_backend`]) and runs independent BLAS calls.
 /// Accelerate/MKL handles per-call SIMD but multiple concurrent calls
 /// saturate all cores.
+#[expect(
+    dead_code,
+    reason = "superseded by embed_distributed, removed in task 7"
+)]
 fn embed_cpu_parallel(
     chunks: &[CodeChunk],
     backend: &dyn EmbedBackend,
@@ -357,6 +374,10 @@ fn embed_cpu_parallel(
 ///   1. CPU→device transfer
 ///   2. device compute (forward pass)
 ///   3. device→CPU transfer
+#[expect(
+    dead_code,
+    reason = "superseded by embed_distributed, removed in task 7"
+)]
 fn embed_gpu_pipelined(
     chunks: &[CodeChunk],
     backend: &dyn EmbedBackend,
@@ -425,10 +446,6 @@ fn embed_gpu_pipelined(
 }
 
 /// Shared state for [`embed_distributed`] workers.
-#[allow(
-    dead_code,
-    reason = "used by tests now, wired into embed_all in task 3"
-)]
 struct DistributedState<'a> {
     tokenized: &'a [Option<Encoding>],
     cursor: std::sync::atomic::AtomicUsize,
@@ -521,10 +538,6 @@ impl DistributedState<'_> {
 ///
 /// Returns the first error from any backend. Other workers exit early
 /// when an error is detected.
-#[allow(
-    dead_code,
-    reason = "used by tests now, wired into embed_all in task 3"
-)]
 fn embed_distributed(
     tokenized: &[Option<Encoding>],
     backends: &[&dyn EmbedBackend],
@@ -693,7 +706,7 @@ mod tests {
         let results = search(
             &dir,
             "embedding model",
-            backend.as_ref(),
+            &[backend.as_ref()],
             &tokenizer,
             1,
             &cfg,

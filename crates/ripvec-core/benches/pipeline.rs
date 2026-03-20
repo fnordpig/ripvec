@@ -247,7 +247,7 @@ fn bench_search(c: &mut Criterion) {
             ripvec_core::embed::search(
                 black_box(&src_dir),
                 black_box("embedding model inference"),
-                black_box(f.backend.as_ref()),
+                black_box(&[f.backend.as_ref()]),
                 black_box(&f.tokenizer),
                 black_box(5),
                 black_box(&cfg),

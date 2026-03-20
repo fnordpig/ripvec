@@ -81,7 +81,7 @@ impl RipvecServer {
             ripvec_core::embed::search(
                 std::path::Path::new(&path),
                 &query,
-                backend.as_ref(),
+                &[backend.as_ref()],
                 &tokenizer,
                 top_k,
                 &ripvec_core::embed::SearchConfig::default(),
