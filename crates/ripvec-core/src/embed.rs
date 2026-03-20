@@ -346,12 +346,12 @@ fn embed_cpu_parallel(
     Ok(results)
 }
 
-/// GPU embedding with bounded producer-consumer pipeline.
+/// GPU embedding: pre-tokenize all chunks in parallel, then feed GPU.
 ///
-/// A producer thread tokenizes batches on CPU (rayon-parallel) and sends
-/// them through a bounded channel. The main thread feeds tokenized
-/// batches to the GPU. When the buffer is full the producer blocks,
-/// bounding peak memory for tokenized data to `O(RING_SIZE * gpu_bs)`.
+/// Phase 1 (CPU, all cores): tokenize every chunk via rayon. With
+/// `MODEL_MAX_TOKENS = 512`, memory is bounded: `N × 3 × 512 × 8` bytes.
+/// Phase 2 (GPU, sequential batches): feed pre-tokenized batches to
+/// the backend. The GPU never waits for tokenization.
 ///
 /// Each `embed_batch` call does:
 ///   1. CPU→device transfer
@@ -365,86 +365,60 @@ fn embed_gpu_pipelined(
     batch_size: usize,
     profiler: &crate::profile::Profiler,
 ) -> crate::Result<Vec<Vec<f32>>> {
-    use std::sync::mpsc;
-
-    /// Max tokenized batches buffered ahead of GPU consumption.
-    const RING_SIZE: usize = 4;
-
-    type BatchMsg = (Vec<Encoding>, Vec<bool>);
-
     let gpu_bs = batch_size * 4;
-    let (tx, rx) = mpsc::sync_channel::<BatchMsg>(RING_SIZE);
 
+    // Phase 1: Pre-tokenize ALL chunks in parallel (CPU-bound, all rayon threads)
+    let all_tokenized: Vec<Option<Encoding>> = chunks
+        .par_iter()
+        .map(|chunk| {
+            tokenize(&chunk.content, tokenizer, max_tokens)
+                .inspect_err(|e| {
+                    warn!(file = %chunk.file_path, err = %e, "tokenization failed, skipping chunk");
+                })
+                .ok()
+        })
+        .collect();
+
+    // Phase 2: Feed pre-tokenized batches to GPU sequentially
     let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
     let mut done = 0usize;
-    let mut first_error: Option<crate::Error> = None;
 
-    std::thread::scope(|s| {
-        s.spawn(|| {
-            for chunk_batch in chunks.chunks(gpu_bs) {
-                let encodings: Vec<Option<Encoding>> = chunk_batch
-                    .par_iter()
-                    .map(|chunk| {
-                        tokenize(&chunk.content, tokenizer, max_tokens)
-                            .inspect_err(|e| {
-                                warn!(file = %chunk.file_path, err = %e, "tokenization failed, skipping chunk");
-                            })
-                            .ok()
-                    })
-                    .collect();
-
-                let mut valid = Vec::with_capacity(encodings.len());
-                let mut mask = Vec::with_capacity(encodings.len());
-                for enc in encodings {
-                    if let Some(e) = enc {
-                        valid.push(e);
-                        mask.push(true);
-                    } else {
-                        mask.push(false);
-                    }
-                }
-
-                if tx.send((valid, mask)).is_err() {
-                    break;
-                }
+    for batch in all_tokenized.chunks(gpu_bs) {
+        let mut valid = Vec::with_capacity(batch.len());
+        let mut mask = Vec::with_capacity(batch.len());
+        for enc in batch {
+            if let Some(e) = enc {
+                valid.push(Encoding {
+                    input_ids: e.input_ids.clone(),
+                    attention_mask: e.attention_mask.clone(),
+                    token_type_ids: e.token_type_ids.clone(),
+                });
+                mask.push(true);
+            } else {
+                mask.push(false);
             }
-            drop(tx);
-        });
-
-        for (valid, mask) in rx {
-            let batch_len = mask.len();
-
-            if valid.is_empty() {
-                embeddings.extend(mask.iter().map(|_| vec![]));
-                done += batch_len;
-                profiler.embed_tick(done);
-                continue;
-            }
-
-            match backend.embed_batch(&valid) {
-                Ok(batch_embeddings) => {
-                    let mut emb_iter = batch_embeddings.into_iter();
-                    for ok in &mask {
-                        if *ok {
-                            embeddings.push(emb_iter.next().unwrap_or_default());
-                        } else {
-                            embeddings.push(vec![]);
-                        }
-                    }
-                }
-                Err(e) => {
-                    first_error = Some(e);
-                    break;
-                }
-            }
-
-            done += batch_len;
-            profiler.embed_tick(done);
         }
-    });
 
-    if let Some(err) = first_error {
-        return Err(err);
+        if valid.is_empty() {
+            embeddings.extend(mask.iter().map(|_| vec![]));
+            done += batch.len();
+            profiler.embed_tick(done);
+            continue;
+        }
+
+        let batch_embeddings = backend.embed_batch(&valid)?;
+
+        let mut emb_iter = batch_embeddings.into_iter();
+        for ok in &mask {
+            if *ok {
+                embeddings.push(emb_iter.next().unwrap_or_default());
+            } else {
+                embeddings.push(vec![]);
+            }
+        }
+
+        done += batch.len();
+        profiler.embed_tick(done);
     }
 
     Ok(embeddings)
