@@ -305,29 +305,17 @@ fn linear(input: &Array, weight: &Array, bias: Option<&Array>) -> crate::Result<
 impl BertSelfAttention {
     /// Scaled dot-product multi-head attention with residual + LayerNorm.
     ///
-    /// ClassicBert: post-norm (attention → residual → LayerNorm).
-    /// NomicBert: pre-norm (LayerNorm → attention → residual).
+    /// Both variants use post-norm: attention → residual → LayerNorm.
+    /// NomicBert config has `prenorm: false` (same as ClassicBert).
+    /// The only NomicBert differences are RoPE and no bias.
     fn forward(&self, hidden: &Array, attention_mask: &Array) -> crate::Result<Array> {
         let batch = hidden.shape()[0];
         let seq_len = hidden.shape()[1];
 
-        // Pre-norm for NomicBert: LayerNorm before attention
-        let attn_input = if self.variant == ModelVariant::NomicBert {
-            mlx_rs::fast::layer_norm(
-                hidden,
-                Some(&self.output_ln_weight),
-                Some(&self.output_ln_bias),
-                self.layer_norm_eps,
-            )
-            .map_err(mlx_err)?
-        } else {
-            hidden.clone()
-        };
-
         // Q, K, V projections
-        let q = linear(&attn_input, &self.query_weight, self.query_bias.as_ref())?;
-        let k = linear(&attn_input, &self.key_weight, self.key_bias.as_ref())?;
-        let v = linear(&attn_input, &self.value_weight, self.value_bias.as_ref())?;
+        let q = linear(hidden, &self.query_weight, self.query_bias.as_ref())?;
+        let k = linear(hidden, &self.key_weight, self.key_bias.as_ref())?;
+        let v = linear(hidden, &self.value_weight, self.value_bias.as_ref())?;
 
         // Reshape to [batch, seq, num_heads, head_dim] then transpose to [batch, num_heads, seq, head_dim]
         let q = mlx_rs::ops::reshape(&q, &[batch, seq_len, self.num_heads, self.head_dim])
@@ -364,22 +352,17 @@ impl BertSelfAttention {
         // Output projection
         let projected = linear(&attn_out, &self.output_weight, self.output_bias.as_ref())?;
 
-        // Residual connection
-        let output = mlx_rs::ops::add(hidden, &projected).map_err(mlx_err)?;
+        // Residual + LayerNorm (post-norm for both variants)
+        let residual = mlx_rs::ops::add(hidden, &projected).map_err(mlx_err)?;
+        let normed = mlx_rs::fast::layer_norm(
+            &residual,
+            Some(&self.output_ln_weight),
+            Some(&self.output_ln_bias),
+            self.layer_norm_eps,
+        )
+        .map_err(mlx_err)?;
 
-        // Post-norm for ClassicBert only
-        if self.variant == ModelVariant::ClassicBert {
-            let normed = mlx_rs::fast::layer_norm(
-                &output,
-                Some(&self.output_ln_weight),
-                Some(&self.output_ln_bias),
-                self.layer_norm_eps,
-            )
-            .map_err(mlx_err)?;
-            Ok(normed)
-        } else {
-            Ok(output)
-        }
+        Ok(normed)
     }
 }
 
@@ -403,27 +386,15 @@ struct BertFfn {
 }
 
 impl BertFfn {
-    /// FFN forward pass, dispatching on variant for activation and norm order.
+    /// FFN forward pass, dispatching on variant for activation function.
     ///
-    /// ClassicBert: post-norm (FFN → residual → LayerNorm).
-    /// NomicBert: pre-norm (LayerNorm → FFN → residual).
+    /// Both variants use post-norm: FFN → residual → LayerNorm.
+    /// ClassicBert: GELU activation.
+    /// NomicBert: SwiGLU (value * SiLU(gate), where fc11=value, fc12=gate).
     fn forward(&self, hidden: &Array) -> crate::Result<Array> {
-        // Pre-norm for NomicBert
-        let ffn_input = if self.variant == ModelVariant::NomicBert {
-            mlx_rs::fast::layer_norm(
-                hidden,
-                Some(&self.output_ln_weight),
-                Some(&self.output_ln_bias),
-                self.layer_norm_eps,
-            )
-            .map_err(mlx_err)?
-        } else {
-            hidden.clone()
-        };
-
         // Intermediate projection
         let intermediate = linear(
-            &ffn_input,
+            hidden,
             &self.intermediate_weight,
             self.intermediate_bias.as_ref(),
         )?;
@@ -432,34 +403,31 @@ impl BertFfn {
         let activated = match self.variant {
             ModelVariant::ClassicBert => mlx_rs::nn::gelu(&intermediate).map_err(mlx_err)?,
             ModelVariant::NomicBert => {
-                // SwiGLU: split into gate + value, then SiLU(gate) * value
+                // SwiGLU: intermediate has shape [b, s, 2*inter] from [fc11; fc12]
+                // fc11 = value (up), fc12 = gate
+                // Output = value * SiLU(gate) = fc11(x) * SiLU(fc12(x))
                 let parts = mlx_rs::ops::split(&intermediate, 2, -1).map_err(mlx_err)?;
-                let gate = &parts[0];
-                let up = &parts[1];
+                let value = &parts[0]; // fc11 output
+                let gate = &parts[1]; // fc12 output
                 let gate_activated = mlx_rs::nn::silu(gate).map_err(mlx_err)?;
-                mlx_rs::ops::multiply(&gate_activated, up).map_err(mlx_err)?
+                mlx_rs::ops::multiply(value, &gate_activated).map_err(mlx_err)?
             }
         };
 
         // Output projection
         let output = linear(&activated, &self.output_weight, self.output_bias.as_ref())?;
 
-        // Residual connection
-        let output = mlx_rs::ops::add(hidden, &output).map_err(mlx_err)?;
+        // Residual + LayerNorm (post-norm for both variants)
+        let residual = mlx_rs::ops::add(hidden, &output).map_err(mlx_err)?;
+        let normed = mlx_rs::fast::layer_norm(
+            &residual,
+            Some(&self.output_ln_weight),
+            Some(&self.output_ln_bias),
+            self.layer_norm_eps,
+        )
+        .map_err(mlx_err)?;
 
-        // Post-norm for ClassicBert only
-        if self.variant == ModelVariant::ClassicBert {
-            let normed = mlx_rs::fast::layer_norm(
-                &output,
-                Some(&self.output_ln_weight),
-                Some(&self.output_ln_bias),
-                self.layer_norm_eps,
-            )
-            .map_err(mlx_err)?;
-            Ok(normed)
-        } else {
-            Ok(output)
-        }
+        Ok(normed)
     }
 }
 
