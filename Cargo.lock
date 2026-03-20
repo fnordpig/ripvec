@@ -3355,8 +3355,11 @@ dependencies = [
  "rmcp",
  "schemars",
  "serde",
+ "serde_json",
  "tokenizers",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
