@@ -6,6 +6,7 @@
 
 use indicatif::{ProgressBar, ProgressStyle};
 use ripvec_core::profile::EmbedProgress;
+use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::time::Duration;
 
@@ -40,7 +41,7 @@ pub struct EmbedDisplay {
     /// The underlying indicatif progress bar.
     bar: ProgressBar,
     /// Rolling window of recent throughput rates for the sparkline.
-    rate_history: Vec<f64>,
+    rate_history: VecDeque<f64>,
     /// All-time peak rate (sticky max for sparkline scaling).
     peak_rate: f64,
 }
@@ -61,7 +62,7 @@ impl EmbedDisplay {
         bar.enable_steady_tick(Duration::from_millis(100));
         Self {
             bar,
-            rate_history: Vec::with_capacity(SPARK_WIDTH),
+            rate_history: VecDeque::with_capacity(SPARK_WIDTH),
             peak_rate: 0.0,
         }
     }
@@ -76,13 +77,13 @@ impl EmbedDisplay {
             if rate > self.peak_rate {
                 self.peak_rate = rate;
             }
-            self.rate_history.push(rate);
+            self.rate_history.push_back(rate);
             if self.rate_history.len() > SPARK_WIDTH {
-                self.rate_history.remove(0);
+                self.rate_history.pop_front();
             }
         }
 
-        let sparkline = render_sparkline(&self.rate_history, self.peak_rate);
+        let sparkline = render_sparkline(self.rate_history.make_contiguous(), self.peak_rate);
         let gauge = render_gauge(p.inference_pct, p.lock_wait_pct);
 
         self.bar.set_message(format!(

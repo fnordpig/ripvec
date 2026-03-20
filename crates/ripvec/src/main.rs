@@ -158,11 +158,7 @@ fn load_pipeline(
         ripvec_core::tokenize::load_tokenizer(model_repo).context("failed to load tokenizer")?;
 
     let search_cfg = ripvec_core::embed::SearchConfig {
-        batch_size: if use_progress && args.batch_size > 8 {
-            8
-        } else {
-            args.batch_size
-        },
+        batch_size: args.batch_size,
         max_tokens: args.max_tokens,
         chunk: ripvec_core::chunk::ChunkConfig {
             max_chunk_bytes: args.max_chunk_bytes,
@@ -256,9 +252,10 @@ fn run_interactive(
                 .unwrap_or("other");
             *ext_counts.entry(ext.to_string()).or_default() += 1;
         }
-        let breakdown: Vec<String> = ext_counts
-            .iter()
-            .rev() // largest extensions first (BTreeMap is sorted)
+        let mut pairs: Vec<_> = ext_counts.into_iter().collect();
+        pairs.sort_by(|a, b| b.1.cmp(&a.1)); // most-common extension first
+        let breakdown: Vec<String> = pairs
+            .into_iter()
             .map(|(ext, count)| format!("{count} .{ext}"))
             .collect();
         format!("{} chunks \u{2502} {}", chunks.len(), breakdown.join(", "))
