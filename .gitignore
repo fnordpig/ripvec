@@ -1,3 +1,18 @@
 /target
 *.onnx
 tests/corpus/
+
+# Profiling artifacts
+flamegraph.svg
+*.json.gz
+perf.data*
+
+# Superpowers planning docs (ephemeral, not source)
+docs/superpowers/
+
+# Early design scratch
+design.md
+
+# Local config (machine-specific)
+.mcp.json
+.claude/
