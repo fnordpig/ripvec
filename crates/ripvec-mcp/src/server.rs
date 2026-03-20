@@ -145,3 +145,30 @@ pub async fn run_background_index(server: &RipvecServer) {
 
     // Guard drop resets indexing flag automatically
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_indexing_guard_resets_on_drop() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let guard = IndexingGuard(Arc::clone(&flag));
+        assert!(flag.load(Ordering::SeqCst));
+        drop(guard);
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_indexing_guard_resets_on_panic() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let flag_clone = Arc::clone(&flag);
+        let handle = std::thread::spawn(move || {
+            let _guard = IndexingGuard(flag_clone);
+            panic!("intentional panic to test RAII guard");
+        });
+        // The thread panicked, but the guard's Drop should have run
+        let _ = handle.join();
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+}

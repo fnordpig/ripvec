@@ -75,3 +75,64 @@ impl SearchResultItem {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ripvec_core::chunk::CodeChunk;
+
+    fn make_chunk(content: &str, start_line: usize, end_line: usize) -> CodeChunk {
+        CodeChunk {
+            file_path: "src/main.rs".to_string(),
+            name: "test_fn".to_string(),
+            kind: "function_item".to_string(),
+            start_line,
+            end_line,
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_from_chunk_converts_lines_to_zero_based() {
+        let chunk = make_chunk("fn hello() {}", 10, 20);
+        let item = SearchResultItem::from_chunk(&chunk, 0.95);
+        assert_eq!(item.lsp_location.start_line, 9);
+        assert_eq!(item.lsp_location.end_line, 19);
+    }
+
+    #[test]
+    fn test_from_chunk_preview_truncation() {
+        let long_content = "a".repeat(300);
+        let chunk = make_chunk(&long_content, 1, 5);
+        let item = SearchResultItem::from_chunk(&chunk, 0.8);
+        assert!(item.preview.ends_with("..."));
+        // 200 chars of content + "..."
+        assert_eq!(item.preview.len(), 203);
+    }
+
+    #[test]
+    fn test_from_chunk_short_content_not_truncated() {
+        let content = "fn short() {}";
+        let chunk = make_chunk(content, 1, 1);
+        let item = SearchResultItem::from_chunk(&chunk, 0.9);
+        assert_eq!(item.preview, content);
+    }
+
+    #[test]
+    fn test_empty_results_serialization() {
+        let response = SearchResponse {
+            results: Vec::new(),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["results"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_lsp_location_zero_based() {
+        let chunk = make_chunk("line 1", 1, 1);
+        let item = SearchResultItem::from_chunk(&chunk, 1.0);
+        assert_eq!(item.lsp_location.start_line, 0);
+        assert_eq!(item.lsp_location.end_line, 0);
+    }
+}

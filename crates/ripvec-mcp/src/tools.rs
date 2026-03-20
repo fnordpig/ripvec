@@ -406,3 +406,51 @@ impl RipvecServer {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_search_params_from_number() {
+        let json = r#"{"query": "test", "top_k": 5, "threshold": 0.5}"#;
+        let params: SearchParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.query, "test");
+        assert_eq!(params.top_k, 5);
+        assert!((params.threshold - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_search_params_from_string() {
+        let json = r#"{"query": "test", "top_k": "5", "threshold": "0.5"}"#;
+        let params: SearchParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.query, "test");
+        assert_eq!(params.top_k, 5);
+        assert!((params.threshold - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_search_params_defaults() {
+        let json = r#"{"query": "test"}"#;
+        let params: SearchParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.query, "test");
+        assert_eq!(params.top_k, 10);
+        assert!((params.threshold - 0.3).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_find_similar_params_from_string() {
+        let json = r#"{"file_path": "foo.rs", "line": "42"}"#;
+        let params: FindSimilarParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.file_path, "foo.rs");
+        assert_eq!(params.line, 42);
+        assert_eq!(params.top_k, 10); // default
+    }
+
+    #[test]
+    fn test_search_params_invalid_string() {
+        let json = r#"{"query": "test", "top_k": "not_a_number"}"#;
+        let result: Result<SearchParams, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+}
