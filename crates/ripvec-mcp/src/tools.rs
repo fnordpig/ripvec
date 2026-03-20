@@ -17,16 +17,42 @@ use serde::Deserialize;
 use crate::result::{SearchResponse, SearchResultItem};
 use crate::server::{RipvecServer, run_background_index};
 
+/// Deserialize a value that may arrive as either a number or a string.
+fn deserialize_number_or_string<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: std::str::FromStr + serde::Deserialize<'de>,
+    <T as std::str::FromStr>::Err: std::fmt::Display,
+{
+    use serde::de::Error;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrNum<T> {
+        Num(T),
+        Str(String),
+    }
+    match StringOrNum::<T>::deserialize(deserializer)? {
+        StringOrNum::Num(v) => Ok(v),
+        StringOrNum::Str(s) => s.parse().map_err(D::Error::custom),
+    }
+}
+
 /// Parameters for the `search_code` and `search_text` tools.
 #[derive(Deserialize, JsonSchema)]
 pub struct SearchParams {
     /// Natural-language query describing the code or text to find.
     pub query: String,
     /// Maximum number of results to return.
-    #[serde(default = "default_top_k")]
+    #[serde(
+        default = "default_top_k",
+        deserialize_with = "deserialize_number_or_string"
+    )]
     pub top_k: usize,
     /// Minimum similarity threshold (0.0 to 1.0).
-    #[serde(default = "default_threshold")]
+    #[serde(
+        default = "default_threshold",
+        deserialize_with = "deserialize_number_or_string"
+    )]
     pub threshold: f32,
 }
 
@@ -36,9 +62,13 @@ pub struct FindSimilarParams {
     /// Path to the source file (relative or absolute).
     pub file_path: String,
     /// 0-based line number within the file.
+    #[serde(deserialize_with = "deserialize_number_or_string")]
     pub line: usize,
     /// Maximum number of results to return.
-    #[serde(default = "default_top_k")]
+    #[serde(
+        default = "default_top_k",
+        deserialize_with = "deserialize_number_or_string"
+    )]
     pub top_k: usize,
 }
 
@@ -59,9 +89,7 @@ impl RipvecServer {
         Self {
             index: Arc::new(tokio::sync::RwLock::new(None)),
             chunks: Arc::new(tokio::sync::RwLock::new(Vec::new())),
-            code_backend: Arc::new(tokio::sync::OnceCell::new()),
             text_backend: Arc::new(tokio::sync::OnceCell::new()),
-            code_tokenizer: Arc::new(tokio::sync::OnceCell::new()),
             text_tokenizer: Arc::new(tokio::sync::OnceCell::new()),
             project_root,
             indexing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -97,41 +125,40 @@ impl RipvecServer {
             }
         })?;
 
-        // Lazy-load code backend (CodeRankEmbed / nomic-ai/CodeRankEmbed)
-        let code_backend = self
-            .code_backend
+        // Use the same backend that built the index (BGE) so embeddings
+        // are in the same vector space. The code-search prefix biases the
+        // query toward code-relevant semantics within that space.
+        let text_backend = self
+            .text_backend
             .get_or_init(|| async {
                 let backends = tokio::task::spawn_blocking(|| {
-                    ripvec_core::backend::detect_backends("nomic-ai/CodeRankEmbed")
+                    ripvec_core::backend::detect_backends("BAAI/bge-small-en-v1.5")
                 })
                 .await
                 .expect("spawn_blocking panicked")
-                .expect("failed to load CodeRankEmbed backend");
+                .expect("failed to load BGE backend");
                 Arc::from(backends.into_iter().next().expect("no backend available"))
             })
             .await;
 
-        let code_tokenizer = self
-            .code_tokenizer
+        let text_tokenizer = self
+            .text_tokenizer
             .get_or_init(|| async {
                 let t = tokio::task::spawn_blocking(|| {
-                    ripvec_core::tokenize::load_tokenizer("nomic-ai/CodeRankEmbed")
+                    ripvec_core::tokenize::load_tokenizer("BAAI/bge-small-en-v1.5")
                 })
                 .await
                 .expect("spawn_blocking panicked")
-                .expect("failed to load CodeRankEmbed tokenizer");
+                .expect("failed to load BGE tokenizer");
                 Arc::new(t)
             })
             .await;
 
-        // Prepend code search query prefix
-        let prefixed_query = format!(
-            "Represent this query for searching relevant code: {}",
-            params.query
-        );
+        // Prepend code search query prefix to bias toward code semantics
+        let prefixed_query = format!("search for code: {}", params.query);
 
-        let backend = Arc::clone(code_backend);
-        let tokenizer = Arc::clone(code_tokenizer);
+        let backend = Arc::clone(text_backend);
+        let tokenizer = Arc::clone(text_tokenizer);
         let threshold = params.threshold;
         let top_k = params.top_k;
 

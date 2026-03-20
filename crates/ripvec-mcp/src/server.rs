@@ -21,12 +21,8 @@ pub struct RipvecServer {
     pub index: Arc<RwLock<Option<ripvec_core::index::SearchIndex>>>,
     /// All chunks in the current index, for metadata queries.
     pub chunks: Arc<RwLock<Vec<ripvec_core::chunk::CodeChunk>>>,
-    /// Code embedding backend (`CodeRankEmbed`), lazy-loaded on first search.
-    pub code_backend: Arc<OnceCell<Arc<dyn ripvec_core::backend::EmbedBackend>>>,
     /// Text embedding backend (BGE-small), lazy-loaded on first search.
     pub text_backend: Arc<OnceCell<Arc<dyn ripvec_core::backend::EmbedBackend>>>,
-    /// Tokenizer for the code model, lazy-loaded.
-    pub code_tokenizer: Arc<OnceCell<Arc<tokenizers::Tokenizer>>>,
     /// Tokenizer for the text model, lazy-loaded.
     pub text_tokenizer: Arc<OnceCell<Arc<tokenizers::Tokenizer>>>,
     /// Root directory of the project being indexed.
