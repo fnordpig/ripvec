@@ -304,14 +304,30 @@ fn linear(input: &Array, weight: &Array, bias: Option<&Array>) -> crate::Result<
 
 impl BertSelfAttention {
     /// Scaled dot-product multi-head attention with residual + LayerNorm.
+    ///
+    /// ClassicBert: post-norm (attention → residual → LayerNorm).
+    /// NomicBert: pre-norm (LayerNorm → attention → residual).
     fn forward(&self, hidden: &Array, attention_mask: &Array) -> crate::Result<Array> {
         let batch = hidden.shape()[0];
         let seq_len = hidden.shape()[1];
 
+        // Pre-norm for NomicBert: LayerNorm before attention
+        let attn_input = if self.variant == ModelVariant::NomicBert {
+            mlx_rs::fast::layer_norm(
+                hidden,
+                Some(&self.output_ln_weight),
+                Some(&self.output_ln_bias),
+                self.layer_norm_eps,
+            )
+            .map_err(mlx_err)?
+        } else {
+            hidden.clone()
+        };
+
         // Q, K, V projections
-        let q = linear(hidden, &self.query_weight, self.query_bias.as_ref())?;
-        let k = linear(hidden, &self.key_weight, self.key_bias.as_ref())?;
-        let v = linear(hidden, &self.value_weight, self.value_bias.as_ref())?;
+        let q = linear(&attn_input, &self.query_weight, self.query_bias.as_ref())?;
+        let k = linear(&attn_input, &self.key_weight, self.key_bias.as_ref())?;
+        let v = linear(&attn_input, &self.value_weight, self.value_bias.as_ref())?;
 
         // Reshape to [batch, seq, num_heads, head_dim] then transpose to [batch, num_heads, seq, head_dim]
         let q = mlx_rs::ops::reshape(&q, &[batch, seq_len, self.num_heads, self.head_dim])
@@ -334,7 +350,6 @@ impl BertSelfAttention {
         }
 
         // Scaled dot-product attention with mask
-        // MLX's fast SDPA dispatches to optimized Metal kernels.
         let scale = (self.head_dim as f32).sqrt().recip();
         let attn_out =
             mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, scale, attention_mask)
@@ -349,17 +364,22 @@ impl BertSelfAttention {
         // Output projection
         let projected = linear(&attn_out, &self.output_weight, self.output_bias.as_ref())?;
 
-        // Residual + LayerNorm
-        let residual = mlx_rs::ops::add(hidden, &projected).map_err(mlx_err)?;
-        let normed = mlx_rs::fast::layer_norm(
-            &residual,
-            Some(&self.output_ln_weight),
-            Some(&self.output_ln_bias),
-            self.layer_norm_eps,
-        )
-        .map_err(mlx_err)?;
+        // Residual connection
+        let output = mlx_rs::ops::add(hidden, &projected).map_err(mlx_err)?;
 
-        Ok(normed)
+        // Post-norm for ClassicBert only
+        if self.variant == ModelVariant::ClassicBert {
+            let normed = mlx_rs::fast::layer_norm(
+                &output,
+                Some(&self.output_ln_weight),
+                Some(&self.output_ln_bias),
+                self.layer_norm_eps,
+            )
+            .map_err(mlx_err)?;
+            Ok(normed)
+        } else {
+            Ok(output)
+        }
     }
 }
 
@@ -383,21 +403,34 @@ struct BertFfn {
 }
 
 impl BertFfn {
-    /// FFN forward pass, dispatching on variant for activation function.
+    /// FFN forward pass, dispatching on variant for activation and norm order.
+    ///
+    /// ClassicBert: post-norm (FFN → residual → LayerNorm).
+    /// NomicBert: pre-norm (LayerNorm → FFN → residual).
     fn forward(&self, hidden: &Array) -> crate::Result<Array> {
+        // Pre-norm for NomicBert
+        let ffn_input = if self.variant == ModelVariant::NomicBert {
+            mlx_rs::fast::layer_norm(
+                hidden,
+                Some(&self.output_ln_weight),
+                Some(&self.output_ln_bias),
+                self.layer_norm_eps,
+            )
+            .map_err(mlx_err)?
+        } else {
+            hidden.clone()
+        };
+
         // Intermediate projection
         let intermediate = linear(
-            hidden,
+            &ffn_input,
             &self.intermediate_weight,
             self.intermediate_bias.as_ref(),
         )?;
 
         // Activation
         let activated = match self.variant {
-            ModelVariant::ClassicBert => {
-                // GELU activation (Metal compute shader, not software erff)
-                mlx_rs::nn::gelu(&intermediate).map_err(mlx_err)?
-            }
+            ModelVariant::ClassicBert => mlx_rs::nn::gelu(&intermediate).map_err(mlx_err)?,
             ModelVariant::NomicBert => {
                 // SwiGLU: split into gate + value, then SiLU(gate) * value
                 let parts = mlx_rs::ops::split(&intermediate, 2, -1).map_err(mlx_err)?;
@@ -411,17 +444,22 @@ impl BertFfn {
         // Output projection
         let output = linear(&activated, &self.output_weight, self.output_bias.as_ref())?;
 
-        // Residual + LayerNorm
-        let residual = mlx_rs::ops::add(hidden, &output).map_err(mlx_err)?;
-        let normed = mlx_rs::fast::layer_norm(
-            &residual,
-            Some(&self.output_ln_weight),
-            Some(&self.output_ln_bias),
-            self.layer_norm_eps,
-        )
-        .map_err(mlx_err)?;
+        // Residual connection
+        let output = mlx_rs::ops::add(hidden, &output).map_err(mlx_err)?;
 
-        Ok(normed)
+        // Post-norm for ClassicBert only
+        if self.variant == ModelVariant::ClassicBert {
+            let normed = mlx_rs::fast::layer_norm(
+                &output,
+                Some(&self.output_ln_weight),
+                Some(&self.output_ln_bias),
+                self.layer_norm_eps,
+            )
+            .map_err(mlx_err)?;
+            Ok(normed)
+        } else {
+            Ok(output)
+        }
     }
 }
 
