@@ -5,7 +5,6 @@
 //! [`ratatui`] with a [`crossterm`] backend.
 
 pub mod highlight;
-pub mod index;
 pub mod input;
 pub mod ui;
 
@@ -22,8 +21,7 @@ use ratatui::Terminal;
 use ratatui::prelude::CrosstermBackend;
 
 use ripvec_core::backend::{EmbedBackend, Encoding};
-
-use index::SearchIndex;
+use ripvec_core::index::SearchIndex;
 
 /// TUI application state.
 pub struct App {

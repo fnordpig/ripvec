@@ -8,6 +8,7 @@ pub mod backend;
 pub mod chunk;
 pub mod embed;
 pub mod error;
+pub mod index;
 pub mod languages;
 pub mod profile;
 pub mod similarity;

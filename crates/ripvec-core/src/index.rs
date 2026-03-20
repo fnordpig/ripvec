@@ -1,10 +1,11 @@
 //! In-memory search index for real-time re-ranking.
 //!
 //! Stores all chunk embeddings as a contiguous ndarray matrix so that
-//! re-ranking is a single BLAS matrix-vector multiply via [`ripvec_core::similarity::rank_all`].
+//! re-ranking is a single BLAS matrix-vector multiply via [`crate::similarity::rank_all`].
 
 use ndarray::{Array1, Array2};
-use ripvec_core::chunk::CodeChunk;
+
+use crate::chunk::CodeChunk;
 
 /// Pre-computed embedding matrix for fast re-ranking.
 ///
@@ -59,7 +60,7 @@ impl SearchIndex {
             return vec![];
         }
         let query = Array1::from_vec(query_embedding.to_vec());
-        let scores = ripvec_core::similarity::rank_all(&self.embeddings, &query);
+        let scores = crate::similarity::rank_all(&self.embeddings, &query);
 
         let mut results: Vec<(usize, f32)> = scores
             .into_iter()
@@ -71,19 +72,11 @@ impl SearchIndex {
     }
 
     /// Number of chunks in the index.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "public API for future TUI features")
-    )]
     pub fn len(&self) -> usize {
         self.chunks.len()
     }
 
     /// Whether the index is empty.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "public API for future TUI features")
-    )]
     pub fn is_empty(&self) -> bool {
         self.chunks.is_empty()
     }

@@ -269,7 +269,7 @@ fn run_interactive(
         format!("{} chunks \u{2502} {}", chunks.len(), breakdown.join(", "))
     };
 
-    let index = tui::index::SearchIndex::new(chunks, &embeddings);
+    let index = ripvec_core::index::SearchIndex::new(chunks, &embeddings);
 
     let app = tui::App {
         query: String::new(),
