@@ -146,6 +146,42 @@ pub fn load_backend(
     }
 }
 
+/// Detect all available backends and load them.
+///
+/// Probes for GPU backends (MLX, CUDA) first, then always adds CPU
+/// as the baseline. Returns backends in priority order — the first
+/// entry is the primary (used for query embedding in interactive mode).
+///
+/// # Errors
+///
+/// Returns an error if no backends can be loaded (not even CPU).
+pub fn detect_backends(model_repo: &str) -> crate::Result<Vec<Box<dyn EmbedBackend>>> {
+    let mut backends: Vec<Box<dyn EmbedBackend>> = Vec::new();
+
+    // Try MLX (Apple Silicon GPU)
+    #[cfg(feature = "mlx")]
+    if let Ok(b) = mlx::MlxBackend::load(model_repo, &DeviceHint::Auto) {
+        backends.push(Box::new(b));
+    }
+
+    // Future: enumerate CUDA devices
+    // #[cfg(feature = "cuda")]
+    // for device_id in 0..cuda_device_count() { ... }
+
+    // Always add CPU (Candle with Accelerate/MKL) as helper/fallback
+    if let Ok(b) = candle::CandleBackend::load(model_repo, &DeviceHint::Cpu) {
+        backends.push(Box::new(b));
+    }
+
+    if backends.is_empty() {
+        return Err(crate::Error::Other(anyhow::anyhow!(
+            "no embedding backends available"
+        )));
+    }
+
+    Ok(backends)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,5 +260,18 @@ mod tests {
     fn load_backend_ort_not_implemented() {
         let result = load_backend(BackendKind::Ort, "test/model", DeviceHint::Cpu);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn detect_backends_returns_at_least_one() {
+        let backends = detect_backends("BAAI/bge-small-en-v1.5").unwrap();
+        assert!(!backends.is_empty());
+    }
+
+    #[test]
+    fn detect_backends_cpu_always_last() {
+        let backends = detect_backends("BAAI/bge-small-en-v1.5").unwrap();
+        let last = backends.last().unwrap();
+        assert!(!last.is_gpu(), "last backend should be CPU fallback");
     }
 }
