@@ -11,6 +11,15 @@ use rmcp::handler::server::tool::ToolRouter;
 use tokio::sync::{OnceCell, RwLock};
 use tracing::error;
 
+/// RAII guard that resets the indexing flag on drop (including panics).
+struct IndexingGuard(Arc<AtomicBool>);
+
+impl Drop for IndexingGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// The ripvec MCP server, holding shared backend and tokenizer state.
 ///
 /// All fields use `Arc` / `OnceCell` / `RwLock` so the struct is cheaply
@@ -19,8 +28,6 @@ use tracing::error;
 pub struct RipvecServer {
     /// Pre-built search index (populated after background indexing).
     pub index: Arc<RwLock<Option<ripvec_core::index::SearchIndex>>>,
-    /// All chunks in the current index, for metadata queries.
-    pub chunks: Arc<RwLock<Vec<ripvec_core::chunk::CodeChunk>>>,
     /// Text embedding backend (BGE-small), lazy-loaded on first search.
     pub text_backend: Arc<OnceCell<Arc<dyn ripvec_core::backend::EmbedBackend>>>,
     /// Tokenizer for the text model, lazy-loaded.
@@ -42,8 +49,8 @@ impl rmcp::ServerHandler for RipvecServer {
         )
         .with_instructions(
             "Semantic code search server (ripvec). Tools: \
-             search_code (semantic code search with CodeRankEmbed), \
-             search_text (general text search with BGE), \
+             search_code (semantic code search with BGE embeddings), \
+             search_text (general text search with BGE embeddings), \
              find_similar (find chunks similar to a given location), \
              reindex (rebuild the search index), \
              index_status (check indexing state).",
@@ -82,6 +89,7 @@ impl rmcp::ServerHandler for RipvecServer {
 /// Run background indexing: walk, chunk, embed, and build the search index.
 ///
 /// Sets `server.indexing` to `true` during the operation and `false` when done.
+/// The indexing flag is managed via an RAII guard so it resets even on panic.
 /// Errors are logged to stderr rather than propagated.
 pub async fn run_background_index(server: &RipvecServer) {
     if server
@@ -93,10 +101,11 @@ pub async fn run_background_index(server: &RipvecServer) {
         return;
     }
 
+    // RAII guard ensures the flag resets even if we panic
+    let _guard = IndexingGuard(Arc::clone(&server.indexing));
+
     let root = server.project_root.clone();
     let index_lock = Arc::clone(&server.index);
-    let chunks_lock = Arc::clone(&server.chunks);
-    let indexing_flag = Arc::clone(&server.indexing);
 
     let result = tokio::task::spawn_blocking(move || {
         let backends = ripvec_core::backend::detect_backends("BAAI/bge-small-en-v1.5")?;
@@ -109,22 +118,20 @@ pub async fn run_background_index(server: &RipvecServer) {
         let (chunks, embeddings) =
             ripvec_core::embed::embed_all(&root, &backend_refs, &tokenizer, &cfg, &profiler)?;
 
-        let search_index = ripvec_core::index::SearchIndex::new(chunks.clone(), &embeddings);
-        Ok::<_, ripvec_core::Error>((chunks, search_index))
+        let search_index = ripvec_core::index::SearchIndex::new(chunks, &embeddings);
+        Ok::<_, ripvec_core::Error>(search_index)
     })
     .await;
 
     match result {
-        Ok(Ok((new_chunks, new_index))) => {
+        Ok(Ok(new_index)) => {
             eprintln!(
                 "[ripvec-mcp] indexed {} chunks from {}",
-                new_chunks.len(),
+                new_index.chunks.len(),
                 server.project_root.display()
             );
             let mut idx = index_lock.write().await;
             *idx = Some(new_index);
-            let mut ch = chunks_lock.write().await;
-            *ch = new_chunks;
         }
         Ok(Err(e)) => {
             error!("background indexing failed: {e}");
@@ -136,5 +143,5 @@ pub async fn run_background_index(server: &RipvecServer) {
         }
     }
 
-    indexing_flag.store(false, Ordering::SeqCst);
+    // Guard drop resets indexing flag automatically
 }

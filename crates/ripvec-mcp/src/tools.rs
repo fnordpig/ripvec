@@ -72,10 +72,12 @@ pub struct FindSimilarParams {
     pub top_k: usize,
 }
 
+/// Default number of results to return.
 fn default_top_k() -> usize {
     10
 }
 
+/// Default similarity threshold.
 fn default_threshold() -> f32 {
     0.3
 }
@@ -88,7 +90,6 @@ impl RipvecServer {
     pub fn new(project_root: std::path::PathBuf) -> Self {
         Self {
             index: Arc::new(tokio::sync::RwLock::new(None)),
-            chunks: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             text_backend: Arc::new(tokio::sync::OnceCell::new()),
             text_tokenizer: Arc::new(tokio::sync::OnceCell::new()),
             project_root,
@@ -97,75 +98,85 @@ impl RipvecServer {
         }
     }
 
-    /// Search code semantically using `CodeRankEmbed` embeddings.
+    /// Lazy-load the text embedding backend (BGE-small).
     ///
-    /// Prepends a code-search query prefix and ranks indexed chunks by
-    /// cosine similarity.
-    #[tool(
-        name = "search_code",
-        description = "Search code by semantic meaning using CodeRankEmbed. Returns ranked code chunks with LSP locations."
-    )]
-    async fn search_code(
+    /// Returns the cached backend on subsequent calls.
+    async fn load_text_backend(
         &self,
-        Parameters(params): Parameters<SearchParams>,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
-        // Ensure index is ready
-        let idx_guard = self.index.read().await;
-        let index = idx_guard.as_ref().ok_or_else(|| {
-            if self.indexing.load(Ordering::SeqCst) {
-                rmcp::ErrorData::internal_error(
-                    "Index is still building. Try again shortly.".to_string(),
-                    None,
-                )
-            } else {
-                rmcp::ErrorData::internal_error(
-                    "No index available. Call reindex first.".to_string(),
-                    None,
-                )
-            }
-        })?;
-
-        // Use the same backend that built the index (BGE) so embeddings
-        // are in the same vector space. The code-search prefix biases the
-        // query toward code-relevant semantics within that space.
-        let text_backend = self
-            .text_backend
-            .get_or_init(|| async {
+    ) -> Result<&Arc<dyn ripvec_core::backend::EmbedBackend>, rmcp::ErrorData> {
+        self.text_backend
+            .get_or_try_init(|| async {
                 let backends = tokio::task::spawn_blocking(|| {
                     ripvec_core::backend::detect_backends("BAAI/bge-small-en-v1.5")
                 })
                 .await
-                .expect("spawn_blocking panicked")
-                .expect("failed to load BGE backend");
-                Arc::from(backends.into_iter().next().expect("no backend available"))
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                let first = backends.into_iter().next().ok_or_else(|| {
+                    rmcp::ErrorData::internal_error("no backend available".to_string(), None)
+                })?;
+                Ok(Arc::from(first))
             })
-            .await;
+            .await
+    }
 
-        let text_tokenizer = self
-            .text_tokenizer
-            .get_or_init(|| async {
+    /// Lazy-load the text tokenizer (BGE-small).
+    ///
+    /// Returns the cached tokenizer on subsequent calls.
+    async fn load_text_tokenizer(&self) -> Result<&Arc<tokenizers::Tokenizer>, rmcp::ErrorData> {
+        self.text_tokenizer
+            .get_or_try_init(|| async {
                 let t = tokio::task::spawn_blocking(|| {
                     ripvec_core::tokenize::load_tokenizer("BAAI/bge-small-en-v1.5")
                 })
                 .await
-                .expect("spawn_blocking panicked")
-                .expect("failed to load BGE tokenizer");
-                Arc::new(t)
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                Ok(Arc::new(t))
             })
-            .await;
+            .await
+    }
 
-        // Prepend code search query prefix to bias toward code semantics
-        let prefixed_query = format!("search for code: {}", params.query);
+    /// Shared search implementation used by both `search_code` and `search_text`.
+    ///
+    /// Checks the index exists, lazy-loads the backend/tokenizer, embeds the
+    /// query, and ranks chunks by cosine similarity.
+    async fn run_search(
+        &self,
+        query: &str,
+        top_k: usize,
+        threshold: f32,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        // Check index exists, then drop the read lock before doing embedding work
+        {
+            let idx_guard = self.index.read().await;
+            if idx_guard.is_none() {
+                return Err(if self.indexing.load(Ordering::SeqCst) {
+                    rmcp::ErrorData::internal_error(
+                        "Index is still building. Try again shortly.".to_string(),
+                        None,
+                    )
+                } else {
+                    rmcp::ErrorData::internal_error(
+                        "No index available. Call reindex first.".to_string(),
+                        None,
+                    )
+                });
+            }
+        }
+
+        // Lazy-load backend and tokenizer (no index lock held)
+        let text_backend = self.load_text_backend().await?;
+        let text_tokenizer = self.load_text_tokenizer().await?;
 
         let backend = Arc::clone(text_backend);
         let tokenizer = Arc::clone(text_tokenizer);
-        let threshold = params.threshold;
-        let top_k = params.top_k;
+        let query_owned = query.to_string();
 
+        // Embed the query (no index lock held)
         let query_embedding = tokio::task::spawn_blocking(move || {
             let max_tokens = backend.max_tokens();
-            let enc =
-                ripvec_core::tokenize::tokenize_query(&prefixed_query, &tokenizer, max_tokens)?;
+            let enc = ripvec_core::tokenize::tokenize_query(&query_owned, &tokenizer, max_tokens)?;
             let mut results = backend.embed_batch(&[enc])?;
             results.pop().ok_or_else(|| {
                 ripvec_core::Error::Other(anyhow::anyhow!(
@@ -177,14 +188,23 @@ impl RipvecServer {
         .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
         .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
 
+        // Re-acquire read lock for ranking
+        let idx_guard = self.index.read().await;
+        let index = idx_guard.as_ref().ok_or_else(|| {
+            rmcp::ErrorData::internal_error(
+                "Index was cleared during search. Call reindex.".to_string(),
+                None,
+            )
+        })?;
+
         let ranked = index.rank(&query_embedding, threshold);
-        let chunks_guard = self.chunks.read().await;
 
         let results: Vec<SearchResultItem> = ranked
             .into_iter()
             .take(top_k)
             .filter_map(|(idx, score)| {
-                chunks_guard
+                index
+                    .chunks
                     .get(idx)
                     .map(|chunk| SearchResultItem::from_chunk(chunk, score))
             })
@@ -197,97 +217,36 @@ impl RipvecServer {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    /// Search text semantically using BGE-small embeddings.
+    /// Search code by semantic meaning.
     ///
-    /// Uses the general-purpose BGE model without a query prefix.
+    /// Uses BGE-small embeddings to rank indexed chunks by cosine similarity
+    /// to the query. Returns ranked chunks with LSP locations.
+    #[tool(
+        name = "search_code",
+        description = "Search code by semantic meaning. Returns ranked chunks with LSP locations."
+    )]
+    async fn search_code(
+        &self,
+        Parameters(params): Parameters<SearchParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.run_search(&params.query, params.top_k, params.threshold)
+            .await
+    }
+
+    /// Search text by semantic meaning.
+    ///
+    /// Uses BGE-small embeddings to rank indexed chunks by cosine similarity
+    /// to the query. Returns ranked chunks with LSP locations.
     #[tool(
         name = "search_text",
-        description = "Search text by semantic meaning using BGE-small. Returns ranked text chunks with LSP locations."
+        description = "Search text by semantic meaning. Returns ranked text chunks with LSP locations."
     )]
     async fn search_text(
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let idx_guard = self.index.read().await;
-        let index = idx_guard.as_ref().ok_or_else(|| {
-            if self.indexing.load(Ordering::SeqCst) {
-                rmcp::ErrorData::internal_error(
-                    "Index is still building. Try again shortly.".to_string(),
-                    None,
-                )
-            } else {
-                rmcp::ErrorData::internal_error(
-                    "No index available. Call reindex first.".to_string(),
-                    None,
-                )
-            }
-        })?;
-
-        // Lazy-load text backend (BGE-small)
-        let text_backend = self
-            .text_backend
-            .get_or_init(|| async {
-                let backends = tokio::task::spawn_blocking(|| {
-                    ripvec_core::backend::detect_backends("BAAI/bge-small-en-v1.5")
-                })
-                .await
-                .expect("spawn_blocking panicked")
-                .expect("failed to load BGE backend");
-                Arc::from(backends.into_iter().next().expect("no backend available"))
-            })
-            .await;
-
-        let text_tokenizer = self
-            .text_tokenizer
-            .get_or_init(|| async {
-                let t = tokio::task::spawn_blocking(|| {
-                    ripvec_core::tokenize::load_tokenizer("BAAI/bge-small-en-v1.5")
-                })
-                .await
-                .expect("spawn_blocking panicked")
-                .expect("failed to load BGE tokenizer");
-                Arc::new(t)
-            })
-            .await;
-
-        let backend = Arc::clone(text_backend);
-        let tokenizer = Arc::clone(text_tokenizer);
-        let threshold = params.threshold;
-        let top_k = params.top_k;
-        let query = params.query;
-
-        let query_embedding = tokio::task::spawn_blocking(move || {
-            let max_tokens = backend.max_tokens();
-            let enc = ripvec_core::tokenize::tokenize_query(&query, &tokenizer, max_tokens)?;
-            let mut results = backend.embed_batch(&[enc])?;
-            results.pop().ok_or_else(|| {
-                ripvec_core::Error::Other(anyhow::anyhow!(
-                    "backend returned no embedding for query"
-                ))
-            })
-        })
-        .await
-        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
-        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-
-        let ranked = index.rank(&query_embedding, threshold);
-        let chunks_guard = self.chunks.read().await;
-
-        let results: Vec<SearchResultItem> = ranked
-            .into_iter()
-            .take(top_k)
-            .filter_map(|(idx, score)| {
-                chunks_guard
-                    .get(idx)
-                    .map(|chunk| SearchResultItem::from_chunk(chunk, score))
-            })
-            .collect();
-
-        let response = SearchResponse { results };
-        let json = serde_json::to_string_pretty(&response)
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        self.run_search(&params.query, params.top_k, params.threshold)
+            .await
     }
 
     /// Find chunks similar to the chunk at a given file location.
@@ -307,13 +266,12 @@ impl RipvecServer {
             rmcp::ErrorData::internal_error("No index available.".to_string(), None)
         })?;
 
-        let chunks_guard = self.chunks.read().await;
-
         // Convert 0-based input line to 1-based chunk lines
         let target_line = params.line + 1;
 
         // Find the chunk containing this location
-        let source_idx = chunks_guard
+        let source_idx = index
+            .chunks
             .iter()
             .position(|chunk| {
                 chunk.file_path.ends_with(&params.file_path)
@@ -343,7 +301,8 @@ impl RipvecServer {
             .filter(|(idx, _)| *idx != source_idx) // Exclude the source chunk
             .take(params.top_k)
             .filter_map(|(idx, score)| {
-                chunks_guard
+                index
+                    .chunks
                     .get(idx)
                     .map(|chunk| SearchResultItem::from_chunk(chunk, score))
             })
@@ -369,21 +328,25 @@ impl RipvecServer {
         {
             let mut idx = self.index.write().await;
             *idx = None;
-            let mut ch = self.chunks.write().await;
-            ch.clear();
         }
 
         let start = Instant::now();
         run_background_index(self).await;
         let duration_ms = start.elapsed().as_millis();
 
-        let chunks_guard = self.chunks.read().await;
-        let chunk_count = chunks_guard.len();
-        let file_count = chunks_guard
-            .iter()
-            .map(|c| c.file_path.as_str())
-            .collect::<HashSet<_>>()
-            .len();
+        let idx_guard = self.index.read().await;
+        let (chunk_count, file_count) = match idx_guard.as_ref() {
+            Some(index) => {
+                let files = index
+                    .chunks
+                    .iter()
+                    .map(|c| c.file_path.as_str())
+                    .collect::<HashSet<_>>()
+                    .len();
+                (index.chunks.len(), files)
+            }
+            None => (0, 0),
+        };
 
         let response = serde_json::json!({
             "chunks": chunk_count,
@@ -410,26 +373,29 @@ impl RipvecServer {
         let idx_guard = self.index.read().await;
         let ready = idx_guard.is_some();
 
-        let chunks_guard = self.chunks.read().await;
-        let chunk_count = chunks_guard.len();
-
-        let mut files_set = HashSet::new();
-        let mut ext_counts: HashMap<String, usize> = HashMap::new();
-        for chunk in chunks_guard.iter() {
-            files_set.insert(chunk.file_path.as_str());
-            let ext = std::path::Path::new(&chunk.file_path)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("(none)")
-                .to_string();
-            *ext_counts.entry(ext).or_insert(0) += 1;
-        }
+        let (chunk_count, files_count, ext_counts) = match idx_guard.as_ref() {
+            Some(index) => {
+                let mut files_set = HashSet::new();
+                let mut exts: HashMap<String, usize> = HashMap::new();
+                for chunk in &index.chunks {
+                    files_set.insert(chunk.file_path.as_str());
+                    let ext = std::path::Path::new(&chunk.file_path)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("(none)")
+                        .to_string();
+                    *exts.entry(ext).or_insert(0) += 1;
+                }
+                (index.chunks.len(), files_set.len(), exts)
+            }
+            None => (0, 0, HashMap::new()),
+        };
 
         let response = serde_json::json!({
             "ready": ready,
             "indexing": is_indexing,
             "chunks": chunk_count,
-            "files": files_set.len(),
+            "files": files_count,
             "extensions": ext_counts,
             "project_root": self.project_root.display().to_string(),
         });
