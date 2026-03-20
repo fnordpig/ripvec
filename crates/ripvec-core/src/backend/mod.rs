@@ -70,7 +70,7 @@ pub trait EmbedBackend: Send + Sync {
 
     /// Maximum token count this model supports (position embedding limit).
     ///
-    /// ClassicBert: 512. NomicBert: 8192. Tokens beyond this are truncated
+    /// `ClassicBert`: 512. `NomicBert`: 8192. Tokens beyond this are truncated
     /// during tokenization.
     fn max_tokens(&self) -> usize {
         512 // default for classic BERT models

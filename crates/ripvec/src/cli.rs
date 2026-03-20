@@ -5,6 +5,10 @@ use clap::Parser;
 /// Semantic code search — like ripgrep but for meaning.
 #[derive(Parser, Debug)]
 #[command(name = "ripvec", version, about)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "CLI flags are naturally boolean"
+)]
 pub struct Args {
     /// Natural language query to search for.
     ///

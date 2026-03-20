@@ -128,7 +128,7 @@ fn load_pipeline(
         let _guard = profiler.phase("model_load");
         let pb = use_progress.then(|| progress::spinner("Loading model\u{2026}"));
         let result = match args.backend {
-            cli::BackendArg::Auto => ripvec_core::backend::detect_backends(&model_repo)
+            cli::BackendArg::Auto => ripvec_core::backend::detect_backends(model_repo)
                 .context("failed to detect available backends")?,
             ref specific => {
                 let kind = match specific {
@@ -144,7 +144,7 @@ fn load_pipeline(
                     }
                 };
                 vec![
-                    ripvec_core::backend::load_backend(kind, &model_repo, device_hint)
+                    ripvec_core::backend::load_backend(kind, model_repo, device_hint)
                         .context("failed to load embedding backend")?,
                 ]
             }
@@ -155,10 +155,14 @@ fn load_pipeline(
         result
     };
     let tokenizer =
-        ripvec_core::tokenize::load_tokenizer(&model_repo).context("failed to load tokenizer")?;
+        ripvec_core::tokenize::load_tokenizer(model_repo).context("failed to load tokenizer")?;
 
     let search_cfg = ripvec_core::embed::SearchConfig {
-        batch_size: args.batch_size,
+        batch_size: if use_progress && args.batch_size > 8 {
+            8
+        } else {
+            args.batch_size
+        },
         max_tokens: args.max_tokens,
         chunk: ripvec_core::chunk::ChunkConfig {
             max_chunk_bytes: args.max_chunk_bytes,
@@ -186,18 +190,32 @@ fn run_interactive(
     _profiler: &ripvec_core::profile::Profiler,
     use_code_model: bool,
 ) -> Result<()> {
-    // Create a profiler that drives the spinner with live stats
-    let pb = if use_progress {
+    // Create a profiler that drives progress display with live stats.
+    // Starts as a spinner for walk/chunk phases, then switches to a
+    // determinate progress bar once the embed phase begins.
+    let spinner = if use_progress {
         Some(progress::spinner("Indexing\u{2026}"))
     } else {
         None
     };
-    let live_profiler = if let Some(ref pb) = pb {
-        let pb = pb.clone();
-        ripvec_core::profile::Profiler::with_callback(
-            std::time::Duration::from_millis(500),
-            move |msg| pb.set_message(msg.to_string()),
-        )
+    let embed_display: std::sync::Arc<std::sync::Mutex<Option<progress::EmbedDisplay>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let live_profiler = if let Some(ref spinner) = spinner {
+        let spinner_clone = spinner.clone();
+        let profiler =
+            ripvec_core::profile::Profiler::with_callback(std::time::Duration::ZERO, move |msg| {
+                spinner_clone.set_message(msg.to_string());
+            });
+        let display = embed_display.clone();
+        let spinner_for_tick = spinner.clone();
+        profiler.with_embed_tick(move |p| {
+            let mut guard = display.lock().unwrap();
+            let d = guard.get_or_insert_with(|| {
+                spinner_for_tick.finish_and_clear();
+                progress::EmbedDisplay::new(p.total as u64)
+            });
+            d.update(p);
+        })
     } else {
         ripvec_core::profile::Profiler::noop()
     };
@@ -213,17 +231,23 @@ fn run_interactive(
     )
     .context("embedding failed")?;
 
-    if let Some(pb) = pb {
+    if use_progress {
         let n_files = chunks
             .iter()
             .map(|c| &c.file_path)
             .collect::<std::collections::HashSet<_>>()
             .len();
-        pb.finish_with_message(format!(
-            "Indexed {} chunks from {} files",
-            chunks.len(),
-            n_files,
-        ));
+        // Finish whichever progress widget is active (embed display or spinner).
+        let mut guard = embed_display.lock().unwrap();
+        if let Some(d) = guard.take() {
+            d.finish(chunks.len(), n_files);
+        } else if let Some(spinner) = spinner {
+            spinner.finish_with_message(format!(
+                "Indexed {} chunks from {} files",
+                chunks.len(),
+                n_files,
+            ));
+        }
     }
 
     // Build index summary: count chunks by file extension
@@ -287,7 +311,33 @@ fn run_oneshot(
 
     let backend_refs: Vec<&dyn ripvec_core::backend::EmbedBackend> =
         backends.iter().map(|b| &**b).collect();
-    let pb_search = use_progress.then(|| progress::spinner("Embedding\u{2026}"));
+
+    // When progress is enabled, create a profiler with an embed progress bar.
+    // Otherwise use the caller's profiler (which may be --profile or Noop).
+    let spinner = use_progress.then(|| progress::spinner("Searching\u{2026}"));
+    let embed_display: std::sync::Arc<std::sync::Mutex<Option<progress::EmbedDisplay>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let live_profiler;
+    let effective_profiler: &ripvec_core::profile::Profiler = if use_progress {
+        let spinner_clone = spinner.as_ref().unwrap().clone();
+        let display = embed_display.clone();
+        live_profiler = ripvec_core::profile::Profiler::with_callback(
+            std::time::Duration::ZERO,
+            move |_msg| {},
+        )
+        .with_embed_tick(move |p| {
+            let mut guard = display.lock().unwrap();
+            let d = guard.get_or_insert_with(|| {
+                spinner_clone.finish_and_clear();
+                progress::EmbedDisplay::new(p.total as u64)
+            });
+            d.update(p);
+        });
+        &live_profiler
+    } else {
+        profiler
+    };
+
     let results = ripvec_core::embed::search(
         std::path::Path::new(&args.path),
         &args.query,
@@ -295,11 +345,18 @@ fn run_oneshot(
         tokenizer,
         args.top_k,
         search_cfg,
-        profiler,
+        effective_profiler,
     )
     .context("search failed")?;
-    if let Some(pb) = pb_search {
-        pb.finish_and_clear();
+
+    // Finish whichever progress widget is active
+    {
+        let mut guard = embed_display.lock().unwrap();
+        if let Some(d) = guard.take() {
+            d.finish_and_clear();
+        } else if let Some(spinner) = spinner {
+            spinner.finish_and_clear();
+        }
     }
 
     profiler.finish();

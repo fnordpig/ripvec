@@ -18,6 +18,30 @@ use std::time::{Duration, Instant};
 /// normally print to stderr. Set via [`Profiler::with_callback`].
 type ProgressCallback = Box<dyn Fn(&str) + Send + Sync>;
 
+/// Snapshot of embed-phase progress, passed to the tick callback.
+#[derive(Debug, Clone)]
+pub struct EmbedProgress {
+    /// Chunks completed so far.
+    pub done: usize,
+    /// Total chunks to embed.
+    pub total: usize,
+    /// Chunks/s over the most recent reporting window.
+    pub window_rate: f64,
+    /// Chunks/s since embed phase started.
+    pub overall_rate: f64,
+    /// Fraction of time spent waiting for the model lock (0.0–1.0).
+    pub lock_wait_pct: f64,
+    /// Fraction of time spent in inference (0.0–1.0).
+    pub inference_pct: f64,
+}
+
+/// Callback for per-batch embed progress.
+type EmbedTickCallback = Box<dyn Fn(&EmbedProgress) + Send + Sync>;
+
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Active is the common case; Noop is only for --profile=false"
+)]
 pub enum Profiler {
     /// Actively collects timing and prints to stderr.
     #[expect(
@@ -35,6 +59,8 @@ pub enum Profiler {
         chunk_counts: Mutex<Vec<usize>>,
         /// Optional callback for live progress updates.
         on_progress: Option<ProgressCallback>,
+        /// Optional callback for per-chunk embed progress (drives progress bars).
+        on_embed_tick: Option<EmbedTickCallback>,
     },
     /// No-op profiler. All methods are empty.
     Noop,
@@ -44,6 +70,10 @@ pub(crate) struct EmbedState {
     phase_start: Instant,
     last_report: Instant,
     chunks_at_last_report: usize,
+    /// Timestamp of the last `embed_tick` call (for per-batch window rate).
+    last_tick: Instant,
+    /// Chunks completed at last tick (for per-batch window rate).
+    chunks_at_last_tick: usize,
     total_lock_wait: Duration,
     total_inference: Duration,
     total_chunks: usize,
@@ -56,6 +86,8 @@ impl EmbedState {
             phase_start: now,
             last_report: now,
             chunks_at_last_report: 0,
+            last_tick: now,
+            chunks_at_last_tick: 0,
             total_lock_wait: Duration::ZERO,
             total_inference: Duration::ZERO,
             total_chunks: 0,
@@ -74,6 +106,7 @@ impl Profiler {
                 embed: Mutex::new(EmbedState::new()),
                 chunk_counts: Mutex::new(Vec::new()),
                 on_progress: None,
+                on_embed_tick: None,
             }
         } else {
             Self::Noop
@@ -91,7 +124,24 @@ impl Profiler {
             embed: Mutex::new(EmbedState::new()),
             chunk_counts: Mutex::new(Vec::new()),
             on_progress: Some(Box::new(cb)),
+            on_embed_tick: None,
         }
+    }
+
+    /// Set a callback that fires on every embed chunk completion with `(done, total)`.
+    ///
+    /// Unlike the throttled `on_progress` callback, this fires for every chunk
+    /// so progress bars can update smoothly (indicatif handles display rate).
+    #[must_use]
+    pub fn with_embed_tick(mut self, cb: impl Fn(&EmbedProgress) + Send + Sync + 'static) -> Self {
+        if let Self::Active {
+            ref mut on_embed_tick,
+            ..
+        } = self
+        {
+            *on_embed_tick = Some(Box::new(cb));
+        }
+        self
     }
 
     /// Create a no-op profiler.
@@ -214,29 +264,57 @@ impl Profiler {
             start,
             interval,
             embed,
+            on_embed_tick,
             ..
         } = self
-            && let Ok(mut state) = embed.lock()
         {
+            let Ok(mut state) = embed.lock() else {
+                return;
+            };
             let now = Instant::now();
+            let overall_elapsed = now.duration_since(state.phase_start).as_secs_f64();
+            let overall_rate = if overall_elapsed > 0.0 {
+                done as f64 / overall_elapsed
+            } else {
+                0.0
+            };
+            let total_timing = state.total_lock_wait + state.total_inference;
+            let lock_pct = if total_timing.as_nanos() > 0 {
+                state.total_lock_wait.as_nanos() as f64 / total_timing.as_nanos() as f64
+            } else {
+                0.0
+            };
+
+            // Per-batch callback: compute a fresh per-batch window rate so the
+            // sparkline gets a new data point on every batch, not every interval.
+            if let Some(cb) = on_embed_tick {
+                let tick_elapsed = now.duration_since(state.last_tick).as_secs_f64();
+                let tick_chunks = done - state.chunks_at_last_tick;
+                let batch_rate = if tick_elapsed > 0.0 {
+                    tick_chunks as f64 / tick_elapsed
+                } else {
+                    overall_rate
+                };
+                state.last_tick = now;
+                state.chunks_at_last_tick = done;
+
+                cb(&EmbedProgress {
+                    done,
+                    total: state.total_chunks,
+                    window_rate: batch_rate,
+                    overall_rate,
+                    lock_wait_pct: lock_pct,
+                    inference_pct: 1.0 - lock_pct,
+                });
+            }
+
+            // Throttled text report for --profile / spinner modes.
             if now.duration_since(state.last_report) >= *interval {
                 let wall = start.elapsed();
-                let overall_elapsed = now.duration_since(state.phase_start).as_secs_f64();
-                let window_elapsed = now.duration_since(state.last_report).as_secs_f64();
-                let window_chunks = done - state.chunks_at_last_report;
-                let overall_rate = if overall_elapsed > 0.0 {
-                    done as f64 / overall_elapsed
-                } else {
-                    0.0
-                };
-                let window_rate = if window_elapsed > 0.0 {
-                    window_chunks as f64 / window_elapsed
-                } else {
-                    0.0
-                };
-                let total_timing = state.total_lock_wait + state.total_inference;
-                let lock_pct = if total_timing.as_nanos() > 0 {
-                    state.total_lock_wait.as_nanos() as f64 / total_timing.as_nanos() as f64 * 100.0
+                let report_elapsed = now.duration_since(state.last_report).as_secs_f64();
+                let report_chunks = done - state.chunks_at_last_report;
+                let window_rate = if report_elapsed > 0.0 {
+                    report_chunks as f64 / report_elapsed
                 } else {
                     0.0
                 };
@@ -245,11 +323,11 @@ impl Profiler {
                     wall.as_secs_f64(),
                     done,
                     state.total_chunks,
-                    window_elapsed,
+                    report_elapsed,
                     window_rate,
                     overall_rate,
-                    lock_pct,
-                    100.0 - lock_pct,
+                    lock_pct * 100.0,
+                    (1.0 - lock_pct) * 100.0,
                 ));
                 state.last_report = now;
                 state.chunks_at_last_report = done;

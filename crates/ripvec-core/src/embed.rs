@@ -474,7 +474,7 @@ fn read_source(path: &Path) -> Option<SourceText> {
 /// Tokenize text into an [`Encoding`] ready for model inference.
 ///
 /// Always truncates to `model_max_tokens` (the model's position embedding
-/// limit — 512 for BERT, 8192 for NomicBert). When `max_tokens` is non-zero,
+/// limit — 512 for BERT, 8192 for `NomicBert`). When `max_tokens` is non-zero,
 /// further truncates to that value. CLS pooling means the first token's
 /// representation carries most semantic weight, so truncation has minimal
 /// quality impact.
@@ -514,6 +514,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "loads model + embeds full source tree; run with `cargo test -- --ignored`"]
     fn search_with_backend_trait() {
         let backend = crate::backend::load_backend(
             crate::backend::BackendKind::Candle,
