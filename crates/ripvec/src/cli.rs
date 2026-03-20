@@ -84,10 +84,6 @@ pub struct Args {
     #[arg(long, default_value_t = 512)]
     pub window_overlap: usize,
 
-    /// Chunk scheduling order for parallel embedding batches.
-    #[arg(long, default_value = "none")]
-    pub sort_order: SortOrderArg,
-
     /// Treat all files as plain text (sliding-window chunking only).
     /// By default, recognized source files use tree-sitter semantic chunking
     /// and unrecognized files fall back to plain-text windows.
@@ -141,15 +137,4 @@ pub enum BackendArg {
     Mlx,
     /// ONNX Runtime (cross-platform, CPU + GPU).
     Ort,
-}
-
-/// Chunk scheduling order for the embedding pipeline.
-#[derive(clap::ValueEnum, Clone, Debug)]
-pub enum SortOrderArg {
-    /// Longest chunks first (best load balance — default).
-    Desc,
-    /// Shortest chunks first.
-    Asc,
-    /// No sorting — process chunks in file-walk order.
-    None,
 }

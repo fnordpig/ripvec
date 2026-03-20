@@ -12,13 +12,6 @@
 //! `[batch_size, max_seq_len]`. This amortizes per-call overhead and enables
 //! SIMD across the batch dimension.
 //!
-//! # Scheduling
-//!
-//! Chunks are sorted by content length **descending** (longest first) before
-//! batching. This ensures the heaviest batches run first while all threads
-//! are busy, and short chunks fill in the gaps at the end — classic
-//! longest-job-first scheduling for optimal load balancing.
-//!
 //! # Parallelism
 //!
 //! On CPU, each rayon thread gets its own backend clone (cheap — most
@@ -30,7 +23,7 @@ use std::time::Instant;
 
 use memmap2::Mmap;
 use rayon::prelude::*;
-use tracing::{info_span, instrument, warn};
+use tracing::{debug, info_span, instrument, warn};
 
 use crate::backend::{EmbedBackend, Encoding};
 use crate::chunk::{ChunkConfig, CodeChunk};
@@ -42,22 +35,6 @@ const MMAP_THRESHOLD: u64 = 32 * 1024; // 32 KB
 
 /// Default batch size for embedding inference.
 pub const DEFAULT_BATCH_SIZE: usize = 32;
-
-/// Chunk scheduling order for the embedding pipeline.
-///
-/// Controls how chunks are sorted before batching. Sorting longest-first
-/// (`Descending`) is the classic longest-job-first heuristic for optimal
-/// load balancing across rayon threads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SortOrder {
-    /// Longest chunks first (default — best load balance).
-    #[default]
-    Descending,
-    /// Shortest chunks first.
-    Ascending,
-    /// No sorting — process chunks in file-walk order.
-    None,
-}
 
 /// Runtime configuration for the search pipeline.
 ///
@@ -76,8 +53,6 @@ pub struct SearchConfig {
     pub max_tokens: usize,
     /// Chunking parameters forwarded to the chunking phase.
     pub chunk: ChunkConfig,
-    /// Sort order for chunks before batching.
-    pub sort_order: SortOrder,
     /// Force all files to be chunked as plain text (sliding windows only).
     /// When `false` (default), files with recognized extensions use tree-sitter
     /// semantic chunking, and unrecognized extensions fall back to sliding windows.
@@ -90,7 +65,6 @@ impl Default for SearchConfig {
             batch_size: DEFAULT_BATCH_SIZE,
             max_tokens: 0,
             chunk: ChunkConfig::default(),
-            sort_order: SortOrder::None,
             text_mode: false,
         }
     }
@@ -200,8 +174,8 @@ pub fn embed_all(
 /// Accepts multiple backends for hybrid scheduling — the first backend
 /// (`backends[0]`) is used for query embedding.
 ///
-/// All tuning parameters (batch size, token limit, chunk sizing, sort order)
-/// are controlled via [`SearchConfig`].
+/// All tuning parameters (batch size, token limit, chunk sizing) are
+/// controlled via [`SearchConfig`].
 ///
 /// # Errors
 ///
@@ -310,6 +284,8 @@ impl DistributedState<'_> {
             let mut valid_indices = Vec::with_capacity(batch.len());
             for (i, enc) in batch.iter().enumerate() {
                 if let Some(e) = enc {
+                    // TODO(perf): cloning 3 Vecs per chunk; consider making
+                    // `EmbedBackend::embed_batch` accept `&[&Encoding]` to avoid this.
                     valid.push(e.clone());
                     valid_indices.push(start + i);
                 } else {
@@ -456,18 +432,47 @@ impl std::ops::Deref for SourceText {
 }
 
 /// Read a source file, using mmap for large files and `read_to_string` for small ones.
+///
+/// Returns `None` (with a debug log) when the file cannot be read or is not valid UTF-8.
 #[expect(unsafe_code, reason = "mmap of read-only source file")]
 fn read_source(path: &Path) -> Option<SourceText> {
-    let metadata = std::fs::metadata(path).ok()?;
+    let metadata = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) => {
+            debug!(path = %path.display(), err = %e, "skipping file: metadata read failed");
+            return None;
+        }
+    };
     if metadata.len() >= MMAP_THRESHOLD {
-        let file = std::fs::File::open(path).ok()?;
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) => {
+                debug!(path = %path.display(), err = %e, "skipping file: open failed");
+                return None;
+            }
+        };
         // SAFETY: file is read-only, not modified while mapped
-        let mmap = unsafe { Mmap::map(&file) }.ok()?;
+        let mmap = match unsafe { Mmap::map(&file) } {
+            Ok(m) => m,
+            Err(e) => {
+                debug!(path = %path.display(), err = %e, "skipping file: mmap failed");
+                return None;
+            }
+        };
         // Validate UTF-8 before wrapping
-        std::str::from_utf8(&mmap).ok()?;
+        if std::str::from_utf8(&mmap).is_err() {
+            debug!(path = %path.display(), "skipping file: not valid UTF-8");
+            return None;
+        }
         Some(SourceText::Mapped(mmap))
     } else {
-        std::fs::read_to_string(path).ok().map(SourceText::Owned)
+        match std::fs::read_to_string(path) {
+            Ok(s) => Some(SourceText::Owned(s)),
+            Err(e) => {
+                debug!(path = %path.display(), err = %e, "skipping file: read failed");
+                None
+            }
+        }
     }
 }
 

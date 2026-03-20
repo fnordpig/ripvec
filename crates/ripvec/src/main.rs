@@ -169,11 +169,6 @@ fn load_pipeline(
             window_size: args.window_size,
             window_overlap: args.window_overlap,
         },
-        sort_order: match args.sort_order {
-            cli::SortOrderArg::Desc => ripvec_core::embed::SortOrder::Descending,
-            cli::SortOrderArg::Asc => ripvec_core::embed::SortOrder::Ascending,
-            cli::SortOrderArg::None => ripvec_core::embed::SortOrder::None,
-        },
         text_mode: args.text_mode,
     };
 

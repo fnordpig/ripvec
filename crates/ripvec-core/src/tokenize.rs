@@ -37,7 +37,7 @@ pub fn tokenize_query(
 ) -> crate::Result<crate::backend::Encoding> {
     let encoding = tokenizer
         .encode(text, true)
-        .map_err(|e| crate::Error::Other(anyhow::anyhow!("tokenization failed: {e}")))?;
+        .map_err(|e| crate::Error::Tokenization(e.to_string()))?;
 
     let len = encoding.get_ids().len().min(model_max_tokens);
     Ok(crate::backend::Encoding {

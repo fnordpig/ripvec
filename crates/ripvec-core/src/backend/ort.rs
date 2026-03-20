@@ -208,9 +208,10 @@ impl EmbedBackend for OrtBackend {
 
     /// Whether inference runs on a GPU.
     ///
-    /// Returns `true` for GPU device hints (`CoreML` or CUDA), `false` for CPU.
+    /// Returns `true` when GPU execution providers are configured
+    /// (`DeviceHint::Gpu` or `DeviceHint::Auto`), `false` for CPU-only.
     fn is_gpu(&self) -> bool {
-        matches!(self.device_hint, DeviceHint::Gpu)
+        matches!(self.device_hint, DeviceHint::Gpu | DeviceHint::Auto)
     }
 }
 

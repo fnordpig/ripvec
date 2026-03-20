@@ -284,6 +284,7 @@ mod tests {
         assert!(!backends.is_empty());
     }
 
+    #[cfg(not(feature = "mlx"))]
     #[test]
     fn detect_backends_cpu_always_last() {
         let backends = detect_backends("BAAI/bge-small-en-v1.5").unwrap();
