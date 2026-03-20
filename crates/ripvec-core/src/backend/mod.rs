@@ -173,10 +173,8 @@ pub fn detect_backends(model_repo: &str) -> crate::Result<Vec<Box<dyn EmbedBacke
     // MLX alone because they share the same physical cores and memory.
     // On discrete GPU systems (CUDA), CPU would be a useful helper.
     let has_gpu = backends.iter().any(|b| b.is_gpu());
-    if !has_gpu {
-        if let Ok(b) = candle::CandleBackend::load(model_repo, &DeviceHint::Cpu) {
-            backends.push(Box::new(b));
-        }
+    if !has_gpu && let Ok(b) = candle::CandleBackend::load(model_repo, &DeviceHint::Cpu) {
+        backends.push(Box::new(b));
     }
 
     if backends.is_empty() {
