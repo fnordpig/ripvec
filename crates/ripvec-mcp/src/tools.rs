@@ -101,17 +101,13 @@ impl RipvecServer {
         let code_backend = self
             .code_backend
             .get_or_init(|| async {
-                let b = tokio::task::spawn_blocking(|| {
-                    ripvec_core::backend::load_backend(
-                        ripvec_core::backend::BackendKind::Candle,
-                        "nomic-ai/CodeRankEmbed",
-                        ripvec_core::backend::DeviceHint::Auto,
-                    )
+                let backends = tokio::task::spawn_blocking(|| {
+                    ripvec_core::backend::detect_backends("nomic-ai/CodeRankEmbed")
                 })
                 .await
                 .expect("spawn_blocking panicked")
                 .expect("failed to load CodeRankEmbed backend");
-                Arc::from(b)
+                Arc::from(backends.into_iter().next().expect("no backend available"))
             })
             .await;
 
@@ -204,17 +200,13 @@ impl RipvecServer {
         let text_backend = self
             .text_backend
             .get_or_init(|| async {
-                let b = tokio::task::spawn_blocking(|| {
-                    ripvec_core::backend::load_backend(
-                        ripvec_core::backend::BackendKind::Candle,
-                        "BAAI/bge-small-en-v1.5",
-                        ripvec_core::backend::DeviceHint::Auto,
-                    )
+                let backends = tokio::task::spawn_blocking(|| {
+                    ripvec_core::backend::detect_backends("BAAI/bge-small-en-v1.5")
                 })
                 .await
                 .expect("spawn_blocking panicked")
                 .expect("failed to load BGE backend");
-                Arc::from(b)
+                Arc::from(backends.into_iter().next().expect("no backend available"))
             })
             .await;
 

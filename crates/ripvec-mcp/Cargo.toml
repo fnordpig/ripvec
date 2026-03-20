@@ -11,7 +11,7 @@ name = "ripvec-mcp"
 path = "src/main.rs"
 
 [dependencies]
-ripvec-core = { path = "../ripvec-core" }
+ripvec-core = { path = "../ripvec-core", features = ["mlx"] }
 rmcp.workspace = true
 tokio.workspace = true
 serde.workspace = true
