@@ -67,6 +67,14 @@ pub trait EmbedBackend: Send + Sync {
     /// GPU backends use a ring-buffer pipelined scheduler (`RING_SIZE = 4`)
     /// for bounded memory usage.
     fn is_gpu(&self) -> bool;
+
+    /// Maximum token count this model supports (position embedding limit).
+    ///
+    /// ClassicBert: 512. NomicBert: 8192. Tokens beyond this are truncated
+    /// during tokenization.
+    fn max_tokens(&self) -> usize {
+        512 // default for classic BERT models
+    }
 }
 
 /// Available embedding backend implementations.

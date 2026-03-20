@@ -736,6 +736,11 @@ impl EmbedBackend for MlxBackend {
     fn is_gpu(&self) -> bool {
         true
     }
+
+    /// Maximum tokens from model config (512 for BERT, 8192 for NomicBert).
+    fn max_tokens(&self) -> usize {
+        self.max_position_embeddings as usize
+    }
 }
 
 // NOTE: MLX tests must run single-threaded (`--test-threads=1`) because

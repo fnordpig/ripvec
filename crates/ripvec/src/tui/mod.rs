@@ -72,7 +72,8 @@ impl App {
         let start = Instant::now();
 
         // Tokenize + embed the query
-        let Ok(enc) = tokenize_query(&self.query, &self.tokenizer) else {
+        let model_max = self.backends[0].max_tokens();
+        let Ok(enc) = tokenize_query(&self.query, &self.tokenizer, model_max) else {
             self.results.clear();
             self.rank_time_ms = 0.0;
             return;
@@ -94,16 +95,17 @@ impl App {
     }
 }
 
-/// Hard limit matching bge-small-en-v1.5 `max_position_embeddings`.
-const MODEL_MAX_TOKENS: usize = 512;
-
 /// Tokenize a query string into an [`Encoding`] for inference.
-fn tokenize_query(text: &str, tokenizer: &tokenizers::Tokenizer) -> Result<Encoding> {
+fn tokenize_query(
+    text: &str,
+    tokenizer: &tokenizers::Tokenizer,
+    model_max_tokens: usize,
+) -> Result<Encoding> {
     let encoding = tokenizer
         .encode(text, true)
         .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
 
-    let len = encoding.get_ids().len().min(MODEL_MAX_TOKENS);
+    let len = encoding.get_ids().len().min(model_max_tokens);
     Ok(Encoding {
         input_ids: encoding.get_ids()[..len]
             .iter()

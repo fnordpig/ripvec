@@ -170,13 +170,14 @@ pub fn embed_all(
     // Phase 3: Pre-tokenize all chunks in parallel (CPU-bound, all rayon threads)
     let bs = cfg.batch_size.max(1);
     let max_tokens_cfg = cfg.max_tokens;
+    let model_max = backends[0].max_tokens();
     let _span = info_span!("embed_chunks", chunk_count = chunks.len(), batch_size = bs).entered();
     profiler.embed_begin(chunks.len());
 
     let all_encodings: Vec<Option<Encoding>> = chunks
         .par_iter()
         .map(|chunk| {
-            tokenize(&chunk.content, tokenizer, max_tokens_cfg)
+            tokenize(&chunk.content, tokenizer, max_tokens_cfg, model_max)
                 .inspect_err(|e| {
                     warn!(file = %chunk.file_path, err = %e, "tokenization failed, skipping chunk");
                 })
@@ -227,7 +228,7 @@ pub fn search(
     let query_embedding = {
         let _span = info_span!("embed_query").entered();
         let _guard = profiler.phase("embed_query");
-        let enc = tokenize(query, tokenizer, cfg.max_tokens)?;
+        let enc = tokenize(query, tokenizer, cfg.max_tokens, backends[0].max_tokens())?;
         let mut results = backends[0].embed_batch(&[enc])?;
         results.pop().ok_or_else(|| {
             crate::Error::Other(anyhow::anyhow!("backend returned no embedding for query"))
@@ -470,27 +471,25 @@ fn read_source(path: &Path) -> Option<SourceText> {
     }
 }
 
-/// Hard limit matching bge-small-en-v1.5 `max_position_embeddings`.
-/// Sequences at or above this length cause an OOB error in the model.
-const MODEL_MAX_TOKENS: usize = 512;
-
 /// Tokenize text into an [`Encoding`] ready for model inference.
 ///
-/// Always truncates to [`MODEL_MAX_TOKENS`] (the model's position embedding
-/// limit). When `max_tokens` is non-zero, further truncates to that value.
-/// CLS pooling means the first token's representation carries most semantic
-/// weight, so truncation has minimal quality impact.
+/// Always truncates to `model_max_tokens` (the model's position embedding
+/// limit — 512 for BERT, 8192 for NomicBert). When `max_tokens` is non-zero,
+/// further truncates to that value. CLS pooling means the first token's
+/// representation carries most semantic weight, so truncation has minimal
+/// quality impact.
 fn tokenize(
     text: &str,
     tokenizer: &tokenizers::Tokenizer,
     max_tokens: usize,
+    model_max_tokens: usize,
 ) -> crate::Result<Encoding> {
     let encoding = tokenizer
         .encode(text, true)
         .map_err(|e| crate::Error::Tokenization(e.to_string()))?;
 
     let full_len = encoding.get_ids().len();
-    let mut len = full_len.min(MODEL_MAX_TOKENS);
+    let mut len = full_len.min(model_max_tokens);
     if max_tokens > 0 {
         len = len.min(max_tokens);
     }
@@ -554,7 +553,7 @@ mod tests {
         let texts = ["fn hello() {}", "class Foo:", "func main() {}"];
         let encoded: Vec<Option<Encoding>> = texts
             .iter()
-            .map(|t| super::tokenize(t, &tokenizer, 0).ok())
+            .map(|t| super::tokenize(t, &tokenizer, 0, 512).ok())
             .collect();
 
         let results =
