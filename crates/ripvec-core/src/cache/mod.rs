@@ -4,6 +4,7 @@
 //! tracks file state in a Merkle-tree manifest, and supports incremental
 //! reindexing by diffing against the filesystem.
 
+pub mod diff;
 pub mod file_cache;
 pub mod manifest;
 pub mod store;
