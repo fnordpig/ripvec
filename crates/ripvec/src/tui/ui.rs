@@ -173,11 +173,27 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let loc_len = location.chars().count();
     let pad = width.saturating_sub(loc_len + hints_len);
 
-    let line = Line::from(vec![
-        Span::styled(&*location, Style::default().fg(Color::Cyan)),
-        Span::raw(" ".repeat(pad)),
-        Span::styled(STATUS_HINTS, Style::default().fg(Color::DarkGray)),
-    ]);
+    // Show status flash (e.g. "↻ 3 files updated") if active, otherwise normal location
+    let line = if let Some((ref msg, _)) = app.status_flash {
+        let msg_len = msg.chars().count();
+        let flash_pad = width.saturating_sub(msg_len + hints_len);
+        Line::from(vec![
+            Span::styled(
+                format!(" {msg}"),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            ),
+            Span::raw(" ".repeat(flash_pad)),
+            Span::styled(STATUS_HINTS, Style::default().fg(Color::DarkGray)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(&*location, Style::default().fg(Color::Cyan)),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(STATUS_HINTS, Style::default().fg(Color::DarkGray)),
+        ])
+    };
 
     let paragraph =
         Paragraph::new(line).style(Style::default().bg(Color::DarkGray).fg(Color::White));

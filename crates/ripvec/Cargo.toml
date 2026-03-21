@@ -25,6 +25,7 @@ crossterm = "0.28"
 tokenizers.workspace = true
 ndarray = "0.17"
 syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "regex-onig"] }
+notify = "8.2.0"
 
 [features]
 default = []

@@ -3498,6 +3498,7 @@ dependencies = [
  "crossterm",
  "indicatif 0.17.11",
  "ndarray",
+ "notify",
  "owo-colors",
  "predicates",
  "ratatui",

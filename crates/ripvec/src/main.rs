@@ -188,6 +188,10 @@ fn load_pipeline(
 }
 
 /// Interactive TUI mode: embed the codebase once, then launch the search UI.
+#[expect(
+    clippy::too_many_lines,
+    reason = "progress bar setup + watcher setup in one function"
+)]
 fn run_interactive(
     backends: Vec<Box<dyn ripvec_core::backend::EmbedBackend>>,
     tokenizer: tokenizers::Tokenizer,
@@ -279,7 +283,7 @@ fn run_interactive(
 
     let index = ripvec_core::index::SearchIndex::new(chunks, &embeddings);
 
-    let app = tui::App {
+    let mut app = tui::App {
         query: String::new(),
         selected: 0,
         preview_scroll: 0,
@@ -298,7 +302,49 @@ fn run_interactive(
         } else {
             String::new()
         },
+        watcher_rx: None,
+        watcher_handle: None,
+        status_flash: None,
+        cache_config: if args.index {
+            let model = args.model_repo.clone().unwrap_or_else(|| {
+                if use_code_model {
+                    "nomic-ai/CodeRankEmbed".to_string()
+                } else {
+                    "BAAI/bge-small-en-v1.5".to_string()
+                }
+            });
+            Some(tui::CacheConfig {
+                root: std::path::PathBuf::from(&args.path),
+                model_repo: model,
+                cache_dir: args.cache_dir.as_ref().map(std::path::PathBuf::from),
+            })
+        } else {
+            None
+        },
     };
+
+    // Set up file watcher if --index mode
+    if args.index {
+        use notify::{RecursiveMode, Watcher};
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if let Ok(event) = res {
+                use notify::EventKind;
+                if matches!(
+                    event.kind,
+                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+                ) {
+                    let _ = tx.send(());
+                }
+            }
+        })
+        .context("failed to create file watcher")?;
+        watcher
+            .watch(std::path::Path::new(&args.path), RecursiveMode::Recursive)
+            .context("failed to watch directory")?;
+        app.watcher_rx = Some(rx);
+        app.watcher_handle = Some(watcher);
+    }
 
     tui::run(app)
 }

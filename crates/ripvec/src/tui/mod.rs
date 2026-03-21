@@ -53,6 +53,24 @@ pub struct App {
     pub index_summary: String,
     /// Query prefix for code models (e.g. "Represent this query for searching relevant code: ").
     pub query_prefix: String,
+    /// Receiver for file watcher events (only active with `--index -i`).
+    pub watcher_rx: Option<std::sync::mpsc::Receiver<()>>,
+    /// Keep the watcher alive (dropped when App is dropped).
+    pub watcher_handle: Option<notify::RecommendedWatcher>,
+    /// Transient status message (e.g. "↻ 3 files updated") with display time.
+    pub status_flash: Option<(String, std::time::Instant)>,
+    /// Cache config for incremental reindex on watcher events.
+    pub cache_config: Option<CacheConfig>,
+}
+
+/// Configuration for the persistent cache (used by the TUI file watcher).
+pub struct CacheConfig {
+    /// Project root directory.
+    pub root: std::path::PathBuf,
+    /// Model repository name.
+    pub model_repo: String,
+    /// Optional cache directory override.
+    pub cache_dir: Option<std::path::PathBuf>,
 }
 
 impl App {
@@ -145,6 +163,53 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut A
             if needs_rerank {
                 app.rerank();
             }
+        }
+
+        // Check for file watcher events (non-blocking)
+        if let Some(ref rx) = app.watcher_rx
+            && rx.try_recv().is_ok()
+        {
+            // Drain additional events
+            while rx.try_recv().is_ok() {}
+
+            // Re-index incrementally if cache config is set
+            if let Some(ref cfg) = app.cache_config {
+                let backend_refs: Vec<&dyn EmbedBackend> =
+                    app.backends.iter().map(|b| &**b).collect();
+                let search_cfg = ripvec_core::embed::SearchConfig::default();
+                let profiler = ripvec_core::profile::Profiler::noop();
+
+                match ripvec_core::cache::reindex::incremental_index(
+                    &cfg.root,
+                    &backend_refs,
+                    &app.tokenizer,
+                    &search_cfg,
+                    &profiler,
+                    &cfg.model_repo,
+                    cfg.cache_dir.as_deref(),
+                ) {
+                    Ok((new_index, stats)) => {
+                        let msg = format!(
+                            "\u{21bb} {} files updated ({} chunks re-embedded)",
+                            stats.files_changed, stats.chunks_reembedded,
+                        );
+                        app.index = new_index;
+                        app.status_flash = Some((msg, std::time::Instant::now()));
+                        app.rerank();
+                    }
+                    Err(e) => {
+                        app.status_flash =
+                            Some((format!("reindex error: {e}"), std::time::Instant::now()));
+                    }
+                }
+            }
+        }
+
+        // Clear status flash after 3 seconds
+        if let Some((_, when)) = &app.status_flash
+            && when.elapsed() > Duration::from_secs(3)
+        {
+            app.status_flash = None;
         }
 
         // If Enter was pressed on a result, suspend TUI, open editor, resume.
