@@ -299,17 +299,19 @@ impl BertEmbeddings {
 
 /// Self-attention sub-layer within a BERT encoder layer.
 ///
-/// For `ClassicBert`, QKV projections include bias terms and no rotary
-/// encoding. For `NomicBert`, projections are unbiased and RoPE is applied
-/// to Q and K after reshaping to head layout.
+/// Uses a fused QKV projection for both variants: a single `[3*hidden, hidden]`
+/// weight matrix produces Q, K, V in one matmul, then splits the result.
+/// This eliminates 2 kernel launches per layer (24 total for 12-layer BERT).
+///
+/// For `ClassicBert`, projections include bias terms and no rotary encoding.
+/// For `NomicBert`, projections are unbiased and RoPE is applied to Q and K
+/// after reshaping to head layout.
 #[derive(Debug)]
 struct BertSelfAttention {
-    query_weight: Array,
-    query_bias: Option<Array>,
-    key_weight: Array,
-    key_bias: Option<Array>,
-    value_weight: Array,
-    value_bias: Option<Array>,
+    /// Fused Q/K/V weight matrix `[3*hidden, hidden]`.
+    qkv_weight: Array,
+    /// Fused Q/K/V bias `[3*hidden]` (`ClassicBert` only).
+    qkv_bias: Option<Array>,
     output_weight: Array,
     output_bias: Option<Array>,
     output_ln_weight: Array,
@@ -342,21 +344,21 @@ impl BertSelfAttention {
         let batch = hidden.shape()[0];
         let seq_len = hidden.shape()[1];
 
-        // Q, K, V projections
-        let q = linear(hidden, &self.query_weight, self.query_bias.as_ref())?;
-        let k = linear(hidden, &self.key_weight, self.key_bias.as_ref())?;
-        let v = linear(hidden, &self.value_weight, self.value_bias.as_ref())?;
+        // Fused Q/K/V projection: one matmul instead of three
+        let qkv = linear(hidden, &self.qkv_weight, self.qkv_bias.as_ref())?;
+        let parts = mlx_rs::ops::split(&qkv, 3, -1).map_err(mlx_err)?;
+        let (q, k, v) = (&parts[0], &parts[1], &parts[2]);
 
         // Reshape to [batch, seq, num_heads, head_dim] then transpose to [batch, num_heads, seq, head_dim]
-        let q = mlx_rs::ops::reshape(&q, &[batch, seq_len, self.num_heads, self.head_dim])
+        let q = mlx_rs::ops::reshape(q, &[batch, seq_len, self.num_heads, self.head_dim])
             .map_err(mlx_err)?;
         let mut q = mlx_rs::ops::transpose_axes(&q, &[0, 2, 1, 3]).map_err(mlx_err)?;
 
-        let k = mlx_rs::ops::reshape(&k, &[batch, seq_len, self.num_heads, self.head_dim])
+        let k = mlx_rs::ops::reshape(k, &[batch, seq_len, self.num_heads, self.head_dim])
             .map_err(mlx_err)?;
         let mut k = mlx_rs::ops::transpose_axes(&k, &[0, 2, 1, 3]).map_err(mlx_err)?;
 
-        let v = mlx_rs::ops::reshape(&v, &[batch, seq_len, self.num_heads, self.head_dim])
+        let v = mlx_rs::ops::reshape(v, &[batch, seq_len, self.num_heads, self.head_dim])
             .map_err(mlx_err)?;
         let v = mlx_rs::ops::transpose_axes(&v, &[0, 2, 1, 3]).map_err(mlx_err)?;
 
@@ -580,19 +582,34 @@ impl BertModel {
             let (attention, ffn) = match config.variant {
                 ModelVariant::ClassicBert => {
                     let prefix = format!("encoder.layer.{i}");
+
+                    // Load separate Q/K/V weights then fuse into single matrix
+                    let query_weight =
+                        take_weight(w, &format!("{prefix}.attention.self.query.weight"))?;
+                    let key_weight =
+                        take_weight(w, &format!("{prefix}.attention.self.key.weight"))?;
+                    let value_weight =
+                        take_weight(w, &format!("{prefix}.attention.self.value.weight"))?;
+                    let qkv_weight = mlx_rs::ops::concatenate_axis(
+                        &[&query_weight, &key_weight, &value_weight],
+                        0,
+                    )
+                    .map_err(mlx_err)?;
+
+                    // Fuse biases if present
+                    let query_bias = w.remove(&format!("{prefix}.attention.self.query.bias"));
+                    let key_bias = w.remove(&format!("{prefix}.attention.self.key.bias"));
+                    let value_bias = w.remove(&format!("{prefix}.attention.self.value.bias"));
+                    let qkv_bias = match (&query_bias, &key_bias, &value_bias) {
+                        (Some(qb), Some(kb), Some(vb)) => {
+                            Some(mlx_rs::ops::concatenate_axis(&[qb, kb, vb], 0).map_err(mlx_err)?)
+                        }
+                        _ => None,
+                    };
+
                     let attention = BertSelfAttention {
-                        query_weight: take_weight(
-                            w,
-                            &format!("{prefix}.attention.self.query.weight"),
-                        )?,
-                        query_bias: w.remove(&format!("{prefix}.attention.self.query.bias")),
-                        key_weight: take_weight(w, &format!("{prefix}.attention.self.key.weight"))?,
-                        key_bias: w.remove(&format!("{prefix}.attention.self.key.bias")),
-                        value_weight: take_weight(
-                            w,
-                            &format!("{prefix}.attention.self.value.weight"),
-                        )?,
-                        value_bias: w.remove(&format!("{prefix}.attention.self.value.bias")),
+                        qkv_weight,
+                        qkv_bias,
                         output_weight: take_weight(
                             w,
                             &format!("{prefix}.attention.output.dense.weight"),
@@ -631,19 +648,13 @@ impl BertModel {
                 }
                 ModelVariant::NomicBert => {
                     let prefix = format!("encoder.layers.{i}");
-                    // NomicBert uses fused QKV: Wqkv is [3*hidden, hidden]
-                    // Split into three [hidden, hidden] chunks along dim 0
-                    let wqkv = take_weight(w, &format!("{prefix}.attn.Wqkv.weight"))?;
+                    // NomicBert weights are already fused: Wqkv is [3*hidden, hidden]
+                    let qkv_weight = take_weight(w, &format!("{prefix}.attn.Wqkv.weight"))?;
                     let hidden = config.hidden_size;
-                    let qkv_chunks = wqkv.split(3, 0).map_err(mlx_err)?;
 
                     let attention = BertSelfAttention {
-                        query_weight: qkv_chunks[0].clone(),
-                        query_bias: None,
-                        key_weight: qkv_chunks[1].clone(),
-                        key_bias: None,
-                        value_weight: qkv_chunks[2].clone(),
-                        value_bias: None,
+                        qkv_weight,
+                        qkv_bias: None,
                         output_weight: take_weight(w, &format!("{prefix}.attn.out_proj.weight"))?,
                         output_bias: None,
                         // NomicBert uses post-norm (prenorm: false): norm1 is after attention
