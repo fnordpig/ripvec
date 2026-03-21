@@ -5,6 +5,8 @@
 //! discriminant. Use [`load_backend`] to construct a backend by kind.
 
 pub mod candle;
+#[cfg(feature = "cpu")]
+pub mod cpu;
 #[cfg(feature = "mlx")]
 pub mod mlx;
 #[cfg(feature = "ort")]

@@ -43,9 +43,10 @@ pub fn collect_files(root: &Path) -> Vec<PathBuf> {
                             | "poetry.lock"
                             | "Gemfile.lock"
                             | "go.sum"
-                    ) {
-                        return ignore::WalkState::Continue;
-                    }
+                    )
+                {
+                    return ignore::WalkState::Continue;
+                }
                 if let Ok(mut files) = files.lock() {
                     files.push(entry.into_path());
                 }

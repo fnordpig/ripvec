@@ -29,6 +29,9 @@ thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 ndarray = "0.17"
+blas-src = { version = "0.10", default-features = false, features = ["openblas"], optional = true }
+openblas-src = { version = "0.10", default-features = false, features = ["system"], optional = true }
+safetensors = "0.4"
 ort = { version = "2.0.0-rc.12", optional = true }
 mlx-rs = { version = "0.25", optional = true, features = ["safetensors"] }
 blake3 = "1.8.3"
@@ -41,6 +44,7 @@ default = []
 accelerate = ["candle-core/accelerate"]
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+cpu = ["ndarray/blas", "dep:blas-src", "dep:openblas-src"]
 ort = ["dep:ort"]
 mlx = ["dep:mlx-rs"]
 
