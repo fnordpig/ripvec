@@ -62,7 +62,7 @@ pub struct Args {
     pub backend: BackendArg,
 
     /// Batch size for embedding inference (chunks per model forward pass).
-    #[arg(short = 'b', long, default_value_t = 32)]
+    #[arg(short = 'b', long, default_value_t = 64)]
     pub batch_size: usize,
 
     /// Maximum tokens per chunk fed to the model (0 = unlimited).
