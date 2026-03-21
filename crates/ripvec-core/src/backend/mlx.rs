@@ -779,12 +779,55 @@ impl MlxBackend {
     }
 }
 
+/// Build padded `[batch, seq]` MLX tensors from pre-tokenized encodings.
+///
+/// This is pure CPU + memory work (no model needed) so it can run outside
+/// the model mutex.  Returns `(input_ids, attention_mask, token_type_ids)`.
+fn prepare_batch_tensors(encodings: &[Encoding]) -> (Array, Array, Array) {
+    let batch_size = encodings.len() as i32;
+    let max_len = encodings
+        .iter()
+        .map(|e| e.input_ids.len())
+        .max()
+        .unwrap_or(0) as i32;
+
+    let mut ids_flat = vec![0i32; (batch_size * max_len) as usize];
+    let mut mask_flat = vec![0.0_f32; (batch_size * max_len) as usize];
+    let mut types_flat = vec![0i32; (batch_size * max_len) as usize];
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "token IDs from tokenizer are always non-negative and fit in i32"
+    )]
+    for (i, enc) in encodings.iter().enumerate() {
+        let offset = i * max_len as usize;
+        for (j, (&id, (&mask, &typ))) in enc
+            .input_ids
+            .iter()
+            .zip(enc.attention_mask.iter().zip(enc.token_type_ids.iter()))
+            .enumerate()
+        {
+            ids_flat[offset + j] = id as i32;
+            mask_flat[offset + j] = mask as f32;
+            types_flat[offset + j] = typ as i32;
+        }
+    }
+
+    let input_ids = Array::from_slice(&ids_flat, &[batch_size, max_len]);
+    let attention_mask = Array::from_slice(&mask_flat, &[batch_size, max_len]);
+    let token_type_ids = Array::from_slice(&types_flat, &[batch_size, max_len]);
+
+    (input_ids, attention_mask, token_type_ids)
+}
+
 impl EmbedBackend for MlxBackend {
     /// Embed a batch of pre-tokenized inputs using CLS pooling and L2
     /// normalization.
     ///
-    /// Builds padded `[batch, seq]` tensors, runs the BERT forward pass on
-    /// Metal via MLX, CLS-pools the output, and L2-normalizes each vector.
+    /// Tensor preparation and post-processing (CLS pooling, L2 normalize,
+    /// eval, extraction) run outside the model lock. Only the forward pass
+    /// holds the mutex, minimising contention.
     ///
     /// # Errors
     ///
@@ -794,51 +837,20 @@ impl EmbedBackend for MlxBackend {
             return Ok(vec![]);
         }
 
-        let batch_size = encodings.len() as i32;
-        let max_len = encodings
-            .iter()
-            .map(|e| e.input_ids.len())
-            .max()
-            .unwrap_or(0) as i32;
+        // Phase 1: Tensor prep (no lock needed)
+        let (input_ids, attention_mask, token_type_ids) = prepare_batch_tensors(encodings);
 
-        // Build padded tensors [batch_size, max_len]
-        let mut ids_flat = vec![0i32; (batch_size * max_len) as usize];
-        let mut mask_flat = vec![0.0_f32; (batch_size * max_len) as usize];
-        let mut types_flat = vec![0i32; (batch_size * max_len) as usize];
+        // Phase 2: Forward pass (lock needed)
+        let hidden = {
+            let model = self
+                .model
+                .lock()
+                .map_err(|e| crate::Error::Other(anyhow::anyhow!("MLX mutex poisoned: {e}")))?;
+            model.forward(&input_ids, &token_type_ids, &attention_mask)?
+        }; // lock released here
 
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "token IDs from tokenizer are always non-negative and fit in i32"
-        )]
-        for (i, enc) in encodings.iter().enumerate() {
-            let offset = i * max_len as usize;
-            for (j, (&id, (&mask, &typ))) in enc
-                .input_ids
-                .iter()
-                .zip(enc.attention_mask.iter().zip(enc.token_type_ids.iter()))
-                .enumerate()
-            {
-                ids_flat[offset + j] = id as i32;
-                mask_flat[offset + j] = mask as f32;
-                types_flat[offset + j] = typ as i32;
-            }
-        }
-
-        let input_ids = Array::from_slice(&ids_flat, &[batch_size, max_len]);
-        let attention_mask = Array::from_slice(&mask_flat, &[batch_size, max_len]);
-        let token_type_ids = Array::from_slice(&types_flat, &[batch_size, max_len]);
-
-        // Forward pass through BERT (lock model for thread-safety since Array is not Sync)
-        let model = self
-            .model
-            .lock()
-            .map_err(|e| crate::Error::Other(anyhow::anyhow!("MLX mutex poisoned: {e}")))?;
-        let hidden = model.forward(&input_ids, &token_type_ids, &attention_mask)?;
-        drop(model);
-
+        // Phase 3: Post-process (no lock needed)
         // CLS pooling: take first token [batch, hidden]
-        // Slice hidden[:, 0:1, :] then squeeze
         let cls = hidden.try_index((.., 0, ..)).map_err(mlx_err)?;
 
         // L2 normalize each vector (clamp norm to avoid NaN on zero vectors)
@@ -859,7 +871,7 @@ impl EmbedBackend for MlxBackend {
         let flat: &[f32] = normalized.as_slice::<f32>();
         let hidden_dim = self.hidden_size as usize;
 
-        let mut results = Vec::with_capacity(batch_size as usize);
+        let mut results = Vec::with_capacity(encodings.len());
         for i in 0..shape[0] as usize {
             let start = i * hidden_dim;
             results.push(flat[start..start + hidden_dim].to_vec());
