@@ -11,7 +11,7 @@ name = "ripvec-mcp"
 path = "src/main.rs"
 
 [dependencies]
-ripvec-core = { path = "../ripvec-core", features = ["mlx"] }
+ripvec-core = { path = "../ripvec-core" }
 rmcp.workspace = true
 tokio.workspace = true
 serde.workspace = true
@@ -22,6 +22,16 @@ tokenizers.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 notify = "8.2.0"
+
+[features]
+default = []
+cuda = ["ripvec-core/cuda"]
+mlx = ["ripvec-core/mlx"]
+accelerate = ["ripvec-core/accelerate"]
+
+# Auto-enable Apple BLAS + MLX on macOS
+[target.'cfg(target_os = "macos")'.dependencies]
+ripvec-core = { path = "../ripvec-core", features = ["accelerate", "mlx"] }
 
 [lints]
 workspace = true

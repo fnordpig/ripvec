@@ -31,6 +31,15 @@ notify = "8.2.0"
 default = []
 metal = ["ripvec-core/metal"]
 cuda = ["ripvec-core/cuda"]
+mlx = ["ripvec-core/mlx"]
+accelerate = ["ripvec-core/accelerate"]
+
+# Auto-enable Apple BLAS + MLX on macOS
+[target.'cfg(target_os = "macos")'.dependencies]
+ripvec-core = { path = "../ripvec-core", features = ["accelerate", "mlx"] }
+
+# Linux: CPU by default, --features cuda to enable GPU
+# (CUDA auto-detection would require probing for nvcc at build time)
 
 [dev-dependencies]
 assert_cmd.workspace = true
