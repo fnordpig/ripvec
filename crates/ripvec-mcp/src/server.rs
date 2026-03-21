@@ -108,27 +108,38 @@ pub async fn run_background_index(server: &RipvecServer) {
     let index_lock = Arc::clone(&server.index);
 
     let result = tokio::task::spawn_blocking(move || {
-        let backends = ripvec_core::backend::detect_backends("BAAI/bge-small-en-v1.5")?;
-        let tokenizer = ripvec_core::tokenize::load_tokenizer("BAAI/bge-small-en-v1.5")?;
+        let model_repo = "BAAI/bge-small-en-v1.5";
+        let backends = ripvec_core::backend::detect_backends(model_repo)?;
+        let tokenizer = ripvec_core::tokenize::load_tokenizer(model_repo)?;
         let cfg = ripvec_core::embed::SearchConfig::default();
         let profiler = ripvec_core::profile::Profiler::noop();
 
         let backend_refs: Vec<&dyn ripvec_core::backend::EmbedBackend> =
             backends.iter().map(AsRef::as_ref).collect();
-        let (chunks, embeddings) =
-            ripvec_core::embed::embed_all(&root, &backend_refs, &tokenizer, &cfg, &profiler)?;
 
-        let search_index = ripvec_core::index::SearchIndex::new(chunks, &embeddings);
-        Ok::<_, ripvec_core::Error>(search_index)
+        // Use persistent cache for instant restarts
+        let (index, stats) = ripvec_core::cache::reindex::incremental_index(
+            &root,
+            &backend_refs,
+            &tokenizer,
+            &cfg,
+            &profiler,
+            model_repo,
+            None,
+        )?;
+
+        Ok::<_, ripvec_core::Error>((index, stats))
     })
     .await;
 
     match result {
-        Ok(Ok(new_index)) => {
+        Ok(Ok((new_index, stats))) => {
             eprintln!(
-                "[ripvec-mcp] indexed {} chunks from {}",
-                new_index.chunks.len(),
-                server.project_root.display()
+                "[ripvec-mcp] indexed {} chunks ({} cached, {} re-embedded, {}ms)",
+                stats.chunks_total,
+                stats.files_unchanged,
+                stats.chunks_reembedded,
+                stats.duration_ms,
             );
             let mut idx = index_lock.write().await;
             *idx = Some(new_index);
@@ -144,6 +155,59 @@ pub async fn run_background_index(server: &RipvecServer) {
     }
 
     // Guard drop resets indexing flag automatically
+}
+
+/// Watch the project directory for file changes and re-index after a 2-second quiet period.
+///
+/// Uses the `notify` crate for OS-level file watching (`FSEvents` on macOS,
+/// inotify on Linux). After detecting changes, waits 2 seconds for quiet
+/// then runs `run_background_index` to incrementally update the index.
+pub async fn run_file_watcher(server: &RipvecServer) {
+    use notify::{RecursiveMode, Watcher};
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(100);
+
+    let _watcher = match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if let Ok(event) = res {
+            use notify::EventKind;
+            if matches!(
+                event.kind,
+                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+            ) {
+                let _ = tx.blocking_send(());
+            }
+        }
+    }) {
+        Ok(mut w) => {
+            if let Err(e) = w.watch(&server.project_root, RecursiveMode::Recursive) {
+                eprintln!(
+                    "[ripvec-mcp] file watcher failed to watch {}: {e}",
+                    server.project_root.display()
+                );
+                return;
+            }
+            eprintln!(
+                "[ripvec-mcp] file watcher active on {}",
+                server.project_root.display()
+            );
+            w
+        }
+        Err(e) => {
+            eprintln!("[ripvec-mcp] file watcher failed to start: {e}");
+            return;
+        }
+    };
+
+    while rx.recv().await.is_some() {
+        // Debounce: wait 2 seconds for quiet period
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        // Drain any events that arrived during the debounce window
+        while rx.try_recv().is_ok() {}
+
+        eprintln!("[ripvec-mcp] changes detected, re-indexing...");
+        run_background_index(server).await;
+    }
 }
 
 #[cfg(test)]

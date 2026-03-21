@@ -39,6 +39,12 @@ async fn main() -> anyhow::Result<()> {
         server::run_background_index(&bg_server).await;
     });
 
+    // Spawn debounced file watcher (re-indexes on changes after 2s quiet)
+    let watcher_server = server.clone();
+    tokio::spawn(async move {
+        server::run_file_watcher(&watcher_server).await;
+    });
+
     let service = server
         .serve(rmcp::transport::stdio())
         .await
