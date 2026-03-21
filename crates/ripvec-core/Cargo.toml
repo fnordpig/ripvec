@@ -29,8 +29,8 @@ thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 ndarray = "0.17"
-blas-src = { version = "0.10", default-features = false, features = ["openblas"], optional = true }
-openblas-src = { version = "0.10", default-features = false, features = ["system"], optional = true }
+blas-src = { version = "0.14", optional = true, features = ["openblas"] }
+openblas-src = { version = "0.10", optional = true, features = ["system"] }
 safetensors = "0.4"
 ort = { version = "2.0.0-rc.12", optional = true }
 mlx-rs = { version = "0.25", optional = true, features = ["safetensors"] }
@@ -46,6 +46,7 @@ accelerate = ["candle-core/accelerate"]
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 cuda = ["dep:cudarc"]
 cpu = ["ndarray/blas", "dep:blas-src", "dep:openblas-src"]
+cpu-mkl = ["ndarray/blas", "dep:blas-src", "blas-src/intel-mkl-dynamic-sequential"]
 ort = ["dep:ort"]
 mlx = ["dep:mlx-rs"]
 
