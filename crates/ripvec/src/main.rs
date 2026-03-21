@@ -148,11 +148,9 @@ fn load_pipeline(
                 .context("failed to detect available backends")?,
             ref specific => {
                 let kind = match specific {
-                    cli::BackendArg::Candle => ripvec_core::backend::BackendKind::Candle,
-                    cli::BackendArg::Mlx => ripvec_core::backend::BackendKind::Mlx,
-                    cli::BackendArg::Ort => ripvec_core::backend::BackendKind::Ort,
                     cli::BackendArg::Cpu => ripvec_core::backend::BackendKind::Cpu,
                     cli::BackendArg::Cuda => ripvec_core::backend::BackendKind::Cuda,
+                    cli::BackendArg::Mlx => ripvec_core::backend::BackendKind::Mlx,
                     cli::BackendArg::Auto => unreachable!(),
                 };
                 let device_hint = match args.device {

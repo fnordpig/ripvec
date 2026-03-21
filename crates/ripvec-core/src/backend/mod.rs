@@ -1,19 +1,16 @@
 //! Embedding backend abstraction layer.
 //!
-//! Defines the [`EmbedBackend`] trait that all embedding backends (Candle, MLX,
-//! ORT) implement, plus the [`Encoding`] input type and [`BackendKind`]
+//! Defines the [`EmbedBackend`] trait that all embedding backends (CPU, CUDA,
+//! MLX) implement, plus the [`Encoding`] input type and [`BackendKind`]
 //! discriminant. Use [`load_backend`] to construct a backend by kind.
 
 pub mod blas_info;
-pub mod candle;
 #[cfg(feature = "cpu")]
 pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 #[cfg(feature = "mlx")]
 pub mod mlx;
-#[cfg(feature = "ort")]
-pub mod ort;
 
 /// Pre-tokenized encoding ready for inference.
 ///
@@ -85,26 +82,20 @@ pub trait EmbedBackend: Send + Sync {
 /// Available embedding backend implementations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BackendKind {
-    /// Candle (pure-Rust, CPU + Metal + CUDA).
-    #[default]
-    Candle,
     /// CUDA (cudarc, NVIDIA GPUs via cuBLAS + custom kernels).
     Cuda,
     /// MLX (Apple Silicon, macOS only).
     Mlx,
-    /// ONNX Runtime (cross-platform, CPU + GPU).
-    Ort,
     /// CPU (ndarray + system BLAS).
+    #[default]
     Cpu,
 }
 
 impl std::fmt::Display for BackendKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Candle => write!(f, "candle"),
             Self::Cuda => write!(f, "cuda"),
             Self::Mlx => write!(f, "mlx"),
-            Self::Ort => write!(f, "ort"),
             Self::Cpu => write!(f, "cpu"),
         }
     }
@@ -136,17 +127,13 @@ pub enum DeviceHint {
 /// feature flag) or if model loading fails.
 pub fn load_backend(
     kind: BackendKind,
-    model_repo: &str,
-    device_hint: DeviceHint,
+    _model_repo: &str,
+    _device_hint: DeviceHint,
 ) -> crate::Result<Box<dyn EmbedBackend>> {
     match kind {
-        BackendKind::Candle => {
-            let backend = candle::CandleBackend::load(model_repo, &device_hint)?;
-            Ok(Box::new(backend))
-        }
         #[cfg(feature = "cuda")]
         BackendKind::Cuda => {
-            let backend = cuda::CudaBackend::load(model_repo, &device_hint)?;
+            let backend = cuda::CudaBackend::load(_model_repo, &_device_hint)?;
             Ok(Box::new(backend))
         }
         #[cfg(not(feature = "cuda"))]
@@ -155,25 +142,16 @@ pub fn load_backend(
         ))),
         #[cfg(feature = "mlx")]
         BackendKind::Mlx => {
-            let backend = mlx::MlxBackend::load(model_repo, &device_hint)?;
+            let backend = mlx::MlxBackend::load(_model_repo, &_device_hint)?;
             Ok(Box::new(backend))
         }
         #[cfg(not(feature = "mlx"))]
         BackendKind::Mlx => Err(crate::Error::Other(anyhow::anyhow!(
             "mlx backend requires building with: cargo build --features mlx"
         ))),
-        #[cfg(feature = "ort")]
-        BackendKind::Ort => {
-            let backend = ort::OrtBackend::load(model_repo, &device_hint)?;
-            Ok(Box::new(backend))
-        }
-        #[cfg(not(feature = "ort"))]
-        BackendKind::Ort => Err(crate::Error::Other(anyhow::anyhow!(
-            "ort backend requires building with: cargo build --features ort"
-        ))),
         #[cfg(feature = "cpu")]
         BackendKind::Cpu => {
-            let backend = cpu::CpuBackend::load(model_repo, &device_hint)?;
+            let backend = cpu::CpuBackend::load(_model_repo, &_device_hint)?;
             Ok(Box::new(backend))
         }
         #[cfg(not(feature = "cpu"))]
@@ -185,25 +163,29 @@ pub fn load_backend(
 
 /// Detect all available backends and load them.
 ///
-/// Probes for GPU backends (MLX, CUDA) first, then always adds CPU
-/// as the baseline. Returns backends in priority order — the first
-/// entry is the primary (used for query embedding in interactive mode).
+/// Probes for GPU backends (CUDA, MLX) first, then falls back to CPU.
+/// Returns backends in priority order — the first entry is the primary
+/// (used for query embedding in interactive mode).
 ///
 /// # Errors
 ///
 /// Returns an error if no backends can be loaded (not even CPU).
-pub fn detect_backends(model_repo: &str) -> crate::Result<Vec<Box<dyn EmbedBackend>>> {
+pub fn detect_backends(_model_repo: &str) -> crate::Result<Vec<Box<dyn EmbedBackend>>> {
+    #[cfg_attr(
+        not(any(feature = "cuda", feature = "mlx", feature = "cpu")),
+        expect(unused_mut, reason = "mut needed when backend features are enabled")
+    )]
     let mut backends: Vec<Box<dyn EmbedBackend>> = Vec::new();
-
-    // Try MLX (Apple Silicon GPU)
-    #[cfg(feature = "mlx")]
-    if let Ok(b) = mlx::MlxBackend::load(model_repo, &DeviceHint::Auto) {
-        backends.push(Box::new(b));
-    }
 
     // Try CUDA (NVIDIA GPU)
     #[cfg(feature = "cuda")]
-    if let Ok(b) = cuda::CudaBackend::load(model_repo, &DeviceHint::Gpu) {
+    if let Ok(b) = cuda::CudaBackend::load(_model_repo, &DeviceHint::Gpu) {
+        backends.push(Box::new(b));
+    }
+
+    // Try MLX (Apple Silicon GPU)
+    #[cfg(feature = "mlx")]
+    if let Ok(b) = mlx::MlxBackend::load(_model_repo, &DeviceHint::Auto) {
         backends.push(Box::new(b));
     }
 
@@ -211,13 +193,12 @@ pub fn detect_backends(model_repo: &str) -> crate::Result<Vec<Box<dyn EmbedBacke
     // On Apple Silicon, running CPU + MLX concurrently is slower than
     // MLX alone because they share the same physical cores and memory.
     // On discrete GPU systems (CUDA), CPU would be a useful helper.
-    // Add CPU as fallback only when no GPU backend was loaded.
-    // On Apple Silicon, even 1 CPU thread causes 3.87% __ulock_wait
-    // contention with Metal due to shared memory bus. Profiled via
-    // tracemeld: hybrid 115/s vs MLX-only 166/s.
-    let has_gpu = backends.iter().any(|b| b.is_gpu());
-    if !has_gpu && let Ok(b) = candle::CandleBackend::load(model_repo, &DeviceHint::Cpu) {
-        backends.push(Box::new(b));
+    let _has_gpu = backends.iter().any(|b| b.is_gpu());
+    #[cfg(feature = "cpu")]
+    if !_has_gpu {
+        if let Ok(b) = cpu::CpuBackend::load(_model_repo, &DeviceHint::Cpu) {
+            backends.push(Box::new(b));
+        }
     }
 
     if backends.is_empty() {
@@ -285,15 +266,15 @@ mod tests {
     }
 
     #[test]
-    fn backend_kind_default_is_candle() {
-        assert_eq!(BackendKind::default(), BackendKind::Candle);
+    fn backend_kind_default_is_cpu() {
+        assert_eq!(BackendKind::default(), BackendKind::Cpu);
     }
 
     #[test]
     fn backend_kind_display() {
-        assert_eq!(BackendKind::Candle.to_string(), "candle");
+        assert_eq!(BackendKind::Cuda.to_string(), "cuda");
         assert_eq!(BackendKind::Mlx.to_string(), "mlx");
-        assert_eq!(BackendKind::Ort.to_string(), "ort");
+        assert_eq!(BackendKind::Cpu.to_string(), "cpu");
     }
 
     #[cfg(not(feature = "mlx"))]
@@ -303,19 +284,14 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn load_backend_ort_not_implemented() {
-        let result = load_backend(BackendKind::Ort, "test/model", DeviceHint::Cpu);
-        assert!(result.is_err());
-    }
-
+    #[cfg(feature = "cpu")]
     #[test]
     fn detect_backends_returns_at_least_one() {
         let backends = detect_backends("BAAI/bge-small-en-v1.5").unwrap();
         assert!(!backends.is_empty());
     }
 
-    #[cfg(not(feature = "mlx"))]
+    #[cfg(all(feature = "cpu", not(feature = "mlx")))]
     #[test]
     fn detect_backends_cpu_always_last() {
         let backends = detect_backends("BAAI/bge-small-en-v1.5").unwrap();

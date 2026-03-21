@@ -1,7 +1,7 @@
 //! Core library for ripvec semantic code search.
 //!
 //! Provides pluggable embedding backends ([`backend::EmbedBackend`] trait with
-//! Candle, MLX, and ORT implementations), tree-sitter code chunking, parallel
+//! CPU, CUDA, and MLX implementations), tree-sitter code chunking, parallel
 //! embedding, and cosine similarity ranking.
 
 pub mod backend;

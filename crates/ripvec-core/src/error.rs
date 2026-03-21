@@ -9,14 +9,6 @@ pub enum Error {
     #[error("model download failed: {0}")]
     Download(String),
 
-    /// Candle model inference failed.
-    #[error("candle inference failed")]
-    Candle(#[from] candle_core::Error),
-
-    /// ONNX Runtime inference failed.
-    #[error("ORT inference failed: {0}")]
-    Ort(String),
-
     /// CUDA backend error.
     #[error("CUDA error: {0}")]
     Cuda(String),

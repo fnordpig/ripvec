@@ -586,7 +586,7 @@ mod tests {
     #[ignore = "loads model + embeds full source tree; run with `cargo test -- --ignored`"]
     fn search_with_backend_trait() {
         let backend = crate::backend::load_backend(
-            crate::backend::BackendKind::Candle,
+            crate::backend::BackendKind::Cpu,
             "BAAI/bge-small-en-v1.5",
             crate::backend::DeviceHint::Cpu,
         )
@@ -611,7 +611,7 @@ mod tests {
     #[test]
     fn embed_distributed_produces_correct_count() {
         let backend = crate::backend::load_backend(
-            crate::backend::BackendKind::Candle,
+            crate::backend::BackendKind::Cpu,
             "BAAI/bge-small-en-v1.5",
             crate::backend::DeviceHint::Cpu,
         )

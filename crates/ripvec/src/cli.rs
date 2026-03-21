@@ -150,14 +150,10 @@ pub enum BackendArg {
     /// Auto-detect all available backends (default).
     #[default]
     Auto,
-    /// Candle (pure-Rust, CPU + Metal + CUDA).
-    Candle,
-    /// MLX (Apple Silicon, macOS only).
-    Mlx,
-    /// ONNX Runtime (cross-platform, CPU + GPU).
-    Ort,
     /// CPU (ndarray + system BLAS).
     Cpu,
     /// CUDA (cudarc, NVIDIA GPU via cuBLAS).
     Cuda,
+    /// MLX (Apple Silicon, macOS only).
+    Mlx,
 }

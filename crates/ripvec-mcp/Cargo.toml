@@ -27,11 +27,10 @@ notify = "8.2.0"
 default = []
 cuda = ["ripvec-core/cuda"]
 mlx = ["ripvec-core/mlx"]
-accelerate = ["ripvec-core/accelerate"]
 
-# Auto-enable Apple BLAS + MLX on macOS
+# Auto-enable MLX on macOS
 [target.'cfg(target_os = "macos")'.dependencies]
-ripvec-core = { path = "../ripvec-core", features = ["accelerate", "mlx"] }
+ripvec-core = { path = "../ripvec-core", features = ["mlx"] }
 
 [lints]
 workspace = true
