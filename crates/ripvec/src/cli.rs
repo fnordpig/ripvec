@@ -156,4 +156,6 @@ pub enum BackendArg {
     Mlx,
     /// ONNX Runtime (cross-platform, CPU + GPU).
     Ort,
+    /// CPU (ndarray + system BLAS).
+    Cpu,
 }

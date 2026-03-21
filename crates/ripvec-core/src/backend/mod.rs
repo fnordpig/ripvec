@@ -89,6 +89,8 @@ pub enum BackendKind {
     Mlx,
     /// ONNX Runtime (cross-platform, CPU + GPU).
     Ort,
+    /// CPU (ndarray + system BLAS).
+    Cpu,
 }
 
 impl std::fmt::Display for BackendKind {
@@ -97,6 +99,7 @@ impl std::fmt::Display for BackendKind {
             Self::Candle => write!(f, "candle"),
             Self::Mlx => write!(f, "mlx"),
             Self::Ort => write!(f, "ort"),
+            Self::Cpu => write!(f, "cpu"),
         }
     }
 }
@@ -152,6 +155,15 @@ pub fn load_backend(
         #[cfg(not(feature = "ort"))]
         BackendKind::Ort => Err(crate::Error::Other(anyhow::anyhow!(
             "ort backend requires building with: cargo build --features ort"
+        ))),
+        #[cfg(feature = "cpu")]
+        BackendKind::Cpu => {
+            let backend = cpu::CpuBackend::load(model_repo, &device_hint)?;
+            Ok(Box::new(backend))
+        }
+        #[cfg(not(feature = "cpu"))]
+        BackendKind::Cpu => Err(crate::Error::Other(anyhow::anyhow!(
+            "cpu backend requires building with: cargo build --features cpu"
         ))),
     }
 }

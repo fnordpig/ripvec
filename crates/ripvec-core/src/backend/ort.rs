@@ -97,8 +97,9 @@ impl OrtBackend {
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
+                    let cuda_ep = ort::ep::CUDA::default().build();
                     builder = builder
-                        .with_execution_providers([ort::ep::CUDA::default().build()])
+                        .with_execution_providers([cuda_ep])
                         .map_err(ort_err)?;
                 }
             }
