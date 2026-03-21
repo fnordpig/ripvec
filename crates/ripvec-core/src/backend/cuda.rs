@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use cudarc::cublas::{sys, CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
+use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig, sys};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
@@ -19,6 +19,12 @@ use hf_hub::api::sync::Api;
 use safetensors::SafeTensors;
 
 use super::{DeviceHint, EmbedBackend, Encoding};
+
+/// Maximum batch size for pre-allocated workspace buffers.
+///
+/// Workspace is allocated once for `MAX_BATCH * max_seq_len`. Batches larger
+/// than this are split into sub-batches automatically.
+const MAX_BATCH: i32 = 128;
 
 // ---------------------------------------------------------------------------
 // Error helper
@@ -369,22 +375,28 @@ extern "C" __global__ void add_embeddings_kernel(
 }
 
 // Build attention mask: 0.0 for real tokens (mask=1), -1e9 for padding (mask=0)
+// Batched: mask is [batch * seq], output is [batch * seq]
 extern "C" __global__ void build_attn_mask_kernel(
-    float* output, const int* mask, int seq_len
+    float* output, const int* mask, int total
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < seq_len) {
+    if (i < total) {
         output[i] = (mask[i] == 1) ? 0.0f : -1e9f;
     }
 }
 
-// Add attention mask to scores: scores[row, col] += mask[col]
+// Add attention mask to scores: scores[b*nh*seq*seq] += mask[b*seq]
+// Each batch element's heads share the same mask row.
 extern "C" __global__ void add_attn_mask_kernel(
-    float* scores, const float* mask, int rows, int cols
+    float* scores, const float* mask,
+    int batch, int num_heads, int seq
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < rows * cols) {
-        scores[idx] += mask[idx % cols];
+    int total = batch * num_heads * seq * seq;
+    if (idx < total) {
+        int b = idx / (num_heads * seq * seq);
+        int col = idx % seq;
+        scores[idx] += mask[b * seq + col];
     }
 }
 
@@ -394,23 +406,32 @@ extern "C" __global__ void scale_kernel(float* x, float scale, int n) {
     if (i < n) x[i] *= scale;
 }
 
-// CLS pooling: copy first row to output
+// CLS pooling: extract row 0 of each batch element from [batch, seq, hidden]
+// output is [batch, hidden]
 extern "C" __global__ void cls_pool_kernel(
-    float* output, const float* hidden, int hidden_dim
+    float* output, const float* hidden,
+    int batch, int seq, int hidden_dim
 ) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < hidden_dim) {
-        output[i] = hidden[i];
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * hidden_dim;
+    if (idx < total) {
+        int b = idx / hidden_dim;
+        int d = idx % hidden_dim;
+        output[idx] = hidden[b * seq * hidden_dim + d];
     }
 }
 
-// L2 normalize a single vector
-extern "C" __global__ void l2_normalize_kernel(float* x, int cols) {
+// L2 normalize each row of a [rows, cols] matrix in-place
+extern "C" __global__ void l2_normalize_kernel(float* x, int rows, int cols) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
     extern __shared__ float sdata[];
 
     float local_sq = 0.0f;
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
-        local_sq += x[i] * x[i];
+        float v = x[row * cols + i];
+        local_sq += v * v;
     }
     sdata[threadIdx.x] = local_sq;
     __syncthreads();
@@ -425,7 +446,7 @@ extern "C" __global__ void l2_normalize_kernel(float* x, int cols) {
     __syncthreads();
 
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
-        x[i] *= inv_norm;
+        x[row * cols + i] *= inv_norm;
     }
 }
 
@@ -456,46 +477,49 @@ extern "C" __global__ void rope_kernel(
     mat[second_idx] = first * sin_a + second * cos_a;
 }
 
-// Split QKV [seq, 3*hidden] into Q,K,V each [num_heads, seq, head_dim] on GPU.
-// Eliminates GPU→CPU→GPU round trip for reshape.
+// Split QKV [batch*seq, 3*hidden] into Q,K,V each [batch*num_heads, seq, head_dim] on GPU.
 extern "C" __global__ void qkv_split_kernel(
     float* q, float* k, float* v,
     const float* qkv,
-    int seq, int hidden, int num_heads, int head_dim
+    int batch, int seq, int hidden, int num_heads, int head_dim
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = num_heads * seq * head_dim;
+    int total = batch * num_heads * seq * head_dim;
     if (idx >= total) return;
 
-    int h = idx / (seq * head_dim);
-    int rem = idx % (seq * head_dim);
-    int t = rem / head_dim;
-    int d = rem % head_dim;
+    int per_batch = num_heads * seq * head_dim;
+    int b = idx / per_batch;
+    int rem0 = idx % per_batch;
+    int h = rem0 / (seq * head_dim);
+    int rem1 = rem0 % (seq * head_dim);
+    int t = rem1 / head_dim;
+    int d = rem1 % head_dim;
 
-    int qkv_idx = t * (3 * hidden) + h * head_dim + d;
+    int qkv_idx = b * seq * (3 * hidden) + t * (3 * hidden) + h * head_dim + d;
     q[idx] = qkv[qkv_idx];
     k[idx] = qkv[qkv_idx + hidden];
     v[idx] = qkv[qkv_idx + 2 * hidden];
 }
 
-// Reshape attention output from [num_heads, seq, head_dim] back to [seq, hidden].
-// Eliminates GPU→CPU→GPU round trip after attention.
+// Reshape attention output from [batch*num_heads, seq, head_dim] back to [batch*seq, hidden].
 extern "C" __global__ void attn_reshape_kernel(
     float* output,
     const float* heads,
-    int seq, int num_heads, int head_dim
+    int batch, int seq, int num_heads, int head_dim
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int hidden = num_heads * head_dim;
-    int total = seq * hidden;
+    int total = batch * seq * hidden;
     if (idx >= total) return;
 
-    int t = idx / hidden;
-    int flat_hd = idx % hidden;
+    int b = idx / (seq * hidden);
+    int rem = idx % (seq * hidden);
+    int t = rem / hidden;
+    int flat_hd = rem % hidden;
     int h = flat_hd / head_dim;
     int d = flat_hd % head_dim;
 
-    int heads_idx = h * (seq * head_dim) + t * head_dim + d;
+    int heads_idx = (b * num_heads + h) * (seq * head_dim) + t * head_dim + d;
     output[idx] = heads[heads_idx];
 }
 "#;
@@ -530,15 +554,15 @@ struct KernelHandles {
     add_attn_mask: CudaFunction,
     /// Scale all elements by a constant.
     scale: CudaFunction,
-    /// CLS pooling (copy first row).
+    /// CLS pooling (extract row 0 per batch element).
     cls_pool: CudaFunction,
-    /// L2 normalize a vector.
+    /// L2 normalize each row.
     l2_normalize: CudaFunction,
     /// Rotary position embedding.
     rope: CudaFunction,
-    /// Split QKV [seq, 3*hidden] into Q,K,V [num_heads, seq, head_dim] on GPU.
+    /// Split QKV `[batch*seq, 3*hidden]` into Q,K,V `[batch*num_heads, seq, head_dim]` on GPU.
     qkv_split: CudaFunction,
-    /// Reshape attention output [num_heads, seq, head_dim] to [seq, hidden].
+    /// Reshape attention output `[batch*num_heads, seq, head_dim]` to `[batch*seq, hidden]`.
     attn_reshape: CudaFunction,
 }
 
@@ -611,10 +635,6 @@ struct CudaBertSelfAttention {
     output_ln_weight: CudaSlice<f32>,
     /// Post-attention `LayerNorm` bias `[hidden]`.
     output_ln_bias: CudaSlice<f32>,
-    /// Number of attention heads.
-    num_heads: i32,
-    /// Dimension per head (`hidden / num_heads`).
-    head_dim: i32,
     /// Layer norm epsilon.
     layer_norm_eps: f32,
     /// Rotary embedding base (`NomicBert` only).
@@ -640,8 +660,6 @@ struct CudaBertFfn {
     output_ln_bias: CudaSlice<f32>,
     /// Layer norm epsilon.
     layer_norm_eps: f32,
-    /// Model variant (determines GELU vs `SwiGLU` activation).
-    variant: ModelVariant,
     /// Intermediate dimension (for `ClassicBert`) or half-dim (for `NomicBert` `SwiGLU`).
     intermediate_dim: i32,
 }
@@ -652,6 +670,41 @@ struct CudaBertLayer {
     attention: CudaBertSelfAttention,
     /// Feed-forward sub-layer.
     ffn: CudaBertFfn,
+}
+
+/// Pre-allocated GPU workspace buffers to eliminate per-forward `cudaMalloc` calls.
+///
+/// Sized for `MAX_BATCH * max_seq_len` at model load time. Reused across
+/// all forward passes -- contents are overwritten, never freed until model drop.
+struct CudaWorkspace {
+    /// Fused QKV output `[batch*seq, 3*hidden]`.
+    qkv: CudaSlice<f32>,
+    /// Q heads `[batch*num_heads, seq, head_dim]`.
+    q: CudaSlice<f32>,
+    /// K heads `[batch*num_heads, seq, head_dim]`.
+    k: CudaSlice<f32>,
+    /// V heads `[batch*num_heads, seq, head_dim]`.
+    v: CudaSlice<f32>,
+    /// Attention scores `[batch*num_heads, seq, seq]`.
+    scores: CudaSlice<f32>,
+    /// Attention output `[batch*num_heads, seq, head_dim]`.
+    attn_out: CudaSlice<f32>,
+    /// Context after reshape `[batch*seq, hidden]`.
+    context: CudaSlice<f32>,
+    /// FFN intermediate `[batch*seq, max(intermediate, 2*intermediate)]`.
+    ffn_inter: CudaSlice<f32>,
+    /// Ping-pong hidden state A `[batch*seq, hidden]`.
+    hidden_a: CudaSlice<f32>,
+    /// Ping-pong hidden state B `[batch*seq, hidden]`.
+    hidden_b: CudaSlice<f32>,
+    /// Projected output after attention `[batch*seq, hidden]`.
+    projected: CudaSlice<f32>,
+    /// `SwiGLU` activated output `[batch*seq, intermediate]`.
+    activated: CudaSlice<f32>,
+    /// Scratch buffer `[batch*seq, hidden]`.
+    scratch: CudaSlice<f32>,
+    /// CLS pooled + L2 normalized output `[batch, hidden]`.
+    cls: CudaSlice<f32>,
 }
 
 /// Complete BERT model with all weights on GPU.
@@ -668,6 +721,14 @@ struct CudaBertModel {
     layers: Vec<CudaBertLayer>,
     /// Hidden dimension.
     hidden_size: i32,
+    /// Number of attention heads.
+    num_heads: i32,
+    /// Dimension per head.
+    head_dim: i32,
+    /// Model variant.
+    variant: ModelVariant,
+    /// Pre-allocated workspace buffers.
+    workspace: CudaWorkspace,
 }
 
 // ---------------------------------------------------------------------------
@@ -678,32 +739,17 @@ struct CudaBertModel {
 ///
 /// Input `a` is `[m, k]` row-major, `weight` is `[n, k]` row-major (stored
 /// as-is from safetensors). This computes `C = A * W^T` producing `[m, n]`.
-///
-/// cuBLAS uses column-major ordering. For row-major data:
-/// `C_rm = A_rm @ B_rm^T` is equivalent to `C_cm^T = B_cm @ A_cm^T`.
-/// So we call sgemm with `(B, A)` in cuBLAS terms with `CUBLAS_OP_T` on A.
-#[expect(
-    unsafe_code,
-    clippy::cast_sign_loss,
-    reason = "cuBLAS GEMM requires unsafe; dimensions are small positive ints"
-)]
+/// Output written to pre-allocated `output` buffer.
+#[expect(unsafe_code, reason = "cuBLAS GEMM requires unsafe")]
 fn gpu_linear(
     blas: &CudaBlas,
-    stream: &Arc<CudaStream>,
     input: &CudaSlice<f32>,
     weight: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
     m: i32,
     n: i32,
     k: i32,
-) -> crate::Result<CudaSlice<f32>> {
-    let mut output = stream
-        .alloc_zeros::<f32>((m * n) as usize)
-        .map_err(cuda_err)?;
-
-    // cuBLAS column-major: C(n,m) = B(n,k) @ A(k,m)
-    // where B = weight [n,k] and A = input [m,k]^T
-    // transa = CUBLAS_OP_T (transpose A from [m,k] to [k,m])
-    // transb = CUBLAS_OP_N (B is already [n,k] which in col-major is fine)
+) -> crate::Result<()> {
     let cfg = GemmConfig {
         transa: sys::cublasOperation_t::CUBLAS_OP_T,
         transb: sys::cublasOperation_t::CUBLAS_OP_N,
@@ -718,57 +764,27 @@ fn gpu_linear(
     };
 
     unsafe {
-        blas.gemm(cfg, weight, input, &mut output)
-            .map_err(cuda_err)?;
+        blas.gemm(cfg, weight, input, output).map_err(cuda_err)?;
     }
 
-    Ok(output)
+    Ok(())
 }
 
-/// Batched GEMM for multi-head attention: C = A @ B^T with per-head strides.
+/// Batched GEMM for multi-head attention: C = Q @ K^T with per-head strides.
 ///
-/// `q` has shape `[num_heads, seq, head_dim]` (contiguous, stride = `seq*head_dim`).
-/// `k` has shape `[num_heads, seq, head_dim]` (same layout).
-/// Output has shape `[num_heads, seq, seq]` (stride = `seq*seq`).
-#[expect(
-    unsafe_code,
-    clippy::cast_sign_loss,
-    reason = "cuBLAS batched GEMM requires unsafe; dimensions are small positive ints"
-)]
+/// `q` has shape `[batch_heads, seq, head_dim]`.
+/// `k` has shape `[batch_heads, seq, head_dim]`.
+/// `scores` (output) has shape `[batch_heads, seq, seq]`.
+#[expect(unsafe_code, reason = "cuBLAS batched GEMM requires unsafe")]
 fn gpu_batched_attn_scores(
     blas: &CudaBlas,
-    stream: &Arc<CudaStream>,
     q: &CudaSlice<f32>,
     k: &CudaSlice<f32>,
-    num_heads: i32,
+    scores: &mut CudaSlice<f32>,
+    batch_heads: i32,
     seq: i32,
     head_dim: i32,
-) -> crate::Result<CudaSlice<f32>> {
-    let mut scores = stream
-        .alloc_zeros::<f32>((num_heads * seq * seq) as usize)
-        .map_err(cuda_err)?;
-
-    // Row-major C[seq,seq] = Q[seq,hd] @ K[seq,hd]^T
-    // cuBLAS is col-major. For row-major A[m,k] @ B[n,k]^T = C[m,n]:
-    //   call sgemm with: transa=T, transb=N, m=seq, n=seq, k=hd,
-    //   A_cublas=K (col-major view: [hd,seq]), B_cublas=Q (col-major view: [hd,seq])
-    //   lda=seq (stride between cols in row-major K = seq),
-    //   ldb=seq (stride between cols in row-major Q = seq),
-    //   ldc=seq
-    // Actually simpler: swap A and B, use N and T:
-    //   C_cm[seq,seq] = K_rm_as_cm[hd,seq] @ Q_rm_as_cm^T[seq,hd]
-    // But cuBLAS output C is col-major [seq,seq] which is same as row-major [seq,seq] for square.
-    //
-    // Correct approach for row-major: C = A @ B^T → cuBLAS: C^T = B @ A^T
-    // Since C is symmetric-shaped (seq×seq), C^T has same layout.
-    // A=Q[seq,hd] stored row-major → col-major view [hd,seq], ld=hd
-    // B=K[seq,hd] stored row-major → col-major view [hd,seq], ld=hd
-    // C^T[seq,seq] = B_cm[hd,seq].T @ A_cm[hd,seq]
-    // → transa=T on K: K^T_cm = [seq,hd], transb=N on Q: Q_cm = [hd,seq]
-    // → m=seq (rows of op(A)), n=seq (cols of op(B)), k=hd
-    // → lda=hd (leading dim of A before op = rows of K_cm = hd)
-    // → ldb=hd (leading dim of B = rows of Q_cm = hd)
-    // → ldc=seq
+) -> crate::Result<()> {
     let cfg = StridedBatchedConfig {
         gemm: GemmConfig {
             transa: sys::cublasOperation_t::CUBLAS_OP_T,
@@ -782,46 +798,35 @@ fn gpu_batched_attn_scores(
             beta: 0.0_f32,
             ldc: seq,
         },
-        batch_size: num_heads,
+        batch_size: batch_heads,
         stride_a: i64::from(seq * head_dim),
         stride_b: i64::from(seq * head_dim),
         stride_c: i64::from(seq * seq),
     };
 
     unsafe {
-        blas.gemm_strided_batched(cfg, k, q, &mut scores)
+        blas.gemm_strided_batched(cfg, k, q, scores)
             .map_err(cuda_err)?;
     }
 
-    Ok(scores)
+    Ok(())
 }
 
 /// Batched GEMM for attention output: C = scores @ V.
 ///
-/// `scores` has shape `[num_heads, seq, seq]`.
-/// `v` has shape `[num_heads, seq, head_dim]`.
-/// Output has shape `[num_heads, seq, head_dim]`.
-#[expect(
-    unsafe_code,
-    clippy::cast_sign_loss,
-    reason = "cuBLAS batched GEMM requires unsafe; dimensions are small positive ints"
-)]
+/// `scores` has shape `[batch_heads, seq, seq]`.
+/// `v` has shape `[batch_heads, seq, head_dim]`.
+/// `output` has shape `[batch_heads, seq, head_dim]`.
+#[expect(unsafe_code, reason = "cuBLAS batched GEMM requires unsafe")]
 fn gpu_batched_attn_output(
     blas: &CudaBlas,
-    stream: &Arc<CudaStream>,
     scores: &CudaSlice<f32>,
     v: &CudaSlice<f32>,
-    num_heads: i32,
+    output: &mut CudaSlice<f32>,
+    batch_heads: i32,
     seq: i32,
     head_dim: i32,
-) -> crate::Result<CudaSlice<f32>> {
-    let mut output = stream
-        .alloc_zeros::<f32>((num_heads * seq * head_dim) as usize)
-        .map_err(cuda_err)?;
-
-    // scores[h] @ V[h]: [seq, seq] @ [seq, head_dim] = [seq, head_dim]
-    // In col-major: C_cm[hd, seq] = V_cm[hd, seq] @ scores_cm[seq, seq]
-    // A = V, transa = N, B = scores, transb = N
+) -> crate::Result<()> {
     let cfg = StridedBatchedConfig {
         gemm: GemmConfig {
             transa: sys::cublasOperation_t::CUBLAS_OP_N,
@@ -835,18 +840,18 @@ fn gpu_batched_attn_output(
             beta: 0.0_f32,
             ldc: head_dim,
         },
-        batch_size: num_heads,
+        batch_size: batch_heads,
         stride_a: i64::from(seq * head_dim),
         stride_b: i64::from(seq * seq),
         stride_c: i64::from(seq * head_dim),
     };
 
     unsafe {
-        blas.gemm_strided_batched(cfg, v, scores, &mut output)
+        blas.gemm_strided_batched(cfg, v, scores, output)
             .map_err(cuda_err)?;
     }
 
-    Ok(output)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -878,497 +883,473 @@ fn launch_cfg_per_row_shared(rows: i32, threads: u32, shared_bytes: u32) -> Laun
 // ---------------------------------------------------------------------------
 
 impl CudaBertModel {
-    /// Run embedding lookup + optional position / token-type + layer norm.
-    #[expect(
-        unsafe_code,
-        clippy::cast_sign_loss,
-        reason = "kernel launches require unsafe; dimensions are small non-negative values"
-    )]
-    fn forward_embeddings(
-        &self,
-        input_ids: &CudaSlice<i32>,
-        token_type_ids: &CudaSlice<i32>,
-        position_ids: &CudaSlice<i32>,
-        seq_len: i32,
-    ) -> crate::Result<CudaSlice<f32>> {
-        let hd = self.hidden_size;
-        let n = seq_len * hd;
-
-        // Word embedding lookup
-        let mut output = self
-            .stream
-            .alloc_zeros::<f32>(n as usize)
-            .map_err(cuda_err)?;
-        {
-            let mut builder = self.stream.launch_builder(&self.kernels.embedding_lookup);
-            builder.arg(&mut output);
-            builder.arg(&self.embeddings.word_embeddings);
-            builder.arg(input_ids);
-            builder.arg(&seq_len);
-            builder.arg(&hd);
-            unsafe { builder.launch(launch_cfg_1d(n)) }.map_err(cuda_err)?;
-        }
-
-        // Add position embeddings (ClassicBert)
-        if let Some(ref pos_emb) = self.embeddings.position_embeddings {
-            let mut builder = self.stream.launch_builder(&self.kernels.add_embeddings);
-            builder.arg(&mut output);
-            builder.arg(pos_emb);
-            builder.arg(position_ids);
-            builder.arg(&seq_len);
-            builder.arg(&hd);
-            unsafe { builder.launch(launch_cfg_1d(n)) }.map_err(cuda_err)?;
-        }
-
-        // Add token type embeddings (ClassicBert)
-        if let Some(ref tok_emb) = self.embeddings.token_type_embeddings {
-            let mut builder = self.stream.launch_builder(&self.kernels.add_embeddings);
-            builder.arg(&mut output);
-            builder.arg(tok_emb);
-            builder.arg(token_type_ids);
-            builder.arg(&seq_len);
-            builder.arg(&hd);
-            unsafe { builder.launch(launch_cfg_1d(n)) }.map_err(cuda_err)?;
-        }
-
-        // Layer norm
-        let mut normed = self
-            .stream
-            .alloc_zeros::<f32>(n as usize)
-            .map_err(cuda_err)?;
-        let threads = 256_u32.min(hd as u32).next_power_of_two();
-        let shared = threads * 2 * 4; // 2 shared arrays of floats
-        {
-            let eps = self.embeddings.layer_norm_eps;
-            let mut builder = self.stream.launch_builder(&self.kernels.layer_norm);
-            builder.arg(&mut normed);
-            builder.arg(&output);
-            builder.arg(&self.embeddings.layer_norm_weight);
-            builder.arg(&self.embeddings.layer_norm_bias);
-            builder.arg(&seq_len);
-            builder.arg(&hd);
-            builder.arg(&eps);
-            unsafe { builder.launch(launch_cfg_per_row_shared(seq_len, threads, shared)) }
-                .map_err(cuda_err)?;
-        }
-
-        Ok(normed)
-    }
-
-    /// Self-attention forward pass for one layer.
-    #[expect(
-        unsafe_code,
-        clippy::cast_sign_loss,
-        clippy::cast_precision_loss,
-        clippy::too_many_lines,
-        reason = "kernel launches require unsafe; dimensions from config are small positive ints"
-    )]
-    fn forward_attention(
-        &self,
-        layer: &CudaBertSelfAttention,
-        hidden: &CudaSlice<f32>,
-        mask: &CudaSlice<f32>,
-        seq: i32,
-    ) -> crate::Result<CudaSlice<f32>> {
-        let hd = self.hidden_size;
-        let nh = layer.num_heads;
-        let head_dim = layer.head_dim;
-
-        // Fused QKV projection: [seq, hidden] @ [hidden, 3*hidden]^T = [seq, 3*hidden]
-        let mut qkv = gpu_linear(
-            &self.blas,
-            &self.stream,
-            hidden,
-            &layer.qkv_weight,
-            seq,
-            3 * hd,
-            hd,
-        )?;
-
-        // Add QKV bias if present
-        if let Some(ref bias) = layer.qkv_bias {
-            let total = seq * 3 * hd;
-            let cols = 3 * hd;
-            let mut builder = self.stream.launch_builder(&self.kernels.add_bias);
-            builder.arg(&mut qkv);
-            builder.arg(bias);
-            builder.arg(&seq);
-            builder.arg(&cols);
-            unsafe { builder.launch(launch_cfg_1d(total)) }.map_err(cuda_err)?;
-        }
-
-        // QKV is [seq, 3*hidden] row-major. Split into Q, K, V each [num_heads, seq, head_dim]
-        // entirely on GPU — no CPU round-trip.
-        let total_head_elems = nh * seq * head_dim;
-        let mut q_dev = self
-            .stream
-            .alloc_zeros::<f32>(total_head_elems as usize)
-            .map_err(cuda_err)?;
-        let mut k_dev = self
-            .stream
-            .alloc_zeros::<f32>(total_head_elems as usize)
-            .map_err(cuda_err)?;
-        let v_dev = {
-            let mut v = self
-                .stream
-                .alloc_zeros::<f32>(total_head_elems as usize)
-                .map_err(cuda_err)?;
-            let mut builder = self.stream.launch_builder(&self.kernels.qkv_split);
-            builder.arg(&mut q_dev);
-            builder.arg(&mut k_dev);
-            builder.arg(&mut v);
-            builder.arg(&qkv);
-            builder.arg(&seq);
-            builder.arg(&hd);
-            builder.arg(&nh);
-            builder.arg(&head_dim);
-            unsafe { builder.launch(launch_cfg_1d(total_head_elems)) }.map_err(cuda_err)?;
-            v
-        };
-
-        // Apply RoPE for NomicBert
-        if let Some(base) = layer.rotary_emb_base {
-            let half = head_dim / 2;
-            let total_rope = nh * seq * half;
-            let rope_seq = nh * seq;
-
-            {
-                let mut builder = self.stream.launch_builder(&self.kernels.rope);
-                builder.arg(&mut q_dev);
-                builder.arg(&rope_seq);
-                builder.arg(&head_dim);
-                builder.arg(&base);
-                unsafe { builder.launch(launch_cfg_1d(total_rope)) }.map_err(cuda_err)?;
-            }
-            {
-                let mut builder = self.stream.launch_builder(&self.kernels.rope);
-                builder.arg(&mut k_dev);
-                builder.arg(&rope_seq);
-                builder.arg(&head_dim);
-                builder.arg(&base);
-                unsafe { builder.launch(launch_cfg_1d(total_rope)) }.map_err(cuda_err)?;
-            }
-        }
-
-        // Batched attention scores: [nh, seq, seq] = Q @ K^T
-        let mut scores =
-            gpu_batched_attn_scores(&self.blas, &self.stream, &q_dev, &k_dev, nh, seq, head_dim)?;
-
-        // Scale by 1/sqrt(head_dim)
-        let scale = 1.0_f32 / (head_dim as f32).sqrt();
-        let total_scores = nh * seq * seq;
-        {
-            let mut builder = self.stream.launch_builder(&self.kernels.scale);
-            builder.arg(&mut scores);
-            builder.arg(&scale);
-            builder.arg(&total_scores);
-            unsafe { builder.launch(launch_cfg_1d(total_scores)) }.map_err(cuda_err)?;
-        }
-
-        // Add attention mask to each head's score matrix
-        {
-            let total_mask = nh * seq * seq;
-            let mask_rows = nh * seq;
-            let mut builder = self.stream.launch_builder(&self.kernels.add_attn_mask);
-            builder.arg(&mut scores);
-            builder.arg(mask);
-            builder.arg(&mask_rows);
-            builder.arg(&seq);
-            unsafe { builder.launch(launch_cfg_1d(total_mask)) }.map_err(cuda_err)?;
-        }
-
-        // Softmax per row
-        {
-            let total_rows = nh * seq;
-            let threads = 256_u32.min(seq as u32).next_power_of_two();
-            let shared = threads * 4;
-            let mut builder = self.stream.launch_builder(&self.kernels.softmax);
-            builder.arg(&mut scores);
-            builder.arg(&total_rows);
-            builder.arg(&seq);
-            unsafe { builder.launch(launch_cfg_per_row_shared(total_rows, threads, shared)) }
-                .map_err(cuda_err)?;
-        }
-
-        // Attention output: [nh, seq, head_dim] = scores @ V
-        let attn_out =
-            gpu_batched_attn_output(&self.blas, &self.stream, &scores, &v_dev, nh, seq, head_dim)?;
-
-        // Rearrange [num_heads, seq, head_dim] → [seq, hidden] on GPU
-        let context_dev = {
-            let mut ctx = self
-                .stream
-                .alloc_zeros::<f32>((seq * hd) as usize)
-                .map_err(cuda_err)?;
-            let mut builder = self.stream.launch_builder(&self.kernels.attn_reshape);
-            builder.arg(&mut ctx);
-            builder.arg(&attn_out);
-            builder.arg(&seq);
-            builder.arg(&nh);
-            builder.arg(&head_dim);
-            unsafe { builder.launch(launch_cfg_1d(seq * hd)) }.map_err(cuda_err)?;
-            ctx
-        };
-
-        // Output projection: [seq, hidden] @ [hidden, hidden]^T = [seq, hidden]
-        let mut projected = gpu_linear(
-            &self.blas,
-            &self.stream,
-            &context_dev,
-            &layer.output_weight,
-            seq,
-            hd,
-            hd,
-        )?;
-
-        // Add output bias if present
-        if let Some(ref bias) = layer.output_bias {
-            let total = seq * hd;
-            let mut builder = self.stream.launch_builder(&self.kernels.add_bias);
-            builder.arg(&mut projected);
-            builder.arg(bias);
-            builder.arg(&seq);
-            builder.arg(&hd);
-            unsafe { builder.launch(launch_cfg_1d(total)) }.map_err(cuda_err)?;
-        }
-
-        // Residual connection: projected += hidden
-        {
-            let total = seq * hd;
-            let mut builder = self.stream.launch_builder(&self.kernels.residual_add);
-            builder.arg(&mut projected);
-            builder.arg(hidden);
-            builder.arg(&total);
-            unsafe { builder.launch(launch_cfg_1d(total)) }.map_err(cuda_err)?;
-        }
-
-        // Layer norm
-        let mut normed = self
-            .stream
-            .alloc_zeros::<f32>((seq * hd) as usize)
-            .map_err(cuda_err)?;
-        {
-            let eps = layer.layer_norm_eps;
-            let threads = 256_u32.min(hd as u32).next_power_of_two();
-            let shared = threads * 2 * 4;
-            let mut builder = self.stream.launch_builder(&self.kernels.layer_norm);
-            builder.arg(&mut normed);
-            builder.arg(&projected);
-            builder.arg(&layer.output_ln_weight);
-            builder.arg(&layer.output_ln_bias);
-            builder.arg(&seq);
-            builder.arg(&hd);
-            builder.arg(&eps);
-            unsafe { builder.launch(launch_cfg_per_row_shared(seq, threads, shared)) }
-                .map_err(cuda_err)?;
-        }
-
-        Ok(normed)
-    }
-
-    /// FFN forward pass for one layer.
-    #[expect(
-        unsafe_code,
-        clippy::cast_sign_loss,
-        reason = "kernel launches require unsafe; dimensions from config are small positive ints"
-    )]
-    fn forward_ffn(
-        &self,
-        layer: &CudaBertFfn,
-        hidden: &CudaSlice<f32>,
-        seq: i32,
-    ) -> crate::Result<CudaSlice<f32>> {
-        let hd = self.hidden_size;
-
-        // Intermediate projection: [seq, hidden] @ [inter_out, hidden]^T = [seq, inter_out]
-        let inter_out_dim = match layer.variant {
-            ModelVariant::ClassicBert => layer.intermediate_dim,
-            ModelVariant::NomicBert => 2 * layer.intermediate_dim,
-        };
-
-        let mut intermediate = gpu_linear(
-            &self.blas,
-            &self.stream,
-            hidden,
-            &layer.intermediate_weight,
-            seq,
-            inter_out_dim,
-            hd,
-        )?;
-
-        // Add intermediate bias (ClassicBert only)
-        if let Some(ref bias) = layer.intermediate_bias {
-            let total = seq * inter_out_dim;
-            let mut builder = self.stream.launch_builder(&self.kernels.add_bias);
-            builder.arg(&mut intermediate);
-            builder.arg(bias);
-            builder.arg(&seq);
-            builder.arg(&inter_out_dim);
-            unsafe { builder.launch(launch_cfg_1d(total)) }.map_err(cuda_err)?;
-        }
-
-        // Activation
-        let activated = match layer.variant {
-            ModelVariant::ClassicBert => {
-                let total = seq * layer.intermediate_dim;
-                let mut builder = self.stream.launch_builder(&self.kernels.gelu);
-                builder.arg(&mut intermediate);
-                builder.arg(&total);
-                unsafe { builder.launch(launch_cfg_1d(total)) }.map_err(cuda_err)?;
-                intermediate
-            }
-            ModelVariant::NomicBert => {
-                let half_cols = layer.intermediate_dim;
-                let total = seq * half_cols;
-                let mut activated = self
-                    .stream
-                    .alloc_zeros::<f32>(total as usize)
-                    .map_err(cuda_err)?;
-                let mut builder = self.stream.launch_builder(&self.kernels.swiglu);
-                builder.arg(&mut activated);
-                builder.arg(&intermediate);
-                builder.arg(&seq);
-                builder.arg(&half_cols);
-                unsafe { builder.launch(launch_cfg_1d(total)) }.map_err(cuda_err)?;
-                activated
-            }
-        };
-
-        // Output projection: [seq, inter] @ [hidden, inter]^T = [seq, hidden]
-        let mut output = gpu_linear(
-            &self.blas,
-            &self.stream,
-            &activated,
-            &layer.output_weight,
-            seq,
-            hd,
-            layer.intermediate_dim,
-        )?;
-
-        // Add output bias (ClassicBert only)
-        if let Some(ref bias) = layer.output_bias {
-            let total = seq * hd;
-            let mut builder = self.stream.launch_builder(&self.kernels.add_bias);
-            builder.arg(&mut output);
-            builder.arg(bias);
-            builder.arg(&seq);
-            builder.arg(&hd);
-            unsafe { builder.launch(launch_cfg_1d(total)) }.map_err(cuda_err)?;
-        }
-
-        // Residual connection: output += hidden
-        {
-            let total = seq * hd;
-            let mut builder = self.stream.launch_builder(&self.kernels.residual_add);
-            builder.arg(&mut output);
-            builder.arg(hidden);
-            builder.arg(&total);
-            unsafe { builder.launch(launch_cfg_1d(total)) }.map_err(cuda_err)?;
-        }
-
-        // Layer norm
-        let mut normed = self
-            .stream
-            .alloc_zeros::<f32>((seq * hd) as usize)
-            .map_err(cuda_err)?;
-        {
-            let eps = layer.layer_norm_eps;
-            let threads = 256_u32.min(hd as u32).next_power_of_two();
-            let shared = threads * 2 * 4;
-            let mut builder = self.stream.launch_builder(&self.kernels.layer_norm);
-            builder.arg(&mut normed);
-            builder.arg(&output);
-            builder.arg(&layer.output_ln_weight);
-            builder.arg(&layer.output_ln_bias);
-            builder.arg(&seq);
-            builder.arg(&hd);
-            builder.arg(&eps);
-            unsafe { builder.launch(launch_cfg_per_row_shared(seq, threads, shared)) }
-                .map_err(cuda_err)?;
-        }
-
-        Ok(normed)
-    }
-
-    /// Full forward pass for a single sequence.
+    /// Batched forward pass: process all encodings in a single GPU pass.
+    ///
+    /// Pads all encodings to `max_seq_len` in the batch, transfers padded
+    /// tensors to GPU in one `clone_htod` per tensor, runs the full BERT
+    /// forward pass with batch dimension, then extracts CLS embeddings
+    /// for each batch element.
+    ///
+    /// Uses a ping-pong scheme between `hidden_a` and `hidden_b`:
+    /// - Embeddings write to `hidden_a`.
+    /// - Attention reads `hidden_a`, writes to `hidden_b`.
+    /// - FFN reads `hidden_b`, writes back to `hidden_a`.
+    /// - Next layer repeats.
     #[expect(
         unsafe_code,
         clippy::cast_possible_truncation,
         clippy::cast_possible_wrap,
         clippy::cast_sign_loss,
-        reason = "kernel launches require unsafe; token IDs and seq lengths are small positive values"
+        clippy::cast_precision_loss,
+        clippy::too_many_lines,
+        reason = "monolithic GPU forward pass requires unsafe kernel launches and integer casts"
     )]
-    fn forward(&self, encoding: &Encoding) -> crate::Result<Vec<f32>> {
-        let seq = encoding.input_ids.len() as i32;
+    fn forward_batch(&mut self, encodings: &[Encoding]) -> crate::Result<Vec<Vec<f32>>> {
+        let batch = encodings.len() as i32;
         let hd = self.hidden_size;
+        let nh = self.num_heads;
+        let head_dim = self.head_dim;
 
-        // Build integer input arrays for GPU
-        let input_ids: Vec<i32> = encoding.input_ids.iter().map(|&id| id as i32).collect();
-        let token_type_ids: Vec<i32> = encoding
-            .token_type_ids
+        // Find max sequence length in this batch
+        let max_seq = encodings
             .iter()
-            .map(|&id| id as i32)
-            .collect();
-        let position_ids: Vec<i32> = (0..seq).collect();
-        let attn_mask_int: Vec<i32> = encoding.attention_mask.iter().map(|&m| m as i32).collect();
+            .map(|e| e.input_ids.len())
+            .max()
+            .unwrap_or(0) as i32;
+        let batch_seq = batch * max_seq;
+        let batch_heads = batch * nh;
 
-        // Upload to GPU
+        // Build padded input tensors on CPU: [batch, max_seq]
+        let total = batch_seq as usize;
+        let mut input_ids = vec![0_i32; total];
+        let mut token_type_ids = vec![0_i32; total];
+        let mut position_ids = vec![0_i32; total];
+        let mut attn_mask_int = vec![0_i32; total];
+
+        for (b, enc) in encodings.iter().enumerate() {
+            let seq_len = enc.input_ids.len();
+            let offset = b * max_seq as usize;
+            for (i, &id) in enc.input_ids.iter().enumerate() {
+                input_ids[offset + i] = id as i32;
+            }
+            for (i, &id) in enc.token_type_ids.iter().enumerate() {
+                token_type_ids[offset + i] = id as i32;
+            }
+            for i in 0..seq_len {
+                position_ids[offset + i] = i as i32;
+            }
+            for (i, &m) in enc.attention_mask.iter().enumerate() {
+                attn_mask_int[offset + i] = m as i32;
+            }
+        }
+
+        // ONE clone_htod per tensor
         let input_ids_dev = self.stream.clone_htod(&input_ids).map_err(cuda_err)?;
         let token_type_ids_dev = self.stream.clone_htod(&token_type_ids).map_err(cuda_err)?;
         let position_ids_dev = self.stream.clone_htod(&position_ids).map_err(cuda_err)?;
         let attn_mask_int_dev = self.stream.clone_htod(&attn_mask_int).map_err(cuda_err)?;
 
-        // Build float attention mask: 0.0 for real tokens, -1e9 for padding
+        // Build float attention mask [batch * max_seq]: 0.0 for real, -1e9 for padding
+        let mask_total = batch * max_seq;
         let mut attn_mask_dev = self
             .stream
-            .alloc_zeros::<f32>(seq as usize)
+            .alloc_zeros::<f32>(mask_total as usize)
             .map_err(cuda_err)?;
         {
             let mut builder = self.stream.launch_builder(&self.kernels.build_attn_mask);
             builder.arg(&mut attn_mask_dev);
             builder.arg(&attn_mask_int_dev);
-            builder.arg(&seq);
-            unsafe { builder.launch(launch_cfg_1d(seq)) }.map_err(cuda_err)?;
+            builder.arg(&mask_total);
+            unsafe { builder.launch(launch_cfg_1d(mask_total)) }.map_err(cuda_err)?;
         }
 
-        // Embeddings
-        let mut hidden =
-            self.forward_embeddings(&input_ids_dev, &token_type_ids_dev, &position_ids_dev, seq)?;
-
-        // Transformer layers
-        for layer in &self.layers {
-            let after_attn =
-                self.forward_attention(&layer.attention, &hidden, &attn_mask_dev, seq)?;
-            hidden = self.forward_ffn(&layer.ffn, &after_attn, seq)?;
+        // ---------------------------------------------------------------
+        // Embeddings: [batch*max_seq, hidden] → hidden_a
+        // ---------------------------------------------------------------
+        let n = batch_seq * hd;
+        // Word embedding lookup → scratch
+        {
+            let mut builder = self.stream.launch_builder(&self.kernels.embedding_lookup);
+            builder.arg(&mut self.workspace.scratch);
+            builder.arg(&self.embeddings.word_embeddings);
+            builder.arg(&input_ids_dev);
+            builder.arg(&batch_seq);
+            builder.arg(&hd);
+            unsafe { builder.launch(launch_cfg_1d(n)) }.map_err(cuda_err)?;
+        }
+        if let Some(ref pos_emb) = self.embeddings.position_embeddings {
+            let mut builder = self.stream.launch_builder(&self.kernels.add_embeddings);
+            builder.arg(&mut self.workspace.scratch);
+            builder.arg(pos_emb);
+            builder.arg(&position_ids_dev);
+            builder.arg(&batch_seq);
+            builder.arg(&hd);
+            unsafe { builder.launch(launch_cfg_1d(n)) }.map_err(cuda_err)?;
+        }
+        if let Some(ref tok_emb) = self.embeddings.token_type_embeddings {
+            let mut builder = self.stream.launch_builder(&self.kernels.add_embeddings);
+            builder.arg(&mut self.workspace.scratch);
+            builder.arg(tok_emb);
+            builder.arg(&token_type_ids_dev);
+            builder.arg(&batch_seq);
+            builder.arg(&hd);
+            unsafe { builder.launch(launch_cfg_1d(n)) }.map_err(cuda_err)?;
+        }
+        // Embedding layer norm: scratch → hidden_a
+        {
+            let eps = self.embeddings.layer_norm_eps;
+            let threads = 256_u32.min(hd as u32).next_power_of_two();
+            let shared = threads * 2 * 4;
+            let mut builder = self.stream.launch_builder(&self.kernels.layer_norm);
+            builder.arg(&mut self.workspace.hidden_a);
+            builder.arg(&self.workspace.scratch);
+            builder.arg(&self.embeddings.layer_norm_weight);
+            builder.arg(&self.embeddings.layer_norm_bias);
+            builder.arg(&batch_seq);
+            builder.arg(&hd);
+            builder.arg(&eps);
+            unsafe { builder.launch(launch_cfg_per_row_shared(batch_seq, threads, shared)) }
+                .map_err(cuda_err)?;
         }
 
-        // CLS pooling (first row) + L2 normalize
-        let mut cls = self
-            .stream
-            .alloc_zeros::<f32>(hd as usize)
-            .map_err(cuda_err)?;
+        // ---------------------------------------------------------------
+        // Transformer layers: ping-pong hidden_a ↔ hidden_b
+        //
+        // Attention: reads hidden_a → writes hidden_b
+        // FFN:       reads hidden_b → writes hidden_a
+        // ---------------------------------------------------------------
+        let num_layers = self.layers.len();
+        for layer_idx in 0..num_layers {
+            // === ATTENTION: hidden_a → hidden_b ===
+
+            // QKV projection: [batch*seq, hidden] @ [3*hidden, hidden]^T
+            gpu_linear(
+                &self.blas,
+                &self.workspace.hidden_a,
+                &self.layers[layer_idx].attention.qkv_weight,
+                &mut self.workspace.qkv,
+                batch_seq,
+                3 * hd,
+                hd,
+            )?;
+
+            if let Some(ref bias) = self.layers[layer_idx].attention.qkv_bias {
+                let total_qkv = batch_seq * 3 * hd;
+                let cols = 3 * hd;
+                let mut builder = self.stream.launch_builder(&self.kernels.add_bias);
+                builder.arg(&mut self.workspace.qkv);
+                builder.arg(bias);
+                builder.arg(&batch_seq);
+                builder.arg(&cols);
+                unsafe { builder.launch(launch_cfg_1d(total_qkv)) }.map_err(cuda_err)?;
+            }
+
+            // Split QKV → Q, K, V each [batch*nh, seq, head_dim]
+            let total_head_elems = batch_heads * max_seq * head_dim;
+            {
+                let mut builder = self.stream.launch_builder(&self.kernels.qkv_split);
+                builder.arg(&mut self.workspace.q);
+                builder.arg(&mut self.workspace.k);
+                builder.arg(&mut self.workspace.v);
+                builder.arg(&self.workspace.qkv);
+                builder.arg(&batch);
+                builder.arg(&max_seq);
+                builder.arg(&hd);
+                builder.arg(&nh);
+                builder.arg(&head_dim);
+                unsafe { builder.launch(launch_cfg_1d(total_head_elems)) }.map_err(cuda_err)?;
+            }
+
+            // RoPE for NomicBert
+            if let Some(base) = self.layers[layer_idx].attention.rotary_emb_base {
+                let half = head_dim / 2;
+                let total_rope = batch_heads * max_seq * half;
+                let rope_seq = batch_heads * max_seq;
+                {
+                    let mut builder = self.stream.launch_builder(&self.kernels.rope);
+                    builder.arg(&mut self.workspace.q);
+                    builder.arg(&rope_seq);
+                    builder.arg(&head_dim);
+                    builder.arg(&base);
+                    unsafe { builder.launch(launch_cfg_1d(total_rope)) }.map_err(cuda_err)?;
+                }
+                {
+                    let mut builder = self.stream.launch_builder(&self.kernels.rope);
+                    builder.arg(&mut self.workspace.k);
+                    builder.arg(&rope_seq);
+                    builder.arg(&head_dim);
+                    builder.arg(&base);
+                    unsafe { builder.launch(launch_cfg_1d(total_rope)) }.map_err(cuda_err)?;
+                }
+            }
+
+            // Attention scores: [batch*nh, seq, seq]
+            gpu_batched_attn_scores(
+                &self.blas,
+                &self.workspace.q,
+                &self.workspace.k,
+                &mut self.workspace.scores,
+                batch_heads,
+                max_seq,
+                head_dim,
+            )?;
+
+            // Scale
+            let scale = 1.0_f32 / (head_dim as f32).sqrt();
+            let total_scores = batch_heads * max_seq * max_seq;
+            {
+                let mut builder = self.stream.launch_builder(&self.kernels.scale);
+                builder.arg(&mut self.workspace.scores);
+                builder.arg(&scale);
+                builder.arg(&total_scores);
+                unsafe { builder.launch(launch_cfg_1d(total_scores)) }.map_err(cuda_err)?;
+            }
+
+            // Add attention mask (batched)
+            {
+                let mut builder = self.stream.launch_builder(&self.kernels.add_attn_mask);
+                builder.arg(&mut self.workspace.scores);
+                builder.arg(&attn_mask_dev);
+                builder.arg(&batch);
+                builder.arg(&nh);
+                builder.arg(&max_seq);
+                unsafe { builder.launch(launch_cfg_1d(total_scores)) }.map_err(cuda_err)?;
+            }
+
+            // Softmax
+            {
+                let total_rows = batch_heads * max_seq;
+                let threads = 256_u32.min(max_seq as u32).next_power_of_two();
+                let shared = threads * 4;
+                let mut builder = self.stream.launch_builder(&self.kernels.softmax);
+                builder.arg(&mut self.workspace.scores);
+                builder.arg(&total_rows);
+                builder.arg(&max_seq);
+                unsafe { builder.launch(launch_cfg_per_row_shared(total_rows, threads, shared)) }
+                    .map_err(cuda_err)?;
+            }
+
+            // Attention output: [batch*nh, seq, head_dim]
+            gpu_batched_attn_output(
+                &self.blas,
+                &self.workspace.scores,
+                &self.workspace.v,
+                &mut self.workspace.attn_out,
+                batch_heads,
+                max_seq,
+                head_dim,
+            )?;
+
+            // Reshape → [batch*seq, hidden]
+            {
+                let total_ctx = batch_seq * hd;
+                let mut builder = self.stream.launch_builder(&self.kernels.attn_reshape);
+                builder.arg(&mut self.workspace.context);
+                builder.arg(&self.workspace.attn_out);
+                builder.arg(&batch);
+                builder.arg(&max_seq);
+                builder.arg(&nh);
+                builder.arg(&head_dim);
+                unsafe { builder.launch(launch_cfg_1d(total_ctx)) }.map_err(cuda_err)?;
+            }
+
+            // Output projection → projected
+            gpu_linear(
+                &self.blas,
+                &self.workspace.context,
+                &self.layers[layer_idx].attention.output_weight,
+                &mut self.workspace.projected,
+                batch_seq,
+                hd,
+                hd,
+            )?;
+
+            if let Some(ref bias) = self.layers[layer_idx].attention.output_bias {
+                let total_proj = batch_seq * hd;
+                let mut builder = self.stream.launch_builder(&self.kernels.add_bias);
+                builder.arg(&mut self.workspace.projected);
+                builder.arg(bias);
+                builder.arg(&batch_seq);
+                builder.arg(&hd);
+                unsafe { builder.launch(launch_cfg_1d(total_proj)) }.map_err(cuda_err)?;
+            }
+
+            // Residual: projected += hidden_a
+            {
+                let total_res = batch_seq * hd;
+                let mut builder = self.stream.launch_builder(&self.kernels.residual_add);
+                builder.arg(&mut self.workspace.projected);
+                builder.arg(&self.workspace.hidden_a);
+                builder.arg(&total_res);
+                unsafe { builder.launch(launch_cfg_1d(total_res)) }.map_err(cuda_err)?;
+            }
+
+            // Attention layer norm: projected → hidden_b
+            {
+                let eps = self.layers[layer_idx].attention.layer_norm_eps;
+                let threads = 256_u32.min(hd as u32).next_power_of_two();
+                let shared = threads * 2 * 4;
+                let mut builder = self.stream.launch_builder(&self.kernels.layer_norm);
+                builder.arg(&mut self.workspace.hidden_b);
+                builder.arg(&self.workspace.projected);
+                builder.arg(&self.layers[layer_idx].attention.output_ln_weight);
+                builder.arg(&self.layers[layer_idx].attention.output_ln_bias);
+                builder.arg(&batch_seq);
+                builder.arg(&hd);
+                builder.arg(&eps);
+                unsafe { builder.launch(launch_cfg_per_row_shared(batch_seq, threads, shared)) }
+                    .map_err(cuda_err)?;
+            }
+
+            // === FFN: hidden_b → hidden_a ===
+
+            let inter_dim = self.layers[layer_idx].ffn.intermediate_dim;
+            let inter_out_dim = match self.variant {
+                ModelVariant::ClassicBert => inter_dim,
+                ModelVariant::NomicBert => 2 * inter_dim,
+            };
+
+            // Intermediate projection
+            gpu_linear(
+                &self.blas,
+                &self.workspace.hidden_b,
+                &self.layers[layer_idx].ffn.intermediate_weight,
+                &mut self.workspace.ffn_inter,
+                batch_seq,
+                inter_out_dim,
+                hd,
+            )?;
+
+            if let Some(ref bias) = self.layers[layer_idx].ffn.intermediate_bias {
+                let total_inter = batch_seq * inter_out_dim;
+                let mut builder = self.stream.launch_builder(&self.kernels.add_bias);
+                builder.arg(&mut self.workspace.ffn_inter);
+                builder.arg(bias);
+                builder.arg(&batch_seq);
+                builder.arg(&inter_out_dim);
+                unsafe { builder.launch(launch_cfg_1d(total_inter)) }.map_err(cuda_err)?;
+            }
+
+            // Activation + output projection → scratch
+            match self.variant {
+                ModelVariant::ClassicBert => {
+                    let total_act = batch_seq * inter_dim;
+                    {
+                        let mut builder = self.stream.launch_builder(&self.kernels.gelu);
+                        builder.arg(&mut self.workspace.ffn_inter);
+                        builder.arg(&total_act);
+                        unsafe { builder.launch(launch_cfg_1d(total_act)) }.map_err(cuda_err)?;
+                    }
+                    gpu_linear(
+                        &self.blas,
+                        &self.workspace.ffn_inter,
+                        &self.layers[layer_idx].ffn.output_weight,
+                        &mut self.workspace.scratch,
+                        batch_seq,
+                        hd,
+                        inter_dim,
+                    )?;
+                }
+                ModelVariant::NomicBert => {
+                    let half_cols = inter_dim;
+                    let total_act = batch_seq * half_cols;
+                    {
+                        let mut builder = self.stream.launch_builder(&self.kernels.swiglu);
+                        builder.arg(&mut self.workspace.activated);
+                        builder.arg(&self.workspace.ffn_inter);
+                        builder.arg(&batch_seq);
+                        builder.arg(&half_cols);
+                        unsafe { builder.launch(launch_cfg_1d(total_act)) }.map_err(cuda_err)?;
+                    }
+                    gpu_linear(
+                        &self.blas,
+                        &self.workspace.activated,
+                        &self.layers[layer_idx].ffn.output_weight,
+                        &mut self.workspace.scratch,
+                        batch_seq,
+                        hd,
+                        inter_dim,
+                    )?;
+                }
+            }
+
+            // Add FFN output bias
+            if let Some(ref bias) = self.layers[layer_idx].ffn.output_bias {
+                let total_out = batch_seq * hd;
+                let mut builder = self.stream.launch_builder(&self.kernels.add_bias);
+                builder.arg(&mut self.workspace.scratch);
+                builder.arg(bias);
+                builder.arg(&batch_seq);
+                builder.arg(&hd);
+                unsafe { builder.launch(launch_cfg_1d(total_out)) }.map_err(cuda_err)?;
+            }
+
+            // Residual: scratch += hidden_b
+            {
+                let total_res = batch_seq * hd;
+                let mut builder = self.stream.launch_builder(&self.kernels.residual_add);
+                builder.arg(&mut self.workspace.scratch);
+                builder.arg(&self.workspace.hidden_b);
+                builder.arg(&total_res);
+                unsafe { builder.launch(launch_cfg_1d(total_res)) }.map_err(cuda_err)?;
+            }
+
+            // FFN layer norm: scratch → hidden_a (ready for next layer)
+            {
+                let eps = self.layers[layer_idx].ffn.layer_norm_eps;
+                let threads = 256_u32.min(hd as u32).next_power_of_two();
+                let shared = threads * 2 * 4;
+                let mut builder = self.stream.launch_builder(&self.kernels.layer_norm);
+                builder.arg(&mut self.workspace.hidden_a);
+                builder.arg(&self.workspace.scratch);
+                builder.arg(&self.layers[layer_idx].ffn.output_ln_weight);
+                builder.arg(&self.layers[layer_idx].ffn.output_ln_bias);
+                builder.arg(&batch_seq);
+                builder.arg(&hd);
+                builder.arg(&eps);
+                unsafe { builder.launch(launch_cfg_per_row_shared(batch_seq, threads, shared)) }
+                    .map_err(cuda_err)?;
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // CLS pooling + L2 normalize
+        // ---------------------------------------------------------------
+        let cls_total = batch * hd;
         {
             let mut builder = self.stream.launch_builder(&self.kernels.cls_pool);
-            builder.arg(&mut cls);
-            builder.arg(&hidden);
+            builder.arg(&mut self.workspace.cls);
+            builder.arg(&self.workspace.hidden_a);
+            builder.arg(&batch);
+            builder.arg(&max_seq);
             builder.arg(&hd);
-            unsafe { builder.launch(launch_cfg_1d(hd)) }.map_err(cuda_err)?;
+            unsafe { builder.launch(launch_cfg_1d(cls_total)) }.map_err(cuda_err)?;
         }
-
-        // L2 normalize
         {
             let threads = 256_u32.min(hd as u32).next_power_of_two();
             let shared = threads * 4;
             let mut builder = self.stream.launch_builder(&self.kernels.l2_normalize);
-            builder.arg(&mut cls);
+            builder.arg(&mut self.workspace.cls);
+            builder.arg(&batch);
             builder.arg(&hd);
-            unsafe { builder.launch(launch_cfg_per_row_shared(1, threads, shared)) }
+            unsafe { builder.launch(launch_cfg_per_row_shared(batch, threads, shared)) }
                 .map_err(cuda_err)?;
         }
 
-        // Copy result back to host
-        let result = self.stream.clone_dtoh(&cls).map_err(cuda_err)?;
-        Ok(result)
+        // ONE clone_dtoh to bring back all embeddings [batch * hidden]
+        let flat_result = self
+            .stream
+            .clone_dtoh(&self.workspace.cls)
+            .map_err(cuda_err)?;
+
+        // Split into per-encoding vectors
+        let hd_usize = hd as usize;
+        let mut results = Vec::with_capacity(batch as usize);
+        for b in 0..batch as usize {
+            results.push(flat_result[b * hd_usize..(b + 1) * hd_usize].to_vec());
+        }
+
+        Ok(results)
     }
 }
 
@@ -1441,8 +1422,6 @@ fn load_classic_layer_gpu(
         output_bias,
         output_ln_weight,
         output_ln_bias,
-        num_heads: config.num_attention_heads,
-        head_dim: config.hidden_size / config.num_attention_heads,
         layer_norm_eps: config.layer_norm_eps,
         rotary_emb_base: None,
     };
@@ -1483,7 +1462,6 @@ fn load_classic_layer_gpu(
         output_ln_weight: out_ln_weight,
         output_ln_bias: out_ln_bias,
         layer_norm_eps: config.layer_norm_eps,
-        variant: config.variant,
         intermediate_dim,
     };
 
@@ -1513,8 +1491,6 @@ fn load_nomic_layer_gpu(
         output_bias: None,
         output_ln_weight,
         output_ln_bias,
-        num_heads: config.num_attention_heads,
-        head_dim: config.hidden_size / config.num_attention_heads,
         layer_norm_eps: config.layer_norm_eps,
         rotary_emb_base: Some(config.rotary_emb_base),
     };
@@ -1547,11 +1523,59 @@ fn load_nomic_layer_gpu(
         output_ln_weight: out_ln_weight,
         output_ln_bias: out_ln_bias,
         layer_norm_eps: config.layer_norm_eps,
-        variant: config.variant,
         intermediate_dim,
     };
 
     Ok(CudaBertLayer { attention, ffn })
+}
+
+// ---------------------------------------------------------------------------
+// Workspace allocation
+// ---------------------------------------------------------------------------
+
+/// Allocate workspace buffers for the given model config.
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "all dimensions are small positive ints from model config"
+)]
+fn allocate_workspace(
+    stream: &Arc<CudaStream>,
+    config: &BertConfig,
+    intermediate_dim: i32,
+) -> crate::Result<CudaWorkspace> {
+    let hd = config.hidden_size;
+    let nh = config.num_attention_heads;
+    let head_dim = hd / nh;
+    let max_seq = config.max_position_embeddings;
+    let max_batch = MAX_BATCH;
+    let bs = max_batch * max_seq;
+    let bh = max_batch * nh;
+
+    let inter_out = match config.variant {
+        ModelVariant::ClassicBert => intermediate_dim,
+        ModelVariant::NomicBert => 2 * intermediate_dim,
+    };
+
+    let alloc = |size: usize| -> crate::Result<CudaSlice<f32>> {
+        stream.alloc_zeros::<f32>(size).map_err(cuda_err)
+    };
+
+    Ok(CudaWorkspace {
+        qkv: alloc((bs * 3 * hd) as usize)?,
+        q: alloc((bh * max_seq * head_dim) as usize)?,
+        k: alloc((bh * max_seq * head_dim) as usize)?,
+        v: alloc((bh * max_seq * head_dim) as usize)?,
+        scores: alloc((bh * max_seq * max_seq) as usize)?,
+        attn_out: alloc((bh * max_seq * head_dim) as usize)?,
+        context: alloc((bs * hd) as usize)?,
+        ffn_inter: alloc((bs * inter_out) as usize)?,
+        hidden_a: alloc((bs * hd) as usize)?,
+        hidden_b: alloc((bs * hd) as usize)?,
+        projected: alloc((bs * hd) as usize)?,
+        activated: alloc((bs * intermediate_dim) as usize)?,
+        scratch: alloc((bs * hd) as usize)?,
+        cls: alloc((max_batch * hd) as usize)?,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1571,8 +1595,8 @@ fn load_nomic_layer_gpu(
 /// Supports both `ClassicBert` (BGE) and `NomicBert` (`CodeRankEmbed`) model
 /// families, detected automatically from weight names.
 pub struct CudaBackend {
-    /// The BERT model with all weights on GPU.
-    model: CudaBertModel,
+    /// The BERT model with all weights on GPU (interior mutability for workspace).
+    model: std::cell::UnsafeCell<CudaBertModel>,
     /// Hidden dimension for output vector size validation.
     hidden_size: i32,
     /// Maximum sequence length supported by the model.
@@ -1589,9 +1613,9 @@ pub struct CudaBackend {
     reason = "GPU resources are refcounted and CUDA driver is thread-safe"
 )]
 unsafe impl Send for CudaBackend {}
-// Safety: embed_batch takes &self and all GPU ops serialize through the CUDA
-// stream. Concurrent calls from multiple threads are safe because the stream
-// guarantees ordered execution.
+// Safety: embed_batch serializes through the CUDA stream. The UnsafeCell is
+// needed because embed_batch takes &self but forward_batch needs &mut self
+// (for workspace buffers). Concurrent calls serialize through the CUDA stream.
 #[expect(unsafe_code, reason = "CUDA stream serializes all GPU operations")]
 unsafe impl Sync for CudaBackend {}
 
@@ -1663,6 +1687,8 @@ impl CudaBackend {
 
         let hidden_size = config.hidden_size;
         let max_position_embeddings = config.max_position_embeddings;
+        let num_heads = config.num_attention_heads;
+        let head_dim = hidden_size / num_heads;
 
         // Load embeddings to GPU
         let embeddings = match config.variant {
@@ -1706,13 +1732,18 @@ impl CudaBackend {
 
         // Load encoder layers
         let mut layers = Vec::with_capacity(config.num_hidden_layers as usize);
+        let mut intermediate_dim = 0_i32;
         for i in 0..config.num_hidden_layers {
             let layer = match config.variant {
                 ModelVariant::ClassicBert => load_classic_layer_gpu(&stream, &tensors, i, &config)?,
                 ModelVariant::NomicBert => load_nomic_layer_gpu(&stream, &tensors, i, &config)?,
             };
+            intermediate_dim = layer.ffn.intermediate_dim;
             layers.push(layer);
         }
+
+        // Allocate workspace buffers
+        let workspace = allocate_workspace(&stream, &config, intermediate_dim)?;
 
         let model = CudaBertModel {
             stream,
@@ -1721,10 +1752,14 @@ impl CudaBackend {
             embeddings,
             layers,
             hidden_size,
+            num_heads,
+            head_dim,
+            variant,
+            workspace,
         };
 
         Ok(Self {
-            model,
+            model: std::cell::UnsafeCell::new(model),
             hidden_size,
             max_position_embeddings,
             _module: module,
@@ -1735,20 +1770,34 @@ impl CudaBackend {
 impl EmbedBackend for CudaBackend {
     /// Embed a batch of pre-tokenized inputs using the full BERT forward pass on GPU.
     ///
-    /// Runs: embeddings -> N attention+FFN layers -> CLS pooling -> L2 normalize.
-    /// Each batch item is processed independently through the GPU pipeline.
+    /// All encodings in the batch are padded to the same sequence length and
+    /// processed in a single GPU pass. This eliminates per-encoding kernel
+    /// launch overhead and enables batched cuBLAS GEMMs.
+    #[expect(
+        unsafe_code,
+        reason = "UnsafeCell access is safe because CUDA stream serializes operations"
+    )]
     fn embed_batch(&self, encodings: &[Encoding]) -> crate::Result<Vec<Vec<f32>>> {
         if encodings.is_empty() {
             return Ok(vec![]);
         }
 
-        let mut results = Vec::with_capacity(encodings.len());
-        for enc in encodings {
-            let embedding = self.model.forward(enc)?;
-            results.push(embedding);
+        // Safety: we need &mut for workspace buffers, but the trait requires &self.
+        // This is safe because the CUDA stream serializes all GPU operations, so
+        // concurrent calls are ordered. The workspace is only modified during
+        // forward_batch and not aliased.
+        let model = unsafe { &mut *self.model.get() };
+
+        // Split into sub-batches if needed (workspace is sized for MAX_BATCH)
+        let max_batch = MAX_BATCH as usize;
+        let mut all_results = Vec::with_capacity(encodings.len());
+
+        for chunk in encodings.chunks(max_batch) {
+            let mut results = model.forward_batch(chunk)?;
+            all_results.append(&mut results);
         }
 
-        Ok(results)
+        Ok(all_results)
     }
 
     /// CUDA backend does not support cheap cloning (GPU resources are not trivially clonable).
