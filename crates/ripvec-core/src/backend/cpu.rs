@@ -12,10 +12,11 @@
 extern crate blas_src;
 extern crate openblas_src;
 
+use std::f32::consts::PI;
 use std::sync::Arc;
 
 use hf_hub::api::sync::Api;
-use ndarray::{Array1, Array2, ArrayView1, Axis};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use safetensors::SafeTensors;
 
 use super::{DeviceHint, EmbedBackend, Encoding};
@@ -225,6 +226,38 @@ fn layer_norm(
 }
 
 // ---------------------------------------------------------------------------
+// Activation helpers
+// ---------------------------------------------------------------------------
+
+/// GELU activation (tanh approximation).
+///
+/// `x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`
+fn gelu(x: f32) -> f32 {
+    x * 0.5 * (1.0 + ((2.0 / PI).sqrt() * (x + 0.044_715 * x.powi(3))).tanh())
+}
+
+/// `SiLU` (Sigmoid Linear Unit) activation: `x * sigmoid(x)`.
+fn silu(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
+/// Softmax along the last axis of a 1D slice (in-place).
+///
+/// Uses the numerically stable `exp(x - max) / sum(exp(x - max))` form.
+fn softmax_inplace(vals: &mut [f32]) {
+    let max = vals.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0_f32;
+    for v in vals.iter_mut() {
+        *v = (*v - max).exp();
+        sum += *v;
+    }
+    let inv_sum = 1.0 / sum;
+    for v in vals.iter_mut() {
+        *v *= inv_sum;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // BERT embeddings layer
 // ---------------------------------------------------------------------------
 
@@ -298,7 +331,7 @@ impl CpuBertEmbeddings {
 }
 
 // ---------------------------------------------------------------------------
-// Self-attention (struct only -- forward() in a later task)
+// Self-attention
 // ---------------------------------------------------------------------------
 
 /// Self-attention sub-layer within a BERT encoder layer.
@@ -308,7 +341,6 @@ impl CpuBertEmbeddings {
 ///
 /// For `ClassicBert`, projections include bias terms and no rotary encoding.
 /// For `NomicBert`, projections are unbiased and `RoPE` is applied to Q and K.
-#[expect(dead_code, reason = "scaffold -- forward() will use these fields")]
 #[derive(Debug)]
 struct CpuBertSelfAttention {
     /// Fused Q/K/V weight matrix `[3*hidden, hidden]`.
@@ -333,15 +365,153 @@ struct CpuBertSelfAttention {
     rotary_emb_base: Option<f32>,
 }
 
+/// Apply rotary position embeddings to Q and K for a single (batch, head) pair.
+///
+/// Each row `[head_dim]` is split into two halves. For position `pos`:
+/// `theta_i = base^(-2i/head_dim)`, then:
+///   `first' = first * cos(pos * theta) - second * sin(pos * theta)`
+///   `second' = first * sin(pos * theta) + second * cos(pos * theta)`
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "position/dimension indices are small; f64 trig results fit in f32"
+)]
+fn apply_rope_to_2d(mat: &ArrayView2<'_, f32>, base: f32, head_dim: i32) -> Array2<f32> {
+    let seq = mat.shape()[0];
+    let hd = head_dim as usize;
+    let half = hd / 2;
+    let mut out = mat.to_owned();
+
+    for pos in 0..seq {
+        for i in 0..half {
+            let theta = f64::from(base).powf(-2.0 * i as f64 / hd as f64);
+            let angle = pos as f64 * theta;
+            let cos_a = angle.cos() as f32;
+            let sin_a = angle.sin() as f32;
+
+            let first = mat[[pos, i]];
+            let second = mat[[pos, i + half]];
+            out[[pos, i]] = first * cos_a - second * sin_a;
+            out[[pos, i + half]] = first * sin_a + second * cos_a;
+        }
+    }
+    out
+}
+
+impl CpuBertSelfAttention {
+    /// Scaled dot-product multi-head attention with residual + `LayerNorm`.
+    ///
+    /// Both variants use post-norm: attention -> residual -> `LayerNorm`.
+    /// `NomicBert` applies `RoPE` to Q and K; `ClassicBert` does not.
+    ///
+    /// `hidden` is `[seq, hidden]` (single batch item). `mask` is `[seq]`
+    /// with 0.0 for real tokens and a large negative value for padding.
+    #[expect(
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        reason = "num_heads/head_dim are small positive ints from config"
+    )]
+    fn forward(&self, hidden: &Array2<f32>, mask: &Array1<f32>) -> crate::Result<Array2<f32>> {
+        let seq = hidden.shape()[0];
+        let nh = self.num_heads as usize;
+        let hd = self.head_dim as usize;
+        let hidden_dim = nh * hd;
+
+        // --- Fused QKV projection: [seq, hidden] @ [hidden, 3*hidden] => [seq, 3*hidden] ---
+        let qkv = hidden.dot(&self.qkv_weight.t());
+        let qkv = if let Some(ref bias) = self.qkv_bias {
+            qkv + bias
+        } else {
+            qkv
+        };
+
+        // Split into Q, K, V each [seq, hidden]
+        let q = qkv.slice(s![.., 0..hidden_dim]).to_owned();
+        let k = qkv.slice(s![.., hidden_dim..2 * hidden_dim]).to_owned();
+        let v = qkv.slice(s![.., 2 * hidden_dim..3 * hidden_dim]).to_owned();
+
+        // --- Per-head attention ---
+        // We iterate over heads since ndarray doesn't have native 4D matmul.
+        let mut context = Array2::<f32>::zeros((seq, hidden_dim));
+
+        for h in 0..nh {
+            let col_start = h * hd;
+            let col_end = col_start + hd;
+
+            // Extract head slices: [seq, head_dim]
+            let q_h = q.slice(s![.., col_start..col_end]);
+            let k_h = k.slice(s![.., col_start..col_end]);
+            let v_h = v.slice(s![.., col_start..col_end]);
+
+            // Apply RoPE for NomicBert
+            let (q_h_owned, k_h_owned);
+            let (q_h_ref, k_h_ref) = if let Some(base) = self.rotary_emb_base {
+                q_h_owned = apply_rope_to_2d(&q_h, base, self.head_dim);
+                k_h_owned = apply_rope_to_2d(&k_h, base, self.head_dim);
+                (q_h_owned.view(), k_h_owned.view())
+            } else {
+                // Bind to owned copies so lifetimes match
+                q_h_owned = q_h.to_owned();
+                k_h_owned = k_h.to_owned();
+                (q_h_owned.view(), k_h_owned.view())
+            };
+
+            // scores = Q @ K^T / sqrt(head_dim)  => [seq, seq]
+            let scale = 1.0 / (hd as f32).sqrt();
+            let mut scores = q_h_ref.dot(&k_h_ref.t());
+            scores.mapv_inplace(|v| v * scale);
+
+            // Add attention mask: broadcast [seq] to each row
+            for mut row in scores.rows_mut() {
+                row.zip_mut_with(mask, |s, &m| *s += m);
+            }
+
+            // Softmax along last axis (each row)
+            for mut row in scores.rows_mut() {
+                softmax_inplace(row.as_slice_mut().ok_or_else(|| {
+                    crate::Error::Other(anyhow::anyhow!("attention scores not contiguous"))
+                })?);
+            }
+
+            // context_h = scores @ V_h  => [seq, head_dim]
+            let ctx_h = scores.dot(&v_h);
+            context.slice_mut(s![.., col_start..col_end]).assign(&ctx_h);
+        }
+
+        // --- Output projection ---
+        let projected = context.dot(&self.output_weight.t());
+        let projected = if let Some(ref bias) = self.output_bias {
+            projected + bias
+        } else {
+            projected
+        };
+
+        // --- Residual + LayerNorm ---
+        let residual = hidden + &projected;
+        let mut output = Array2::<f32>::zeros((seq, hidden_dim));
+        for t in 0..seq {
+            let normed = layer_norm(
+                &residual.row(t),
+                &self.output_ln_weight,
+                &self.output_ln_bias,
+                self.layer_norm_eps,
+            );
+            output.row_mut(t).assign(&normed);
+        }
+
+        Ok(output)
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Feed-forward network (struct only -- forward() in a later task)
+// Feed-forward network
 // ---------------------------------------------------------------------------
 
 /// Feed-forward network sub-layer within a BERT encoder layer.
 ///
 /// `ClassicBert`: Linear -> GELU -> Linear (all with bias).
 /// `NomicBert`: Linear -> `SwiGLU` split -> Linear (no bias).
-#[expect(dead_code, reason = "scaffold -- forward() will use these fields")]
 #[derive(Debug)]
 struct CpuBertFfn {
     /// Intermediate projection weight.
@@ -365,18 +535,84 @@ struct CpuBertFfn {
     variant: ModelVariant,
 }
 
+impl CpuBertFfn {
+    /// FFN forward pass, dispatching on variant for activation function.
+    ///
+    /// Both variants use post-norm: FFN -> residual -> `LayerNorm`.
+    /// `ClassicBert`: GELU activation.
+    /// `NomicBert`: `SwiGLU` (`value * silu(gate)`).
+    ///
+    /// `hidden` is `[seq, hidden]`.
+    fn forward(&self, hidden: &Array2<f32>) -> Array2<f32> {
+        let seq = hidden.shape()[0];
+        let hidden_dim = hidden.shape()[1];
+
+        // Intermediate projection: [seq, hidden] @ [hidden, intermediate] => [seq, intermediate]
+        let intermediate = hidden.dot(&self.intermediate_weight.t());
+        let intermediate = if let Some(ref bias) = self.intermediate_bias {
+            intermediate + bias
+        } else {
+            intermediate
+        };
+
+        // Activation (dispatch on variant)
+        let activated = match self.variant {
+            ModelVariant::ClassicBert => intermediate.mapv(gelu),
+            ModelVariant::NomicBert => {
+                // SwiGLU: intermediate has shape [seq, 2*inter]
+                // Split into value (first half) and gate (second half)
+                let inter_dim = intermediate.shape()[1] / 2;
+                let value = intermediate.slice(s![.., ..inter_dim]);
+                let gate = intermediate.slice(s![.., inter_dim..]);
+                let gate_activated = gate.mapv(silu);
+                &value * &gate_activated
+            }
+        };
+
+        // Output projection: [seq, intermediate] @ [intermediate, hidden] => [seq, hidden]
+        let output = activated.dot(&self.output_weight.t());
+        let output = if let Some(ref bias) = self.output_bias {
+            output + bias
+        } else {
+            output
+        };
+
+        // Residual + LayerNorm
+        let residual = hidden + &output;
+        let mut result = Array2::<f32>::zeros((seq, hidden_dim));
+        for t in 0..seq {
+            let normed = layer_norm(
+                &residual.row(t),
+                &self.output_ln_weight,
+                &self.output_ln_bias,
+                self.layer_norm_eps,
+            );
+            result.row_mut(t).assign(&normed);
+        }
+
+        result
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Encoder layer
 // ---------------------------------------------------------------------------
 
 /// A single BERT encoder layer (self-attention + FFN).
-#[expect(dead_code, reason = "scaffold -- forward() will use these fields")]
 #[derive(Debug)]
 struct CpuBertLayer {
     /// Self-attention sub-layer.
     attention: CpuBertSelfAttention,
     /// Feed-forward sub-layer.
     ffn: CpuBertFfn,
+}
+
+impl CpuBertLayer {
+    /// Run attention then FFN, returning updated hidden states `[seq, hidden]`.
+    fn forward(&self, hidden: &Array2<f32>, mask: &Array1<f32>) -> crate::Result<Array2<f32>> {
+        let after_attn = self.attention.forward(hidden, mask)?;
+        Ok(self.ffn.forward(&after_attn))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -389,8 +625,26 @@ struct CpuBertModel {
     /// Embeddings layer (word + position + `token_type` + `LayerNorm`).
     embeddings: CpuBertEmbeddings,
     /// Transformer encoder layers.
-    #[expect(dead_code, reason = "scaffold -- forward() will iterate layers")]
     layers: Vec<CpuBertLayer>,
+}
+
+impl CpuBertModel {
+    /// Run the full BERT forward pass for a single sequence.
+    ///
+    /// Chains: embeddings -> N attention+FFN layers -> hidden states `[seq, hidden]`.
+    fn forward(&self, encoding: &Encoding, mask: &Array1<f32>) -> crate::Result<Array2<f32>> {
+        let batched = self.embeddings.forward(std::slice::from_ref(encoding));
+        // embeddings.forward returns Vec<Array2> — take the single item
+        let mut hidden = batched.into_iter().next().ok_or_else(|| {
+            crate::Error::Other(anyhow::anyhow!("embeddings produced empty output"))
+        })?;
+
+        for layer in &self.layers {
+            hidden = layer.forward(&hidden, mask)?;
+        }
+
+        Ok(hidden)
+    }
 }
 
 /// Load `ClassicBert` encoder layers from safetensors.
@@ -645,24 +899,30 @@ impl CpuBackend {
 }
 
 impl EmbedBackend for CpuBackend {
-    /// Embed a batch of pre-tokenized inputs using CLS pooling and L2 norm.
+    /// Embed a batch of pre-tokenized inputs using the full BERT forward pass.
     ///
-    /// Currently runs only the embeddings layer (word + position +
-    /// `token_type` + `layer_norm`). The full forward pass (attention + FFN
-    /// layers) will be added in a follow-up task.
+    /// Runs: embeddings -> N attention+FFN layers -> CLS pooling -> L2 normalize.
+    /// Each batch item is processed independently (no cross-batch padding needed).
     fn embed_batch(&self, encodings: &[Encoding]) -> crate::Result<Vec<Vec<f32>>> {
         if encodings.is_empty() {
             return Ok(vec![]);
         }
 
-        // Run embeddings layer (attention layers not yet wired up)
-        let hidden_states = self.model.embeddings.forward(encodings);
-
-        // CLS pooling + L2 normalize
         let mut results = Vec::with_capacity(encodings.len());
-        for emb in &hidden_states {
-            // CLS token is the first row
-            let cls = emb.row(0);
+        for enc in encodings {
+            // Build attention mask: 0.0 for real tokens, -1e9 for padding
+            let mask = Array1::from_vec(
+                enc.attention_mask
+                    .iter()
+                    .map(|&m| if m == 1 { 0.0_f32 } else { -1e9_f32 })
+                    .collect(),
+            );
+
+            // Full forward pass: embeddings -> layers -> hidden [seq, hidden]
+            let hidden = self.model.forward(enc, &mask)?;
+
+            // CLS pooling (first token) + L2 normalize
+            let cls = hidden.row(0);
             let norm = cls.mapv(|v| v * v).sum().sqrt().max(1e-12);
             let normalized: Vec<f32> = cls.iter().map(|&v| v / norm).collect();
             results.push(normalized);
@@ -777,5 +1037,74 @@ mod tests {
         assert!(!cloned.is_gpu());
         assert!(cloned.supports_clone());
         assert_eq!(cloned.max_tokens(), 512);
+    }
+
+    #[test]
+    fn cpu_backend_full_forward_output_dim() {
+        // "hello world" tokenized: [CLS]=101, hello=7592, world=2088, [SEP]=102
+        let backend = CpuBackend::load(BGE_SMALL, &DeviceHint::Cpu).unwrap();
+        let enc = Encoding {
+            input_ids: vec![101, 7592, 2088, 102],
+            attention_mask: vec![1, 1, 1, 1],
+            token_type_ids: vec![0, 0, 0, 0],
+        };
+        let result = backend.embed_batch(&[enc]).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].len(),
+            384,
+            "BGE-small should produce 384-dim embeddings"
+        );
+    }
+
+    #[test]
+    fn cpu_backend_full_forward_l2_norm() {
+        let backend = CpuBackend::load(BGE_SMALL, &DeviceHint::Cpu).unwrap();
+        let enc = Encoding {
+            input_ids: vec![101, 7592, 2088, 102],
+            attention_mask: vec![1, 1, 1, 1],
+            token_type_ids: vec![0, 0, 0, 0],
+        };
+        let result = backend.embed_batch(&[enc]).unwrap();
+        let norm: f32 = result[0].iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-4,
+            "L2 norm should be ~1.0, got {norm}"
+        );
+    }
+
+    #[test]
+    fn cpu_backend_different_inputs_differ() {
+        let backend = CpuBackend::load(BGE_SMALL, &DeviceHint::Cpu).unwrap();
+        let enc1 = Encoding {
+            input_ids: vec![101, 7592, 2088, 102], // "hello world"
+            attention_mask: vec![1, 1, 1, 1],
+            token_type_ids: vec![0, 0, 0, 0],
+        };
+        let enc2 = Encoding {
+            input_ids: vec![101, 19387, 8840, 4313, 102], // "quantum physics"
+            attention_mask: vec![1, 1, 1, 1, 1],
+            token_type_ids: vec![0, 0, 0, 0, 0],
+        };
+        let results = backend.embed_batch(&[enc1, enc2]).unwrap();
+        assert_eq!(results.len(), 2);
+
+        // Cosine similarity (both L2-normalized, so dot product = cosine sim)
+        let dot: f32 = results[0]
+            .iter()
+            .zip(results[1].iter())
+            .map(|(a, b)| a * b)
+            .sum();
+        assert!(
+            dot < 0.99,
+            "different inputs should produce different embeddings, cosine sim = {dot}"
+        );
+    }
+
+    #[test]
+    fn cpu_backend_empty_batch() {
+        let backend = CpuBackend::load(BGE_SMALL, &DeviceHint::Cpu).unwrap();
+        let result = backend.embed_batch(&[]).unwrap();
+        assert!(result.is_empty(), "empty batch should return empty vec");
     }
 }
