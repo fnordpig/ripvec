@@ -252,13 +252,10 @@ fn full_index_path(
     }
 
     for (file_path, (file_chunks, file_embeddings)) in &file_groups {
-        let abs_path = if Path::new(file_path).is_absolute() {
-            PathBuf::from(file_path)
-        } else {
-            root.join(file_path)
-        };
+        // file_path from CodeChunk is already an absolute or cwd-relative path
+        let file_path_buf = PathBuf::from(file_path);
 
-        let content_hash = diff::hash_file(&abs_path).unwrap_or_else(|_| {
+        let content_hash = diff::hash_file(&file_path_buf).unwrap_or_else(|_| {
             // File might not exist (e.g., generated content) — use chunk content hash
             blake3::hash(file_chunks[0].content.as_bytes())
                 .to_hex()
@@ -273,13 +270,13 @@ fn full_index_path(
         };
         store.write(&content_hash, &fc.to_bytes())?;
 
-        let relative = abs_path
+        let relative = file_path_buf
             .strip_prefix(root)
-            .unwrap_or(&abs_path)
+            .unwrap_or(&file_path_buf)
             .to_string_lossy()
             .to_string();
-        let mtime = diff::mtime_secs(&abs_path);
-        let size = std::fs::metadata(&abs_path).map_or(0, |m| m.len());
+        let mtime = diff::mtime_secs(&file_path_buf);
+        let size = std::fs::metadata(&file_path_buf).map_or(0, |m| m.len());
         manifest.add_file(&relative, mtime, size, &content_hash, file_chunks.len());
     }
 

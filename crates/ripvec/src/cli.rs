@@ -101,6 +101,25 @@ pub struct Args {
     /// Write a Chrome trace JSON file (open in `chrome://tracing` or Perfetto).
     #[arg(long, value_name = "FILE")]
     pub trace: Option<String>,
+
+    /// Use persistent index: cache embeddings to disk, re-embed only changed files.
+    ///
+    /// First run builds the full index. Subsequent runs load from cache and
+    /// only re-embed files that changed since last run.
+    #[arg(long)]
+    pub index: bool,
+
+    /// Force a full rebuild of the persistent index (requires `--index`).
+    #[arg(long, requires = "index")]
+    pub reindex: bool,
+
+    /// Clear the persistent index cache for this project and exit.
+    #[arg(long)]
+    pub clear_cache: bool,
+
+    /// Override the cache directory (default: `~/.cache/ripvec/`).
+    #[arg(long, value_name = "DIR")]
+    pub cache_dir: Option<String>,
 }
 
 /// Output format for search results.

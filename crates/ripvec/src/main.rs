@@ -17,6 +17,22 @@ fn main() -> Result<()> {
         args.path = std::mem::take(&mut args.query);
     }
 
+    // Handle --clear-cache early (before loading anything)
+    if args.clear_cache {
+        let root = std::path::Path::new(&args.path);
+        let cache_dir = ripvec_core::cache::reindex::resolve_cache_dir(
+            root,
+            args.cache_dir.as_deref().map(std::path::Path::new),
+        );
+        if cache_dir.exists() {
+            std::fs::remove_dir_all(&cache_dir).context("failed to clear cache")?;
+            eprintln!("Cache cleared: {}", cache_dir.display());
+        } else {
+            eprintln!("No cache found at {}", cache_dir.display());
+        }
+        return Ok(());
+    }
+
     // Resolve model repo: --code → CodeRankEmbed, --text/default → BGE-small
     let use_code_model = args.code;
     let model_repo = args.model_repo.clone().unwrap_or_else(|| {
@@ -288,6 +304,10 @@ fn run_interactive(
 }
 
 /// One-shot search mode: embed, rank, print results, exit.
+#[expect(
+    clippy::too_many_lines,
+    reason = "two code paths (--index vs stateless) in one function"
+)]
 fn run_oneshot(
     backends: &[Box<dyn ripvec_core::backend::EmbedBackend>],
     tokenizer: &tokenizers::Tokenizer,
@@ -304,52 +324,131 @@ fn run_oneshot(
     let backend_refs: Vec<&dyn ripvec_core::backend::EmbedBackend> =
         backends.iter().map(|b| &**b).collect();
 
-    // When progress is enabled, create a profiler with an embed progress bar.
-    // Otherwise use the caller's profiler (which may be --profile or Noop).
-    let spinner = use_progress.then(|| progress::spinner("Searching\u{2026}"));
-    let embed_display: std::sync::Arc<std::sync::Mutex<Option<progress::EmbedDisplay>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(None));
-    let live_profiler;
-    let effective_profiler: &ripvec_core::profile::Profiler = if use_progress {
-        let spinner_clone = spinner.as_ref().unwrap().clone();
-        let display = embed_display.clone();
-        live_profiler = ripvec_core::profile::Profiler::with_callback(
-            std::time::Duration::ZERO,
-            move |_msg| {},
-        )
-        .with_embed_tick(move |p| {
-            let mut guard = display.lock().unwrap();
-            let d = guard.get_or_insert_with(|| {
-                spinner_clone.finish_and_clear();
-                progress::EmbedDisplay::new(p.total as u64)
-            });
-            d.update(p);
-        });
-        &live_profiler
-    } else {
-        profiler
-    };
-
-    let results = ripvec_core::embed::search(
-        std::path::Path::new(&args.path),
-        &args.query,
-        &backend_refs,
-        tokenizer,
-        args.top_k,
-        search_cfg,
-        effective_profiler,
-    )
-    .context("search failed")?;
-
-    // Finish whichever progress widget is active
-    {
-        let mut guard = embed_display.lock().unwrap();
-        if let Some(d) = guard.take() {
-            d.finish_and_clear();
-        } else if let Some(spinner) = spinner {
-            spinner.finish_and_clear();
+    // Resolve model repo for cache compatibility check
+    let model_repo = args.model_repo.clone().unwrap_or_else(|| {
+        if args.code {
+            "nomic-ai/CodeRankEmbed".to_string()
+        } else {
+            "BAAI/bge-small-en-v1.5".to_string()
         }
-    }
+    });
+
+    // If --index, use persistent cache; otherwise embed from scratch
+    let results = if args.index {
+        // Clear and rebuild if --reindex
+        if args.reindex {
+            let cache_dir = ripvec_core::cache::reindex::resolve_cache_dir(
+                std::path::Path::new(&args.path),
+                args.cache_dir.as_deref().map(std::path::Path::new),
+            );
+            let _ = std::fs::remove_dir_all(&cache_dir);
+        }
+
+        let pb = use_progress.then(|| progress::spinner("Loading index\u{2026}"));
+
+        let (index, stats) = ripvec_core::cache::reindex::incremental_index(
+            std::path::Path::new(&args.path),
+            &backend_refs,
+            tokenizer,
+            search_cfg,
+            profiler,
+            &model_repo,
+            args.cache_dir.as_deref().map(std::path::Path::new),
+        )
+        .context("incremental index failed")?;
+
+        if let Some(pb) = &pb {
+            if stats.chunks_reembedded > 0 {
+                pb.finish_with_message(format!(
+                    "Indexed {} chunks ({} re-embedded, {} cached)",
+                    stats.chunks_total, stats.chunks_reembedded, stats.files_unchanged,
+                ));
+            } else {
+                pb.finish_with_message(format!(
+                    "Loaded {} chunks from cache ({}ms)",
+                    stats.chunks_total, stats.duration_ms,
+                ));
+            }
+        }
+
+        // Query against the cached index
+        let enc = ripvec_core::tokenize::tokenize_query(
+            &args.query,
+            tokenizer,
+            backend_refs[0].max_tokens(),
+        )?;
+        let mut query_emb = backend_refs[0].embed_batch(&[enc])?;
+        let query_embedding = query_emb
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("backend returned no embedding"))?;
+
+        let ranked = index.rank(&query_embedding, args.threshold);
+        ranked
+            .into_iter()
+            .take(if args.top_k > 0 {
+                args.top_k
+            } else {
+                usize::MAX
+            })
+            .filter_map(|(idx, score)| {
+                index
+                    .chunks
+                    .get(idx)
+                    .map(|chunk| ripvec_core::embed::SearchResult {
+                        chunk: chunk.clone(),
+                        similarity: score,
+                    })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        // Original stateless path
+        let spinner = use_progress.then(|| progress::spinner("Searching\u{2026}"));
+        let embed_display: std::sync::Arc<std::sync::Mutex<Option<progress::EmbedDisplay>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let live_profiler;
+        let effective_profiler: &ripvec_core::profile::Profiler = if use_progress {
+            let spinner_clone = spinner.as_ref().unwrap().clone();
+            let display = embed_display.clone();
+            live_profiler = ripvec_core::profile::Profiler::with_callback(
+                std::time::Duration::ZERO,
+                move |_msg| {},
+            )
+            .with_embed_tick(move |p| {
+                let mut guard = display.lock().unwrap();
+                let d = guard.get_or_insert_with(|| {
+                    spinner_clone.finish_and_clear();
+                    progress::EmbedDisplay::new(p.total as u64)
+                });
+                d.update(p);
+            });
+            &live_profiler
+        } else {
+            profiler
+        };
+
+        let search_results = ripvec_core::embed::search(
+            std::path::Path::new(&args.path),
+            &args.query,
+            &backend_refs,
+            tokenizer,
+            args.top_k,
+            search_cfg,
+            effective_profiler,
+        )
+        .context("search failed")?;
+
+        // Finish whichever progress widget is active
+        {
+            let mut guard = embed_display.lock().unwrap();
+            if let Some(d) = guard.take() {
+                d.finish_and_clear();
+            } else if let Some(spinner) = spinner {
+                spinner.finish_and_clear();
+            }
+        }
+
+        search_results
+    };
 
     profiler.finish();
 
