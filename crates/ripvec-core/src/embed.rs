@@ -389,7 +389,11 @@ pub(crate) fn embed_distributed(
 
     // Collect (index, embedding) pairs from all workers
     let all_pairs: Vec<(usize, Vec<f32>)> = if backends.len() == 1 {
-        // Single backend: run directly on the main thread, no spawning overhead
+        // Single backend: run on the calling thread.
+        // For CPU backends, gemm already parallelizes each matmul across
+        // all cores via rayon — spawning multiple workers would cause
+        // thread oversubscription (N workers × N rayon threads).
+        // For GPU backends (MLX/CUDA), the GPU handles parallelism internally.
         state.run_worker(backends[0])
     } else {
         // Multiple backends: one thread per backend via std::thread::scope

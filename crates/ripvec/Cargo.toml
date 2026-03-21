@@ -33,6 +33,7 @@ metal = ["ripvec-core/metal"]
 cuda = ["ripvec-core/cuda"]
 mlx = ["ripvec-core/mlx"]
 accelerate = ["ripvec-core/accelerate"]
+ort = ["ripvec-core/ort"]
 
 # Auto-enable Apple BLAS + MLX on macOS
 [target.'cfg(target_os = "macos")'.dependencies]
