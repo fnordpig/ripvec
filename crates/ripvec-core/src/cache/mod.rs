@@ -7,4 +7,5 @@
 pub mod diff;
 pub mod file_cache;
 pub mod manifest;
+pub mod reindex;
 pub mod store;

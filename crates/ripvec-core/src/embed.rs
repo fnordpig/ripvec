@@ -370,7 +370,7 @@ impl DistributedState<'_> {
 ///
 /// Returns the first error from any backend. Other workers exit early
 /// when an error is detected.
-fn embed_distributed(
+pub(crate) fn embed_distributed(
     tokenized: &[Option<Encoding>],
     backends: &[&dyn EmbedBackend],
     batch_size: usize,
@@ -439,7 +439,7 @@ fn embed_distributed(
 }
 
 /// Source text either owned (from `read_to_string`) or mmap'd.
-enum SourceText {
+pub(crate) enum SourceText {
     Owned(String),
     Mapped(Mmap),
 }
@@ -467,7 +467,7 @@ impl std::ops::Deref for SourceText {
 ///
 /// Returns `None` (with a debug log) when the file cannot be read or is not valid UTF-8.
 #[expect(unsafe_code, reason = "mmap of read-only source file")]
-fn read_source(path: &Path) -> Option<SourceText> {
+pub(crate) fn read_source(path: &Path) -> Option<SourceText> {
     let metadata = match std::fs::metadata(path) {
         Ok(m) => m,
         Err(e) => {
