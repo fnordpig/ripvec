@@ -455,6 +455,49 @@ extern "C" __global__ void rope_kernel(
     mat[first_idx] = first * cos_a - second * sin_a;
     mat[second_idx] = first * sin_a + second * cos_a;
 }
+
+// Split QKV [seq, 3*hidden] into Q,K,V each [num_heads, seq, head_dim] on GPU.
+// Eliminates GPU→CPU→GPU round trip for reshape.
+extern "C" __global__ void qkv_split_kernel(
+    float* q, float* k, float* v,
+    const float* qkv,
+    int seq, int hidden, int num_heads, int head_dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_heads * seq * head_dim;
+    if (idx >= total) return;
+
+    int h = idx / (seq * head_dim);
+    int rem = idx % (seq * head_dim);
+    int t = rem / head_dim;
+    int d = rem % head_dim;
+
+    int qkv_idx = t * (3 * hidden) + h * head_dim + d;
+    q[idx] = qkv[qkv_idx];
+    k[idx] = qkv[qkv_idx + hidden];
+    v[idx] = qkv[qkv_idx + 2 * hidden];
+}
+
+// Reshape attention output from [num_heads, seq, head_dim] back to [seq, hidden].
+// Eliminates GPU→CPU→GPU round trip after attention.
+extern "C" __global__ void attn_reshape_kernel(
+    float* output,
+    const float* heads,
+    int seq, int num_heads, int head_dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int hidden = num_heads * head_dim;
+    int total = seq * hidden;
+    if (idx >= total) return;
+
+    int t = idx / hidden;
+    int flat_hd = idx % hidden;
+    int h = flat_hd / head_dim;
+    int d = flat_hd % head_dim;
+
+    int heads_idx = h * (seq * head_dim) + t * head_dim + d;
+    output[idx] = heads[heads_idx];
+}
 "#;
 
 // ---------------------------------------------------------------------------
@@ -493,6 +536,10 @@ struct KernelHandles {
     l2_normalize: CudaFunction,
     /// Rotary position embedding.
     rope: CudaFunction,
+    /// Split QKV [seq, 3*hidden] into Q,K,V [num_heads, seq, head_dim] on GPU.
+    qkv_split: CudaFunction,
+    /// Reshape attention output [num_heads, seq, head_dim] to [seq, hidden].
+    attn_reshape: CudaFunction,
 }
 
 impl KernelHandles {
@@ -523,6 +570,8 @@ impl KernelHandles {
                 cls_pool: load("cls_pool_kernel")?,
                 l2_normalize: load("l2_normalize_kernel")?,
                 rope: load("rope_kernel")?,
+                qkv_split: load("qkv_split_kernel")?,
+                attn_reshape: load("attn_reshape_kernel")?,
             },
         ))
     }
@@ -948,34 +997,34 @@ impl CudaBertModel {
             unsafe { builder.launch(launch_cfg_1d(total)) }.map_err(cuda_err)?;
         }
 
-        // QKV is [seq, 3*hidden] row-major. Split into Q, K, V each [seq, hidden],
-        // then reshape to [num_heads, seq, head_dim] for batched attention.
-        // We rearrange via host for simplicity. This is a small tensor.
-        let qkv_host = self.stream.clone_dtoh(&qkv).map_err(cuda_err)?;
-
-        let head_stride = (nh * seq * head_dim) as usize;
-        let mut q_heads = vec![0.0_f32; head_stride];
-        let mut k_heads = vec![0.0_f32; head_stride];
-        let mut v_heads = vec![0.0_f32; head_stride];
-
-        for t in 0..seq as usize {
-            for h in 0..nh as usize {
-                for d in 0..head_dim as usize {
-                    let qkv_base = t * (3 * hd as usize);
-                    let head_offset = h * head_dim as usize + d;
-                    let heads_idx =
-                        h * (seq as usize * head_dim as usize) + t * head_dim as usize + d;
-
-                    q_heads[heads_idx] = qkv_host[qkv_base + head_offset];
-                    k_heads[heads_idx] = qkv_host[qkv_base + hd as usize + head_offset];
-                    v_heads[heads_idx] = qkv_host[qkv_base + 2 * hd as usize + head_offset];
-                }
-            }
-        }
-
-        let mut q_dev = self.stream.clone_htod(&q_heads).map_err(cuda_err)?;
-        let mut k_dev = self.stream.clone_htod(&k_heads).map_err(cuda_err)?;
-        let v_dev = self.stream.clone_htod(&v_heads).map_err(cuda_err)?;
+        // QKV is [seq, 3*hidden] row-major. Split into Q, K, V each [num_heads, seq, head_dim]
+        // entirely on GPU — no CPU round-trip.
+        let total_head_elems = nh * seq * head_dim;
+        let mut q_dev = self
+            .stream
+            .alloc_zeros::<f32>(total_head_elems as usize)
+            .map_err(cuda_err)?;
+        let mut k_dev = self
+            .stream
+            .alloc_zeros::<f32>(total_head_elems as usize)
+            .map_err(cuda_err)?;
+        let v_dev = {
+            let mut v = self
+                .stream
+                .alloc_zeros::<f32>(total_head_elems as usize)
+                .map_err(cuda_err)?;
+            let mut builder = self.stream.launch_builder(&self.kernels.qkv_split);
+            builder.arg(&mut q_dev);
+            builder.arg(&mut k_dev);
+            builder.arg(&mut v);
+            builder.arg(&qkv);
+            builder.arg(&seq);
+            builder.arg(&hd);
+            builder.arg(&nh);
+            builder.arg(&head_dim);
+            unsafe { builder.launch(launch_cfg_1d(total_head_elems)) }.map_err(cuda_err)?;
+            v
+        };
 
         // Apply RoPE for NomicBert
         if let Some(base) = layer.rotary_emb_base {
@@ -1045,19 +1094,21 @@ impl CudaBertModel {
         let attn_out =
             gpu_batched_attn_output(&self.blas, &self.stream, &scores, &v_dev, nh, seq, head_dim)?;
 
-        // Rearrange back from [nh, seq, head_dim] to [seq, hidden]
-        let attn_host = self.stream.clone_dtoh(&attn_out).map_err(cuda_err)?;
-        let mut context = vec![0.0_f32; (seq * hd) as usize];
-        for h in 0..nh as usize {
-            for t in 0..seq as usize {
-                for d in 0..head_dim as usize {
-                    let src = h * (seq as usize * head_dim as usize) + t * head_dim as usize + d;
-                    let dst = t * hd as usize + h * head_dim as usize + d;
-                    context[dst] = attn_host[src];
-                }
-            }
-        }
-        let context_dev = self.stream.clone_htod(&context).map_err(cuda_err)?;
+        // Rearrange [num_heads, seq, head_dim] → [seq, hidden] on GPU
+        let context_dev = {
+            let mut ctx = self
+                .stream
+                .alloc_zeros::<f32>((seq * hd) as usize)
+                .map_err(cuda_err)?;
+            let mut builder = self.stream.launch_builder(&self.kernels.attn_reshape);
+            builder.arg(&mut ctx);
+            builder.arg(&attn_out);
+            builder.arg(&seq);
+            builder.arg(&nh);
+            builder.arg(&head_dim);
+            unsafe { builder.launch(launch_cfg_1d(seq * hd)) }.map_err(cuda_err)?;
+            ctx
+        };
 
         // Output projection: [seq, hidden] @ [hidden, hidden]^T = [seq, hidden]
         let mut projected = gpu_linear(
