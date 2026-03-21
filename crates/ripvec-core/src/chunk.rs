@@ -40,7 +40,7 @@ impl Default for ChunkConfig {
 }
 
 /// A semantic chunk extracted from a source file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct CodeChunk {
     /// Path to the source file.
     pub file_path: String,
