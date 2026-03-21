@@ -165,8 +165,21 @@ pub fn embed_all(
         })
         .collect();
 
+    // Sort chunks and their encodings together by descending token count.
+    // This groups similar-length sequences into the same batch, minimizing
+    // padding waste (short chunks no longer get padded to a long neighbour).
+    let mut paired: Vec<(CodeChunk, Option<Encoding>)> =
+        chunks.into_iter().zip(all_encodings).collect();
+    paired.sort_by(|a, b| {
+        let len_a = a.1.as_ref().map_or(0, |e| e.input_ids.len());
+        let len_b = b.1.as_ref().map_or(0, |e| e.input_ids.len());
+        len_b.cmp(&len_a) // descending — longest first
+    });
+    let (chunks, sorted_encodings): (Vec<CodeChunk>, Vec<Option<Encoding>>) =
+        paired.into_iter().unzip();
+
     // Phase 4: Distribute pre-tokenized batches across all backends
-    let embeddings = embed_distributed(&all_encodings, backends, bs, profiler)?;
+    let embeddings = embed_distributed(&sorted_encodings, backends, bs, profiler)?;
     profiler.embed_done();
 
     // Filter out chunks whose tokenization failed (empty embedding vectors).
