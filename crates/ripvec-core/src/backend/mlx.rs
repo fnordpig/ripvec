@@ -27,6 +27,19 @@ fn mlx_err(e: impl std::fmt::Display) -> crate::Error {
     crate::Error::Other(anyhow::anyhow!("MLX: {e}"))
 }
 
+/// Convert an array to FP16 for reduced memory bandwidth on Apple Silicon.
+///
+/// Halves the memory footprint of weight matrices, which speeds up the
+/// memory-bound matmul operations that dominate BERT inference.
+fn to_fp16(arr: &Array) -> crate::Result<Array> {
+    arr.as_dtype(mlx_rs::Dtype::Float16).map_err(mlx_err)
+}
+
+/// Optionally convert an array to FP16 (for `Option<Array>` fields).
+fn opt_to_fp16(arr: Option<Array>) -> crate::Result<Option<Array>> {
+    arr.map(|a| to_fp16(&a)).transpose()
+}
+
 // ---------------------------------------------------------------------------
 // Model variant detection
 // ---------------------------------------------------------------------------
@@ -505,11 +518,17 @@ impl BertModel {
         let mut hidden = self.embeddings.forward(input_ids, token_type_ids)?;
 
         // Build padding attention mask for BERT (bidirectional, not causal).
-        // Converts 0/1 mask to additive bias: mask = (1.0 - mask) * -1e9
+        // Converts 0/1 mask to additive bias: mask = (1.0 - mask) * -65504
         // broadcast to [batch, 1, 1, seq] so padding tokens get ~-inf scores.
-        let ones = Array::ones::<f32>(attention_mask.shape()).map_err(mlx_err)?;
+        // Uses -65504 instead of -1e9 because FP16 max is ~65504.
+        let ones = Array::ones::<f32>(attention_mask.shape())
+            .map_err(mlx_err)?
+            .as_dtype(mlx_rs::Dtype::Float16)
+            .map_err(mlx_err)?;
         let inverted = mlx_rs::ops::subtract(&ones, attention_mask).map_err(mlx_err)?;
-        let large_neg = Array::from_slice(&[-1e9_f32], &[1]);
+        let large_neg = Array::from_slice(&[-65504.0_f32], &[1])
+            .as_dtype(mlx_rs::Dtype::Float16)
+            .map_err(mlx_err)?;
         let mask_bias = mlx_rs::ops::multiply(&inverted, &large_neg).map_err(mlx_err)?;
 
         // Expand to [batch, 1, 1, seq] for broadcasting over heads and query positions
@@ -535,20 +554,27 @@ impl BertModel {
 
         let embeddings = match config.variant {
             ModelVariant::ClassicBert => BertEmbeddings {
-                word_embeddings: take_weight(w, "embeddings.word_embeddings.weight")?,
-                position_embeddings: Some(take_weight(w, "embeddings.position_embeddings.weight")?),
-                token_type_embeddings: Some(take_weight(
+                word_embeddings: to_fp16(&take_weight(w, "embeddings.word_embeddings.weight")?)?,
+                position_embeddings: Some(to_fp16(&take_weight(
+                    w,
+                    "embeddings.position_embeddings.weight",
+                )?)?),
+                token_type_embeddings: Some(to_fp16(&take_weight(
                     w,
                     "embeddings.token_type_embeddings.weight",
-                )?),
+                )?)?),
+                // LayerNorm stays FP32 — mean/variance computation needs full precision
                 layer_norm_weight: take_weight(w, "embeddings.LayerNorm.weight")?,
                 layer_norm_bias: take_weight(w, "embeddings.LayerNorm.bias")?,
                 layer_norm_eps: config.layer_norm_eps,
             },
             ModelVariant::NomicBert => BertEmbeddings {
-                word_embeddings: take_weight(w, "embeddings.word_embeddings.weight")?,
+                word_embeddings: to_fp16(&take_weight(w, "embeddings.word_embeddings.weight")?)?,
                 position_embeddings: None,
-                token_type_embeddings: w.remove("embeddings.token_type_embeddings.weight"),
+                token_type_embeddings: opt_to_fp16(
+                    w.remove("embeddings.token_type_embeddings.weight"),
+                )?,
+                // LayerNorm stays FP32
                 layer_norm_weight: take_weight(w, "emb_ln.weight")?,
                 layer_norm_bias: take_weight(w, "emb_ln.bias")?,
                 layer_norm_eps: config.layer_norm_eps,
@@ -590,31 +616,36 @@ impl BertModel {
                         take_weight(w, &format!("{prefix}.attention.self.key.weight"))?;
                     let value_weight =
                         take_weight(w, &format!("{prefix}.attention.self.value.weight"))?;
-                    let qkv_weight = mlx_rs::ops::concatenate_axis(
-                        &[&query_weight, &key_weight, &value_weight],
-                        0,
-                    )
-                    .map_err(mlx_err)?;
+                    let qkv_weight = to_fp16(
+                        &mlx_rs::ops::concatenate_axis(
+                            &[&query_weight, &key_weight, &value_weight],
+                            0,
+                        )
+                        .map_err(mlx_err)?,
+                    )?;
 
-                    // Fuse biases if present
+                    // Fuse biases if present (FP16)
                     let query_bias = w.remove(&format!("{prefix}.attention.self.query.bias"));
                     let key_bias = w.remove(&format!("{prefix}.attention.self.key.bias"));
                     let value_bias = w.remove(&format!("{prefix}.attention.self.value.bias"));
                     let qkv_bias = match (&query_bias, &key_bias, &value_bias) {
-                        (Some(qb), Some(kb), Some(vb)) => {
-                            Some(mlx_rs::ops::concatenate_axis(&[qb, kb, vb], 0).map_err(mlx_err)?)
-                        }
+                        (Some(qb), Some(kb), Some(vb)) => Some(to_fp16(
+                            &mlx_rs::ops::concatenate_axis(&[qb, kb, vb], 0).map_err(mlx_err)?,
+                        )?),
                         _ => None,
                     };
 
                     let attention = BertSelfAttention {
                         qkv_weight,
                         qkv_bias,
-                        output_weight: take_weight(
+                        output_weight: to_fp16(&take_weight(
                             w,
                             &format!("{prefix}.attention.output.dense.weight"),
+                        )?)?,
+                        output_bias: opt_to_fp16(
+                            w.remove(&format!("{prefix}.attention.output.dense.bias")),
                         )?,
-                        output_bias: w.remove(&format!("{prefix}.attention.output.dense.bias")),
+                        // LayerNorm stays FP32
                         output_ln_weight: take_weight(
                             w,
                             &format!("{prefix}.attention.output.LayerNorm.weight"),
@@ -629,13 +660,19 @@ impl BertModel {
                         rope_cache: None,
                     };
                     let ffn = BertFfn {
-                        intermediate_weight: take_weight(
+                        intermediate_weight: to_fp16(&take_weight(
                             w,
                             &format!("{prefix}.intermediate.dense.weight"),
+                        )?)?,
+                        intermediate_bias: opt_to_fp16(
+                            w.remove(&format!("{prefix}.intermediate.dense.bias")),
                         )?,
-                        intermediate_bias: w.remove(&format!("{prefix}.intermediate.dense.bias")),
-                        output_weight: take_weight(w, &format!("{prefix}.output.dense.weight"))?,
-                        output_bias: w.remove(&format!("{prefix}.output.dense.bias")),
+                        output_weight: to_fp16(&take_weight(
+                            w,
+                            &format!("{prefix}.output.dense.weight"),
+                        )?)?,
+                        output_bias: opt_to_fp16(w.remove(&format!("{prefix}.output.dense.bias")))?,
+                        // LayerNorm stays FP32
                         output_ln_weight: take_weight(
                             w,
                             &format!("{prefix}.output.LayerNorm.weight"),
@@ -649,15 +686,20 @@ impl BertModel {
                 ModelVariant::NomicBert => {
                     let prefix = format!("encoder.layers.{i}");
                     // NomicBert weights are already fused: Wqkv is [3*hidden, hidden]
-                    let qkv_weight = take_weight(w, &format!("{prefix}.attn.Wqkv.weight"))?;
+                    let qkv_weight =
+                        to_fp16(&take_weight(w, &format!("{prefix}.attn.Wqkv.weight"))?)?;
                     let hidden = config.hidden_size;
 
                     let attention = BertSelfAttention {
                         qkv_weight,
                         qkv_bias: None,
-                        output_weight: take_weight(w, &format!("{prefix}.attn.out_proj.weight"))?,
+                        output_weight: to_fp16(&take_weight(
+                            w,
+                            &format!("{prefix}.attn.out_proj.weight"),
+                        )?)?,
                         output_bias: None,
                         // NomicBert uses post-norm (prenorm: false): norm1 is after attention
+                        // LayerNorm stays FP32
                         output_ln_weight: take_weight(w, &format!("{prefix}.norm1.weight"))?,
                         output_ln_bias: take_weight(w, &format!("{prefix}.norm1.bias"))?,
                         num_heads: config.num_attention_heads,
@@ -670,14 +712,19 @@ impl BertModel {
                     // to compute fc11(x) * SiLU(fc12(x))
                     let fc11 = take_weight(w, &format!("{prefix}.mlp.fc11.weight"))?;
                     let fc12 = take_weight(w, &format!("{prefix}.mlp.fc12.weight"))?;
-                    let gate_up =
-                        mlx_rs::ops::concatenate_axis(&[&fc11, &fc12], 0).map_err(mlx_err)?;
+                    let gate_up = to_fp16(
+                        &mlx_rs::ops::concatenate_axis(&[&fc11, &fc12], 0).map_err(mlx_err)?,
+                    )?;
 
                     let ffn = BertFfn {
                         intermediate_weight: gate_up,
                         intermediate_bias: None,
-                        output_weight: take_weight(w, &format!("{prefix}.mlp.fc2.weight"))?,
+                        output_weight: to_fp16(&take_weight(
+                            w,
+                            &format!("{prefix}.mlp.fc2.weight"),
+                        )?)?,
                         output_bias: None,
+                        // LayerNorm stays FP32
                         output_ln_weight: take_weight(w, &format!("{prefix}.norm2.weight"))?,
                         output_ln_bias: take_weight(w, &format!("{prefix}.norm2.bias"))?,
                         layer_norm_eps: config.layer_norm_eps,
@@ -839,6 +886,10 @@ impl EmbedBackend for MlxBackend {
 
         // Phase 1: Tensor prep (no lock needed)
         let (input_ids, attention_mask, token_type_ids) = prepare_batch_tensors(encodings);
+        // Attention mask to FP16 — float tensor used in matmul-heavy attention
+        let attention_mask = attention_mask
+            .as_dtype(mlx_rs::Dtype::Float16)
+            .map_err(mlx_err)?;
 
         // Phase 2: Forward pass (lock needed)
         let hidden = {
@@ -863,6 +914,11 @@ impl EmbedBackend for MlxBackend {
         let eps = Array::from_slice(&[1e-12_f32], &[1]);
         let norms = mlx_rs::ops::maximum(&norms, &eps).map_err(mlx_err)?;
         let normalized = mlx_rs::ops::divide(&cls, &norms).map_err(mlx_err)?;
+
+        // Back to FP32 for host extraction (as_slice requires matching type)
+        let normalized = normalized
+            .as_dtype(mlx_rs::Dtype::Float32)
+            .map_err(mlx_err)?;
 
         // Evaluate and extract to Vec<Vec<f32>>
         normalized.eval().map_err(mlx_err)?;
@@ -916,6 +972,17 @@ mod tests {
     use crate::backend::Encoding;
 
     const BGE_SMALL: &str = "BAAI/bge-small-en-v1.5";
+
+    #[test]
+    fn mlx_supports_fp16() {
+        let arr = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
+        let half = arr.as_dtype(mlx_rs::Dtype::Float16);
+        assert!(
+            half.is_ok(),
+            "MLX doesn't support Float16: {:?}",
+            half.err()
+        );
+    }
 
     #[test]
     fn mlx_backend_loads_model() {
