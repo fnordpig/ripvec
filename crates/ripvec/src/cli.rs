@@ -158,4 +158,6 @@ pub enum BackendArg {
     Ort,
     /// CPU (ndarray + system BLAS).
     Cpu,
+    /// CUDA (cudarc, NVIDIA GPU via cuBLAS).
+    Cuda,
 }

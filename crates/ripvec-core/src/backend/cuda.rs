@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig, sys};
+use cudarc::cublas::{sys, CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
@@ -699,14 +699,31 @@ fn gpu_batched_attn_scores(
         .alloc_zeros::<f32>((num_heads * seq * seq) as usize)
         .map_err(cuda_err)?;
 
-    // For row-major [seq, head_dim]:
-    // C_rm[seq,seq] = Q_rm[seq,hd] @ K_rm[seq,hd]^T
-    // In col-major: C_cm[seq,seq] = K_cm[hd,seq] @ Q_cm[hd,seq]^T
-    // A = K, transa = N, B = Q, transb = T
+    // Row-major C[seq,seq] = Q[seq,hd] @ K[seq,hd]^T
+    // cuBLAS is col-major. For row-major A[m,k] @ B[n,k]^T = C[m,n]:
+    //   call sgemm with: transa=T, transb=N, m=seq, n=seq, k=hd,
+    //   A_cublas=K (col-major view: [hd,seq]), B_cublas=Q (col-major view: [hd,seq])
+    //   lda=seq (stride between cols in row-major K = seq),
+    //   ldb=seq (stride between cols in row-major Q = seq),
+    //   ldc=seq
+    // Actually simpler: swap A and B, use N and T:
+    //   C_cm[seq,seq] = K_rm_as_cm[hd,seq] @ Q_rm_as_cm^T[seq,hd]
+    // But cuBLAS output C is col-major [seq,seq] which is same as row-major [seq,seq] for square.
+    //
+    // Correct approach for row-major: C = A @ B^T → cuBLAS: C^T = B @ A^T
+    // Since C is symmetric-shaped (seq×seq), C^T has same layout.
+    // A=Q[seq,hd] stored row-major → col-major view [hd,seq], ld=hd
+    // B=K[seq,hd] stored row-major → col-major view [hd,seq], ld=hd
+    // C^T[seq,seq] = B_cm[hd,seq].T @ A_cm[hd,seq]
+    // → transa=T on K: K^T_cm = [seq,hd], transb=N on Q: Q_cm = [hd,seq]
+    // → m=seq (rows of op(A)), n=seq (cols of op(B)), k=hd
+    // → lda=hd (leading dim of A before op = rows of K_cm = hd)
+    // → ldb=hd (leading dim of B = rows of Q_cm = hd)
+    // → ldc=seq
     let cfg = StridedBatchedConfig {
         gemm: GemmConfig {
-            transa: sys::cublasOperation_t::CUBLAS_OP_N,
-            transb: sys::cublasOperation_t::CUBLAS_OP_T,
+            transa: sys::cublasOperation_t::CUBLAS_OP_T,
+            transb: sys::cublasOperation_t::CUBLAS_OP_N,
             m: seq,
             n: seq,
             k: head_dim,
