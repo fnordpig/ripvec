@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig, sys};
+use cudarc::cublas::{sys, CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
@@ -1546,7 +1546,10 @@ fn allocate_workspace(
     let hd = config.hidden_size;
     let nh = config.num_attention_heads;
     let head_dim = hd / nh;
-    let max_seq = config.max_position_embeddings;
+    // Cap workspace seq length at 512 — real chunks rarely exceed this.
+    // NomicBert's 8192 max_position_embeddings would require 400+ GB for scores.
+    // If a batch exceeds this, forward_batch will allocate dynamically.
+    let max_seq = config.max_position_embeddings.min(512);
     let max_batch = MAX_BATCH;
     let bs = max_batch * max_seq;
     let bh = max_batch * nh;
