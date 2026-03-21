@@ -4,6 +4,7 @@
 //! ORT) implement, plus the [`Encoding`] input type and [`BackendKind`]
 //! discriminant. Use [`load_backend`] to construct a backend by kind.
 
+pub mod blas_info;
 pub mod candle;
 #[cfg(feature = "cpu")]
 pub mod cpu;

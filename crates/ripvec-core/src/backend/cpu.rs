@@ -16,7 +16,7 @@ use std::f32::consts::PI;
 use std::sync::Arc;
 
 use hf_hub::api::sync::Api;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
+use ndarray::{s, Array1, Array2, ArrayView1, ArrayView2, Axis};
 use safetensors::SafeTensors;
 
 use super::{DeviceHint, EmbedBackend, Encoding};
@@ -859,6 +859,14 @@ impl CpuBackend {
     /// Returns an error if the model cannot be downloaded, the config
     /// cannot be parsed, or the weights fail to load.
     pub fn load(model_repo: &str, _device_hint: &DeviceHint) -> crate::Result<Self> {
+        // Report BLAS status and recommend optimal library for this CPU
+        let blas = super::blas_info::detect_blas();
+        let cpu = super::blas_info::detect_cpu_vendor();
+        tracing::info!("CPU backend: {} CPU, {} BLAS", cpu, blas);
+        if let Some(tip) = super::blas_info::recommend_blas() {
+            eprintln!("[ripvec] {tip}");
+        }
+
         let api = Api::new().map_err(|e| crate::Error::Download(e.to_string()))?;
         let repo = api.model(model_repo.to_string());
 

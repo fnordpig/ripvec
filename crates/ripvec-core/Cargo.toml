@@ -39,6 +39,7 @@ blake3 = "1.8.3"
 rkyv = { version = "0.8.15", features = ["bytecheck"] }
 dirs = "6.0.0"
 serde = { workspace = true, features = ["derive"] }
+libc = "0.2"
 
 [features]
 default = []
@@ -46,7 +47,6 @@ accelerate = ["candle-core/accelerate"]
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 cuda = ["dep:cudarc"]
 cpu = ["ndarray/blas", "dep:blas-src", "dep:openblas-src"]
-cpu-mkl = ["ndarray/blas", "dep:blas-src", "blas-src/intel-mkl-dynamic-sequential"]
 ort = ["dep:ort"]
 mlx = ["dep:mlx-rs"]
 
