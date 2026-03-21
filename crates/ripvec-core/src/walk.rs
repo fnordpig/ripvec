@@ -32,6 +32,20 @@ pub fn collect_files(root: &Path) -> Vec<PathBuf> {
                 if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                     return ignore::WalkState::Continue;
                 }
+                // Skip known generated/binary files that add noise to the index
+                if let Some(name) = entry.path().file_name().and_then(|n| n.to_str())
+                    && matches!(
+                        name,
+                        "Cargo.lock"
+                            | "package-lock.json"
+                            | "yarn.lock"
+                            | "pnpm-lock.yaml"
+                            | "poetry.lock"
+                            | "Gemfile.lock"
+                            | "go.sum"
+                    ) {
+                        return ignore::WalkState::Continue;
+                    }
                 if let Ok(mut files) = files.lock() {
                     files.push(entry.into_path());
                 }
