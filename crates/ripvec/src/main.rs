@@ -233,14 +233,43 @@ fn run_interactive(
 
     let backend_refs: Vec<&dyn ripvec_core::backend::EmbedBackend> =
         backends.iter().map(|b| &**b).collect();
-    let (chunks, embeddings) = ripvec_core::embed::embed_all(
-        std::path::Path::new(&args.path),
-        &backend_refs,
-        &tokenizer,
-        search_cfg,
-        &live_profiler,
-    )
-    .context("embedding failed")?;
+
+    let model_repo = args.model_repo.clone().unwrap_or_else(|| {
+        if use_code_model {
+            "nomic-ai/CodeRankEmbed".to_string()
+        } else {
+            "BAAI/bge-small-en-v1.5".to_string()
+        }
+    });
+
+    let (chunks, embeddings) = if args.index {
+        // Persistent index path: load from cache, diff, re-embed only changes
+        let (index, _stats) = ripvec_core::cache::reindex::incremental_index(
+            std::path::Path::new(&args.path),
+            &backend_refs,
+            &tokenizer,
+            search_cfg,
+            &live_profiler,
+            &model_repo,
+            args.cache_dir.as_deref().map(std::path::Path::new),
+        )
+        .context("incremental index failed")?;
+
+        // Extract chunks and embeddings from the index for the TUI
+        let n = index.chunks.len();
+        let embs: Vec<Vec<f32>> = (0..n).filter_map(|i| index.embedding(i)).collect();
+        (index.chunks.clone(), embs)
+    } else {
+        // Stateless path: embed everything from scratch
+        ripvec_core::embed::embed_all(
+            std::path::Path::new(&args.path),
+            &backend_refs,
+            &tokenizer,
+            search_cfg,
+            &live_profiler,
+        )
+        .context("embedding failed")?
+    };
 
     if use_progress {
         let n_files = chunks
