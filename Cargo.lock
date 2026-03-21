@@ -3455,6 +3455,7 @@ dependencies = [
  "ort",
  "rayon",
  "rkyv",
+ "serde",
  "serde_json",
  "streaming-iterator",
  "tempfile",

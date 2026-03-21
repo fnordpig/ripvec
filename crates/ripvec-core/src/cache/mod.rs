@@ -5,4 +5,5 @@
 //! reindexing by diffing against the filesystem.
 
 pub mod file_cache;
+pub mod manifest;
 pub mod store;

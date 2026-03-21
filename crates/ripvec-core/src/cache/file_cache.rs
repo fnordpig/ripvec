@@ -25,7 +25,7 @@ impl FileCache {
     /// # Panics
     ///
     /// Panics if serialization fails (should not happen for valid data).
-    #[must_use] 
+    #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         rkyv::to_bytes::<rkyv::rancor::Error>(self)
             .expect("FileCache serialization should never fail")
