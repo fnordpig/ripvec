@@ -3457,6 +3457,7 @@ dependencies = [
  "rkyv",
  "serde_json",
  "streaming-iterator",
+ "tempfile",
  "thiserror 2.0.18",
  "tokenizers",
  "tracing",

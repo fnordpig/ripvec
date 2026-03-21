@@ -45,6 +45,7 @@ mlx = ["dep:mlx-rs"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+tempfile.workspace = true
 tokenizers = "0.22.2"
 
 [[bench]]

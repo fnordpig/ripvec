@@ -5,6 +5,7 @@
 //! embedding, and cosine similarity ranking.
 
 pub mod backend;
+pub mod cache;
 pub mod chunk;
 pub mod embed;
 pub mod error;
