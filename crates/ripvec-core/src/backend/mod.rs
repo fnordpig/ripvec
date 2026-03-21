@@ -7,6 +7,8 @@
 pub mod candle;
 #[cfg(feature = "cpu")]
 pub mod cpu;
+#[cfg(feature = "cuda")]
+pub mod cuda;
 #[cfg(feature = "mlx")]
 pub mod mlx;
 #[cfg(feature = "ort")]
@@ -85,6 +87,8 @@ pub enum BackendKind {
     /// Candle (pure-Rust, CPU + Metal + CUDA).
     #[default]
     Candle,
+    /// CUDA (cudarc, NVIDIA GPUs via cuBLAS + custom kernels).
+    Cuda,
     /// MLX (Apple Silicon, macOS only).
     Mlx,
     /// ONNX Runtime (cross-platform, CPU + GPU).
@@ -97,6 +101,7 @@ impl std::fmt::Display for BackendKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Candle => write!(f, "candle"),
+            Self::Cuda => write!(f, "cuda"),
             Self::Mlx => write!(f, "mlx"),
             Self::Ort => write!(f, "ort"),
             Self::Cpu => write!(f, "cpu"),
@@ -138,6 +143,15 @@ pub fn load_backend(
             let backend = candle::CandleBackend::load(model_repo, &device_hint)?;
             Ok(Box::new(backend))
         }
+        #[cfg(feature = "cuda")]
+        BackendKind::Cuda => {
+            let backend = cuda::CudaBackend::load(model_repo, &device_hint)?;
+            Ok(Box::new(backend))
+        }
+        #[cfg(not(feature = "cuda"))]
+        BackendKind::Cuda => Err(crate::Error::Other(anyhow::anyhow!(
+            "cuda backend requires building with: cargo build --features cuda"
+        ))),
         #[cfg(feature = "mlx")]
         BackendKind::Mlx => {
             let backend = mlx::MlxBackend::load(model_repo, &device_hint)?;
@@ -186,9 +200,11 @@ pub fn detect_backends(model_repo: &str) -> crate::Result<Vec<Box<dyn EmbedBacke
         backends.push(Box::new(b));
     }
 
-    // Future: enumerate CUDA devices
-    // #[cfg(feature = "cuda")]
-    // for device_id in 0..cuda_device_count() { ... }
+    // Try CUDA (NVIDIA GPU)
+    #[cfg(feature = "cuda")]
+    if let Ok(b) = cuda::CudaBackend::load(model_repo, &DeviceHint::Gpu) {
+        backends.push(Box::new(b));
+    }
 
     // Add CPU as fallback only when no GPU backend was loaded.
     // On Apple Silicon, running CPU + MLX concurrently is slower than

@@ -17,6 +17,10 @@ pub enum Error {
     #[error("ORT inference failed: {0}")]
     Ort(String),
 
+    /// CUDA backend error.
+    #[error("CUDA error: {0}")]
+    Cuda(String),
+
     /// Tokenization of input text failed.
     #[error("tokenization failed: {0}")]
     Tokenization(String),
