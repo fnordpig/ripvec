@@ -61,6 +61,12 @@ pub struct App {
     pub status_flash: Option<(String, std::time::Instant)>,
     /// Cache config for incremental reindex on watcher events.
     pub cache_config: Option<CacheConfig>,
+    /// When set, the next draw will clear the entire terminal first.
+    ///
+    /// This prevents visual artifacts when the preview content changes
+    /// drastically (e.g. navigating results quickly). Set by navigation
+    /// keys and Ctrl-L.
+    pub force_redraw: bool,
 }
 
 /// Configuration for the persistent cache (used by the TUI file watcher).
@@ -145,6 +151,14 @@ pub fn run(mut app: App) -> Result<()> {
 /// Core event loop: poll for input, handle keys, redraw.
 fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
     loop {
+        // When force_redraw is set, clear the back-buffer so ratatui
+        // repaints every cell instead of diffing against stale content.
+        // This prevents visual artifacts when the preview changes rapidly.
+        if app.force_redraw {
+            terminal.clear().context("failed to clear terminal")?;
+            app.force_redraw = false;
+        }
+
         terminal
             .draw(|frame| ui::draw(frame, app))
             .context("failed to draw frame")?;

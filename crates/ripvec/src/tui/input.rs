@@ -31,6 +31,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             true
         }
 
+        // Force full redraw (standard terminal convention)
+        KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.force_redraw = true;
+            false
+        }
+
         // Type a character
         KeyCode::Char(c) => {
             app.query.push(c);
@@ -50,6 +56,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             if app.selected > 0 {
                 app.selected -= 1;
                 app.preview_scroll = 0;
+                app.force_redraw = true;
             }
             false
         }
@@ -57,6 +64,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             if !app.results.is_empty() && app.selected < app.results.len() - 1 {
                 app.selected += 1;
                 app.preview_scroll = 0;
+                app.force_redraw = true;
             }
             false
         }
@@ -64,10 +72,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         // Scroll preview
         KeyCode::PageUp => {
             app.preview_scroll = app.preview_scroll.saturating_sub(10);
+            app.force_redraw = true;
             false
         }
         KeyCode::PageDown => {
             app.preview_scroll = app.preview_scroll.saturating_add(10);
+            app.force_redraw = true;
             false
         }
 
@@ -76,6 +86,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             if !app.results.is_empty() {
                 app.selected = 0;
                 app.preview_scroll = 0;
+                app.force_redraw = true;
             }
             false
         }
@@ -83,6 +94,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             if !app.results.is_empty() {
                 app.selected = app.results.len() - 1;
                 app.preview_scroll = 0;
+                app.force_redraw = true;
             }
             false
         }

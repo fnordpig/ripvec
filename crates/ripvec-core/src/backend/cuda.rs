@@ -10,12 +10,12 @@
 
 use std::sync::Arc;
 
-use cudarc::cublas::{sys, CudaBlas};
+use cudarc::cublas::{CudaBlas, sys};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut,
     LaunchConfig, PushKernelArg,
 };
-use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
+use cudarc::nvrtc::{CompileOptions, compile_ptx_with_opts};
 use hf_hub::api::sync::Api;
 use safetensors::SafeTensors;
 

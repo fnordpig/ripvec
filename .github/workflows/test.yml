@@ -1,0 +1,55 @@
+# CPU tests — runs on every push and PR.
+# Downloads models from HuggingFace (cached between runs).
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # HuggingFace hub cache — used by the cache action below
+  HF_HOME: ${{ github.workspace }}/.hf-cache
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            apt: libopenblas-dev
+            features: ""  # Linux default features auto-enable cpu
+          - os: macos-latest
+            apt: ""
+            features: ""  # macOS default features auto-enable mlx + cpu-accelerate
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        if: matrix.apt != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      # Cache HuggingFace model downloads (~50MB each) across runs.
+      # Key includes model repo names so cache invalidates if models change.
+      - name: Cache HuggingFace models
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.HF_HOME }}
+          key: hf-models-${{ runner.os }}-bge-small-coderank-v1
+
+      # Unit tests (no model download required)
+      - name: Unit tests
+        run: cargo nextest run --workspace
+
+      # Integration tests that need model downloads (marked #[ignore])
+      - name: Integration tests (with models)
+        run: cargo nextest run --workspace --run-ignored ignored-only

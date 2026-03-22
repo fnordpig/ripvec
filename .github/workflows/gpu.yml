@@ -1,0 +1,115 @@
+# GPU backend tests — expensive, only runs on:
+#   - pushes to main
+#   - PRs labeled "gpu-test"
+#   - manual dispatch
+#
+# Requires self-hosted runners with appropriate hardware:
+#   - `cuda`: NVIDIA GPU with CUDA toolkit installed
+#   - `apple-silicon`: macOS ARM64 (M1/M2/M3+)
+name: GPU
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, labeled]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  HF_HOME: ${{ github.workspace }}/.hf-cache
+
+jobs:
+  # ── CUDA (NVIDIA GPU) ─────────────────────────────────────────────
+  cuda:
+    name: CUDA
+    # Only run on main push, manual dispatch, or PRs with the gpu-test label
+    if: >-
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'gpu-test')
+    runs-on: [self-hosted, linux, cuda]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify CUDA availability
+        run: nvidia-smi
+
+      - name: Cache HuggingFace models
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.HF_HOME }}
+          key: hf-models-cuda-bge-small-coderank-v1
+
+      - name: Build (CUDA)
+        run: cargo build --workspace --features cuda
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Unit tests (CUDA)
+        run: cargo nextest run --workspace --features cuda
+
+      - name: Integration tests (CUDA, with models)
+        run: cargo nextest run --workspace --features cuda --run-ignored ignored-only
+
+  # ── MLX (Apple Silicon) ────────────────────────────────────────────
+  mlx:
+    name: MLX (Apple Silicon)
+    if: >-
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'gpu-test')
+    runs-on: [self-hosted, macOS, apple-silicon]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache HuggingFace models
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.HF_HOME }}
+          key: hf-models-mlx-bge-small-coderank-v1
+
+      # On macOS, default features auto-enable mlx + cpu-accelerate
+      - name: Build (MLX)
+        run: cargo build --workspace
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Unit tests (MLX)
+        run: cargo nextest run --workspace
+
+      - name: Integration tests (MLX, with models)
+        run: cargo nextest run --workspace --run-ignored ignored-only
+
+  # ── Benchmarks (optional, main only) ───────────────────────────────
+  bench:
+    name: Benchmarks
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [cuda]
+    runs-on: [self-hosted, linux, cuda]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache HuggingFace models
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.HF_HOME }}
+          key: hf-models-cuda-bge-small-coderank-v1
+
+      - name: Run benchmarks
+        run: cargo bench --features cuda -p ripvec-core
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-report
+          path: target/criterion
+          retention-days: 30

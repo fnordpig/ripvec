@@ -153,7 +153,8 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Keybinding hints shown right-aligned in the status bar.
-const STATUS_HINTS: &str = "ESC quit \u{2502} ENTER open \u{2502} \u{2191}\u{2193} navigate ";
+const STATUS_HINTS: &str =
+    "ESC quit \u{2502} ENTER open \u{2502} \u{2191}\u{2193} navigate \u{2502} ^L redraw ";
 
 /// Draw the status bar with file location left-aligned and keybinding hints right-aligned.
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {

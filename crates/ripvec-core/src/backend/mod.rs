@@ -127,13 +127,21 @@ pub enum DeviceHint {
 /// feature flag) or if model loading fails.
 pub fn load_backend(
     kind: BackendKind,
-    _model_repo: &str,
-    _device_hint: DeviceHint,
+    #[cfg_attr(
+        not(any(feature = "cuda", feature = "mlx", feature = "cpu")),
+        expect(unused_variables, reason = "used when backend features are enabled")
+    )]
+    model_repo: &str,
+    #[cfg_attr(
+        not(any(feature = "cuda", feature = "mlx", feature = "cpu")),
+        expect(unused_variables, reason = "used when backend features are enabled")
+    )]
+    device_hint: DeviceHint,
 ) -> crate::Result<Box<dyn EmbedBackend>> {
     match kind {
         #[cfg(feature = "cuda")]
         BackendKind::Cuda => {
-            let backend = cuda::CudaBackend::load(_model_repo, &_device_hint)?;
+            let backend = cuda::CudaBackend::load(model_repo, &device_hint)?;
             Ok(Box::new(backend))
         }
         #[cfg(not(feature = "cuda"))]
@@ -142,7 +150,7 @@ pub fn load_backend(
         ))),
         #[cfg(feature = "mlx")]
         BackendKind::Mlx => {
-            let backend = mlx::MlxBackend::load(_model_repo, &_device_hint)?;
+            let backend = mlx::MlxBackend::load(model_repo, &device_hint)?;
             Ok(Box::new(backend))
         }
         #[cfg(not(feature = "mlx"))]
@@ -151,7 +159,7 @@ pub fn load_backend(
         ))),
         #[cfg(feature = "cpu")]
         BackendKind::Cpu => {
-            let backend = cpu::CpuBackend::load(_model_repo, &_device_hint)?;
+            let backend = cpu::CpuBackend::load(model_repo, &device_hint)?;
             Ok(Box::new(backend))
         }
         #[cfg(not(feature = "cpu"))]
@@ -170,7 +178,13 @@ pub fn load_backend(
 /// # Errors
 ///
 /// Returns an error if no backends can be loaded (not even CPU).
-pub fn detect_backends(_model_repo: &str) -> crate::Result<Vec<Box<dyn EmbedBackend>>> {
+pub fn detect_backends(
+    #[cfg_attr(
+        not(any(feature = "cuda", feature = "mlx", feature = "cpu")),
+        expect(unused_variables, reason = "used when backend features are enabled")
+    )]
+    model_repo: &str,
+) -> crate::Result<Vec<Box<dyn EmbedBackend>>> {
     #[cfg_attr(
         not(any(feature = "cuda", feature = "mlx", feature = "cpu")),
         expect(unused_mut, reason = "mut needed when backend features are enabled")
@@ -179,13 +193,13 @@ pub fn detect_backends(_model_repo: &str) -> crate::Result<Vec<Box<dyn EmbedBack
 
     // Try CUDA (NVIDIA GPU)
     #[cfg(feature = "cuda")]
-    if let Ok(b) = cuda::CudaBackend::load(_model_repo, &DeviceHint::Gpu) {
+    if let Ok(b) = cuda::CudaBackend::load(model_repo, &DeviceHint::Gpu) {
         backends.push(Box::new(b));
     }
 
     // Try MLX (Apple Silicon GPU)
     #[cfg(feature = "mlx")]
-    if let Ok(b) = mlx::MlxBackend::load(_model_repo, &DeviceHint::Auto) {
+    if let Ok(b) = mlx::MlxBackend::load(model_repo, &DeviceHint::Auto) {
         backends.push(Box::new(b));
     }
 
@@ -193,12 +207,14 @@ pub fn detect_backends(_model_repo: &str) -> crate::Result<Vec<Box<dyn EmbedBack
     // On Apple Silicon, running CPU + MLX concurrently is slower than
     // MLX alone because they share the same physical cores and memory.
     // On discrete GPU systems (CUDA), CPU would be a useful helper.
-    let _has_gpu = backends.iter().any(|b| b.is_gpu());
+    #[cfg_attr(
+        not(feature = "cpu"),
+        expect(unused_variables, reason = "used when cpu feature is enabled")
+    )]
+    let has_gpu = backends.iter().any(|b| b.is_gpu());
     #[cfg(feature = "cpu")]
-    if !_has_gpu {
-        if let Ok(b) = cpu::CpuBackend::load(_model_repo, &DeviceHint::Cpu) {
-            backends.push(Box::new(b));
-        }
+    if !has_gpu && let Ok(b) = cpu::CpuBackend::load(model_repo, &DeviceHint::Cpu) {
+        backends.push(Box::new(b));
     }
 
     if backends.is_empty() {

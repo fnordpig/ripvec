@@ -334,6 +334,7 @@ fn run_interactive(
         watcher_rx: None,
         watcher_handle: None,
         status_flash: None,
+        force_redraw: false,
         cache_config: if args.index {
             let model = args.model_repo.clone().unwrap_or_else(|| {
                 if use_code_model {
