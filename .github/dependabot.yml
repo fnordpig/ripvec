@@ -1,0 +1,22 @@
+version: 2
+updates:
+  # Rust (Cargo) dependencies
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      # Group minor/patch updates into a single PR to reduce noise
+      rust-deps:
+        update-types: [minor, patch]
+    open-pull-requests-limit: 5
+    labels: [dependencies]
+
+  # GitHub Actions versions
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies, ci]
