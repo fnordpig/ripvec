@@ -10,11 +10,12 @@
 
 use std::sync::Arc;
 
-use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig, sys};
+use cudarc::cublas::{sys, CudaBlas};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut,
+    LaunchConfig, PushKernelArg,
 };
-use cudarc::nvrtc::compile_ptx;
+use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use hf_hub::api::sync::Api;
 use safetensors::SafeTensors;
 
@@ -740,6 +741,17 @@ extern "C" __global__ void fused_bias_residual_kernel(
     if (idx >= rows * cols) return;
     output[idx] = input[idx] + bias[idx % cols] + residual[idx];
 }
+
+// Convert FP32 to FP16 using PTX inline asm (no cuda_fp16.h dependency).
+// Output is unsigned short (u16) holding FP16 bit pattern.
+extern "C" __global__ void f32_to_f16_kernel(
+    unsigned short* output, const float* input, int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        asm("cvt.rn.f16.f32 %0, %1;" : "=h"(output[i]) : "f"(input[i]));
+    }
+}
 "#;
 
 // ---------------------------------------------------------------------------
@@ -803,12 +815,18 @@ struct KernelHandles {
     fused_swiglu: CudaFunction,
     /// Fused bias + residual add for output projections.
     fused_bias_residual: CudaFunction,
+    /// Convert FP32 to FP16 (for tensor core GEMM input conversion).
+    f32_to_f16: CudaFunction,
 }
 
 impl KernelHandles {
     /// Compile CUDA kernels and load function handles.
     fn compile(ctx: &Arc<CudaContext>) -> crate::Result<(Arc<CudaModule>, Self)> {
-        let ptx = compile_ptx(KERNELS).map_err(cuda_err)?;
+        let opts = CompileOptions {
+            arch: Some("sm_70"),
+            ..Default::default()
+        };
+        let ptx = compile_ptx_with_opts(KERNELS, opts).map_err(cuda_err)?;
         let module = ctx.load_module(ptx).map_err(cuda_err)?;
         let module = Arc::new(module);
 
@@ -842,6 +860,7 @@ impl KernelHandles {
                 fused_residual_layernorm: load("fused_residual_layernorm_kernel")?,
                 fused_swiglu: load("fused_swiglu_kernel")?,
                 fused_bias_residual: load("fused_bias_residual_kernel")?,
+                f32_to_f16: load("f32_to_f16_kernel")?,
             },
         ))
     }
@@ -869,12 +888,12 @@ struct CudaBertEmbeddings {
 
 /// Self-attention sub-layer on GPU.
 struct CudaBertSelfAttention {
-    /// Fused Q/K/V weight matrix `[3*hidden, hidden]`.
-    qkv_weight: CudaSlice<f32>,
+    /// Fused Q/K/V weight matrix `[3*hidden, hidden]` stored as FP16.
+    qkv_weight: CudaSlice<u16>,
     /// Fused Q/K/V bias `[3*hidden]` (`ClassicBert` only).
     qkv_bias: Option<CudaSlice<f32>>,
-    /// Output projection weight `[hidden, hidden]`.
-    output_weight: CudaSlice<f32>,
+    /// Output projection weight `[hidden, hidden]` stored as FP16.
+    output_weight: CudaSlice<u16>,
     /// Output projection bias `[hidden]` (`ClassicBert` only).
     output_bias: Option<CudaSlice<f32>>,
     /// Post-attention `LayerNorm` weight `[hidden]`.
@@ -889,15 +908,15 @@ struct CudaBertSelfAttention {
 
 /// Feed-forward network sub-layer on GPU.
 struct CudaBertFfn {
-    /// Intermediate projection weight.
+    /// Intermediate projection weight stored as FP16.
     ///
     /// `ClassicBert`: `[intermediate, hidden]`.
     /// `NomicBert`: `[2*intermediate, hidden]` (gate+value fused).
-    intermediate_weight: CudaSlice<f32>,
+    intermediate_weight: CudaSlice<u16>,
     /// Intermediate projection bias (`ClassicBert` only).
     intermediate_bias: Option<CudaSlice<f32>>,
-    /// Output projection weight `[hidden, intermediate]`.
-    output_weight: CudaSlice<f32>,
+    /// Output projection weight `[hidden, intermediate]` stored as FP16.
+    output_weight: CudaSlice<u16>,
     /// Output projection bias (`ClassicBert` only).
     output_bias: Option<CudaSlice<f32>>,
     /// Post-FFN `LayerNorm` weight `[hidden]`.
@@ -951,6 +970,16 @@ struct CudaWorkspace {
     scratch: CudaSlice<f32>,
     /// CLS pooled + L2 normalized output `[batch, hidden]`.
     cls: CudaSlice<f32>,
+    /// FP16 buffer for GEMM input conversion `[batch*seq, max(3*hidden, 2*intermediate)]`.
+    input_f16: CudaSlice<u16>,
+    /// FP16 Q heads for batched attention GEMM `[batch*num_heads, seq, head_dim]`.
+    q_f16: CudaSlice<u16>,
+    /// FP16 K heads for batched attention GEMM `[batch*num_heads, seq, head_dim]`.
+    k_f16: CudaSlice<u16>,
+    /// FP16 V heads for batched attention GEMM `[batch*num_heads, seq, head_dim]`.
+    v_f16: CudaSlice<u16>,
+    /// FP16 attention scores for batched attention GEMM `[batch*num_heads, seq, seq]`.
+    scores_f16: CudaSlice<u16>,
 }
 
 /// Pre-computed `RoPE` cos/sin tables on GPU (`NomicBert` only).
@@ -988,123 +1017,248 @@ struct CudaBertModel {
 }
 
 // ---------------------------------------------------------------------------
-// cuBLAS GEMM helpers
+// FP16 conversion helper
 // ---------------------------------------------------------------------------
 
-/// GPU matrix multiply: C = alpha * A @ B^T + beta * C
+/// Convert FP32 device buffer to FP16 (u16) in a pre-allocated workspace buffer.
 ///
-/// Input `a` is `[m, k]` row-major, `weight` is `[n, k]` row-major (stored
-/// as-is from safetensors). This computes `C = A * W^T` producing `[m, n]`.
-/// Output written to pre-allocated `output` buffer.
-#[expect(unsafe_code, reason = "cuBLAS GEMM requires unsafe")]
-fn gpu_linear(
-    blas: &CudaBlas,
+/// Launches the `f32_to_f16_kernel` to convert `n` elements from `input` (f32)
+/// into `output_f16` (u16 holding FP16 bit patterns).
+#[expect(unsafe_code, reason = "CUDA kernel launch requires unsafe")]
+fn convert_to_f16_inplace(
+    stream: &Arc<CudaStream>,
+    kernels: &KernelHandles,
     input: &CudaSlice<f32>,
-    weight: &CudaSlice<f32>,
+    output_f16: &mut CudaSlice<u16>,
+    n: i32,
+) -> crate::Result<()> {
+    let mut builder = stream.launch_builder(&kernels.f32_to_f16);
+    builder.arg(output_f16);
+    builder.arg(input);
+    builder.arg(&n);
+    // SAFETY: kernel reads `n` f32 elements from `input` and writes `n` u16
+    // elements to `output_f16`. Both buffers are pre-allocated with sufficient size.
+    unsafe { builder.launch(launch_cfg_1d(n)) }.map_err(cuda_err)?;
+    Ok(())
+}
+
+/// Convert FP32 device buffer to FP16 (u16), allocating a new buffer.
+///
+/// Used at model load time to convert weight matrices to FP16 storage.
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "n is a positive dimension from model config"
+)]
+fn convert_to_f16(
+    stream: &Arc<CudaStream>,
+    kernels: &KernelHandles,
+    input: &CudaSlice<f32>,
+    n: i32,
+) -> crate::Result<CudaSlice<u16>> {
+    let mut f16_data = stream.alloc_zeros::<u16>(n as usize).map_err(cuda_err)?;
+    convert_to_f16_inplace(stream, kernels, input, &mut f16_data, n)?;
+    Ok(f16_data)
+}
+
+// ---------------------------------------------------------------------------
+// cuBLAS GEMM helpers (FP16 tensor core)
+// ---------------------------------------------------------------------------
+
+/// FP16 tensor core linear: C(f32) = A(f16) @ W(f16)^T
+///
+/// Input `a` is `[m, k]` row-major (FP32, converted to FP16 via workspace).
+/// `weight_f16` is `[n, k]` row-major stored as FP16.
+/// Output `[m, n]` is FP32 (for downstream layernorm/softmax precision).
+///
+/// Uses `cublasGemmEx` with FP16 inputs, FP32 compute, FP32 output to
+/// engage tensor cores (330 TFLOPS on RTX 4090 vs 83 TFLOPS FP32).
+#[expect(
+    unsafe_code,
+    clippy::too_many_arguments,
+    reason = "cublasGemmEx requires unsafe raw pointer access; args mirror cuBLAS API"
+)]
+fn gpu_linear_f16(
+    blas: &CudaBlas,
+    stream: &Arc<CudaStream>,
+    kernels: &KernelHandles,
+    input_f32: &CudaSlice<f32>,
+    weight_f16: &CudaSlice<u16>,
     output: &mut CudaSlice<f32>,
+    input_f16_buf: &mut CudaSlice<u16>,
     m: i32,
     n: i32,
     k: i32,
 ) -> crate::Result<()> {
-    let cfg = GemmConfig {
-        transa: sys::cublasOperation_t::CUBLAS_OP_T,
-        transb: sys::cublasOperation_t::CUBLAS_OP_N,
-        m: n,
-        n: m,
-        k,
-        alpha: 1.0_f32,
-        lda: k,
-        ldb: k,
-        beta: 0.0_f32,
-        ldc: n,
-    };
+    // Convert FP32 activation to FP16 in pre-allocated workspace
+    convert_to_f16_inplace(stream, kernels, input_f32, input_f16_buf, m * k)?;
 
+    let alpha = 1.0_f32;
+    let beta = 0.0_f32;
+    let handle = *blas.handle();
+
+    // Obtain raw device pointers via the DevicePtr/DevicePtrMut traits.
+    // The _sync guards must live until after the GEMM is scheduled.
+    let (w_ptr, _w_sync) = weight_f16.device_ptr(stream);
+    let (a_ptr, _a_sync) = input_f16_buf.device_ptr(stream);
+    let (c_ptr, _c_sync) = output.device_ptr_mut(stream);
+
+    // SAFETY: All device pointers come from valid CudaSlice allocations sized
+    // for the GEMM dimensions. cublasGemmEx reads FP16 A/B, writes FP32 C
+    // with FP32 accumulation. The handle is valid for the lifetime of `blas`.
     unsafe {
-        blas.gemm(cfg, weight, input, output).map_err(cuda_err)?;
+        // cuBLAS column-major: C(n,m) = W(n,k) @ A(k,m)
+        // For row-major A[m,k] @ W[n,k]^T = C[m,n]:
+        //   transa=T on weight, transb=N on input
+        sys::cublasGemmEx(
+            handle,
+            sys::cublasOperation_t::CUBLAS_OP_T,
+            sys::cublasOperation_t::CUBLAS_OP_N,
+            n,
+            m,
+            k,
+            std::ptr::from_ref(&alpha).cast(),
+            w_ptr as *const _,
+            sys::cudaDataType_t::CUDA_R_16F,
+            k,
+            a_ptr as *const _,
+            sys::cudaDataType_t::CUDA_R_16F,
+            k,
+            std::ptr::from_ref(&beta).cast(),
+            c_ptr as *mut _,
+            sys::cudaDataType_t::CUDA_R_32F,
+            n,
+            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+        )
+        .result()
+        .map_err(cuda_err)?;
     }
 
     Ok(())
 }
 
-/// Batched GEMM for multi-head attention: C = Q @ K^T with per-head strides.
+/// Batched FP16 tensor core GEMM for attention scores: C(f32) = Q(f16) @ K(f16)^T.
 ///
-/// `q` has shape `[batch_heads, seq, head_dim]`.
-/// `k` has shape `[batch_heads, seq, head_dim]`.
-/// `scores` (output) has shape `[batch_heads, seq, seq]`.
-#[expect(unsafe_code, reason = "cuBLAS batched GEMM requires unsafe")]
-fn gpu_batched_attn_scores(
+/// `q_f16` has shape `[batch_heads, seq, head_dim]` as FP16.
+/// `k_f16` has shape `[batch_heads, seq, head_dim]` as FP16.
+/// `scores` (output) has shape `[batch_heads, seq, seq]` as FP32.
+#[expect(
+    unsafe_code,
+    clippy::too_many_arguments,
+    reason = "cublasGemmStridedBatchedEx requires unsafe; args mirror cuBLAS API"
+)]
+fn gpu_batched_attn_scores_f16(
     blas: &CudaBlas,
-    q: &CudaSlice<f32>,
-    k: &CudaSlice<f32>,
+    stream: &Arc<CudaStream>,
+    q_f16: &CudaSlice<u16>,
+    k_f16: &CudaSlice<u16>,
     scores: &mut CudaSlice<f32>,
     batch_heads: i32,
     seq: i32,
     head_dim: i32,
 ) -> crate::Result<()> {
-    let cfg = StridedBatchedConfig {
-        gemm: GemmConfig {
-            transa: sys::cublasOperation_t::CUBLAS_OP_T,
-            transb: sys::cublasOperation_t::CUBLAS_OP_N,
-            m: seq,
-            n: seq,
-            k: head_dim,
-            alpha: 1.0_f32,
-            lda: head_dim,
-            ldb: head_dim,
-            beta: 0.0_f32,
-            ldc: seq,
-        },
-        batch_size: batch_heads,
-        stride_a: i64::from(seq * head_dim),
-        stride_b: i64::from(seq * head_dim),
-        stride_c: i64::from(seq * seq),
-    };
+    let alpha = 1.0_f32;
+    let beta = 0.0_f32;
+    let handle = *blas.handle();
 
+    let (k_ptr, _k_sync) = k_f16.device_ptr(stream);
+    let (q_ptr, _q_sync) = q_f16.device_ptr(stream);
+    let (c_ptr, _c_sync) = scores.device_ptr_mut(stream);
+
+    // SAFETY: All device pointers are valid CudaSlice allocations. Strides and
+    // dimensions match the [batch_heads, seq, head_dim] layout. FP16 inputs
+    // with FP32 accumulation and FP32 output.
     unsafe {
-        blas.gemm_strided_batched(cfg, k, q, scores)
-            .map_err(cuda_err)?;
+        sys::cublasGemmStridedBatchedEx(
+            handle,
+            sys::cublasOperation_t::CUBLAS_OP_T,
+            sys::cublasOperation_t::CUBLAS_OP_N,
+            seq,
+            seq,
+            head_dim,
+            std::ptr::from_ref(&alpha).cast(),
+            k_ptr as *const _,
+            sys::cudaDataType_t::CUDA_R_16F,
+            head_dim,
+            i64::from(seq * head_dim),
+            q_ptr as *const _,
+            sys::cudaDataType_t::CUDA_R_16F,
+            head_dim,
+            i64::from(seq * head_dim),
+            std::ptr::from_ref(&beta).cast(),
+            c_ptr as *mut _,
+            sys::cudaDataType_t::CUDA_R_32F,
+            seq,
+            i64::from(seq * seq),
+            batch_heads,
+            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+        )
+        .result()
+        .map_err(cuda_err)?;
     }
 
     Ok(())
 }
 
-/// Batched GEMM for attention output: C = scores @ V.
+/// Batched FP16 tensor core GEMM for attention output: C(f32) = scores(f16) @ V(f16).
 ///
-/// `scores` has shape `[batch_heads, seq, seq]`.
-/// `v` has shape `[batch_heads, seq, head_dim]`.
-/// `output` has shape `[batch_heads, seq, head_dim]`.
-#[expect(unsafe_code, reason = "cuBLAS batched GEMM requires unsafe")]
-fn gpu_batched_attn_output(
+/// `scores_f16` has shape `[batch_heads, seq, seq]` as FP16.
+/// `v_f16` has shape `[batch_heads, seq, head_dim]` as FP16.
+/// `output` has shape `[batch_heads, seq, head_dim]` as FP32.
+#[expect(
+    unsafe_code,
+    clippy::too_many_arguments,
+    reason = "cublasGemmStridedBatchedEx requires unsafe; args mirror cuBLAS API"
+)]
+fn gpu_batched_attn_output_f16(
     blas: &CudaBlas,
-    scores: &CudaSlice<f32>,
-    v: &CudaSlice<f32>,
+    stream: &Arc<CudaStream>,
+    scores_f16: &CudaSlice<u16>,
+    v_f16: &CudaSlice<u16>,
     output: &mut CudaSlice<f32>,
     batch_heads: i32,
     seq: i32,
     head_dim: i32,
 ) -> crate::Result<()> {
-    let cfg = StridedBatchedConfig {
-        gemm: GemmConfig {
-            transa: sys::cublasOperation_t::CUBLAS_OP_N,
-            transb: sys::cublasOperation_t::CUBLAS_OP_N,
-            m: head_dim,
-            n: seq,
-            k: seq,
-            alpha: 1.0_f32,
-            lda: head_dim,
-            ldb: seq,
-            beta: 0.0_f32,
-            ldc: head_dim,
-        },
-        batch_size: batch_heads,
-        stride_a: i64::from(seq * head_dim),
-        stride_b: i64::from(seq * seq),
-        stride_c: i64::from(seq * head_dim),
-    };
+    let alpha = 1.0_f32;
+    let beta = 0.0_f32;
+    let handle = *blas.handle();
 
+    let (v_ptr, _v_sync) = v_f16.device_ptr(stream);
+    let (s_ptr, _s_sync) = scores_f16.device_ptr(stream);
+    let (c_ptr, _c_sync) = output.device_ptr_mut(stream);
+
+    // SAFETY: All device pointers are valid CudaSlice allocations. Strides and
+    // dimensions match the batched layout. FP16 inputs with FP32 accumulation.
     unsafe {
-        blas.gemm_strided_batched(cfg, v, scores, output)
-            .map_err(cuda_err)?;
+        sys::cublasGemmStridedBatchedEx(
+            handle,
+            sys::cublasOperation_t::CUBLAS_OP_N,
+            sys::cublasOperation_t::CUBLAS_OP_N,
+            head_dim,
+            seq,
+            seq,
+            std::ptr::from_ref(&alpha).cast(),
+            v_ptr as *const _,
+            sys::cudaDataType_t::CUDA_R_16F,
+            head_dim,
+            i64::from(seq * head_dim),
+            s_ptr as *const _,
+            sys::cudaDataType_t::CUDA_R_16F,
+            seq,
+            i64::from(seq * seq),
+            std::ptr::from_ref(&beta).cast(),
+            c_ptr as *mut _,
+            sys::cudaDataType_t::CUDA_R_32F,
+            head_dim,
+            i64::from(seq * head_dim),
+            batch_heads,
+            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+        )
+        .result()
+        .map_err(cuda_err)?;
     }
 
     Ok(())
@@ -1278,12 +1432,15 @@ impl CudaBertModel {
         for layer_idx in 0..num_layers {
             // === ATTENTION: hidden_a → hidden_b ===
 
-            // QKV projection: [batch*seq, hidden] @ [3*hidden, hidden]^T
-            gpu_linear(
+            // QKV projection: [batch*seq, hidden] @ [3*hidden, hidden]^T (FP16 tensor core)
+            gpu_linear_f16(
                 &self.blas,
+                &self.stream,
+                &self.kernels,
                 &self.workspace.hidden_a,
                 &self.layers[layer_idx].attention.qkv_weight,
                 &mut self.workspace.qkv,
+                &mut self.workspace.input_f16,
                 batch_seq,
                 3 * hd,
                 hd,
@@ -1348,11 +1505,38 @@ impl CudaBertModel {
                 }
             }
 
-            // Attention scores: [batch*nh, seq, seq]
-            gpu_batched_attn_scores(
+            // Convert Q, K, V to FP16 for tensor core batched GEMM
+            {
+                let head_elems = batch_heads * max_seq * head_dim;
+                convert_to_f16_inplace(
+                    &self.stream,
+                    &self.kernels,
+                    &self.workspace.q,
+                    &mut self.workspace.q_f16,
+                    head_elems,
+                )?;
+                convert_to_f16_inplace(
+                    &self.stream,
+                    &self.kernels,
+                    &self.workspace.k,
+                    &mut self.workspace.k_f16,
+                    head_elems,
+                )?;
+                convert_to_f16_inplace(
+                    &self.stream,
+                    &self.kernels,
+                    &self.workspace.v,
+                    &mut self.workspace.v_f16,
+                    head_elems,
+                )?;
+            }
+
+            // Attention scores: [batch*nh, seq, seq] (FP16 tensor core)
+            gpu_batched_attn_scores_f16(
                 &self.blas,
-                &self.workspace.q,
-                &self.workspace.k,
+                &self.stream,
+                &self.workspace.q_f16,
+                &self.workspace.k_f16,
                 &mut self.workspace.scores,
                 batch_heads,
                 max_seq,
@@ -1378,11 +1562,21 @@ impl CudaBertModel {
                     .map_err(cuda_err)?;
             }
 
-            // Attention output: [batch*nh, seq, head_dim]
-            gpu_batched_attn_output(
-                &self.blas,
+            // Convert softmax scores to FP16 for tensor core GEMM
+            convert_to_f16_inplace(
+                &self.stream,
+                &self.kernels,
                 &self.workspace.scores,
-                &self.workspace.v,
+                &mut self.workspace.scores_f16,
+                batch_heads * max_seq * max_seq,
+            )?;
+
+            // Attention output: [batch*nh, seq, head_dim] (FP16 tensor core)
+            gpu_batched_attn_output_f16(
+                &self.blas,
+                &self.stream,
+                &self.workspace.scores_f16,
+                &self.workspace.v_f16,
                 &mut self.workspace.attn_out,
                 batch_heads,
                 max_seq,
@@ -1402,12 +1596,15 @@ impl CudaBertModel {
                 unsafe { builder.launch(launch_cfg_1d(total_ctx)) }.map_err(cuda_err)?;
             }
 
-            // Output projection → projected
-            gpu_linear(
+            // Output projection → projected (FP16 tensor core)
+            gpu_linear_f16(
                 &self.blas,
+                &self.stream,
+                &self.kernels,
                 &self.workspace.context,
                 &self.layers[layer_idx].attention.output_weight,
                 &mut self.workspace.projected,
+                &mut self.workspace.input_f16,
                 batch_seq,
                 hd,
                 hd,
@@ -1471,12 +1668,15 @@ impl CudaBertModel {
                 ModelVariant::NomicBert => 2 * inter_dim,
             };
 
-            // Intermediate projection
-            gpu_linear(
+            // Intermediate projection (FP16 tensor core)
+            gpu_linear_f16(
                 &self.blas,
+                &self.stream,
+                &self.kernels,
                 &self.workspace.hidden_b,
                 &self.layers[layer_idx].ffn.intermediate_weight,
                 &mut self.workspace.ffn_inter,
+                &mut self.workspace.input_f16,
                 batch_seq,
                 inter_out_dim,
                 hd,
@@ -1501,11 +1701,14 @@ impl CudaBertModel {
                         builder.arg(&total_act);
                         unsafe { builder.launch(launch_cfg_1d(total_act)) }.map_err(cuda_err)?;
                     }
-                    gpu_linear(
+                    gpu_linear_f16(
                         &self.blas,
+                        &self.stream,
+                        &self.kernels,
                         &self.workspace.ffn_inter,
                         &self.layers[layer_idx].ffn.output_weight,
                         &mut self.workspace.scratch,
+                        &mut self.workspace.input_f16,
                         batch_seq,
                         hd,
                         inter_dim,
@@ -1532,11 +1735,14 @@ impl CudaBertModel {
                     builder.arg(&half_cols);
                     builder.arg(&has_bias_flag);
                     unsafe { builder.launch(launch_cfg_1d(total_act)) }.map_err(cuda_err)?;
-                    gpu_linear(
+                    gpu_linear_f16(
                         &self.blas,
+                        &self.stream,
+                        &self.kernels,
                         &self.workspace.activated,
                         &self.layers[layer_idx].ffn.output_weight,
                         &mut self.workspace.scratch,
+                        &mut self.workspace.input_f16,
                         batch_seq,
                         hd,
                         inter_dim,
@@ -1640,16 +1846,44 @@ impl CudaBertModel {
 // Weight loading
 // ---------------------------------------------------------------------------
 
+/// Load a weight tensor to GPU as FP32, then convert to FP16 storage.
+///
+/// Returns the FP16 `CudaSlice<u16>` and the original shape.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "tensor element count fits in i32 for embedding models"
+)]
+fn load_to_gpu_f16(
+    stream: &Arc<CudaStream>,
+    kernels: &KernelHandles,
+    tensors: &SafeTensors<'_>,
+    name: &str,
+) -> crate::Result<(CudaSlice<u16>, Vec<usize>)> {
+    let (f32_slice, shape) = load_to_gpu(stream, tensors, name)?;
+    let n = shape.iter().product::<usize>() as i32;
+    let f16_slice = convert_to_f16(stream, kernels, &f32_slice, n)?;
+    Ok((f16_slice, shape))
+}
+
 /// Load `ClassicBert` encoder layer weights to GPU.
+///
+/// GEMM weights are stored as FP16 for tensor core acceleration.
+/// Biases and layernorm weights remain FP32 for precision.
+#[expect(
+    clippy::too_many_lines,
+    reason = "monolithic weight loading for one encoder layer"
+)]
 fn load_classic_layer_gpu(
     stream: &Arc<CudaStream>,
+    kernels: &KernelHandles,
     tensors: &SafeTensors<'_>,
     i: i32,
     config: &BertConfig,
 ) -> crate::Result<CudaBertLayer> {
     let prefix = format!("encoder.layer.{i}");
 
-    // Load separate Q/K/V weights then fuse via concatenation
+    // Load separate Q/K/V weights then fuse via concatenation, then convert to FP16
     let (q_weight, _) =
         load_tensor_host(tensors, &format!("{prefix}.attention.self.query.weight"))?;
     let (k_weight, _) = load_tensor_host(tensors, &format!("{prefix}.attention.self.key.weight"))?;
@@ -1660,9 +1894,15 @@ fn load_classic_layer_gpu(
     qkv_data.extend_from_slice(&q_weight);
     qkv_data.extend_from_slice(&k_weight);
     qkv_data.extend_from_slice(&v_weight);
-    let qkv_weight = stream.clone_htod(&qkv_data).map_err(cuda_err)?;
+    let qkv_f32 = stream.clone_htod(&qkv_data).map_err(cuda_err)?;
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "QKV weight element count fits in i32"
+    )]
+    let qkv_weight = convert_to_f16(stream, kernels, &qkv_f32, qkv_data.len() as i32)?;
 
-    // Fuse biases
+    // Fuse biases (stay FP32)
     let q_bias = load_tensor_host(tensors, &format!("{prefix}.attention.self.query.bias")).ok();
     let k_bias = load_tensor_host(tensors, &format!("{prefix}.attention.self.key.bias")).ok();
     let v_bias = load_tensor_host(tensors, &format!("{prefix}.attention.self.value.bias")).ok();
@@ -1677,8 +1917,9 @@ fn load_classic_layer_gpu(
         _ => None,
     };
 
-    let (output_weight, _) = load_to_gpu(
+    let (output_weight, _) = load_to_gpu_f16(
         stream,
+        kernels,
         tensors,
         &format!("{prefix}.attention.output.dense.weight"),
     )?;
@@ -1709,9 +1950,10 @@ fn load_classic_layer_gpu(
         rotary_emb_base: None,
     };
 
-    // FFN
-    let (inter_weight, inter_shape) = load_to_gpu(
+    // FFN — GEMM weights as FP16, biases and LN as FP32
+    let (inter_weight, inter_shape) = load_to_gpu_f16(
         stream,
+        kernels,
         tensors,
         &format!("{prefix}.intermediate.dense.weight"),
     )?;
@@ -1720,7 +1962,12 @@ fn load_classic_layer_gpu(
         tensors,
         &format!("{prefix}.intermediate.dense.bias"),
     )?;
-    let (out_weight, _) = load_to_gpu(stream, tensors, &format!("{prefix}.output.dense.weight"))?;
+    let (out_weight, _) = load_to_gpu_f16(
+        stream,
+        kernels,
+        tensors,
+        &format!("{prefix}.output.dense.weight"),
+    )?;
     let out_bias = try_load_to_gpu(stream, tensors, &format!("{prefix}.output.dense.bias"))?;
     let (out_ln_weight, _) = load_to_gpu(
         stream,
@@ -1752,18 +1999,31 @@ fn load_classic_layer_gpu(
 }
 
 /// Load `NomicBert` encoder layer weights to GPU.
+///
+/// GEMM weights are stored as FP16 for tensor core acceleration.
+/// Biases and layernorm weights remain FP32 for precision.
 fn load_nomic_layer_gpu(
     stream: &Arc<CudaStream>,
+    kernels: &KernelHandles,
     tensors: &SafeTensors<'_>,
     i: i32,
     config: &BertConfig,
 ) -> crate::Result<CudaBertLayer> {
     let prefix = format!("encoder.layers.{i}");
 
-    let (qkv_weight, _) = load_to_gpu(stream, tensors, &format!("{prefix}.attn.Wqkv.weight"))?;
+    let (qkv_weight, _) = load_to_gpu_f16(
+        stream,
+        kernels,
+        tensors,
+        &format!("{prefix}.attn.Wqkv.weight"),
+    )?;
 
-    let (output_weight, _) =
-        load_to_gpu(stream, tensors, &format!("{prefix}.attn.out_proj.weight"))?;
+    let (output_weight, _) = load_to_gpu_f16(
+        stream,
+        kernels,
+        tensors,
+        &format!("{prefix}.attn.out_proj.weight"),
+    )?;
     let (output_ln_weight, _) = load_to_gpu(stream, tensors, &format!("{prefix}.norm1.weight"))?;
     let (output_ln_bias, _) = load_to_gpu(stream, tensors, &format!("{prefix}.norm1.bias"))?;
 
@@ -1778,16 +2038,27 @@ fn load_nomic_layer_gpu(
         rotary_emb_base: Some(config.rotary_emb_base),
     };
 
-    // SwiGLU: fc11 = value/up, fc12 = gate, fc2 = down
+    // SwiGLU: fc11 = value/up, fc12 = gate, fc2 = down — fuse then convert to FP16
     let (fc11, fc11_shape) = load_tensor_host(tensors, &format!("{prefix}.mlp.fc11.weight"))?;
     let (fc12, _) = load_tensor_host(tensors, &format!("{prefix}.mlp.fc12.weight"))?;
 
     let mut gate_up = Vec::with_capacity(fc11.len() + fc12.len());
     gate_up.extend_from_slice(&fc11);
     gate_up.extend_from_slice(&fc12);
-    let intermediate_weight = stream.clone_htod(&gate_up).map_err(cuda_err)?;
+    let gate_up_f32 = stream.clone_htod(&gate_up).map_err(cuda_err)?;
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "gate_up element count fits in i32"
+    )]
+    let intermediate_weight = convert_to_f16(stream, kernels, &gate_up_f32, gate_up.len() as i32)?;
 
-    let (output_weight_ffn, _) = load_to_gpu(stream, tensors, &format!("{prefix}.mlp.fc2.weight"))?;
+    let (output_weight_ffn, _) = load_to_gpu_f16(
+        stream,
+        kernels,
+        tensors,
+        &format!("{prefix}.mlp.fc2.weight"),
+    )?;
     let (out_ln_weight, _) = load_to_gpu(stream, tensors, &format!("{prefix}.norm2.weight"))?;
     let (out_ln_bias, _) = load_to_gpu(stream, tensors, &format!("{prefix}.norm2.bias"))?;
 
@@ -1845,6 +2116,13 @@ fn allocate_workspace(
     let alloc = |size: usize| -> crate::Result<CudaSlice<f32>> {
         stream.alloc_zeros::<f32>(size).map_err(cuda_err)
     };
+    let alloc_f16 = |size: usize| -> crate::Result<CudaSlice<u16>> {
+        stream.alloc_zeros::<u16>(size).map_err(cuda_err)
+    };
+
+    // FP16 input buffer must be large enough for the biggest GEMM input:
+    // max(batch*seq * hidden, batch*seq * 2*intermediate, batch*seq * intermediate)
+    let max_input_f16 = (bs * (3 * hd).max(inter_out)) as usize;
 
     Ok(CudaWorkspace {
         qkv: alloc((bs * 3 * hd) as usize)?,
@@ -1861,6 +2139,11 @@ fn allocate_workspace(
         activated: alloc((bs * intermediate_dim) as usize)?,
         scratch: alloc((bs * hd) as usize)?,
         cls: alloc((max_batch * hd) as usize)?,
+        input_f16: alloc_f16(max_input_f16)?,
+        q_f16: alloc_f16((bh * max_seq * head_dim) as usize)?,
+        k_f16: alloc_f16((bh * max_seq * head_dim) as usize)?,
+        v_f16: alloc_f16((bh * max_seq * head_dim) as usize)?,
+        scores_f16: alloc_f16((bh * max_seq * max_seq) as usize)?,
     })
 }
 
@@ -2022,8 +2305,12 @@ impl CudaBackend {
         let mut intermediate_dim = 0_i32;
         for i in 0..config.num_hidden_layers {
             let layer = match config.variant {
-                ModelVariant::ClassicBert => load_classic_layer_gpu(&stream, &tensors, i, &config)?,
-                ModelVariant::NomicBert => load_nomic_layer_gpu(&stream, &tensors, i, &config)?,
+                ModelVariant::ClassicBert => {
+                    load_classic_layer_gpu(&stream, &kernels, &tensors, i, &config)?
+                }
+                ModelVariant::NomicBert => {
+                    load_nomic_layer_gpu(&stream, &kernels, &tensors, i, &config)?
+                }
             };
             intermediate_dim = layer.ffn.intermediate_dim;
             layers.push(layer);
