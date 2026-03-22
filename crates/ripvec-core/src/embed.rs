@@ -370,7 +370,10 @@ impl DistributedState<'_> {
 ///
 /// Returns the first error from any backend. Other workers exit early
 /// when an error is detected.
-#[expect(unsafe_code, reason = "BLAS thread count must be set via env vars before spawning workers")]
+#[expect(
+    unsafe_code,
+    reason = "BLAS thread count must be set via env vars before spawning workers"
+)]
 pub(crate) fn embed_distributed(
     tokenized: &[Option<Encoding>],
     backends: &[&dyn EmbedBackend],
@@ -389,88 +392,86 @@ pub(crate) fn embed_distributed(
     };
 
     // Collect (index, embedding) pairs from all workers
-    let all_pairs: Vec<(usize, Vec<f32>)> = if backends.len() == 1
-        && backends[0].supports_clone()
-        && !backends[0].is_gpu()
-    {
-        // Single cloneable CPU backend: spawn N workers with single-threaded BLAS.
-        //
-        // BLAS libraries (OpenBLAS, MKL) internally spawn threads for each matmul.
-        // For small matrices ([1,384]×[384,384]), this thread overhead dominates —
-        // profiling shows 80% of time in sched_yield (thread contention).
-        //
-        // Instead: force BLAS to single-thread per worker, parallelize across
-        // independent BERT inferences. Each worker gets its own cloned backend.
-        // Force BLAS libraries to single-threaded mode.
-        // We parallelize across independent BERT inferences instead.
-        // env vars don't always work (OpenBLAS may ignore after init),
-        // so also call the runtime API directly.
-        unsafe {
-            std::env::set_var("OPENBLAS_NUM_THREADS", "1");
-            std::env::set_var("MKL_NUM_THREADS", "1");
-            std::env::set_var("VECLIB_MAXIMUM_THREADS", "1"); // macOS Accelerate
+    let all_pairs: Vec<(usize, Vec<f32>)> =
+        if backends.len() == 1 && backends[0].supports_clone() && !backends[0].is_gpu() {
+            // Single cloneable CPU backend: spawn N workers with single-threaded BLAS.
+            //
+            // BLAS libraries (OpenBLAS, MKL) internally spawn threads for each matmul.
+            // For small matrices ([1,384]×[384,384]), this thread overhead dominates —
+            // profiling shows 80% of time in sched_yield (thread contention).
+            //
+            // Instead: force BLAS to single-thread per worker, parallelize across
+            // independent BERT inferences. Each worker gets its own cloned backend.
+            // Force BLAS libraries to single-threaded mode.
+            // We parallelize across independent BERT inferences instead.
+            // env vars don't always work (OpenBLAS may ignore after init),
+            // so also call the runtime API directly.
+            unsafe {
+                std::env::set_var("OPENBLAS_NUM_THREADS", "1");
+                std::env::set_var("MKL_NUM_THREADS", "1");
+                std::env::set_var("VECLIB_MAXIMUM_THREADS", "1"); // macOS Accelerate
 
-            // Direct FFI: openblas_set_num_threads(1) — works even after init
-            unsafe extern "C" {
-                fn openblas_set_num_threads(num: std::ffi::c_int);
-            }
-            openblas_set_num_threads(1);
-        }
-
-        let num_workers = rayon::current_num_threads().max(1);
-        std::thread::scope(|s| {
-            let handles: Vec<_> = (0..num_workers)
-                .map(|_| {
-                    s.spawn(|| {
-                        let cloned = backends[0].clone_backend();
-                        state.run_worker(cloned.as_ref())
-                    })
-                })
-                .collect();
-            let mut all = Vec::new();
-            for handle in handles {
-                if let Ok(pairs) = handle.join() {
-                    all.extend(pairs);
+                // Direct FFI: openblas_set_num_threads(1) — works even after init
+                unsafe extern "C" {
+                    fn openblas_set_num_threads(num: std::ffi::c_int);
                 }
+                openblas_set_num_threads(1);
             }
-            all
-        })
-    } else if backends.len() == 1 {
-        // Single non-cloneable backend (GPU): run on the calling thread.
-        // MLX/CUDA handle parallelism internally.
-        state.run_worker(backends[0])
-    } else {
-        // Multiple backends: one thread per backend via std::thread::scope
-        std::thread::scope(|s| {
-            let handles: Vec<_> = backends
-                .iter()
-                .map(|&backend| {
-                    s.spawn(|| {
-                        // CPU backends that support cloning get a thread-local copy
-                        if backend.supports_clone() {
-                            let cloned = backend.clone_backend();
+
+            let num_workers = rayon::current_num_threads().max(1);
+            std::thread::scope(|s| {
+                let handles: Vec<_> = (0..num_workers)
+                    .map(|_| {
+                        s.spawn(|| {
+                            let cloned = backends[0].clone_backend();
                             state.run_worker(cloned.as_ref())
-                        } else {
-                            state.run_worker(backend)
-                        }
+                        })
                     })
-                })
-                .collect();
-
-            let mut all = Vec::new();
-            for handle in handles {
-                if let Ok(pairs) = handle.join() {
-                    all.extend(pairs);
-                } else {
-                    warn!("worker thread panicked");
-                    state
-                        .error_flag
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    .collect();
+                let mut all = Vec::new();
+                for handle in handles {
+                    if let Ok(pairs) = handle.join() {
+                        all.extend(pairs);
+                    }
                 }
-            }
-            all
-        })
-    };
+                all
+            })
+        } else if backends.len() == 1 {
+            // Single non-cloneable backend (GPU): run on the calling thread.
+            // MLX/CUDA handle parallelism internally.
+            state.run_worker(backends[0])
+        } else {
+            // Multiple backends: one thread per backend via std::thread::scope
+            std::thread::scope(|s| {
+                let handles: Vec<_> = backends
+                    .iter()
+                    .map(|&backend| {
+                        s.spawn(|| {
+                            // CPU backends that support cloning get a thread-local copy
+                            if backend.supports_clone() {
+                                let cloned = backend.clone_backend();
+                                state.run_worker(cloned.as_ref())
+                            } else {
+                                state.run_worker(backend)
+                            }
+                        })
+                    })
+                    .collect();
+
+                let mut all = Vec::new();
+                for handle in handles {
+                    if let Ok(pairs) = handle.join() {
+                        all.extend(pairs);
+                    } else {
+                        warn!("worker thread panicked");
+                        state
+                            .error_flag
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                all
+            })
+        };
 
     // Check for errors before assembling results
     if let Some(err) = state.first_error.into_inner().ok().flatten() {

@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use cudarc::cublas::{sys, CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
+use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig, sys};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
@@ -616,6 +616,130 @@ extern "C" __global__ void fused_bias_swiglu_kernel(
         output[idx] = value * silu_gate;
     }
 }
+
+// RoPE with pre-computed cos/sin tables (NomicBert).
+// Replaces rope_kernel which recomputed theta/cos/sin on every call.
+extern "C" __global__ void rope_cached_kernel(
+    float* q_or_k,           // [num_rows, head_dim]
+    const float* cos_table,  // [max_seq, half_dim]
+    const float* sin_table,  // [max_seq, half_dim]
+    int num_rows,            // total rows (num_heads * seq for the batch)
+    int seq,                 // sequence length
+    int head_dim,
+    int num_heads
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int half = head_dim / 2;
+    int total = num_rows * half;
+    if (idx >= total) return;
+
+    int row = idx / half;
+    int d = idx % half;
+    int pos = (row % seq);
+
+    int first_idx = row * head_dim + d;
+    int second_idx = first_idx + half;
+
+    float cos_val = cos_table[pos * half + d];
+    float sin_val = sin_table[pos * half + d];
+
+    float first = q_or_k[first_idx];
+    float second = q_or_k[second_idx];
+    q_or_k[first_idx] = first * cos_val - second * sin_val;
+    q_or_k[second_idx] = first * sin_val + second * cos_val;
+}
+
+// Fused residual add + layer norm.
+// Replaces sequential residual_add_kernel + layer_norm_kernel.
+// output = layernorm(hidden + residual)
+extern "C" __global__ void fused_residual_layernorm_kernel(
+    float* output,
+    const float* hidden,
+    const float* residual,
+    const float* weight,
+    const float* bias,
+    int rows, int cols, float eps
+) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    extern __shared__ float sdata[];
+
+    // Pass 1: add residual + compute mean
+    float thread_sum = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float val = hidden[row * cols + i] + residual[row * cols + i];
+        output[row * cols + i] = val;
+        thread_sum += val;
+    }
+    sdata[threadIdx.x] = thread_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float mean = sdata[0] / (float)cols;
+
+    // Pass 2: compute variance
+    float thread_var = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float diff = output[row * cols + i] - mean;
+        thread_var += diff * diff;
+    }
+    sdata[threadIdx.x] = thread_var;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float inv_std = rsqrtf(sdata[0] / (float)cols + eps);
+
+    // Pass 3: normalize + scale + shift
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float val = (output[row * cols + i] - mean) * inv_std;
+        output[row * cols + i] = val * weight[i] + bias[i];
+    }
+}
+
+// Unified SwiGLU kernel handling both bias and no-bias paths.
+// Replaces both fused_bias_swiglu_kernel (when has_bias=1) and
+// swiglu_kernel (when has_bias=0).
+extern "C" __global__ void fused_swiglu_kernel(
+    float* output,
+    const float* input,
+    const float* bias,       // may be NULL when has_bias=0
+    int rows, int out_cols,
+    int has_bias
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * out_cols) return;
+    int row = idx / out_cols;
+    int col = idx % out_cols;
+
+    float value = input[row * 2 * out_cols + col];
+    float gate = input[row * 2 * out_cols + out_cols + col];
+
+    if (has_bias) {
+        value += bias[col];
+        gate += bias[out_cols + col];
+    }
+
+    gate = gate / (1.0f + expf(-gate));
+    output[idx] = value * gate;
+}
+
+// Fused bias + residual add for output projections (ClassicBert).
+// Replaces sequential add_bias_kernel + residual_add_kernel.
+extern "C" __global__ void fused_bias_residual_kernel(
+    float* output,
+    const float* input,
+    const float* bias,
+    const float* residual,
+    int rows, int cols
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * cols) return;
+    output[idx] = input[idx] + bias[idx % cols] + residual[idx];
+}
 "#;
 
 // ---------------------------------------------------------------------------
@@ -628,7 +752,8 @@ extern "C" __global__ void fused_bias_swiglu_kernel(
 struct KernelHandles {
     /// GELU activation (in-place).
     gelu: CudaFunction,
-    /// `SwiGLU` activation (value * silu(gate)).
+    /// `SwiGLU` activation (value * silu(gate)). Superseded by `fused_swiglu`.
+    #[expect(dead_code, reason = "kept for potential standalone use")]
     swiglu: CudaFunction,
     /// Layer normalization.
     layer_norm: CudaFunction,
@@ -637,7 +762,8 @@ struct KernelHandles {
     softmax: CudaFunction,
     /// Add bias vector to rows.
     add_bias: CudaFunction,
-    /// Element-wise residual addition.
+    /// Element-wise residual addition. Superseded by `fused_residual_layernorm` / `fused_bias_residual`.
+    #[expect(dead_code, reason = "kept for potential standalone use")]
     residual_add: CudaFunction,
     /// Embedding table lookup.
     embedding_lookup: CudaFunction,
@@ -655,7 +781,8 @@ struct KernelHandles {
     cls_pool: CudaFunction,
     /// L2 normalize each row.
     l2_normalize: CudaFunction,
-    /// Rotary position embedding.
+    /// Rotary position embedding. Superseded by `rope_cached`.
+    #[expect(dead_code, reason = "kept for potential standalone use")]
     rope: CudaFunction,
     /// Split QKV `[batch*seq, 3*hidden]` into Q,K,V `[batch*num_heads, seq, head_dim]` on GPU.
     qkv_split: CudaFunction,
@@ -665,8 +792,17 @@ struct KernelHandles {
     fused_scale_mask_softmax: CudaFunction,
     /// Fused bias + GELU activation for `ClassicBert` FFN.
     fused_bias_gelu: CudaFunction,
-    /// Fused bias + `SwiGLU` activation for `NomicBert` FFN.
+    /// Fused bias + `SwiGLU` activation for `NomicBert` FFN. Superseded by `fused_swiglu`.
+    #[expect(dead_code, reason = "kept for potential standalone use")]
     fused_bias_swiglu: CudaFunction,
+    /// `RoPE` with pre-computed cos/sin tables.
+    rope_cached: CudaFunction,
+    /// Fused residual add + layer norm (replaces separate `residual_add` + `layer_norm`).
+    fused_residual_layernorm: CudaFunction,
+    /// Unified `SwiGLU` kernel handling both bias and no-bias paths.
+    fused_swiglu: CudaFunction,
+    /// Fused bias + residual add for output projections.
+    fused_bias_residual: CudaFunction,
 }
 
 impl KernelHandles {
@@ -702,6 +838,10 @@ impl KernelHandles {
                 fused_scale_mask_softmax: load("fused_scale_mask_softmax_kernel")?,
                 fused_bias_gelu: load("fused_bias_gelu_kernel")?,
                 fused_bias_swiglu: load("fused_bias_swiglu_kernel")?,
+                rope_cached: load("rope_cached_kernel")?,
+                fused_residual_layernorm: load("fused_residual_layernorm_kernel")?,
+                fused_swiglu: load("fused_swiglu_kernel")?,
+                fused_bias_residual: load("fused_bias_residual_kernel")?,
             },
         ))
     }
@@ -813,6 +953,14 @@ struct CudaWorkspace {
     cls: CudaSlice<f32>,
 }
 
+/// Pre-computed `RoPE` cos/sin tables on GPU (`NomicBert` only).
+struct RopeCache {
+    /// Cosine table `[max_seq, head_dim/2]` on GPU.
+    cos: CudaSlice<f32>,
+    /// Sine table `[max_seq, head_dim/2]` on GPU.
+    sin: CudaSlice<f32>,
+}
+
 /// Complete BERT model with all weights on GPU.
 struct CudaBertModel {
     /// CUDA stream for all operations.
@@ -835,6 +983,8 @@ struct CudaBertModel {
     variant: ModelVariant,
     /// Pre-allocated workspace buffers.
     workspace: CudaWorkspace,
+    /// Pre-computed `RoPE` cos/sin tables (`NomicBert` only).
+    rope_cache: Option<RopeCache>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1166,25 +1316,34 @@ impl CudaBertModel {
                 unsafe { builder.launch(launch_cfg_1d(total_head_elems)) }.map_err(cuda_err)?;
             }
 
-            // RoPE for NomicBert
-            if let Some(base) = self.layers[layer_idx].attention.rotary_emb_base {
+            // RoPE for NomicBert (cached cos/sin tables)
+            if let (Some(_base), Some(rope)) = (
+                self.layers[layer_idx].attention.rotary_emb_base,
+                &self.rope_cache,
+            ) {
                 let half = head_dim / 2;
-                let total_rope = batch_heads * max_seq * half;
-                let rope_seq = batch_heads * max_seq;
+                let num_rows = batch_heads * max_seq;
+                let total_rope = num_rows * half;
                 {
-                    let mut builder = self.stream.launch_builder(&self.kernels.rope);
+                    let mut builder = self.stream.launch_builder(&self.kernels.rope_cached);
                     builder.arg(&mut self.workspace.q);
-                    builder.arg(&rope_seq);
+                    builder.arg(&rope.cos);
+                    builder.arg(&rope.sin);
+                    builder.arg(&num_rows);
+                    builder.arg(&max_seq);
                     builder.arg(&head_dim);
-                    builder.arg(&base);
+                    builder.arg(&nh);
                     unsafe { builder.launch(launch_cfg_1d(total_rope)) }.map_err(cuda_err)?;
                 }
                 {
-                    let mut builder = self.stream.launch_builder(&self.kernels.rope);
+                    let mut builder = self.stream.launch_builder(&self.kernels.rope_cached);
                     builder.arg(&mut self.workspace.k);
-                    builder.arg(&rope_seq);
+                    builder.arg(&rope.cos);
+                    builder.arg(&rope.sin);
+                    builder.arg(&num_rows);
+                    builder.arg(&max_seq);
                     builder.arg(&head_dim);
-                    builder.arg(&base);
+                    builder.arg(&nh);
                     unsafe { builder.launch(launch_cfg_1d(total_rope)) }.map_err(cuda_err)?;
                 }
             }
@@ -1254,34 +1413,47 @@ impl CudaBertModel {
                 hd,
             )?;
 
+            // Fused bias+residual or just residual, then fused residual+layernorm
             if let Some(ref bias) = self.layers[layer_idx].attention.output_bias {
+                // Fused bias + residual: scratch = projected + bias + hidden_a
                 let total_proj = batch_seq * hd;
-                let mut builder = self.stream.launch_builder(&self.kernels.add_bias);
-                builder.arg(&mut self.workspace.projected);
+                let mut builder = self
+                    .stream
+                    .launch_builder(&self.kernels.fused_bias_residual);
+                builder.arg(&mut self.workspace.scratch);
+                builder.arg(&self.workspace.projected);
                 builder.arg(bias);
+                builder.arg(&self.workspace.hidden_a);
                 builder.arg(&batch_seq);
                 builder.arg(&hd);
                 unsafe { builder.launch(launch_cfg_1d(total_proj)) }.map_err(cuda_err)?;
-            }
 
-            // Residual: projected += hidden_a
-            {
-                let total_res = batch_seq * hd;
-                let mut builder = self.stream.launch_builder(&self.kernels.residual_add);
-                builder.arg(&mut self.workspace.projected);
-                builder.arg(&self.workspace.hidden_a);
-                builder.arg(&total_res);
-                unsafe { builder.launch(launch_cfg_1d(total_res)) }.map_err(cuda_err)?;
-            }
-
-            // Attention layer norm: projected → hidden_b
-            {
+                // Layer norm: scratch → hidden_b
                 let eps = self.layers[layer_idx].attention.layer_norm_eps;
                 let threads = 256_u32.min(hd as u32).next_power_of_two();
                 let shared = threads * 2 * 4;
                 let mut builder = self.stream.launch_builder(&self.kernels.layer_norm);
                 builder.arg(&mut self.workspace.hidden_b);
+                builder.arg(&self.workspace.scratch);
+                builder.arg(&self.layers[layer_idx].attention.output_ln_weight);
+                builder.arg(&self.layers[layer_idx].attention.output_ln_bias);
+                builder.arg(&batch_seq);
+                builder.arg(&hd);
+                builder.arg(&eps);
+                unsafe { builder.launch(launch_cfg_per_row_shared(batch_seq, threads, shared)) }
+                    .map_err(cuda_err)?;
+            } else {
+                // No bias: fused residual + layernorm in one kernel
+                // hidden_b = layernorm(projected + hidden_a)
+                let eps = self.layers[layer_idx].attention.layer_norm_eps;
+                let threads = 256_u32.min(hd as u32).next_power_of_two();
+                let shared = threads * 4;
+                let mut builder = self
+                    .stream
+                    .launch_builder(&self.kernels.fused_residual_layernorm);
+                builder.arg(&mut self.workspace.hidden_b);
                 builder.arg(&self.workspace.projected);
+                builder.arg(&self.workspace.hidden_a);
                 builder.arg(&self.layers[layer_idx].attention.output_ln_weight);
                 builder.arg(&self.layers[layer_idx].attention.output_ln_bias);
                 builder.arg(&batch_seq);
@@ -1340,27 +1512,26 @@ impl CudaBertModel {
                     )?;
                 }
                 ModelVariant::NomicBert => {
-                    // Fuse intermediate bias + SwiGLU into one kernel when bias
-                    // exists, otherwise just run SwiGLU alone.
+                    // Unified SwiGLU kernel handles both bias and no-bias paths.
                     let half_cols = inter_dim;
                     let total_act = batch_seq * half_cols;
-                    if let Some(ref bias) = self.layers[layer_idx].ffn.intermediate_bias {
-                        let mut builder =
-                            self.stream.launch_builder(&self.kernels.fused_bias_swiglu);
-                        builder.arg(&mut self.workspace.activated);
-                        builder.arg(&self.workspace.ffn_inter);
-                        builder.arg(bias);
-                        builder.arg(&batch_seq);
-                        builder.arg(&half_cols);
-                        unsafe { builder.launch(launch_cfg_1d(total_act)) }.map_err(cuda_err)?;
-                    } else {
-                        let mut builder = self.stream.launch_builder(&self.kernels.swiglu);
-                        builder.arg(&mut self.workspace.activated);
-                        builder.arg(&self.workspace.ffn_inter);
-                        builder.arg(&batch_seq);
-                        builder.arg(&half_cols);
-                        unsafe { builder.launch(launch_cfg_1d(total_act)) }.map_err(cuda_err)?;
-                    }
+                    let has_bias_flag =
+                        i32::from(self.layers[layer_idx].ffn.intermediate_bias.is_some());
+                    // For no-bias case, pass ffn_inter as dummy (kernel ignores it
+                    // when has_bias=0). For bias case, pass the real bias.
+                    let bias_ref = self.layers[layer_idx]
+                        .ffn
+                        .intermediate_bias
+                        .as_ref()
+                        .unwrap_or(&self.workspace.ffn_inter);
+                    let mut builder = self.stream.launch_builder(&self.kernels.fused_swiglu);
+                    builder.arg(&mut self.workspace.activated);
+                    builder.arg(&self.workspace.ffn_inter);
+                    builder.arg(bias_ref);
+                    builder.arg(&batch_seq);
+                    builder.arg(&half_cols);
+                    builder.arg(&has_bias_flag);
+                    unsafe { builder.launch(launch_cfg_1d(total_act)) }.map_err(cuda_err)?;
                     gpu_linear(
                         &self.blas,
                         &self.workspace.activated,
@@ -1373,35 +1544,47 @@ impl CudaBertModel {
                 }
             }
 
-            // Add FFN output bias
+            // Fused FFN output: bias+residual or just residual, then fused residual+layernorm
             if let Some(ref bias) = self.layers[layer_idx].ffn.output_bias {
+                // Fused bias + residual: projected = scratch + bias + hidden_b
                 let total_out = batch_seq * hd;
-                let mut builder = self.stream.launch_builder(&self.kernels.add_bias);
-                builder.arg(&mut self.workspace.scratch);
+                let mut builder = self
+                    .stream
+                    .launch_builder(&self.kernels.fused_bias_residual);
+                builder.arg(&mut self.workspace.projected);
+                builder.arg(&self.workspace.scratch);
                 builder.arg(bias);
+                builder.arg(&self.workspace.hidden_b);
                 builder.arg(&batch_seq);
                 builder.arg(&hd);
                 unsafe { builder.launch(launch_cfg_1d(total_out)) }.map_err(cuda_err)?;
-            }
 
-            // Residual: scratch += hidden_b
-            {
-                let total_res = batch_seq * hd;
-                let mut builder = self.stream.launch_builder(&self.kernels.residual_add);
-                builder.arg(&mut self.workspace.scratch);
-                builder.arg(&self.workspace.hidden_b);
-                builder.arg(&total_res);
-                unsafe { builder.launch(launch_cfg_1d(total_res)) }.map_err(cuda_err)?;
-            }
-
-            // FFN layer norm: scratch → hidden_a (ready for next layer)
-            {
+                // Layer norm: projected → hidden_a
                 let eps = self.layers[layer_idx].ffn.layer_norm_eps;
                 let threads = 256_u32.min(hd as u32).next_power_of_two();
                 let shared = threads * 2 * 4;
                 let mut builder = self.stream.launch_builder(&self.kernels.layer_norm);
                 builder.arg(&mut self.workspace.hidden_a);
+                builder.arg(&self.workspace.projected);
+                builder.arg(&self.layers[layer_idx].ffn.output_ln_weight);
+                builder.arg(&self.layers[layer_idx].ffn.output_ln_bias);
+                builder.arg(&batch_seq);
+                builder.arg(&hd);
+                builder.arg(&eps);
+                unsafe { builder.launch(launch_cfg_per_row_shared(batch_seq, threads, shared)) }
+                    .map_err(cuda_err)?;
+            } else {
+                // No bias: fused residual + layernorm in one kernel
+                // hidden_a = layernorm(scratch + hidden_b)
+                let eps = self.layers[layer_idx].ffn.layer_norm_eps;
+                let threads = 256_u32.min(hd as u32).next_power_of_two();
+                let shared = threads * 4;
+                let mut builder = self
+                    .stream
+                    .launch_builder(&self.kernels.fused_residual_layernorm);
+                builder.arg(&mut self.workspace.hidden_a);
                 builder.arg(&self.workspace.scratch);
+                builder.arg(&self.workspace.hidden_b);
                 builder.arg(&self.layers[layer_idx].ffn.output_ln_weight);
                 builder.arg(&self.layers[layer_idx].ffn.output_ln_bias);
                 builder.arg(&batch_seq);
@@ -1747,7 +1930,8 @@ impl CudaBackend {
     /// - Weight loading or GPU memory allocation fails
     #[expect(
         clippy::cast_sign_loss,
-        reason = "num_layers is a small positive int from config"
+        clippy::too_many_lines,
+        reason = "monolithic load function; num_layers is a small positive int from config"
     )]
     pub fn load(model_repo: &str, _device_hint: &DeviceHint) -> crate::Result<Self> {
         // Initialize CUDA
@@ -1848,6 +2032,42 @@ impl CudaBackend {
         // Allocate workspace buffers
         let workspace = allocate_workspace(&stream, &config, intermediate_dim)?;
 
+        // Pre-compute RoPE cos/sin tables for NomicBert
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_precision_loss,
+            clippy::cast_sign_loss,
+            reason = "head_dim/seq values are small ints; f64→f32 truncation is intentional"
+        )]
+        let rope_cache = if variant == ModelVariant::NomicBert {
+            let rope_base = f64::from(config.rotary_emb_base);
+            let half_dim = (head_dim / 2) as usize;
+            // Cap at 512 to match workspace allocation
+            let rope_max_seq = config.max_position_embeddings.min(512) as usize;
+
+            let mut cos_table = vec![0.0_f32; rope_max_seq * half_dim];
+            let mut sin_table = vec![0.0_f32; rope_max_seq * half_dim];
+
+            for i in 0..half_dim {
+                let theta = rope_base.powf(-2.0 * i as f64 / f64::from(head_dim));
+                for pos in 0..rope_max_seq {
+                    let angle = pos as f64 * theta;
+                    cos_table[pos * half_dim + i] = angle.cos() as f32;
+                    sin_table[pos * half_dim + i] = angle.sin() as f32;
+                }
+            }
+
+            let cos_dev = stream.clone_htod(&cos_table).map_err(cuda_err)?;
+            let sin_dev = stream.clone_htod(&sin_table).map_err(cuda_err)?;
+
+            Some(RopeCache {
+                cos: cos_dev,
+                sin: sin_dev,
+            })
+        } else {
+            None
+        };
+
         let model = CudaBertModel {
             stream,
             blas,
@@ -1859,6 +2079,7 @@ impl CudaBackend {
             head_dim,
             variant,
             workspace,
+            rope_cache,
         };
 
         Ok(Self {
