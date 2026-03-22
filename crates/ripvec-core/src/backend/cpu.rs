@@ -19,7 +19,7 @@ use std::f32::consts::PI;
 use std::sync::Arc;
 
 use hf_hub::api::sync::Api;
-use ndarray::{s, Array1, Array2, ArrayView1, ArrayView2, Axis};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use safetensors::SafeTensors;
 
 use super::{DeviceHint, EmbedBackend, Encoding};

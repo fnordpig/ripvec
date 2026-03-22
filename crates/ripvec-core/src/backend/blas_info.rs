@@ -80,6 +80,11 @@ pub fn detect_cpu_vendor() -> CpuVendor {
 /// Detect which BLAS library is linked at runtime.
 ///
 /// Probes for vendor-specific symbols using `dlsym(RTLD_DEFAULT, ...)`.
+///
+/// # Panics
+///
+/// Panics if a BLAS symbol name contains an interior NUL byte (should never
+/// happen since all probed symbols are ASCII literals).
 #[must_use]
 pub fn detect_blas() -> BlasKind {
     #[cfg(target_os = "macos")]
@@ -94,7 +99,8 @@ pub fn detect_blas() -> BlasKind {
         use std::ffi::CString;
 
         let probe = |symbol: &str| -> bool {
-            let c_sym = CString::new(symbol).unwrap();
+            // SAFETY: BLAS symbol names are ASCII-only, no interior NULs.
+            let c_sym = CString::new(symbol).expect("BLAS symbol contains NUL byte");
             #[expect(unsafe_code, reason = "dlsym probe for BLAS detection")]
             unsafe {
                 !libc::dlsym(libc::RTLD_DEFAULT, c_sym.as_ptr()).is_null()
@@ -135,11 +141,6 @@ pub fn recommend_blas() -> Option<String> {
     let cpu = detect_cpu_vendor();
 
     match (cpu, blas) {
-        // Already optimal
-        (CpuVendor::Amd, BlasKind::Blis) => None,
-        (CpuVendor::Intel, BlasKind::IntelMkl) => None,
-        (CpuVendor::Apple, BlasKind::Accelerate) => None,
-
         // Suboptimal — recommend better
         (CpuVendor::Amd, BlasKind::OpenBlas) => Some(
             "tip: AOCL-BLAS is 10-15% faster than OpenBLAS on AMD CPUs. \
