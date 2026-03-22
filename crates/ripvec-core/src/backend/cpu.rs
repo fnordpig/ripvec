@@ -9,14 +9,17 @@
 //! - **`NomicBert`** (`CodeRankEmbed`, nomic-embed-text): `RoPE`, `SwiGLU`, no bias.
 
 // Ensure the BLAS linker symbols are pulled in.
+#[cfg(target_os = "macos")]
+extern crate accelerate_src;
 extern crate blas_src;
+#[cfg(not(target_os = "macos"))]
 extern crate openblas_src;
 
 use std::f32::consts::PI;
 use std::sync::Arc;
 
 use hf_hub::api::sync::Api;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
+use ndarray::{s, Array1, Array2, ArrayView1, ArrayView2, Axis};
 use safetensors::SafeTensors;
 
 use super::{DeviceHint, EmbedBackend, Encoding};

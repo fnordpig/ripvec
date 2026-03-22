@@ -411,11 +411,14 @@ pub(crate) fn embed_distributed(
                 std::env::set_var("MKL_NUM_THREADS", "1");
                 std::env::set_var("VECLIB_MAXIMUM_THREADS", "1"); // macOS Accelerate
 
-                // Direct FFI: openblas_set_num_threads(1) — works even after init
-                unsafe extern "C" {
-                    fn openblas_set_num_threads(num: std::ffi::c_int);
+                // Direct FFI to set BLAS thread count — works even after init
+                #[cfg(all(not(target_os = "macos"), feature = "cpu"))]
+                {
+                    unsafe extern "C" {
+                        fn openblas_set_num_threads(num: std::ffi::c_int);
+                    }
+                    openblas_set_num_threads(1);
                 }
-                openblas_set_num_threads(1);
             }
 
             let num_workers = rayon::current_num_threads().max(1);
@@ -610,6 +613,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cpu")]
     fn embed_distributed_produces_correct_count() {
         let backend = crate::backend::load_backend(
             crate::backend::BackendKind::Cpu,

@@ -33,12 +33,12 @@ cuda = ["ripvec-core/cuda"]
 mlx = ["ripvec-core/mlx"]
 cpu = ["ripvec-core/cpu"]
 
-# Auto-enable MLX on macOS
+# Auto-enable platform-appropriate backends
 [target.'cfg(target_os = "macos")'.dependencies]
-ripvec-core = { path = "../ripvec-core", features = ["mlx"] }
+ripvec-core = { path = "../ripvec-core", features = ["mlx", "cpu-accelerate"] }
 
-# Linux: CPU by default, --features cuda to enable GPU
-# (CUDA auto-detection would require probing for nvcc at build time)
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+ripvec-core = { path = "../ripvec-core", features = ["cpu"] }
 
 [dev-dependencies]
 assert_cmd.workspace = true
