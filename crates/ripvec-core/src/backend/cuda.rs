@@ -522,6 +522,100 @@ extern "C" __global__ void attn_reshape_kernel(
     int heads_idx = (b * num_heads + h) * (seq * head_dim) + t * head_dim + d;
     output[idx] = heads[heads_idx];
 }
+
+// Fused scale + attention-mask + softmax.
+// Replaces three separate kernels (scale_kernel, add_attn_mask_kernel,
+// softmax_kernel) with a single pass over the scores matrix.
+// scores: [batch*num_heads*seq, seq] — modified in-place.
+// mask:   [batch*seq] — 0.0 for real tokens, -1e9 for padding.
+// One block per row; shared memory for reductions.
+extern "C" __global__ void fused_scale_mask_softmax_kernel(
+    float* scores, const float* mask,
+    int batch, int num_heads, int seq, float scale
+) {
+    int row = blockIdx.x;
+    int total_rows = batch * num_heads * seq;
+    if (row >= total_rows) return;
+
+    extern __shared__ float sdata[];
+    float* row_data = scores + row * seq;
+
+    // Decompose row → (b, head, row_in_seq) to index into mask
+    int b = row / (num_heads * seq);
+
+    // Pass 1: scale + mask + find row max (numerical stability)
+    float thread_max = -1e30f;
+    for (int i = threadIdx.x; i < seq; i += blockDim.x) {
+        float val = row_data[i] * scale + mask[b * seq + i];
+        row_data[i] = val;
+        thread_max = fmaxf(thread_max, val);
+    }
+
+    // Reduce max
+    sdata[threadIdx.x] = thread_max;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s)
+            sdata[threadIdx.x] = fmaxf(sdata[threadIdx.x], sdata[threadIdx.x + s]);
+        __syncthreads();
+    }
+    float row_max = sdata[0];
+
+    // Pass 2: exp(x - max) and sum
+    float thread_sum = 0.0f;
+    for (int i = threadIdx.x; i < seq; i += blockDim.x) {
+        float val = expf(row_data[i] - row_max);
+        row_data[i] = val;
+        thread_sum += val;
+    }
+
+    // Reduce sum
+    sdata[threadIdx.x] = thread_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s)
+            sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float total = sdata[0];
+
+    // Pass 3: normalize
+    float inv_sum = 1.0f / fmaxf(total, 1e-12f);
+    for (int i = threadIdx.x; i < seq; i += blockDim.x) {
+        row_data[i] *= inv_sum;
+    }
+}
+
+// Fused bias + GELU activation (ClassicBert FFN).
+// Replaces separate add_bias_kernel + gelu_kernel calls.
+extern "C" __global__ void fused_bias_gelu_kernel(
+    float* x, const float* bias, int rows, int cols
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * cols) return;
+    int col = idx % cols;
+    float v = x[idx] + bias[col];
+    x[idx] = 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v)));
+}
+
+// Fused bias + SwiGLU (NomicBert FFN).
+// input has shape [rows, 2*half_cols] with bias [2*half_cols].
+// output[i] = value[i] * silu(gate[i]) where value/gate include bias.
+extern "C" __global__ void fused_bias_swiglu_kernel(
+    float* output, const float* input, const float* bias,
+    int rows, int half_cols
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * half_cols;
+    if (idx < total) {
+        int row = idx / half_cols;
+        int col = idx % half_cols;
+        float value = input[row * (2 * half_cols) + col] + bias[col];
+        float gate = input[row * (2 * half_cols) + half_cols + col] + bias[half_cols + col];
+        float silu_gate = gate / (1.0f + expf(-gate));
+        output[idx] = value * silu_gate;
+    }
+}
 "#;
 
 // ---------------------------------------------------------------------------
@@ -538,7 +632,8 @@ struct KernelHandles {
     swiglu: CudaFunction,
     /// Layer normalization.
     layer_norm: CudaFunction,
-    /// Softmax along last axis (per-row).
+    /// Softmax along last axis (per-row). Superseded by `fused_scale_mask_softmax`.
+    #[expect(dead_code, reason = "kept for potential standalone use")]
     softmax: CudaFunction,
     /// Add bias vector to rows.
     add_bias: CudaFunction,
@@ -550,9 +645,11 @@ struct KernelHandles {
     add_embeddings: CudaFunction,
     /// Build float attention mask from int mask.
     build_attn_mask: CudaFunction,
-    /// Add attention mask to score matrix.
+    /// Add attention mask to score matrix. Superseded by `fused_scale_mask_softmax`.
+    #[expect(dead_code, reason = "kept for potential standalone use")]
     add_attn_mask: CudaFunction,
-    /// Scale all elements by a constant.
+    /// Scale all elements by a constant. Superseded by `fused_scale_mask_softmax`.
+    #[expect(dead_code, reason = "kept for potential standalone use")]
     scale: CudaFunction,
     /// CLS pooling (extract row 0 per batch element).
     cls_pool: CudaFunction,
@@ -564,6 +661,12 @@ struct KernelHandles {
     qkv_split: CudaFunction,
     /// Reshape attention output `[batch*num_heads, seq, head_dim]` to `[batch*seq, hidden]`.
     attn_reshape: CudaFunction,
+    /// Fused scale + attention-mask + softmax (replaces 3 separate kernels).
+    fused_scale_mask_softmax: CudaFunction,
+    /// Fused bias + GELU activation for `ClassicBert` FFN.
+    fused_bias_gelu: CudaFunction,
+    /// Fused bias + `SwiGLU` activation for `NomicBert` FFN.
+    fused_bias_swiglu: CudaFunction,
 }
 
 impl KernelHandles {
@@ -596,6 +699,9 @@ impl KernelHandles {
                 rope: load("rope_kernel")?,
                 qkv_split: load("qkv_split_kernel")?,
                 attn_reshape: load("attn_reshape_kernel")?,
+                fused_scale_mask_softmax: load("fused_scale_mask_softmax_kernel")?,
+                fused_bias_gelu: load("fused_bias_gelu_kernel")?,
+                fused_bias_swiglu: load("fused_bias_swiglu_kernel")?,
             },
         ))
     }
@@ -1094,37 +1200,21 @@ impl CudaBertModel {
                 head_dim,
             )?;
 
-            // Scale
-            let scale = 1.0_f32 / (head_dim as f32).sqrt();
-            let total_scores = batch_heads * max_seq * max_seq;
+            // Fused scale + attention-mask + softmax (one kernel, one memory pass)
             {
-                let mut builder = self.stream.launch_builder(&self.kernels.scale);
-                builder.arg(&mut self.workspace.scores);
-                builder.arg(&scale);
-                builder.arg(&total_scores);
-                unsafe { builder.launch(launch_cfg_1d(total_scores)) }.map_err(cuda_err)?;
-            }
-
-            // Add attention mask (batched)
-            {
-                let mut builder = self.stream.launch_builder(&self.kernels.add_attn_mask);
+                let scale = 1.0_f32 / (head_dim as f32).sqrt();
+                let total_rows = batch_heads * max_seq;
+                let threads = 256_u32.min(max_seq as u32).next_power_of_two();
+                let shared = threads * 4; // one float per thread for reductions
+                let mut builder = self
+                    .stream
+                    .launch_builder(&self.kernels.fused_scale_mask_softmax);
                 builder.arg(&mut self.workspace.scores);
                 builder.arg(&attn_mask_dev);
                 builder.arg(&batch);
                 builder.arg(&nh);
                 builder.arg(&max_seq);
-                unsafe { builder.launch(launch_cfg_1d(total_scores)) }.map_err(cuda_err)?;
-            }
-
-            // Softmax
-            {
-                let total_rows = batch_heads * max_seq;
-                let threads = 256_u32.min(max_seq as u32).next_power_of_two();
-                let shared = threads * 4;
-                let mut builder = self.stream.launch_builder(&self.kernels.softmax);
-                builder.arg(&mut self.workspace.scores);
-                builder.arg(&total_rows);
-                builder.arg(&max_seq);
+                builder.arg(&scale);
                 unsafe { builder.launch(launch_cfg_per_row_shared(total_rows, threads, shared)) }
                     .map_err(cuda_err)?;
             }
@@ -1220,21 +1310,20 @@ impl CudaBertModel {
                 hd,
             )?;
 
-            if let Some(ref bias) = self.layers[layer_idx].ffn.intermediate_bias {
-                let total_inter = batch_seq * inter_out_dim;
-                let mut builder = self.stream.launch_builder(&self.kernels.add_bias);
-                builder.arg(&mut self.workspace.ffn_inter);
-                builder.arg(bias);
-                builder.arg(&batch_seq);
-                builder.arg(&inter_out_dim);
-                unsafe { builder.launch(launch_cfg_1d(total_inter)) }.map_err(cuda_err)?;
-            }
-
-            // Activation + output projection → scratch
+            // Fused bias + activation, then output projection → scratch
             match self.variant {
                 ModelVariant::ClassicBert => {
+                    // Fuse intermediate bias + GELU into one kernel when bias exists,
+                    // otherwise just run GELU alone.
                     let total_act = batch_seq * inter_dim;
-                    {
+                    if let Some(ref bias) = self.layers[layer_idx].ffn.intermediate_bias {
+                        let mut builder = self.stream.launch_builder(&self.kernels.fused_bias_gelu);
+                        builder.arg(&mut self.workspace.ffn_inter);
+                        builder.arg(bias);
+                        builder.arg(&batch_seq);
+                        builder.arg(&inter_dim);
+                        unsafe { builder.launch(launch_cfg_1d(total_act)) }.map_err(cuda_err)?;
+                    } else {
                         let mut builder = self.stream.launch_builder(&self.kernels.gelu);
                         builder.arg(&mut self.workspace.ffn_inter);
                         builder.arg(&total_act);
@@ -1251,9 +1340,20 @@ impl CudaBertModel {
                     )?;
                 }
                 ModelVariant::NomicBert => {
+                    // Fuse intermediate bias + SwiGLU into one kernel when bias
+                    // exists, otherwise just run SwiGLU alone.
                     let half_cols = inter_dim;
                     let total_act = batch_seq * half_cols;
-                    {
+                    if let Some(ref bias) = self.layers[layer_idx].ffn.intermediate_bias {
+                        let mut builder =
+                            self.stream.launch_builder(&self.kernels.fused_bias_swiglu);
+                        builder.arg(&mut self.workspace.activated);
+                        builder.arg(&self.workspace.ffn_inter);
+                        builder.arg(bias);
+                        builder.arg(&batch_seq);
+                        builder.arg(&half_cols);
+                        unsafe { builder.launch(launch_cfg_1d(total_act)) }.map_err(cuda_err)?;
+                    } else {
                         let mut builder = self.stream.launch_builder(&self.kernels.swiglu);
                         builder.arg(&mut self.workspace.activated);
                         builder.arg(&self.workspace.ffn_inter);
