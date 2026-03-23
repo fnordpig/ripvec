@@ -48,12 +48,19 @@ impl rmcp::ServerHandler for RipvecServer {
                 .build(),
         )
         .with_instructions(
-            "Semantic code search server (ripvec). Tools: \
-             search_code (semantic code search with BGE embeddings), \
-             search_text (general text search with BGE embeddings), \
-             find_similar (find chunks similar to a given location), \
-             reindex (rebuild the search index), \
-             index_status (check indexing state).",
+            "Semantic code search powered by vector embeddings. Use ripvec when you need to \
+             find code by MEANING, not by exact text match.\n\n\
+             WHEN TO USE:\n\
+             - \"Find functions that handle error recovery\" → search_code\n\
+             - \"Find documentation about authentication\" → search_text\n\
+             - \"What code is similar to this function?\" → find_similar\n\
+             - After editing files, refresh the index → reindex\n\
+             - Check if index is ready → index_status\n\n\
+             TIPS:\n\
+             - Results include lsp_location fields — pass directly to LSP tools for hover/references\n\
+             - Use natural language queries, not regex or exact code\n\
+             - search_code uses code-optimized embeddings; search_text is for prose/docs\n\
+             - The index updates automatically when files change (2s debounce)",
         )
     }
 

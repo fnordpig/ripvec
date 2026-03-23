@@ -54,6 +54,12 @@ pub struct SearchParams {
         deserialize_with = "deserialize_number_or_string"
     )]
     pub threshold: f32,
+    /// Skip the first N results (for pagination). Default: 0.
+    #[serde(
+        default = "default_offset",
+        deserialize_with = "deserialize_number_or_string"
+    )]
+    pub offset: usize,
 }
 
 /// Parameters for the `find_similar` tool.
@@ -70,6 +76,12 @@ pub struct FindSimilarParams {
         deserialize_with = "deserialize_number_or_string"
     )]
     pub top_k: usize,
+    /// Skip the first N results (for pagination). Default: 0.
+    #[serde(
+        default = "default_offset",
+        deserialize_with = "deserialize_number_or_string"
+    )]
+    pub offset: usize,
 }
 
 /// Default number of results to return.
@@ -80,6 +92,11 @@ fn default_top_k() -> usize {
 /// Default similarity threshold.
 fn default_threshold() -> f32 {
     0.3
+}
+
+/// Default pagination offset.
+fn default_offset() -> usize {
+    0
 }
 
 #[tool_router]
@@ -146,6 +163,7 @@ impl RipvecServer {
         query: &str,
         top_k: usize,
         threshold: f32,
+        offset: usize,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         // Check index exists, then drop the read lock before doing embedding work
         {
@@ -201,6 +219,7 @@ impl RipvecServer {
 
         let results: Vec<SearchResultItem> = ranked
             .into_iter()
+            .skip(offset)
             .take(top_k)
             .filter_map(|(idx, score)| {
                 index
@@ -229,7 +248,7 @@ impl RipvecServer {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.run_search(&params.query, params.top_k, params.threshold)
+        self.run_search(&params.query, params.top_k, params.threshold, params.offset)
             .await
     }
 
@@ -245,7 +264,7 @@ impl RipvecServer {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.run_search(&params.query, params.top_k, params.threshold)
+        self.run_search(&params.query, params.top_k, params.threshold, params.offset)
             .await
     }
 
@@ -299,6 +318,7 @@ impl RipvecServer {
         let results: Vec<SearchResultItem> = ranked
             .into_iter()
             .filter(|(idx, _)| *idx != source_idx) // Exclude the source chunk
+            .skip(params.offset)
             .take(params.top_k)
             .filter_map(|(idx, score)| {
                 index
@@ -418,6 +438,7 @@ mod tests {
         assert_eq!(params.query, "test");
         assert_eq!(params.top_k, 5);
         assert!((params.threshold - 0.5).abs() < f32::EPSILON);
+        assert_eq!(params.offset, 0);
     }
 
     #[test]
@@ -427,6 +448,7 @@ mod tests {
         assert_eq!(params.query, "test");
         assert_eq!(params.top_k, 5);
         assert!((params.threshold - 0.5).abs() < f32::EPSILON);
+        assert_eq!(params.offset, 0);
     }
 
     #[test]
@@ -436,6 +458,21 @@ mod tests {
         assert_eq!(params.query, "test");
         assert_eq!(params.top_k, 10);
         assert!((params.threshold - 0.3).abs() < f32::EPSILON);
+        assert_eq!(params.offset, 0);
+    }
+
+    #[test]
+    fn test_search_params_with_offset() {
+        let json = r#"{"query": "test", "offset": 5}"#;
+        let params: SearchParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.offset, 5);
+    }
+
+    #[test]
+    fn test_search_params_with_offset_string() {
+        let json = r#"{"query": "test", "offset": "10"}"#;
+        let params: SearchParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.offset, 10);
     }
 
     #[test]
@@ -445,6 +482,14 @@ mod tests {
         assert_eq!(params.file_path, "foo.rs");
         assert_eq!(params.line, 42);
         assert_eq!(params.top_k, 10); // default
+        assert_eq!(params.offset, 0); // default
+    }
+
+    #[test]
+    fn test_find_similar_params_with_offset() {
+        let json = r#"{"file_path": "foo.rs", "line": 10, "offset": 3}"#;
+        let params: FindSimilarParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.offset, 3);
     }
 
     #[test]
