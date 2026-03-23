@@ -9,6 +9,10 @@ pub mod blas_info;
 pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+#[cfg(feature = "metal")]
+pub mod metal;
+#[cfg(feature = "metal")]
+pub mod metal_kernels;
 #[cfg(feature = "mlx")]
 pub mod mlx;
 
@@ -89,6 +93,8 @@ pub enum BackendKind {
     /// CPU (ndarray + system BLAS).
     #[default]
     Cpu,
+    /// Metal (Apple Silicon, macOS only, direct Metal GPU).
+    Metal,
 }
 
 impl std::fmt::Display for BackendKind {
@@ -97,6 +103,7 @@ impl std::fmt::Display for BackendKind {
             Self::Cuda => write!(f, "cuda"),
             Self::Mlx => write!(f, "mlx"),
             Self::Cpu => write!(f, "cpu"),
+            Self::Metal => write!(f, "metal"),
         }
     }
 }
@@ -128,12 +135,12 @@ pub enum DeviceHint {
 pub fn load_backend(
     kind: BackendKind,
     #[cfg_attr(
-        not(any(feature = "cuda", feature = "mlx", feature = "cpu")),
+        not(any(feature = "cuda", feature = "mlx", feature = "cpu", feature = "metal")),
         expect(unused_variables, reason = "used when backend features are enabled")
     )]
     model_repo: &str,
     #[cfg_attr(
-        not(any(feature = "cuda", feature = "mlx", feature = "cpu")),
+        not(any(feature = "cuda", feature = "mlx", feature = "cpu", feature = "metal")),
         expect(unused_variables, reason = "used when backend features are enabled")
     )]
     device_hint: DeviceHint,
@@ -166,6 +173,15 @@ pub fn load_backend(
         BackendKind::Cpu => Err(crate::Error::Other(anyhow::anyhow!(
             "cpu backend requires building with: cargo build --features cpu"
         ))),
+        #[cfg(feature = "metal")]
+        BackendKind::Metal => {
+            let backend = metal::MetalBackend::load(model_repo, &device_hint)?;
+            Ok(Box::new(backend))
+        }
+        #[cfg(not(feature = "metal"))]
+        BackendKind::Metal => Err(crate::Error::Other(anyhow::anyhow!(
+            "metal backend requires building with: cargo build --features metal"
+        ))),
     }
 }
 
@@ -180,13 +196,13 @@ pub fn load_backend(
 /// Returns an error if no backends can be loaded (not even CPU).
 pub fn detect_backends(
     #[cfg_attr(
-        not(any(feature = "cuda", feature = "mlx", feature = "cpu")),
+        not(any(feature = "cuda", feature = "mlx", feature = "cpu", feature = "metal")),
         expect(unused_variables, reason = "used when backend features are enabled")
     )]
     model_repo: &str,
 ) -> crate::Result<Vec<Box<dyn EmbedBackend>>> {
     #[cfg_attr(
-        not(any(feature = "cuda", feature = "mlx", feature = "cpu")),
+        not(any(feature = "cuda", feature = "mlx", feature = "cpu", feature = "metal")),
         expect(unused_mut, reason = "mut needed when backend features are enabled")
     )]
     let mut backends: Vec<Box<dyn EmbedBackend>> = Vec::new();
@@ -197,10 +213,18 @@ pub fn detect_backends(
         backends.push(Box::new(b));
     }
 
-    // Try MLX (Apple Silicon GPU)
-    #[cfg(feature = "mlx")]
-    if let Ok(b) = mlx::MlxBackend::load(model_repo, &DeviceHint::Auto) {
+    // Try Metal (Apple Silicon GPU, preferred over MLX)
+    #[cfg(feature = "metal")]
+    if let Ok(b) = metal::MetalBackend::load(model_repo, &DeviceHint::Auto) {
         backends.push(Box::new(b));
+    }
+
+    // Try MLX (Apple Silicon GPU, fallback if Metal unavailable)
+    #[cfg(feature = "mlx")]
+    if backends.is_empty() {
+        if let Ok(b) = mlx::MlxBackend::load(model_repo, &DeviceHint::Auto) {
+            backends.push(Box::new(b));
+        }
     }
 
     // Add CPU as fallback only when no GPU backend was loaded.

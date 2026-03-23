@@ -13,6 +13,10 @@ pub enum Error {
     #[error("CUDA error: {0}")]
     Cuda(String),
 
+    /// Metal GPU backend error.
+    #[error("Metal: {0}")]
+    Metal(String),
+
     /// Tokenization of input text failed.
     #[error("tokenization failed: {0}")]
     Tokenization(String),
