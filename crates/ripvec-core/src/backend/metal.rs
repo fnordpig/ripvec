@@ -29,8 +29,8 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSString, NSUInteger};
 use objc2_metal::{
-    MTLBuffer, MTLCommandQueue, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLGPUFamily, MTLLibrary, MTLResourceOptions,
+    MTLBuffer, MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 use safetensors::SafeTensors;
 
@@ -64,10 +64,6 @@ fn create_queue(
 }
 
 /// Compile MSL source code into a Metal library.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "will be used in BERT inference")
-)]
 fn compile_library(
     device: &ProtocolObject<dyn MTLDevice>,
     source: &str,
@@ -79,10 +75,6 @@ fn compile_library(
 }
 
 /// Create a compute pipeline state from a named kernel function.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "will be used in BERT inference")
-)]
 fn create_pipeline(
     device: &ProtocolObject<dyn MTLDevice>,
     library: &ProtocolObject<dyn MTLLibrary>,
@@ -95,6 +87,142 @@ fn create_pipeline(
     device
         .newComputePipelineStateWithFunction_error(&function)
         .map_err(|e| crate::Error::Metal(format!("pipeline creation failed: {e}")))
+}
+
+// ---------------------------------------------------------------------------
+// Kernel pipelines (compiled MSL compute functions)
+// ---------------------------------------------------------------------------
+
+/// Pre-compiled Metal compute pipeline states for all BERT inference kernels.
+///
+/// Created once at model load time by compiling the MSL source from
+/// [`super::metal_kernels::KERNELS`] and extracting each named function.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "fields will be used in BERT inference dispatch")
+)]
+struct KernelPipelines {
+    /// Embedding table lookup.
+    embedding_lookup: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Add embedding table values to existing output.
+    add_embeddings: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Layer normalization with threadgroup reduction.
+    layer_norm: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// GELU activation (tanh approximation, in-place).
+    gelu: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// `SwiGLU` activation (value * silu(gate)).
+    swiglu: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// `RoPE` with pre-computed cos/sin tables.
+    rope_cached: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Fused scale + attention-mask + softmax.
+    fused_scale_mask_softmax: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Fused residual add + layer norm.
+    fused_residual_layernorm: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Fused bias + GELU activation for `ClassicBert` FFN.
+    fused_bias_gelu: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Fused bias + residual add for output projections.
+    fused_bias_residual: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Unified `SwiGLU` kernel handling both bias and no-bias paths.
+    fused_swiglu: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Split QKV `[batch*seq, 3*hidden]` into Q,K,V `[batch*num_heads, seq, head_dim]`.
+    qkv_split: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Reshape attention output `[batch*num_heads, seq, head_dim]` to `[batch*seq, hidden]`.
+    attn_reshape: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// CLS pooling (extract row 0 per batch element).
+    cls_pool: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// L2 normalize each row.
+    l2_normalize: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Build float attention mask from int mask.
+    build_attn_mask: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Convert FP32 to FP16.
+    f32_to_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+}
+
+impl KernelPipelines {
+    /// Compile all MSL kernels and create pipeline states.
+    fn compile(device: &ProtocolObject<dyn MTLDevice>) -> crate::Result<Self> {
+        let library = compile_library(device, super::metal_kernels::KERNELS)?;
+        let p = |name: &str| create_pipeline(device, &library, name);
+
+        Ok(Self {
+            embedding_lookup: p("embedding_lookup_kernel")?,
+            add_embeddings: p("add_embeddings_kernel")?,
+            layer_norm: p("layer_norm_kernel")?,
+            gelu: p("gelu_kernel")?,
+            swiglu: p("swiglu_kernel")?,
+            rope_cached: p("rope_cached_kernel")?,
+            fused_scale_mask_softmax: p("fused_scale_mask_softmax_kernel")?,
+            fused_residual_layernorm: p("fused_residual_layernorm_kernel")?,
+            fused_bias_gelu: p("fused_bias_gelu_kernel")?,
+            fused_bias_residual: p("fused_bias_residual_kernel")?,
+            fused_swiglu: p("fused_swiglu_kernel")?,
+            qkv_split: p("qkv_split_kernel")?,
+            attn_reshape: p("attn_reshape_kernel")?,
+            cls_pool: p("cls_pool_kernel")?,
+            l2_normalize: p("l2_normalize_kernel")?,
+            build_attn_mask: p("build_attn_mask_kernel")?,
+            f32_to_f16: p("f32_to_f16_kernel")?,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch helpers
+// ---------------------------------------------------------------------------
+
+/// Dispatch a 1D compute kernel over `n` elements.
+///
+/// Automatically chooses a threadgroup size based on the pipeline's maximum.
+/// Uses `dispatchThreads:threadsPerThreadgroup:` for non-uniform grids.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "will be used in BERT inference dispatch")
+)]
+fn dispatch_1d(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    n: usize,
+) {
+    let max_threads = pipeline.maxTotalThreadsPerThreadgroup();
+    let threads_per_tg = max_threads.min(n).max(1);
+    let grid = MTLSize {
+        width: n,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: threads_per_tg,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatchThreads_threadsPerThreadgroup(grid, tg);
+}
+
+/// Dispatch a per-row kernel using threadgroups (one threadgroup per row).
+///
+/// Used for kernels like `layer_norm`, `l2_normalize`, `fused_scale_mask_softmax`,
+/// and `fused_residual_layernorm` that use threadgroup reductions. Each row is
+/// handled by one threadgroup with up to 256 threads.
+#[expect(dead_code, reason = "will be used in BERT inference dispatch")]
+fn dispatch_rows(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    num_rows: usize,
+    threads_per_row: usize,
+) {
+    let max_threads = pipeline.maxTotalThreadsPerThreadgroup();
+    let tpg = max_threads.min(threads_per_row).clamp(1, 256);
+    let grid = MTLSize {
+        width: num_rows,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tpg,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
 }
 
 // ---------------------------------------------------------------------------
@@ -700,6 +828,9 @@ pub struct MetalBackend {
     /// BERT model with weight refs indexing into `weight_buffer`.
     #[expect(dead_code, reason = "will be used for BERT inference dispatch")]
     model: MetalBertModel,
+    /// Pre-compiled compute pipeline states for all MSL kernels.
+    #[expect(dead_code, reason = "will be used for BERT inference dispatch")]
+    kernels: KernelPipelines,
     /// Hidden dimension for output vector size.
     #[cfg_attr(not(test), expect(dead_code, reason = "will be used in embed_batch"))]
     hidden_size: i32,
@@ -781,6 +912,9 @@ impl MetalBackend {
         // Build model from weight refs
         let model = MetalBertModel::from_weight_refs(&refs, &config)?;
 
+        // Compile all MSL kernels into pipeline states
+        let kernels = KernelPipelines::compile(&device)?;
+
         tracing::info!(
             device = %device.name(),
             chip_family = ?chip_family,
@@ -788,7 +922,7 @@ impl MetalBackend {
             layers = config.num_hidden_layers,
             variant = ?variant,
             weights_bytes = mmap.len(),
-            "Metal backend initialized with zero-copy weights"
+            "Metal backend initialized with zero-copy weights + 17 MSL kernels"
         );
 
         Ok(Self {
@@ -797,6 +931,7 @@ impl MetalBackend {
             chip_family,
             weight_buffer,
             model,
+            kernels,
             hidden_size,
             max_position_embeddings,
             _mmap: mmap,
@@ -940,5 +1075,344 @@ mod tests {
         assert_eq!(backend.max_tokens(), 512);
         assert!(backend.is_gpu());
         assert!(!backend.supports_clone());
+    }
+
+    #[test]
+    fn metal_all_kernels_compile() {
+        let device = create_device().unwrap();
+        let pipelines = KernelPipelines::compile(&device).unwrap();
+        // Verify all 17 pipelines have non-zero max threadgroup size
+        assert!(pipelines.embedding_lookup.maxTotalThreadsPerThreadgroup() > 0);
+        assert!(pipelines.add_embeddings.maxTotalThreadsPerThreadgroup() > 0);
+        assert!(pipelines.layer_norm.maxTotalThreadsPerThreadgroup() > 0);
+        assert!(pipelines.gelu.maxTotalThreadsPerThreadgroup() > 0);
+        assert!(pipelines.swiglu.maxTotalThreadsPerThreadgroup() > 0);
+        assert!(pipelines.rope_cached.maxTotalThreadsPerThreadgroup() > 0);
+        assert!(
+            pipelines
+                .fused_scale_mask_softmax
+                .maxTotalThreadsPerThreadgroup()
+                > 0
+        );
+        assert!(
+            pipelines
+                .fused_residual_layernorm
+                .maxTotalThreadsPerThreadgroup()
+                > 0
+        );
+        assert!(pipelines.fused_bias_gelu.maxTotalThreadsPerThreadgroup() > 0);
+        assert!(
+            pipelines
+                .fused_bias_residual
+                .maxTotalThreadsPerThreadgroup()
+                > 0
+        );
+        assert!(pipelines.fused_swiglu.maxTotalThreadsPerThreadgroup() > 0);
+        assert!(pipelines.qkv_split.maxTotalThreadsPerThreadgroup() > 0);
+        assert!(pipelines.attn_reshape.maxTotalThreadsPerThreadgroup() > 0);
+        assert!(pipelines.cls_pool.maxTotalThreadsPerThreadgroup() > 0);
+        assert!(pipelines.l2_normalize.maxTotalThreadsPerThreadgroup() > 0);
+        assert!(pipelines.build_attn_mask.maxTotalThreadsPerThreadgroup() > 0);
+        assert!(pipelines.f32_to_f16.maxTotalThreadsPerThreadgroup() > 0);
+    }
+
+    /// Helper: create a Metal buffer from a slice of f32 values.
+    fn make_f32_buffer(
+        device: &ProtocolObject<dyn MTLDevice>,
+        data: &[f32],
+    ) -> Retained<ProtocolObject<dyn MTLBuffer>> {
+        let size = core::mem::size_of_val(data) as NSUInteger;
+        unsafe {
+            device.newBufferWithBytes_length_options(
+                NonNull::new(data.as_ptr() as *mut c_void).unwrap(),
+                size,
+                MTLResourceOptions::StorageModeShared,
+            )
+        }
+        .expect("failed to create Metal buffer")
+    }
+
+    /// Helper: create a Metal buffer from a slice of i32 values.
+    fn make_i32_buffer(
+        device: &ProtocolObject<dyn MTLDevice>,
+        data: &[i32],
+    ) -> Retained<ProtocolObject<dyn MTLBuffer>> {
+        let size = core::mem::size_of_val(data) as NSUInteger;
+        unsafe {
+            device.newBufferWithBytes_length_options(
+                NonNull::new(data.as_ptr() as *mut c_void).unwrap(),
+                size,
+                MTLResourceOptions::StorageModeShared,
+            )
+        }
+        .expect("failed to create Metal buffer")
+    }
+
+    /// Helper: create a zero-initialized Metal buffer of `n` f32 elements.
+    fn make_zero_buffer(
+        device: &ProtocolObject<dyn MTLDevice>,
+        n: usize,
+    ) -> Retained<ProtocolObject<dyn MTLBuffer>> {
+        let size = (n * core::mem::size_of::<f32>()) as NSUInteger;
+        device
+            .newBufferWithLength_options(size, MTLResourceOptions::StorageModeShared)
+            .expect("failed to create Metal buffer")
+    }
+
+    /// Helper: create a Metal buffer containing a single i32 constant.
+    fn make_i32_const_buffer(
+        device: &ProtocolObject<dyn MTLDevice>,
+        val: i32,
+    ) -> Retained<ProtocolObject<dyn MTLBuffer>> {
+        make_i32_buffer(device, &[val])
+    }
+
+    /// Helper: create a Metal buffer containing a single f32 constant.
+    fn make_f32_const_buffer(
+        device: &ProtocolObject<dyn MTLDevice>,
+        val: f32,
+    ) -> Retained<ProtocolObject<dyn MTLBuffer>> {
+        make_f32_buffer(device, &[val])
+    }
+
+    /// Helper: read back f32 values from a Metal buffer.
+    fn read_f32_buffer(buffer: &ProtocolObject<dyn MTLBuffer>, n: usize) -> Vec<f32> {
+        unsafe { core::slice::from_raw_parts(buffer.contents().as_ptr() as *const f32, n) }.to_vec()
+    }
+
+    #[test]
+    fn metal_layer_norm_kernel() {
+        let device = create_device().unwrap();
+        let queue = create_queue(&device).unwrap();
+        let pipelines = KernelPipelines::compile(&device).unwrap();
+
+        // Input: [1.0, 2.0, 3.0, 4.0] (1 row, 4 cols)
+        // Weight: [1.0, 1.0, 1.0, 1.0], Bias: [0.0, 0.0, 0.0, 0.0], eps: 1e-5
+        // Expected: standard layernorm of [1,2,3,4]
+        // mean = 2.5, var = 1.25, std = sqrt(1.25) = 1.11803...
+        // normalized = [-1.3416, -0.4472, 0.4472, 1.3416]
+        let input = [1.0_f32, 2.0, 3.0, 4.0];
+        let weight = [1.0_f32, 1.0, 1.0, 1.0];
+        let bias = [0.0_f32, 0.0, 0.0, 0.0];
+
+        let output_buf = make_zero_buffer(&device, 4);
+        let input_buf = make_f32_buffer(&device, &input);
+        let weight_buf = make_f32_buffer(&device, &weight);
+        let bias_buf = make_f32_buffer(&device, &bias);
+        let rows_buf = make_i32_const_buffer(&device, 1);
+        let cols_buf = make_i32_const_buffer(&device, 4);
+        let eps_buf = make_f32_const_buffer(&device, 1e-5);
+
+        let cmd_buf = queue.commandBuffer().unwrap();
+        let encoder = cmd_buf.computeCommandEncoder().unwrap();
+        encoder.setComputePipelineState(&pipelines.layer_norm);
+
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(&output_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(&input_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(&bias_buf), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(&rows_buf), 0, 4);
+            encoder.setBuffer_offset_atIndex(Some(&cols_buf), 0, 5);
+            encoder.setBuffer_offset_atIndex(Some(&eps_buf), 0, 6);
+        }
+
+        // One threadgroup for one row, with 4 threads
+        let grid = MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 4,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        encoder.endEncoding();
+
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+
+        let result = read_f32_buffer(&output_buf, 4);
+        let expected = [-1.3416, -0.4472, 0.4472, 1.3416];
+        for (got, exp) in result.iter().zip(expected.iter()) {
+            assert!(
+                (got - exp).abs() < 1e-3,
+                "layer_norm mismatch: got {got}, expected {exp}"
+            );
+        }
+    }
+
+    #[test]
+    fn metal_gelu_kernel() {
+        let device = create_device().unwrap();
+        let queue = create_queue(&device).unwrap();
+        let pipelines = KernelPipelines::compile(&device).unwrap();
+
+        // GELU(0) = 0, GELU(1) ≈ 0.8412, GELU(-1) ≈ -0.1588
+        let data = [0.0_f32, 1.0, -1.0, 2.0];
+        let buf = make_f32_buffer(&device, &data);
+        let n_buf = make_i32_const_buffer(&device, 4);
+
+        let cmd_buf = queue.commandBuffer().unwrap();
+        let encoder = cmd_buf.computeCommandEncoder().unwrap();
+        encoder.setComputePipelineState(&pipelines.gelu);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(&buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(&n_buf), 0, 1);
+        }
+        dispatch_1d(&encoder, &pipelines.gelu, 4);
+        encoder.endEncoding();
+
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+
+        let result = read_f32_buffer(&buf, 4);
+        let expected = [0.0, 0.8412, -0.1588, 1.9545];
+        for (got, exp) in result.iter().zip(expected.iter()) {
+            assert!(
+                (got - exp).abs() < 1e-3,
+                "GELU mismatch: got {got}, expected {exp}"
+            );
+        }
+    }
+
+    #[test]
+    fn metal_l2_normalize_kernel() {
+        let device = create_device().unwrap();
+        let queue = create_queue(&device).unwrap();
+        let pipelines = KernelPipelines::compile(&device).unwrap();
+
+        // [3.0, 4.0] -> L2 norm = 5.0 -> [0.6, 0.8]
+        let data = [3.0_f32, 4.0];
+        let buf = make_f32_buffer(&device, &data);
+        let rows_buf = make_i32_const_buffer(&device, 1);
+        let cols_buf = make_i32_const_buffer(&device, 2);
+
+        let cmd_buf = queue.commandBuffer().unwrap();
+        let encoder = cmd_buf.computeCommandEncoder().unwrap();
+        encoder.setComputePipelineState(&pipelines.l2_normalize);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(&buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(&rows_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&cols_buf), 0, 2);
+        }
+        // dispatch_rows: 1 row, 2 threads per row
+        let grid = MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 2,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        encoder.endEncoding();
+
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+
+        let result = read_f32_buffer(&buf, 2);
+        assert!(
+            (result[0] - 0.6).abs() < 1e-5,
+            "expected 0.6, got {}",
+            result[0]
+        );
+        assert!(
+            (result[1] - 0.8).abs() < 1e-5,
+            "expected 0.8, got {}",
+            result[1]
+        );
+    }
+
+    #[test]
+    fn metal_embedding_lookup_kernel() {
+        let device = create_device().unwrap();
+        let queue = create_queue(&device).unwrap();
+        let pipelines = KernelPipelines::compile(&device).unwrap();
+
+        // Embedding table: 3 tokens x 2 dims
+        // [[10.0, 11.0], [20.0, 21.0], [30.0, 31.0]]
+        let table = [10.0_f32, 11.0, 20.0, 21.0, 30.0, 31.0];
+        let indices = [2_i32, 0]; // look up token 2 and token 0
+        let hidden_dim = 2;
+        let batch_seq = 2;
+
+        let output_buf = make_zero_buffer(&device, 4);
+        let table_buf = make_f32_buffer(&device, &table);
+        let indices_buf = make_i32_buffer(&device, &indices);
+        let batch_seq_buf = make_i32_const_buffer(&device, batch_seq);
+        let hidden_dim_buf = make_i32_const_buffer(&device, hidden_dim);
+
+        let cmd_buf = queue.commandBuffer().unwrap();
+        let encoder = cmd_buf.computeCommandEncoder().unwrap();
+        encoder.setComputePipelineState(&pipelines.embedding_lookup);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(&output_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(&table_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&indices_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(&batch_seq_buf), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(&hidden_dim_buf), 0, 4);
+        }
+        dispatch_1d(&encoder, &pipelines.embedding_lookup, 4);
+        encoder.endEncoding();
+
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+
+        let result = read_f32_buffer(&output_buf, 4);
+        // Token 2: [30.0, 31.0], Token 0: [10.0, 11.0]
+        assert_eq!(result, vec![30.0, 31.0, 10.0, 11.0]);
+    }
+
+    #[test]
+    fn metal_build_attn_mask_kernel() {
+        let device = create_device().unwrap();
+        let queue = create_queue(&device).unwrap();
+        let pipelines = KernelPipelines::compile(&device).unwrap();
+
+        let mask = [1_i32, 1, 0, 1];
+        let output_buf = make_zero_buffer(&device, 4);
+        let mask_buf = make_i32_buffer(&device, &mask);
+        let total_buf = make_i32_const_buffer(&device, 4);
+
+        let cmd_buf = queue.commandBuffer().unwrap();
+        let encoder = cmd_buf.computeCommandEncoder().unwrap();
+        encoder.setComputePipelineState(&pipelines.build_attn_mask);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(&output_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(&mask_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&total_buf), 0, 2);
+        }
+        dispatch_1d(&encoder, &pipelines.build_attn_mask, 4);
+        encoder.endEncoding();
+
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+
+        let result = read_f32_buffer(&output_buf, 4);
+        assert!(
+            (result[0] - 0.0_f32).abs() < f32::EPSILON,
+            "expected 0.0, got {}",
+            result[0]
+        );
+        assert!(
+            (result[1] - 0.0_f32).abs() < f32::EPSILON,
+            "expected 0.0, got {}",
+            result[1]
+        );
+        assert!(
+            (result[2] - (-1e9_f32)).abs() < 1.0,
+            "expected -1e9, got {}",
+            result[2]
+        );
+        assert!(
+            (result[3] - 0.0_f32).abs() < f32::EPSILON,
+            "expected 0.0, got {}",
+            result[3]
+        );
     }
 }
