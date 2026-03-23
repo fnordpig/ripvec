@@ -52,8 +52,117 @@ pub struct CodeChunk {
     pub start_line: usize,
     /// 1-based end line number.
     pub end_line: usize,
-    /// Source text of the chunk.
+    /// Source text of the chunk (raw code for display).
     pub content: String,
+    /// Enriched content with scope chain and signature metadata for embedding.
+    /// Falls back to `content` if metadata would exceed chunk size limits.
+    pub enriched_content: String,
+}
+
+/// Walk up the AST parent chain collecting structural container names.
+///
+/// Produces a scope chain like `"impl_item Foo > fn forward"` by
+/// identifying structural containers (impl blocks, classes, modules, namespaces)
+/// and extracting their names. Tries the `name` field first, then `type`
+/// (for Rust `impl_item` which uses `type` instead of `name`).
+#[must_use]
+pub fn build_scope_chain(node: tree_sitter::Node<'_>, source: &str) -> String {
+    /// Node kinds that represent structural containers, by language.
+    const CONTAINER_KINDS: &[&str] = &[
+        // Rust
+        "impl_item",
+        "trait_item",
+        "mod_item",
+        // Python
+        "class_definition",
+        "module",
+        // JS/TS
+        "class_declaration",
+        // Java
+        // "class_declaration" already covered above
+        // Go
+        "type_declaration",
+        // C++
+        "namespace_definition",
+        "class_specifier",
+    ];
+
+    /// Field names to try when extracting the container name.
+    /// `impl_item` uses `type` instead of `name`; Go `type_declaration`
+    /// has no fields, so we fall back to the node kind.
+    const NAME_FIELDS: &[&str] = &["name", "type"];
+
+    let mut parts = Vec::new();
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        let kind = parent.kind();
+        if CONTAINER_KINDS.contains(&kind) {
+            let name = NAME_FIELDS
+                .iter()
+                .find_map(|field| parent.child_by_field_name(field))
+                .map_or(kind, |n| &source[n.start_byte()..n.end_byte()]);
+            parts.push(format!("{kind} {name}"));
+        }
+        current = parent.parent();
+    }
+    parts.reverse();
+    parts.join(" > ")
+}
+
+/// Extract the function/method signature from a definition node.
+///
+/// Returns the text from the function name to the start of the body,
+/// which captures the parameter list and return type (if any).
+/// Returns `None` if the node has no `name` or `body`/`block` field.
+#[must_use]
+pub fn extract_signature(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+    let name_node = node.child_by_field_name("name")?;
+    let body_node = node
+        .child_by_field_name("body")
+        .or_else(|| node.child_by_field_name("block"))?;
+    let start = name_node.start_byte();
+    let end = body_node.start_byte();
+    if start >= end {
+        return None;
+    }
+    let sig = source[start..end].trim();
+    if sig.is_empty() {
+        None
+    } else {
+        Some(sig.to_string())
+    }
+}
+
+/// Build the enriched content header for a code chunk.
+///
+/// Prepends scope chain and signature metadata as a comment line.
+/// If the header + content would exceed `max_bytes`, returns `content` unchanged.
+fn build_enriched_content(
+    path: &Path,
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    content: &str,
+    max_bytes: usize,
+) -> String {
+    let scope = build_scope_chain(node, source);
+    let sig = extract_signature(node, source).unwrap_or_default();
+    let rel_path = path.display().to_string();
+
+    let header = if scope.is_empty() && sig.is_empty() {
+        format!("// {rel_path}\n")
+    } else if scope.is_empty() {
+        format!("// {rel_path} | defines: {sig}\n")
+    } else if sig.is_empty() {
+        format!("// {rel_path} | {scope}\n")
+    } else {
+        format!("// {rel_path} | {scope} | defines: {sig}\n")
+    };
+
+    if header.len() + content.len() > max_bytes {
+        content.to_string()
+    } else {
+        format!("{header}{content}")
+    }
 }
 
 /// Extract semantic chunks from a source file.
@@ -109,12 +218,20 @@ pub fn chunk_file(
                     chunk_config,
                 ));
             } else {
+                let enriched = build_enriched_content(
+                    path,
+                    node,
+                    source,
+                    content,
+                    chunk_config.max_chunk_bytes,
+                );
                 chunks.push(CodeChunk {
                     file_path: path.display().to_string(),
                     name,
                     kind: node.kind().to_string(),
                     start_line,
                     end_line: node.end_position().row + 1,
+                    enriched_content: enriched,
                     content: content.to_string(),
                 });
             }
@@ -151,6 +268,7 @@ fn sliding_windows(path: &Path, source: &str, chunk_config: &ChunkConfig) -> Vec
 
     // Small enough for a single chunk
     if source.len() <= chunk_config.max_chunk_bytes {
+        let content = source.to_string();
         return vec![CodeChunk {
             file_path: path.display().to_string(),
             name: path
@@ -161,7 +279,8 @@ fn sliding_windows(path: &Path, source: &str, chunk_config: &ChunkConfig) -> Vec
             kind: "file".to_string(),
             start_line: 1,
             end_line: source.lines().count(),
-            content: source.to_string(),
+            enriched_content: content.clone(),
+            content,
         }];
     }
 
@@ -229,13 +348,15 @@ fn sliding_window_chunks(
             let start_line = base_line + source[..offset].matches('\n').count();
             let content_lines = window.lines().count().max(1);
             let end_line = start_line + content_lines - 1;
+            let content = window.to_string();
             chunks.push(CodeChunk {
                 file_path: file_path.display().to_string(),
                 name: format!("{name_prefix}[{window_idx}]"),
                 kind: "window".to_string(),
                 start_line,
                 end_line,
-                content: window.to_string(),
+                enriched_content: content.clone(),
+                content,
             });
             window_idx += 1;
         }
@@ -345,5 +466,182 @@ mod tests {
         let config = crate::languages::config_for_extension("rs").unwrap();
         let chunks = chunk_file(Path::new("empty.rs"), "", &config, &ChunkConfig::default());
         assert!(chunks.is_empty());
+    }
+
+    // --- T1 enrichment tests ---
+
+    /// Helper: parse source with tree-sitter and return the first `@def` node.
+    fn first_def_node(
+        source: &str,
+        ext: &str,
+    ) -> (
+        tree_sitter::Tree,
+        std::sync::Arc<crate::languages::LangConfig>,
+    ) {
+        let config = crate::languages::config_for_extension(ext).unwrap();
+        let mut parser = Parser::new();
+        parser.set_language(&config.language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        (tree, config)
+    }
+
+    #[test]
+    fn scope_chain_rust_impl_method() {
+        let source = "impl Foo {\n    fn bar(&self) {}\n}";
+        let (tree, config) = first_def_node(source, "rs");
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&config.query, tree.root_node(), source.as_bytes());
+
+        let mut def_node = None;
+        while let Some(m) = StreamingIterator::next(&mut matches) {
+            for cap in m.captures {
+                let cap_name = &config.query.capture_names()[cap.index as usize];
+                if *cap_name == "def" {
+                    def_node = Some(cap.node);
+                }
+            }
+        }
+        let node = def_node.expect("should find a @def node");
+        let scope = build_scope_chain(node, source);
+        assert!(
+            scope.contains("impl_item"),
+            "scope should contain impl_item, got: {scope}"
+        );
+        assert!(
+            scope.contains("Foo"),
+            "scope should contain 'Foo', got: {scope}"
+        );
+    }
+
+    #[test]
+    fn scope_chain_python_class_method() {
+        let source = "class Greeter:\n    def say_hello(self):\n        pass\n";
+        let (tree, config) = first_def_node(source, "py");
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&config.query, tree.root_node(), source.as_bytes());
+
+        // Find the function_definition @def (say_hello), not the class @def
+        let mut fn_node = None;
+        while let Some(m) = StreamingIterator::next(&mut matches) {
+            for cap in m.captures {
+                let cap_name = &config.query.capture_names()[cap.index as usize];
+                if *cap_name == "def" && cap.node.kind() == "function_definition" {
+                    fn_node = Some(cap.node);
+                }
+            }
+        }
+        let node = fn_node.expect("should find say_hello @def node");
+        let scope = build_scope_chain(node, source);
+        assert!(
+            scope.contains("class_definition"),
+            "scope should contain class_definition, got: {scope}"
+        );
+        assert!(
+            scope.contains("Greeter"),
+            "scope should contain 'Greeter', got: {scope}"
+        );
+    }
+
+    #[test]
+    fn extract_signature_rust_function() {
+        let source = "fn greet(name: &str) -> String { name.to_string() }";
+        let (tree, config) = first_def_node(source, "rs");
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&config.query, tree.root_node(), source.as_bytes());
+
+        let mut def_node = None;
+        while let Some(m) = StreamingIterator::next(&mut matches) {
+            for cap in m.captures {
+                let cap_name = &config.query.capture_names()[cap.index as usize];
+                if *cap_name == "def" {
+                    def_node = Some(cap.node);
+                }
+            }
+        }
+        let node = def_node.expect("should find @def node");
+        let sig = extract_signature(node, source).expect("should extract signature");
+        assert!(
+            sig.contains("greet"),
+            "signature should contain 'greet', got: {sig}"
+        );
+        assert!(
+            sig.contains("name: &str"),
+            "signature should contain parameter, got: {sig}"
+        );
+        assert!(
+            sig.contains("-> String"),
+            "signature should contain return type, got: {sig}"
+        );
+    }
+
+    #[test]
+    fn enriched_content_has_header() {
+        let source = "fn hello() { println!(\"hi\"); }";
+        let config = crate::languages::config_for_extension("rs").unwrap();
+        let chunks = chunk_file(
+            Path::new("src/main.rs"),
+            source,
+            &config,
+            &ChunkConfig::default(),
+        );
+        assert!(!chunks.is_empty());
+        let chunk = &chunks[0];
+        assert!(
+            chunk.enriched_content.starts_with("//"),
+            "enriched_content should start with '//' header, got: {}",
+            &chunk.enriched_content[..chunk.enriched_content.len().min(80)]
+        );
+        assert!(
+            chunk.enriched_content.contains("src/main.rs"),
+            "enriched_content should contain file path"
+        );
+        // Raw content should NOT have the header
+        assert!(
+            !chunk.content.starts_with("//"),
+            "raw content should not start with header"
+        );
+    }
+
+    #[test]
+    fn sliding_window_enriched_equals_content() {
+        let source = "let x = 42;\nconsole.log(x);\n";
+        let chunks = chunk_text(Path::new("test.txt"), source, &ChunkConfig::default());
+        assert!(!chunks.is_empty());
+        for chunk in &chunks {
+            assert_eq!(
+                chunk.enriched_content, chunk.content,
+                "sliding window chunks should have enriched_content == content"
+            );
+        }
+    }
+
+    #[test]
+    fn header_dropped_when_exceeding_max_bytes() {
+        // Create a chunk that barely fits in max_chunk_bytes, so adding
+        // a header would push it over the limit.
+        let tiny_config = ChunkConfig {
+            max_chunk_bytes: 60,
+            window_size: 30,
+            window_overlap: 10,
+        };
+        // Source is exactly at max_chunk_bytes — any header would exceed it
+        let source = "fn f() { let x = 42; return x; }";
+        assert!(source.len() <= tiny_config.max_chunk_bytes);
+
+        let config = crate::languages::config_for_extension("rs").unwrap();
+        let chunks = chunk_file(
+            Path::new("long/path/to/file.rs"),
+            source,
+            &config,
+            &tiny_config,
+        );
+        assert!(!chunks.is_empty());
+        let chunk = &chunks[0];
+        // Header ("// long/path/to/file.rs | defines: ...") + content > 60 bytes
+        // So enriched_content should fall back to raw content
+        assert_eq!(
+            chunk.enriched_content, chunk.content,
+            "header should be dropped when it would exceed max_chunk_bytes"
+        );
     }
 }

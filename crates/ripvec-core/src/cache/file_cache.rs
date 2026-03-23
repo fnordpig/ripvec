@@ -56,6 +56,7 @@ mod tests {
                 kind: "function".into(),
                 start_line: 1,
                 end_line: 10,
+                enriched_content: "fn foo() {}".into(),
                 content: "fn foo() {}".into(),
             }],
             embeddings: vec![1.0, 2.0, 3.0, 4.0],

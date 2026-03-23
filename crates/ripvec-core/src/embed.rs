@@ -157,11 +157,16 @@ pub fn embed_all(
     let all_encodings: Vec<Option<Encoding>> = chunks
         .par_iter()
         .map(|chunk| {
-            tokenize(&chunk.content, tokenizer, max_tokens_cfg, model_max)
-                .inspect_err(|e| {
-                    warn!(file = %chunk.file_path, err = %e, "tokenization failed, skipping chunk");
-                })
-                .ok()
+            tokenize(
+                &chunk.enriched_content,
+                tokenizer,
+                max_tokens_cfg,
+                model_max,
+            )
+            .inspect_err(|e| {
+                warn!(file = %chunk.file_path, err = %e, "tokenization failed, skipping chunk");
+            })
+            .ok()
         })
         .collect();
 

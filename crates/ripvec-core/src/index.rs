@@ -108,13 +108,15 @@ mod tests {
 
     /// Helper to create a dummy `CodeChunk` for testing.
     fn dummy_chunk(name: &str) -> CodeChunk {
+        let content = format!("fn {name}() {{}}");
         CodeChunk {
             file_path: "test.rs".to_string(),
             name: name.to_string(),
             kind: "function".to_string(),
             start_line: 1,
             end_line: 10,
-            content: format!("fn {name}() {{}}"),
+            enriched_content: content.clone(),
+            content,
         }
     }
 

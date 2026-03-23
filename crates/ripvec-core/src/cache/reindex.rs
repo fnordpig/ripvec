@@ -152,7 +152,9 @@ fn incremental_path(
         let model_max = backends[0].max_tokens();
         let encodings: Vec<Option<crate::backend::Encoding>> = chunks
             .iter()
-            .map(|chunk| crate::tokenize::tokenize_query(&chunk.content, tokenizer, model_max).ok())
+            .map(|chunk| {
+                crate::tokenize::tokenize_query(&chunk.enriched_content, tokenizer, model_max).ok()
+            })
             .collect();
 
         // Embed
