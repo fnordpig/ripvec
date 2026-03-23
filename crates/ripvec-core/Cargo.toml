@@ -29,7 +29,7 @@ blas-src = { version = "0.10", optional = true, default-features = false, featur
 openblas-src = { version = "0.10", optional = true, default-features = false, features = ["system"] }
 accelerate-src = { version = "0.3", optional = true }
 memmap2 = "0.9"
-safetensors = "0.4"
+safetensors = "0.6"
 mlx-rs = { version = "0.25", optional = true, features = ["safetensors"] }
 cudarc = { version = "0.19", optional = true, features = ["cublas", "driver", "nvrtc", "cuda-version-from-build-system"] }
 objc2 = { version = "0.6", optional = true }
