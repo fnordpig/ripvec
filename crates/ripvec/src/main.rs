@@ -151,6 +151,7 @@ fn load_pipeline(
                     cli::BackendArg::Cpu => ripvec_core::backend::BackendKind::Cpu,
                     cli::BackendArg::Cuda => ripvec_core::backend::BackendKind::Cuda,
                     cli::BackendArg::Mlx => ripvec_core::backend::BackendKind::Mlx,
+                    cli::BackendArg::Metal => ripvec_core::backend::BackendKind::Metal,
                     cli::BackendArg::Auto => unreachable!(),
                 };
                 let device_hint = match args.device {

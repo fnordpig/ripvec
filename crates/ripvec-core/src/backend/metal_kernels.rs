@@ -552,4 +552,451 @@ kernel void f32_to_f16_kernel(
     if (i >= uint(n)) return;
     output[i] = half(input[i]);
 }
+
+// ---------------------------------------------------------------------------
+// Two-input SwiGLU: output[i] = value[i] * silu(gate[i])
+// Takes separate value and gate buffers (for NomicBert with separate fc11/fc12 weights).
+// Output is written to the output buffer (may alias value or gate).
+// ---------------------------------------------------------------------------
+kernel void swiglu_two_input_kernel(
+    device float* output           [[buffer(0)]],
+    const device float* value      [[buffer(1)]],
+    const device float* gate       [[buffer(2)]],
+    constant int& n                [[buffer(3)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= uint(n)) return;
+    float g = gate[i];
+    float silu_g = g / (1.0 + exp(-g));
+    output[i] = value[i] * silu_g;
+}
+
+// ---------------------------------------------------------------------------
+// Add bias: x[idx] += bias[idx % cols]  (in-place)
+// ---------------------------------------------------------------------------
+kernel void add_bias_kernel(
+    device float* x                [[buffer(0)]],
+    const device float* bias       [[buffer(1)]],
+    constant int& rows             [[buffer(2)]],
+    constant int& cols             [[buffer(3)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= uint(rows * cols)) return;
+    x[idx] += bias[int(idx) % cols];
+}
+
+// ---------------------------------------------------------------------------
+// Head reshape: [batch*seq, hidden] -> [batch*num_heads, seq, head_dim]
+// Used for ClassicBert where Q/K/V are produced by separate GEMMs.
+// ---------------------------------------------------------------------------
+kernel void head_reshape_kernel(
+    device float* output           [[buffer(0)]],
+    const device float* input      [[buffer(1)]],
+    constant int& batch            [[buffer(2)]],
+    constant int& seq              [[buffer(3)]],
+    constant int& num_heads        [[buffer(4)]],
+    constant int& head_dim         [[buffer(5)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    int hidden = num_heads * head_dim;
+    int total = batch * num_heads * seq * head_dim;
+    if (idx >= uint(total)) return;
+
+    int per_batch = num_heads * seq * head_dim;
+    int b = int(idx) / per_batch;
+    int rem0 = int(idx) % per_batch;
+    int h = rem0 / (seq * head_dim);
+    int rem1 = rem0 % (seq * head_dim);
+    int t = rem1 / head_dim;
+    int d = rem1 % head_dim;
+
+    // Source: [batch*seq, hidden] = [b*seq + t, h*head_dim + d]
+    int src_idx = (b * seq + t) * hidden + h * head_dim + d;
+    output[idx] = input[src_idx];
+}
 ";
+
+/// MSL GEMM kernel using `simdgroup_matrix_multiply_accumulate`.
+///
+/// Computes C\[M,N\] = A\[M,K\] * B\[K,N\] (with optional B transpose) using
+/// Apple Silicon's hardware 8x8 matrix multiply units. Each SIMD group
+/// (32 threads) computes one 8x8 output tile, with 16 SIMD groups per
+/// threadgroup producing a 32x32 output tile.
+///
+/// Includes the `metal_simdgroup_matrix_storage` header from the
+/// [metal-flash-attention](https://github.com/philipturner/metal-flash-attention)
+/// project (MIT licensed, Copyright 2024 Philip Turner).
+pub const GEMM_KERNEL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// ---------------------------------------------------------------------------
+// Begin MFA simdgroup_matrix_storage header (MIT licensed)
+// Copyright (c) 2024 Philip Turner
+// ---------------------------------------------------------------------------
+
+// -*- Metal -*-
+//===-- metal_simdgroup_matrix_storage ------------------------------------===//
+// Copyright (c) 2024 Philip Turner. See MIT LICENSE
+//===----------------------------------------------------------------------===//
+
+#ifndef __METAL_SIMDGROUP_MATRIX_STORAGE
+#define __METAL_SIMDGROUP_MATRIX_STORAGE
+
+// The layout of threads within a SIMD matrix.
+//
+//  0  0  1  1  8  8  9  9
+//  2  2  3  3 10 10 11 11
+//  4  4  5  5 12 12 13 13
+//  6  6  7  7 14 14 15 15
+// 16 16 17 17 24 24 25 25
+// 18 18 19 19 26 26 27 27
+// 20 20 21 21 28 28 29 29
+// 22 22 23 23 30 30 31 31
+//
+// This is Morton order, a method for coalescing data accesses.
+//
+// Source: https://patents.google.com/patent/US11256518B2
+METAL_FUNC static ushort2 morton_order(ushort thread_index_in_simdgroup) {
+  ushort lane_id = thread_index_in_simdgroup;
+  ushort quad_id = lane_id / 4;
+
+  constexpr ushort QUADRANT_SPAN_M = 4;
+  constexpr ushort THREADS_PER_QUADRANT = 8;
+  ushort M_floor_of_quadrant = (quad_id / 4) * QUADRANT_SPAN_M;
+  ushort M_in_quadrant = (lane_id / 2) % (THREADS_PER_QUADRANT / 2);
+  ushort M_in_simd = M_floor_of_quadrant + M_in_quadrant;
+
+  ushort N_floor_of_quadrant = (quad_id & 2) * 2; // 0 or 4
+  ushort N_in_quadrant = (lane_id % 2) * 2; // 0 or 2
+  ushort N_in_simd = N_floor_of_quadrant + N_in_quadrant;
+
+  return ushort2(N_in_simd, M_in_simd);
+}
+
+#pragma METAL internals : enable
+namespace metal
+{
+  template <typename T>
+  struct simdgroup_matrix_storage {
+    typedef vec<T, 64> storage_type;
+    storage_type t;
+
+    METAL_FUNC thread vec<T, 2>* thread_elements() thread {
+      return reinterpret_cast<thread vec<T, 2>*>(&t);
+    }
+
+    METAL_FUNC simdgroup_matrix_storage() thread = default;
+
+    METAL_FUNC simdgroup_matrix_storage(vec<T, 2> thread_elements) thread {
+      *(this->thread_elements()) = thread_elements;
+    }
+
+    METAL_FUNC static device T* apply_offset(device T *src, uint elements_per_row, uint2 matrix_origin, bool transpose_matrix = false) {
+      if (transpose_matrix) {
+        return src + ulong(matrix_origin.x * elements_per_row) + matrix_origin.y;
+      } else {
+        return src + ulong(matrix_origin.y * elements_per_row) + matrix_origin.x;
+      }
+    }
+
+    METAL_FUNC static threadgroup T* apply_offset(threadgroup T *src, ushort elements_per_row, ushort2 matrix_origin, bool transpose_matrix = false) {
+      if (transpose_matrix) {
+        return src + matrix_origin.x * elements_per_row + matrix_origin.y;
+      } else {
+        return src + matrix_origin.y * elements_per_row + matrix_origin.x;
+      }
+    }
+
+    // load (device, non-bf16)
+    template <typename U>
+    METAL_FUNC void load(const device U *src, uint elements_per_row, ushort2 matrix_origin, bool transpose_matrix = false) {
+      if (transpose_matrix) {
+        uint address0 = uint(matrix_origin.x + 0) * elements_per_row + uint(matrix_origin.y);
+        uint address1 = uint(matrix_origin.x + 1) * elements_per_row + uint(matrix_origin.y);
+        U memoryForm0 = src[address0];
+        U memoryForm1 = src[address1];
+        ((thread T*)thread_elements())[0] = T(memoryForm0);
+        ((thread T*)thread_elements())[1] = T(memoryForm1);
+      } else if (elements_per_row % 2 != 0) {
+        uint address0 = uint(matrix_origin.y) * elements_per_row + uint(matrix_origin.x + 0);
+        uint address1 = uint(matrix_origin.y) * elements_per_row + uint(matrix_origin.x + 1);
+        U memoryForm0 = src[address0];
+        U memoryForm1 = src[address1];
+        ((thread T*)thread_elements())[0] = T(memoryForm0);
+        ((thread T*)thread_elements())[1] = T(memoryForm1);
+      } else {
+        auto combinedAddress = uint(matrix_origin.y) * elements_per_row + uint(matrix_origin.x + 0);
+        vec<U, 2> memoryForm = *(const device vec<U, 2>*)(src + combinedAddress);
+        *(thread_elements()) = vec<T, 2>(memoryForm);
+      }
+    }
+
+    // load (device, bf16)
+    // WARNING: 'T' must be 'float'.
+    METAL_FUNC void load_bfloat(const device bfloat *src, uint elements_per_row, ushort2 matrix_origin, bool transpose_matrix = false) {
+      if (transpose_matrix) {
+        uint address0 = uint(matrix_origin.x + 0) * elements_per_row + uint(matrix_origin.y);
+        uint address1 = uint(matrix_origin.x + 1) * elements_per_row + uint(matrix_origin.y);
+        bfloat memoryForm0 = src[address0];
+        bfloat memoryForm1 = src[address1];
+
+        bfloat4 registerForm = *(thread bfloat4*)(thread_elements());
+        registerForm[1] = memoryForm0;
+        registerForm[3] = memoryForm1;
+        ((thread bfloat4*)thread_elements())[0] = registerForm;
+      } else {
+        auto combinedAddress = uint(matrix_origin.y) * elements_per_row + uint(matrix_origin.x + 0);
+        bfloat2 memoryForm = *(const device packed_bfloat2*)(src + combinedAddress);
+
+        bfloat4 registerForm = *(thread bfloat4*)(thread_elements());
+        ((thread float*)&registerForm)[1] = *(thread float*)(&memoryForm);
+        ((thread bfloat*)&registerForm)[1] = memoryForm[0];
+        ((thread bfloat4*)thread_elements())[0] = registerForm;
+      }
+    }
+
+    // load (threadgroup, non-bf16)
+    template <typename U>
+    METAL_FUNC void load(const threadgroup U *src, ushort elements_per_row, ushort2 matrix_origin, bool transpose_matrix = false) {
+      if (transpose_matrix) {
+        ushort address0 = ushort(matrix_origin.x + 0) * elements_per_row + ushort(matrix_origin.y);
+        ushort address1 = ushort(matrix_origin.x + 1) * elements_per_row + ushort(matrix_origin.y);
+        U memoryForm0 = src[address0];
+        U memoryForm1 = src[address1];
+        ((thread T*)thread_elements())[0] = T(memoryForm0);
+        ((thread T*)thread_elements())[1] = T(memoryForm1);
+      } else if (elements_per_row % 2 != 0) {
+        ushort address0 = ushort(matrix_origin.y) * elements_per_row + ushort(matrix_origin.x + 0);
+        ushort address1 = ushort(matrix_origin.y) * elements_per_row + ushort(matrix_origin.x + 1);
+        U memoryForm0 = src[address0];
+        U memoryForm1 = src[address1];
+        ((thread T*)thread_elements())[0] = T(memoryForm0);
+        ((thread T*)thread_elements())[1] = T(memoryForm1);
+      } else {
+        auto combinedAddress = ushort(matrix_origin.y) * elements_per_row + ushort(matrix_origin.x + 0);
+        vec<U, 2> memoryForm = *(const threadgroup vec<U, 2>*)(src + combinedAddress);
+        *(thread_elements()) = vec<T, 2>(memoryForm);
+      }
+    }
+
+    // load (threadgroup, bf16)
+    // WARNING: 'T' must be 'float'.
+    METAL_FUNC void load_bfloat(const threadgroup bfloat *src, ushort elements_per_row, ushort2 matrix_origin, bool transpose_matrix = false) {
+      if (transpose_matrix) {
+        ushort address0 = ushort(matrix_origin.x + 0) * elements_per_row + ushort(matrix_origin.y);
+        ushort address1 = ushort(matrix_origin.x + 1) * elements_per_row + ushort(matrix_origin.y);
+        bfloat memoryForm0 = src[address0];
+        bfloat memoryForm1 = src[address1];
+
+        bfloat4 registerForm = *(thread bfloat4*)(thread_elements());
+        registerForm[1] = memoryForm0;
+        registerForm[3] = memoryForm1;
+        ((thread bfloat4*)thread_elements())[0] = registerForm;
+      } else {
+        auto combinedAddress = ushort(matrix_origin.y) * elements_per_row + ushort(matrix_origin.x + 0);
+        bfloat2 memoryForm = *(const threadgroup packed_bfloat2*)(src + combinedAddress);
+
+        bfloat4 registerForm = *(thread bfloat4*)(thread_elements());
+        ((thread float*)&registerForm)[1] = *(thread float*)(&memoryForm);
+        ((thread bfloat*)&registerForm)[1] = memoryForm[0];
+        ((thread bfloat4*)thread_elements())[0] = registerForm;
+      }
+    }
+
+    // store (device, non-bf16)
+    template <typename U>
+    METAL_FUNC void store(device U *dst, uint elements_per_row, ushort2 matrix_origin, bool transpose_matrix = false) {
+      if (transpose_matrix) {
+        uint address0 = uint(matrix_origin.x + 0) * elements_per_row + uint(matrix_origin.y);
+        uint address1 = uint(matrix_origin.x + 1) * elements_per_row + uint(matrix_origin.y);
+        T registerForm0 = ((thread T*)thread_elements())[0];
+        T registerForm1 = ((thread T*)thread_elements())[1];
+        dst[address0] = U(registerForm0);
+        dst[address1] = U(registerForm1);
+      } else if (elements_per_row % 2 != 0) {
+        uint address0 = uint(matrix_origin.y) * elements_per_row + uint(matrix_origin.x + 0);
+        uint address1 = uint(matrix_origin.y) * elements_per_row + uint(matrix_origin.x + 1);
+        T registerForm0 = ((thread T*)thread_elements())[0];
+        T registerForm1 = ((thread T*)thread_elements())[1];
+        dst[address0] = U(registerForm0);
+        dst[address1] = U(registerForm1);
+      } else {
+        auto combinedAddress = uint(matrix_origin.y) * elements_per_row + uint(matrix_origin.x + 0);
+        vec<T, 2> registerForm = *(thread_elements());
+        *(device vec<U, 2>*)(dst + combinedAddress) = vec<U, 2>(registerForm);
+      }
+    }
+
+    // store (device, bf16)
+    // WARNING: 'T' must be 'float'.
+    METAL_FUNC void store_bfloat(device bfloat *dst, uint elements_per_row, ushort2 matrix_origin, bool transpose_matrix = false) {
+      if (transpose_matrix) {
+        uint address0 = uint(matrix_origin.x + 0) * elements_per_row + uint(matrix_origin.y);
+        uint address1 = uint(matrix_origin.x + 1) * elements_per_row + uint(matrix_origin.y);
+        bfloat4 registerForm = *(thread bfloat4*)(thread_elements());
+        registerForm[2] = registerForm[1];
+        dst[address0] = registerForm[2];
+        dst[address1] = registerForm[3];
+      } else {
+        uint address0 = uint(matrix_origin.y) * elements_per_row + uint(matrix_origin.x + 0);
+        uint address1 = uint(matrix_origin.y) * elements_per_row + uint(matrix_origin.x + 1);
+        bfloat4 registerForm = *(thread bfloat4*)(thread_elements());
+        registerForm[2] = registerForm[1];
+        dst[address0] = registerForm[2];
+        dst[address1] = registerForm[3];
+      }
+    }
+
+    // store (threadgroup, non-bf16)
+    template <typename U>
+    METAL_FUNC void store(threadgroup U *dst, ushort elements_per_row, ushort2 matrix_origin, bool transpose_matrix = false) {
+      if (transpose_matrix) {
+        ushort address0 = ushort(matrix_origin.x + 0) * elements_per_row + ushort(matrix_origin.y);
+        ushort address1 = ushort(matrix_origin.x + 1) * elements_per_row + ushort(matrix_origin.y);
+        T registerForm0 = ((thread T*)thread_elements())[0];
+        T registerForm1 = ((thread T*)thread_elements())[1];
+        dst[address0] = U(registerForm0);
+        dst[address1] = U(registerForm1);
+      } else if (elements_per_row % 2 != 0) {
+        ushort address0 = ushort(matrix_origin.y) * elements_per_row + ushort(matrix_origin.x + 0);
+        ushort address1 = ushort(matrix_origin.y) * elements_per_row + ushort(matrix_origin.x + 1);
+        T registerForm0 = ((thread T*)thread_elements())[0];
+        T registerForm1 = ((thread T*)thread_elements())[1];
+        dst[address0] = U(registerForm0);
+        dst[address1] = U(registerForm1);
+      } else {
+        auto combinedAddress = ushort(matrix_origin.y) * elements_per_row + ushort(matrix_origin.x + 0);
+        vec<T, 2> registerForm = *(thread_elements());
+        *(threadgroup vec<U, 2>*)(dst + combinedAddress) = vec<U, 2>(registerForm);
+      }
+    }
+
+    // store (threadgroup, bf16)
+    // WARNING: 'T' must be 'float'.
+    METAL_FUNC void store_bfloat(threadgroup bfloat *dst, ushort elements_per_row, ushort2 matrix_origin, bool transpose_matrix = false) {
+      if (transpose_matrix) {
+        ushort address0 = ushort(matrix_origin.x + 0) * elements_per_row + ushort(matrix_origin.y);
+        ushort address1 = ushort(matrix_origin.x + 1) * elements_per_row + ushort(matrix_origin.y);
+        bfloat4 registerForm = *(thread bfloat4*)(thread_elements());
+        registerForm[2] = registerForm[1];
+        dst[address0] = registerForm[2];
+        dst[address1] = registerForm[3];
+      } else {
+        ushort address0 = ushort(matrix_origin.y) * elements_per_row + ushort(matrix_origin.x + 0);
+        ushort address1 = ushort(matrix_origin.y) * elements_per_row + ushort(matrix_origin.x + 1);
+        bfloat4 registerForm = *(thread bfloat4*)(thread_elements());
+        registerForm[2] = registerForm[1];
+        dst[address0] = registerForm[2];
+        dst[address1] = registerForm[3];
+      }
+    }
+
+    template <typename U, typename V>
+    METAL_FUNC void multiply(simdgroup_matrix_storage<U> a, simdgroup_matrix_storage<V> b, bool accumulate = true) {
+      if (!accumulate) {
+        *(thread_elements()) = vec<T, 2>(0);
+      }
+      t = __metal_simdgroup_matrix_8x8_multiply_accumulate(a.t, b.t, t, typename simdgroup_matrix_storage<T>::storage_type());
+    }
+  };
+} // namespace metal
+#pragma METAL internals : disable
+
+#endif // __METAL_SIMDGROUP_MATRIX_STORAGE
+
+// ---------------------------------------------------------------------------
+// End MFA simdgroup_matrix_storage header
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// GEMM kernel: C[M,N] = A[M,K] * B[K,N] (or A * B^T when transB=true)
+//
+// Tile sizes: 32x32 output per threadgroup, 8x8 per SIMD group.
+// Each threadgroup has 16 SIMD groups (4 rows x 4 cols of 8x8 tiles).
+// K dimension is tiled in steps of 8.
+//
+// Key design: each thread uses morton_order() to compute its unique
+// position within the 8x8 tile. apply_offset() is called with the
+// Morton offset so each thread gets a different base pointer. Then
+// load() with origin (k, 0) reads the correct 2 elements for this
+// thread's position in the tile.
+// ---------------------------------------------------------------------------
+
+constant uint TILE_M = 32;
+constant uint TILE_N = 32;
+
+kernel void gemm_kernel(
+    device float* A          [[buffer(0)]],
+    device float* B          [[buffer(1)]],
+    device float* C          [[buffer(2)]],
+    constant uint& M         [[buffer(3)]],
+    constant uint& N         [[buffer(4)]],
+    constant uint& K         [[buffer(5)]],
+    constant uint& transB    [[buffer(6)]],
+    uint2 tg_pos             [[threadgroup_position_in_grid]],
+    ushort simd_id           [[simdgroup_index_in_threadgroup]],
+    ushort lane_id           [[thread_index_in_simdgroup]]
+) {
+    // Per-thread Morton-order position within the 8x8 tile
+    ushort2 morton_offset = morton_order(lane_id);
+
+    // SIMD group layout within the 32x32 threadgroup tile:
+    // 4 rows x 4 cols of 8x8 sub-tiles -> 16 SIMD groups
+    ushort2 sid(simd_id % (TILE_N / 8), simd_id / (TILE_N / 8));
+
+    uint M_offset = tg_pos.y * TILE_M;
+    uint N_offset = tg_pos.x * TILE_N;
+
+    // Bounds check: skip SIMD groups entirely outside the matrix
+    if (M_offset + sid.y * 8 >= M || N_offset + sid.x * 8 >= N) return;
+
+    // Per-thread offset within the threadgroup tile (includes Morton order)
+    ushort2 offset_in_group(sid.x * 8 + morton_offset.x,
+                            sid.y * 8 + morton_offset.y);
+
+    // Initialize accumulator to zero
+    simdgroup_matrix_storage<float> C_acc;
+    *(C_acc.thread_elements()) = float2(0.0);
+
+    // Tile over K dimension in steps of 8
+    for (uint k = 0; k < K; k += 8) {
+        simdgroup_matrix_storage<float> A_tile, B_tile;
+
+        // --- Load A tile ---
+        // A is [M, K] row-major. We want the 8x8 block at (global_row, k).
+        // Each thread offsets by its Morton position:
+        //   A_offset = (k + morton_offset.x, M_offset + offset_in_group.y)
+        uint2 A_offset(k + morton_offset.x, M_offset + offset_in_group.y);
+        device float* A_src = simdgroup_matrix_storage<float>::apply_offset(
+            A, K, A_offset);
+        A_tile.load(A_src, K, ushort2(0, 0));
+
+        // --- Load B tile ---
+        if (transB) {
+            // B is [N, K] row-major. We want B^T, so logical B^T[k, col].
+            // Load from B[col, k] with transpose=true.
+            // B_offset = (N_offset + offset_in_group.x, k + morton_offset.y)
+            uint2 B_offset(N_offset + offset_in_group.x, k + morton_offset.y);
+            device float* B_src = simdgroup_matrix_storage<float>::apply_offset(
+                B, K, B_offset, true);
+            B_tile.load(B_src, K, ushort2(0, 0), true);
+        } else {
+            // B is [K, N] row-major. Block at (k, global_col).
+            uint2 B_offset(N_offset + offset_in_group.x, k + morton_offset.y);
+            device float* B_src = simdgroup_matrix_storage<float>::apply_offset(
+                B, N, B_offset);
+            B_tile.load(B_src, N, ushort2(0, 0));
+        }
+
+        // 8x8 multiply-accumulate: C_acc += A_tile * B_tile
+        C_acc.multiply(A_tile, B_tile, true);
+    }
+
+    // Store the result tile to C[M_offset + offset_y, N_offset + offset_x]
+    uint2 C_offset(N_offset + offset_in_group.x, M_offset + offset_in_group.y);
+    device float* C_dst = simdgroup_matrix_storage<float>::apply_offset(
+        C, N, C_offset);
+    C_acc.store(C_dst, N, ushort2(0, 0));
+}
+"#;

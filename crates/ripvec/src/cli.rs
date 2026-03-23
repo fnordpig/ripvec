@@ -156,4 +156,6 @@ pub enum BackendArg {
     Cuda,
     /// MLX (Apple Silicon, macOS only).
     Mlx,
+    /// Metal (Apple Silicon, direct Metal GPU).
+    Metal,
 }
