@@ -32,13 +32,14 @@ memmap2 = "0.9"
 safetensors = "0.4"
 mlx-rs = { version = "0.25", optional = true, features = ["safetensors"] }
 cudarc = { version = "0.19", optional = true, features = ["cublas", "driver", "nvrtc", "cuda-version-from-build-system"] }
+objc2 = { version = "0.6", optional = true }
 objc2-metal = { version = "0.3", optional = true, features = [
     "MTLDevice", "MTLBuffer", "MTLCommandQueue", "MTLCommandBuffer",
     "MTLComputeCommandEncoder", "MTLComputePipeline", "MTLLibrary",
-    "MTLResource"
+    "MTLResource", "MTLAllocation", "MTLCommandEncoder", "MTLTypes",
 ] }
 objc2-foundation = { version = "0.3", optional = true, features = [
-    "NSString", "NSError", "NSObject"
+    "NSString", "NSError", "NSObject",
 ] }
 block2 = { version = "0.6", optional = true }
 blake3 = "1.8.3"
@@ -53,7 +54,7 @@ cuda = ["dep:cudarc"]
 cpu = ["ndarray/blas", "dep:blas-src", "dep:openblas-src"]
 cpu-accelerate = ["ndarray/blas", "dep:accelerate-src"]
 mlx = ["dep:mlx-rs"]
-metal = ["dep:objc2-metal", "dep:objc2-foundation", "dep:block2"]
+metal = ["dep:objc2", "dep:objc2-metal", "dep:objc2-foundation", "dep:block2"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

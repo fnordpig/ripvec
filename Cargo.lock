@@ -2885,6 +2885,7 @@ dependencies = [
  "memmap2",
  "mlx-rs",
  "ndarray",
+ "objc2",
  "objc2-foundation",
  "objc2-metal",
  "openblas-src",
