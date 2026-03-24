@@ -1103,4 +1103,197 @@ kernel void gemm_batched_kernel(
         C_acc.store(C_dst, N, ushort2(0, 0));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Fused FlashAttention: Q@K^T → scale → mask → softmax → @V in ONE kernel.
+//
+// Keeps attention scores in threadgroup memory — never written to global.
+// Uses online softmax (running max/sum) to stream over K/V tiles without
+// materializing the full [seq, seq] scores matrix.
+//
+// Grid: (batch*num_heads, ceil(seq/TILE_Q)) — one threadgroup per (head, Q-tile).
+// Each threadgroup has 16 SIMD groups (4×4 arrangement of 8×8 tiles).
+//
+// Algorithm (Flash Attention 2, Dao 2023):
+//   For each Q tile:
+//     O=0, l=0, m=-inf
+//     For each K/V tile:
+//       S = Q_tile @ K_tile^T           (simdgroup matmul → threadgroup)
+//       S = S * scale + mask            (element-wise)
+//       m_new = max(m, row_max(S))      (parallel reduction)
+//       P = exp(S - m_new)              (element-wise)
+//       l_new = exp(m-m_new)*l + row_sum(P) (parallel reduction)
+//       O = diag(exp(m-m_new)*l/l_new)*O + (1/l_new)*P@V_tile (simdgroup matmul)
+//       m=m_new, l=l_new
+//     Write O to global memory
+// ---------------------------------------------------------------------------
+
+constant uint FA_TILE_Q = 32;   // Q rows per threadgroup
+constant uint FA_TILE_K = 32;   // K/V rows per tile (iterated)
+
+kernel void flash_attention_kernel(
+    device float* Q              [[buffer(0)]],
+    device float* K              [[buffer(1)]],
+    device float* V              [[buffer(2)]],
+    device float* O              [[buffer(3)]],
+    const device float* mask     [[buffer(4)]],   // [batch, seq] — 0.0 or -1e9
+    constant uint& batch         [[buffer(5)]],
+    constant uint& num_heads     [[buffer(6)]],
+    constant uint& seq_len       [[buffer(7)]],
+    constant uint& head_dim      [[buffer(8)]],
+    constant float& scale        [[buffer(9)]],
+    uint3 tg_pos                 [[threadgroup_position_in_grid]],
+    uint3 tid3                   [[thread_position_in_threadgroup]],
+    uint3 tpg3                   [[threads_per_threadgroup]]
+) {
+    uint tid = tid3.x;
+    uint tpg = tpg3.x;
+    uint head_idx = tg_pos.x;
+    uint q_tile_idx = tg_pos.y;
+    uint batch_idx = head_idx / num_heads;
+    uint qr_start = q_tile_idx * FA_TILE_Q;
+    if (qr_start >= seq_len) return;
+
+    uint head_stride = seq_len * head_dim;
+    device float* Q_head = Q + head_idx * head_stride;
+    device float* K_head = K + head_idx * head_stride;
+    device float* V_head = V + head_idx * head_stride;
+    device float* O_head = O + head_idx * head_stride;
+    const device float* mask_batch = mask + batch_idx * seq_len;
+
+    // Threadgroup memory — budget: 32KB (32768 bytes)
+    // K and V share a buffer (loaded sequentially, not simultaneously).
+    // For head_dim=32: q=4KB, kv=4KB, s=4KB, o=4KB, stats=512B = 16.5KB
+    // For head_dim=64: q=8KB, kv=8KB, s=4KB, o=8KB, stats=512B = 28.5KB
+    threadgroup float q_buf[32 * 64];      // Q tile [TILE_Q, head_dim] — max 8KB
+    threadgroup float kv_buf[32 * 64];     // K then V tile [TILE_K, head_dim] — shared, max 8KB
+    threadgroup float s_buf[32 * 32];      // scores [TILE_Q, TILE_K] — 4KB
+    threadgroup float o_buf[32 * 64];      // output accumulator [TILE_Q, head_dim] — max 8KB
+    threadgroup float m_buf[32];           // running row max [TILE_Q] — 128B
+    threadgroup float l_buf[32];           // running row sum [TILE_Q] — 128B
+    threadgroup float rescale_buf[32];     // per-row rescale factor — 128B
+    threadgroup float inv_l_buf[32];       // per-row 1/l_new — 128B
+
+    // Initialize running statistics and output
+    for (uint i = tid; i < FA_TILE_Q; i += tpg) {
+        m_buf[i] = -1e30;
+        l_buf[i] = 0.0;
+    }
+    for (uint i = tid; i < FA_TILE_Q * head_dim; i += tpg) {
+        o_buf[i] = 0.0;
+    }
+
+    // Load Q tile (once — reused across all K/V tiles)
+    for (uint i = tid; i < FA_TILE_Q * head_dim; i += tpg) {
+        uint row = i / head_dim;
+        uint col = i % head_dim;
+        uint global_row = qr_start + row;
+        q_buf[i] = (global_row < seq_len) ? Q_head[global_row * head_dim + col] : 0.0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Iterate over K/V tiles. K and V share kv_buf (loaded sequentially).
+    for (uint kv_start = 0; kv_start < seq_len; kv_start += FA_TILE_K) {
+
+        // --- Load K tile into kv_buf --- (all threads)
+        for (uint i = tid; i < FA_TILE_K * head_dim; i += tpg) {
+            uint row = i / head_dim;
+            uint col = i % head_dim;
+            uint global_row = kv_start + row;
+            kv_buf[i] = (global_row < seq_len) ? K_head[global_row * head_dim + col] : 0.0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // --- Phase 1: S = Q @ K^T * scale + mask --- (all threads)
+        for (uint idx = tid; idx < FA_TILE_Q * FA_TILE_K; idx += tpg) {
+            uint qi = idx / FA_TILE_K;
+            uint kj = idx % FA_TILE_K;
+            float dot = 0.0;
+            for (uint d = 0; d < head_dim; d++) {
+                dot += q_buf[qi * head_dim + d] * kv_buf[kj * head_dim + d];
+            }
+            float mask_val = (qr_start + qi < seq_len && kv_start + kj < seq_len)
+                           ? mask_batch[kv_start + kj] : -1e30;
+            s_buf[idx] = dot * scale + mask_val;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // --- Phase 2a: Online softmax + compute rescale factors --- (32 threads)
+        // Stores rescale_buf and inv_l_buf for phases 2b and 3.
+        if (tid < FA_TILE_Q && (qr_start + tid) < seq_len) {
+            uint qi = tid;
+            float old_m = m_buf[qi];
+            float old_l = l_buf[qi];
+
+            // Row max of this tile's scores
+            float row_max = -1e30;
+            for (uint kj = 0; kj < FA_TILE_K && kv_start + kj < seq_len; kj++) {
+                row_max = max(row_max, s_buf[qi * FA_TILE_K + kj]);
+            }
+            float m_new = max(old_m, row_max);
+
+            // Exp(S - m_new) and row sum
+            float row_sum = 0.0;
+            for (uint kj = 0; kj < FA_TILE_K; kj++) {
+                float p = (kv_start + kj < seq_len)
+                        ? exp(s_buf[qi * FA_TILE_K + kj] - m_new)
+                        : 0.0;
+                s_buf[qi * FA_TILE_K + kj] = p;
+                row_sum += p;
+            }
+
+            float correction = exp(old_m - m_new);
+            float l_new = correction * old_l + row_sum;
+
+            // Rescale factor for previous O: multiply by (correction * old_l / l_new)
+            rescale_buf[qi] = (old_l > 0.0) ? (correction * old_l / max(l_new, 1e-12)) : 0.0;
+            inv_l_buf[qi] = 1.0 / max(l_new, 1e-12);
+
+            m_buf[qi] = m_new;
+            l_buf[qi] = l_new;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // --- Phase 2b: Rescale O accumulator --- (all threads)
+        for (uint idx = tid; idx < FA_TILE_Q * head_dim; idx += tpg) {
+            uint qi = idx / head_dim;
+            if (qr_start + qi < seq_len) {
+                o_buf[idx] *= rescale_buf[qi];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // --- Load V tile into kv_buf (overwrites K) --- (all threads)
+        for (uint i = tid; i < FA_TILE_K * head_dim; i += tpg) {
+            uint row = i / head_dim;
+            uint col = i % head_dim;
+            uint global_row = kv_start + row;
+            kv_buf[i] = (global_row < seq_len) ? V_head[global_row * head_dim + col] : 0.0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // --- Phase 3: O += (1/l) * P @ V --- (all threads)
+        for (uint idx = tid; idx < FA_TILE_Q * head_dim; idx += tpg) {
+            uint qi = idx / head_dim;
+            uint d = idx % head_dim;
+            if (qr_start + qi >= seq_len) continue;
+            float pv = 0.0;
+            for (uint kj = 0; kj < FA_TILE_K; kj++) {
+                pv += s_buf[qi * FA_TILE_K + kj] * kv_buf[kj * head_dim + d];
+            }
+            o_buf[idx] += inv_l_buf[qi] * pv;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Write output to global memory
+    for (uint i = tid; i < FA_TILE_Q * head_dim; i += tpg) {
+        uint row = i / head_dim;
+        uint global_row = qr_start + row;
+        if (global_row < seq_len) {
+            uint col = i % head_dim;
+            O_head[global_row * head_dim + col] = o_buf[i];
+        }
+    }
+}
 "#;

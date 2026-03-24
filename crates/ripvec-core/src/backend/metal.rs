@@ -160,6 +160,8 @@ struct KernelPipelines {
     gemm: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Batched GEMM: same kernel with z-dimension for batch/head index.
     gemm_batched: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Fused FlashAttention: Q@K^T → scale → mask → softmax → @V in one kernel.
+    flash_attention: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 impl KernelPipelines {
@@ -195,6 +197,7 @@ impl KernelPipelines {
             swiglu_two_input: p("swiglu_two_input_kernel")?,
             gemm: create_pipeline(device, &gemm_library, "gemm_kernel")?,
             gemm_batched: create_pipeline(device, &gemm_library, "gemm_batched_kernel")?,
+            flash_attention: create_pipeline(device, &gemm_library, "flash_attention_kernel")?,
         })
     }
 }
@@ -1655,10 +1658,15 @@ impl MetalBackend {
             dispatch_1d(encoder, &self.kernels.rope_cached, total_rope as usize);
         }
 
-        // --- Attention scores: Q @ K^T (all heads in one batched dispatch) ---
-        // Q, K are [batch*nh, seq, head_dim]. Scores = [batch*nh, seq, seq].
-        let stride_qk = (max_seq * head_dim) as u32; // elements per head in Q/K
-        let stride_scores = (max_seq * max_seq) as u32; // elements per head in scores
+        // --- Attention via batched GEMM (faster than FlashAttention for small models) ---
+        //
+        // FlashAttention kernel exists in metal_kernels.rs (flash_attention_kernel)
+        // but uses scalar dot products — slower than simdgroup hardware matmul for
+        // BGE-small's small attention matrices (seq×seq×32). The memory bandwidth
+        // savings don't offset the compute loss. Needs simdgroup matmul integration
+        // to beat the batched GEMM approach. Kept for future larger-model support.
+        let stride_qk = (max_seq * head_dim) as u32;
+        let stride_scores = (max_seq * max_seq) as u32;
 
         dispatch_gemm_batched(
             encoder,
@@ -1669,17 +1677,16 @@ impl MetalBackend {
             0,
             &self.workspace.scores,
             0,
-            max_seq as u32,  // M = seq
-            max_seq as u32,  // N = seq
-            head_dim as u32, // K = head_dim
-            true,            // trans_b
+            max_seq as u32,
+            max_seq as u32,
+            head_dim as u32,
+            true,
             stride_qk,
             stride_qk,
             stride_scores,
             batch_heads as u32,
         );
 
-        // --- Fused scale + mask + softmax ---
         {
             let scale = 1.0_f32 / (head_dim as f32).sqrt();
             let total_rows = batch_heads * max_seq;
@@ -1699,22 +1706,10 @@ impl MetalBackend {
             );
         }
 
-        // --- Attention output: scores @ V per head ---
-        // scores is [batch*nh, seq, seq], V is [batch*nh, seq, head_dim]
-        // output is [batch*nh, seq, head_dim]
-        //
-        // For ClassicBert, V is in k_buf (workspace.k). We write output to
-        // workspace.v (which is free since ClassicBert V was in workspace.k).
-        // For NomicBert, V is in workspace.v. We write to workspace.attn_out.
         let attn_out_buf = match self.variant {
             ModelVariant::NomicBert => &*self.workspace.attn_out,
-            // For ClassicBert: attn_out held Q, but Q is consumed. Use attn_out.
-            // Wait -- attn_out has reshaped Q which was used for scores. Now scores
-            // are computed, so attn_out is free to be overwritten.
             ModelVariant::ClassicBert => &*self.workspace.v,
         };
-
-        // --- Attention output: scores @ V (all heads in one batched dispatch) ---
         dispatch_gemm_batched(
             encoder,
             &self.kernels.gemm_batched,
@@ -1724,10 +1719,10 @@ impl MetalBackend {
             0,
             attn_out_buf,
             0,
-            max_seq as u32,  // M = seq
-            head_dim as u32, // N = head_dim
-            max_seq as u32,  // K = seq
-            false,           // no transpose
+            max_seq as u32,
+            head_dim as u32,
+            max_seq as u32,
+            false,
             stride_scores,
             stride_qk,
             stride_qk,
