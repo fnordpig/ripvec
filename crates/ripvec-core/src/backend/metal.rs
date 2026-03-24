@@ -2596,14 +2596,8 @@ impl MetalBackend {
         }
 
         // Execute and wait
-        let wall_start = std::time::Instant::now();
         cmd_buf.commit();
         cmd_buf.waitUntilCompleted();
-        let wall_elapsed = wall_start.elapsed();
-
-        // Report wall time for each forward pass
-        let wall_ms = wall_elapsed.as_secs_f64() * 1000.0;
-        eprintln!("[metal] batch={batch} seq={max_seq} wall={wall_ms:.2}ms");
 
         // Read back CLS embeddings
         let flat_result = unsafe {
