@@ -17,8 +17,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use hf_hub::api::sync::Api;
-use mlx_rs::ops::indexing::TryIndexOp;
 use mlx_rs::Array;
+use mlx_rs::ops::indexing::TryIndexOp;
 
 use super::{DeviceHint, EmbedBackend, Encoding};
 

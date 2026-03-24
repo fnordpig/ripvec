@@ -597,6 +597,40 @@ fn tokenize(
     Ok(enc)
 }
 
+/// Normalize similarity scores to `[0,1]` and apply a `PageRank` structural boost.
+///
+/// Each result's similarity is min-max normalized, then a weighted `PageRank`
+/// score is added: `final = normalized + alpha * pagerank`. This promotes
+/// architecturally important files (many dependents) in search results.
+///
+/// Called from the MCP search handler which has access to the `RepoGraph`,
+/// rather than from [`search`] directly.
+pub fn apply_structural_boost<S: ::std::hash::BuildHasher>(
+    results: &mut [SearchResult],
+    file_ranks: &std::collections::HashMap<String, f32, S>,
+    alpha: f32,
+) {
+    if results.is_empty() || alpha == 0.0 {
+        return;
+    }
+
+    let min = results
+        .iter()
+        .map(|r| r.similarity)
+        .fold(f32::INFINITY, f32::min);
+    let max = results
+        .iter()
+        .map(|r| r.similarity)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let range = (max - min).max(1e-12);
+
+    for r in results.iter_mut() {
+        let normalized = (r.similarity - min) / range;
+        let pr = file_ranks.get(&r.chunk.file_path).copied().unwrap_or(0.0);
+        r.similarity = normalized + alpha * pr;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -870,5 +904,60 @@ mod tests {
             }
             eprintln!();
         }
+    }
+
+    fn make_result(file_path: &str, similarity: f32) -> SearchResult {
+        SearchResult {
+            chunk: CodeChunk {
+                file_path: file_path.to_string(),
+                name: "test".to_string(),
+                kind: "function".to_string(),
+                start_line: 1,
+                end_line: 10,
+                enriched_content: String::new(),
+                content: String::new(),
+            },
+            similarity,
+        }
+    }
+
+    #[test]
+    fn structural_boost_normalizes_and_applies() {
+        let mut results = vec![
+            make_result("src/a.rs", 0.8),
+            make_result("src/b.rs", 0.4),
+            make_result("src/c.rs", 0.6),
+        ];
+        let mut ranks = std::collections::HashMap::new();
+        ranks.insert("src/a.rs".to_string(), 0.5);
+        ranks.insert("src/b.rs".to_string(), 1.0);
+        ranks.insert("src/c.rs".to_string(), 0.0);
+
+        apply_structural_boost(&mut results, &ranks, 0.2);
+
+        // a: normalized=(0.8-0.4)/0.4=1.0, boost=0.2*0.5=0.1 => 1.1
+        assert!((results[0].similarity - 1.1).abs() < 1e-6);
+        // b: normalized=(0.4-0.4)/0.4=0.0, boost=0.2*1.0=0.2 => 0.2
+        assert!((results[1].similarity - 0.2).abs() < 1e-6);
+        // c: normalized=(0.6-0.4)/0.4=0.5, boost=0.2*0.0=0.0 => 0.5
+        assert!((results[2].similarity - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn structural_boost_noop_on_empty() {
+        let mut results: Vec<SearchResult> = vec![];
+        let ranks = std::collections::HashMap::new();
+        apply_structural_boost(&mut results, &ranks, 0.2);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn structural_boost_noop_on_zero_alpha() {
+        let mut results = vec![make_result("src/a.rs", 0.8)];
+        let mut ranks = std::collections::HashMap::new();
+        ranks.insert("src/a.rs".to_string(), 1.0);
+        apply_structural_boost(&mut results, &ranks, 0.0);
+        // Should be unchanged
+        assert!((results[0].similarity - 0.8).abs() < 1e-6);
     }
 }

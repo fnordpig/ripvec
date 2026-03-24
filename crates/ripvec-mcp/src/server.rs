@@ -38,6 +38,8 @@ pub struct RipvecServer {
     pub indexing: Arc<AtomicBool>,
     /// Generated tool router mapping tool names to handlers.
     pub tool_router: ToolRouter<Self>,
+    /// Cached PageRank-weighted repository graph (built after indexing).
+    pub repo_graph: Arc<std::sync::RwLock<Option<ripvec_core::repo_map::RepoGraph>>>,
 }
 
 impl rmcp::ServerHandler for RipvecServer {
@@ -45,6 +47,7 @@ impl rmcp::ServerHandler for RipvecServer {
         rmcp::model::ServerInfo::new(
             rmcp::model::ServerCapabilities::builder()
                 .enable_tools()
+                .enable_resources()
                 .build(),
         )
         .with_instructions(
@@ -89,6 +92,66 @@ impl rmcp::ServerHandler for RipvecServer {
                 next_cursor: None,
                 meta: None,
             })
+        }
+    }
+
+    fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> impl std::future::Future<Output = Result<rmcp::model::ListResourcesResult, rmcp::ErrorData>>
+    + Send
+    + '_ {
+        async move {
+            let resource = rmcp::model::Resource {
+                raw: rmcp::model::RawResource {
+                    uri: "ripvec://repo-map".to_string(),
+                    name: "Repository Structure Map".to_string(),
+                    title: None,
+                    description: Some("PageRank-weighted structural overview".to_string()),
+                    mime_type: Some("text/markdown".to_string()),
+                    size: None,
+                    icons: None,
+                    meta: None,
+                },
+                annotations: None,
+            };
+            Ok(rmcp::model::ListResourcesResult {
+                resources: vec![resource],
+                next_cursor: None,
+                meta: None,
+            })
+        }
+    }
+
+    fn read_resource(
+        &self,
+        request: rmcp::model::ReadResourceRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> impl std::future::Future<Output = Result<rmcp::model::ReadResourceResult, rmcp::ErrorData>>
+    + Send
+    + '_ {
+        async move {
+            if request.uri != "ripvec://repo-map" {
+                return Err(rmcp::ErrorData::internal_error(
+                    format!("unknown resource URI: {}", request.uri),
+                    None,
+                ));
+            }
+
+            let graph_guard = self
+                .repo_graph
+                .read()
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+
+            let rendered = match graph_guard.as_ref() {
+                Some(graph) => ripvec_core::repo_map::render(graph, 1500, None),
+                None => "Repository graph not yet available. Index is still building.".to_string(),
+            };
+
+            Ok(rmcp::model::ReadResourceResult::new(vec![
+                rmcp::model::ResourceContents::text(rendered, "ripvec://repo-map"),
+            ]))
         }
     }
 }
@@ -158,6 +221,36 @@ pub async fn run_background_index(server: &RipvecServer) {
         Err(e) => {
             error!("background indexing task panicked: {e}");
             eprintln!("[ripvec-mcp] indexing panic: {e}");
+        }
+    }
+
+    // Build the repository graph (non-fatal — search works without it)
+    let graph_root = server.project_root.clone();
+    let graph_lock = Arc::clone(&server.repo_graph);
+    let graph_result =
+        tokio::task::spawn_blocking(move || ripvec_core::repo_map::build_graph(&graph_root)).await;
+
+    match graph_result {
+        Ok(Ok(graph)) => {
+            let file_count = graph.files.len();
+            match graph_lock.write() {
+                Ok(mut g) => {
+                    *g = Some(graph);
+                    eprintln!("[ripvec-mcp] repo graph built ({file_count} files)");
+                }
+                Err(e) => {
+                    error!("repo graph lock poisoned: {e}");
+                    eprintln!("[ripvec-mcp] repo graph lock error: {e}");
+                }
+            }
+        }
+        Ok(Err(e)) => {
+            error!("repo graph build failed: {e}");
+            eprintln!("[ripvec-mcp] repo graph error: {e}");
+        }
+        Err(e) => {
+            error!("repo graph task panicked: {e}");
+            eprintln!("[ripvec-mcp] repo graph panic: {e}");
         }
     }
 

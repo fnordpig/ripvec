@@ -12,6 +12,7 @@ pub mod error;
 pub mod index;
 pub mod languages;
 pub mod profile;
+pub mod repo_map;
 pub mod similarity;
 pub mod tokenize;
 pub mod walk;
