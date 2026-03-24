@@ -4084,17 +4084,22 @@ mod tests {
         }
     }
 
-    /// Sweep early exit layers and MRL truncation dims on BGE-small.
-    /// Measures cosine similarity vs full 12-layer 384-dim embedding.
-    #[test]
-    #[ignore = "requires model download; run with --nocapture"]
-    fn early_exit_and_mrl_quality() {
-        // Get full 12-layer reference embedding
-        let mut backend = MetalBackend::load("BAAI/bge-small-en-v1.5", &DeviceHint::Auto).unwrap();
+    /// Sweep early exit layers and MRL truncation dims.
+    /// Measures cosine similarity vs full N-layer embedding.
+    fn run_early_exit_sweep(model_repo: &str) {
+        let mut backend = MetalBackend::load(model_repo, &DeviceHint::Auto).unwrap();
+        let hd = backend.hidden_size as usize;
+        let num_layers = backend.model.layers.len();
+        eprintln!(
+            "Model: {model_repo}, hidden={hd}, layers={num_layers}, variant={:?}",
+            backend.variant
+        );
+        // Use generic token IDs that work for both BGE and NomicBert tokenizers
+        // (CLS=101/1, content tokens, SEP=102/2)
         let enc = Encoding {
             input_ids: vec![
-                101, 2023, 2003, 1037, 3231, 1997, 3642, 2007, 3674, 9303, 2015, 1998, 4972, 102,
-            ], // "this is a sample of code with variables and functions"
+                1, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200, 2,
+            ],
             attention_mask: vec![1; 14],
             token_type_ids: vec![0; 14],
         };
@@ -4102,75 +4107,67 @@ mod tests {
         backend.max_layers = None;
         let full = backend.embed_batch(&[enc.clone()]).unwrap();
         let full_emb = &full[0];
-        let hd = full_emb.len();
         eprintln!(
-            "Full embedding: {hd} dims, L2={:.4}",
+            "Full embedding: {hd} dims, L2={:.4}\n",
             full_emb.iter().map(|x| x * x).sum::<f32>().sqrt()
         );
 
         // --- Early exit sweep ---
-        eprintln!("\n=== Early Exit (layers 1-12, cosine vs 12-layer) ===");
-        for layers in [1, 2, 3, 4, 6, 8, 10, 12] {
+        eprintln!("=== Early Exit (cosine vs full {num_layers}-layer) ===");
+        let layer_steps: Vec<usize> = (1..=num_layers).collect();
+        for &layers in &layer_steps {
             backend.max_layers = Some(layers);
             let result = backend.embed_batch(&[enc.clone()]).unwrap();
             let emb = &result[0];
-            // Cosine with full embedding
             let cos: f32 = emb.iter().zip(full_emb).map(|(a, b)| a * b).sum();
             eprintln!("  layers={layers:>2}: cosine={cos:.6}");
         }
 
-        // --- MRL truncation sweep (on full 12-layer embedding) ---
-        eprintln!("\n=== MRL Truncation (dims, cosine vs full-dim) ===");
-        eprintln!("  (Truncate to first N dims, re-normalize, compare)");
-        backend.max_layers = None;
-        let full2 = backend.embed_batch(&[enc.clone()]).unwrap();
-        let full_emb2 = &full2[0];
-        for dims in [32, 64, 96, 128, 192, 256, 384] {
-            let trunc: Vec<f32> = full_emb2[..dims].to_vec();
-            let norm: f32 = trunc.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
-            let trunc_norm: Vec<f32> = trunc.iter().map(|x| x / norm).collect();
-            // Compare truncated vs full (first `dims` elements of full, re-normalized)
-            // For MRL, we compare against the FULL embedding to see directional alignment
-            let cos: f32 = trunc_norm
-                .iter()
-                .zip(&full_emb2[..dims])
-                .map(|(a, b)| a * b)
-                .sum::<f32>()
-                / full_emb2[..dims]
-                    .iter()
-                    .map(|x| x * x)
-                    .sum::<f32>()
-                    .sqrt()
-                    .max(1e-12);
-            eprintln!("  dims={dims:>3}: cosine_vs_full_trunc={cos:.6}");
-        }
-
         // --- Combined: early exit + truncation ---
-        eprintln!("\n=== Combined: Early Exit + Truncation ===");
-        eprintln!("  (layers × dims → cosine vs full-12-layer-384-dim)");
-        for layers in [2, 4, 6, 12] {
+        let mrl_dims: Vec<usize> = [64, 128, 256, hd / 2, hd]
+            .into_iter()
+            .filter(|&d| d <= hd)
+            .collect::<std::collections::BTreeSet<usize>>()
+            .into_iter()
+            .collect();
+        eprintln!("\n=== Combined: Early Exit + MRL Truncation ===");
+        eprintln!("  (cosine vs full-{num_layers}-layer-{hd}-dim)");
+        for &layers in &[1, 2, 4, 6, num_layers / 2, num_layers] {
+            if layers > num_layers {
+                continue;
+            }
             backend.max_layers = Some(layers);
             let result = backend.embed_batch(&[enc.clone()]).unwrap();
             let emb = &result[0];
-            for dims in [64, 128, 384] {
+            for &dims in &mrl_dims {
                 let trunc: Vec<f32> = emb[..dims].to_vec();
-                let norm: f32 = trunc.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
-                let trunc_norm: Vec<f32> = trunc.iter().map(|x| x / norm).collect();
-                // Compare against full-12-384 embedding truncated to same dims
-                let full_trunc_norm: f32 = full_emb[..dims]
+                let t_norm: f32 = trunc.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+                let f_norm: f32 = full_emb[..dims]
                     .iter()
                     .map(|x| x * x)
                     .sum::<f32>()
                     .sqrt()
                     .max(1e-12);
-                let cos: f32 = trunc_norm
+                let cos: f32 = trunc
                     .iter()
                     .zip(&full_emb[..dims])
                     .map(|(a, b)| a * b)
                     .sum::<f32>()
-                    / full_trunc_norm;
+                    / (t_norm * f_norm);
                 eprintln!("  layers={layers:>2} dims={dims:>3}: cosine={cos:.6}");
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires model download; run with --nocapture"]
+    fn early_exit_and_mrl_quality() {
+        run_early_exit_sweep("BAAI/bge-small-en-v1.5");
+    }
+
+    #[test]
+    #[ignore = "requires model download; run with --nocapture"]
+    fn early_exit_coderank() {
+        run_early_exit_sweep("nomic-ai/CodeRankEmbed");
     }
 }
