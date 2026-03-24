@@ -158,6 +158,8 @@ struct KernelPipelines {
     swiglu_two_input: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// GEMM kernel using `simdgroup_matrix_multiply_accumulate`.
     gemm: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Batched GEMM: same kernel with z-dimension for batch/head index.
+    gemm_batched: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 impl KernelPipelines {
@@ -192,6 +194,7 @@ impl KernelPipelines {
             head_reshape: p("head_reshape_kernel")?,
             swiglu_two_input: p("swiglu_two_input_kernel")?,
             gemm: create_pipeline(device, &gemm_library, "gemm_kernel")?,
+            gemm_batched: create_pipeline(device, &gemm_library, "gemm_batched_kernel")?,
         })
     }
 }
@@ -320,6 +323,82 @@ fn dispatch_gemm(
         width: grid_x,
         height: grid_y,
         depth: 1,
+    };
+    let threads_per_tg = MTLSize {
+        width: SIMD_GROUPS_PER_TG * THREADS_PER_SIMD,
+        height: 1,
+        depth: 1,
+    };
+
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_tg);
+}
+
+/// Dispatch a batched GEMM: one GEMM per batch slice (z-dimension).
+///
+/// Replaces the per-head dispatch loop in attention. All `batch_count` GEMMs
+/// run in a single dispatch, using strided offsets into A/B/C buffers.
+///
+/// Strides are in **elements** (not bytes).
+#[expect(
+    unsafe_code,
+    clippy::too_many_arguments,
+    clippy::borrow_as_ptr,
+    reason = "Metal buffer binding requires unsafe setBuffer/setBytes calls with raw pointers"
+)]
+fn dispatch_gemm_batched(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    a_buffer: &ProtocolObject<dyn MTLBuffer>,
+    a_offset: usize,
+    b_buffer: &ProtocolObject<dyn MTLBuffer>,
+    b_offset: usize,
+    c_buffer: &ProtocolObject<dyn MTLBuffer>,
+    c_offset: usize,
+    m: u32,
+    n: u32,
+    k: u32,
+    trans_b: bool,
+    stride_a: u32,
+    stride_b: u32,
+    stride_c: u32,
+    batch_count: u32,
+) {
+    const TILE_M: usize = 32;
+    const TILE_N: usize = 32;
+    const SIMD_GROUPS_PER_TG: usize = 16;
+    const THREADS_PER_SIMD: usize = 32;
+
+    encoder.setComputePipelineState(pipeline);
+
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(a_buffer), a_offset, 0);
+        encoder.setBuffer_offset_atIndex(Some(b_buffer), b_offset, 1);
+        encoder.setBuffer_offset_atIndex(Some(c_buffer), c_offset, 2);
+        let params: [u32; 7] = [
+            m,
+            n,
+            k,
+            if trans_b { 1 } else { 0 },
+            stride_a,
+            stride_b,
+            stride_c,
+        ];
+        for (i, val) in params.iter().enumerate() {
+            encoder.setBytes_length_atIndex(
+                std::ptr::NonNull::new(val as *const u32 as *mut _).unwrap(),
+                core::mem::size_of::<u32>(),
+                3 + i,
+            );
+        }
+    }
+
+    let grid_x = (n as usize).div_ceil(TILE_N);
+    let grid_y = (m as usize).div_ceil(TILE_M);
+
+    let threadgroups = MTLSize {
+        width: grid_x,
+        height: grid_y,
+        depth: batch_count as usize,
     };
     let threads_per_tg = MTLSize {
         width: SIMD_GROUPS_PER_TG * THREADS_PER_SIMD,
@@ -1576,28 +1655,29 @@ impl MetalBackend {
             dispatch_1d(encoder, &self.kernels.rope_cached, total_rope as usize);
         }
 
-        // --- Attention scores: Q @ K^T per head ---
+        // --- Attention scores: Q @ K^T (all heads in one batched dispatch) ---
         // Q, K are [batch*nh, seq, head_dim]. Scores = [batch*nh, seq, seq].
-        // Dispatch one GEMM per (batch, head) pair with buffer offsets.
-        let head_stride_qk = (max_seq * head_dim) as usize * core::mem::size_of::<f32>();
-        let head_stride_scores = (max_seq * max_seq) as usize * core::mem::size_of::<f32>();
+        let stride_qk = (max_seq * head_dim) as u32; // elements per head in Q/K
+        let stride_scores = (max_seq * max_seq) as u32; // elements per head in scores
 
-        for h in 0..batch_heads as usize {
-            dispatch_gemm(
-                encoder,
-                &self.kernels.gemm,
-                q_buf,
-                h * head_stride_qk,
-                k_buf,
-                h * head_stride_qk,
-                &self.workspace.scores,
-                h * head_stride_scores,
-                max_seq as u32,  // M = actual seq (GEMM has per-thread bounds checks)
-                max_seq as u32,  // N = actual seq
-                head_dim as u32, // K = head_dim (already multiple of 8 for BGE)
-                true,            // trans_b: K is [seq, head_dim], we want K^T
-            );
-        }
+        dispatch_gemm_batched(
+            encoder,
+            &self.kernels.gemm_batched,
+            q_buf,
+            0,
+            k_buf,
+            0,
+            &self.workspace.scores,
+            0,
+            max_seq as u32,  // M = seq
+            max_seq as u32,  // N = seq
+            head_dim as u32, // K = head_dim
+            true,            // trans_b
+            stride_qk,
+            stride_qk,
+            stride_scores,
+            batch_heads as u32,
+        );
 
         // --- Fused scale + mask + softmax ---
         {
@@ -1634,22 +1714,25 @@ impl MetalBackend {
             ModelVariant::ClassicBert => &*self.workspace.v,
         };
 
-        for h in 0..batch_heads as usize {
-            dispatch_gemm(
-                encoder,
-                &self.kernels.gemm,
-                &self.workspace.scores,
-                h * head_stride_scores,
-                v_buf,
-                h * head_stride_qk,
-                attn_out_buf,
-                h * head_stride_qk,
-                max_seq as u32,  // M = actual seq
-                head_dim as u32, // N = head_dim
-                max_seq as u32,  // K = actual seq
-                false,           // no transpose: scores[seq,seq] @ V[seq,head_dim]
-            );
-        }
+        // --- Attention output: scores @ V (all heads in one batched dispatch) ---
+        dispatch_gemm_batched(
+            encoder,
+            &self.kernels.gemm_batched,
+            &self.workspace.scores,
+            0,
+            v_buf,
+            0,
+            attn_out_buf,
+            0,
+            max_seq as u32,  // M = seq
+            head_dim as u32, // N = head_dim
+            max_seq as u32,  // K = seq
+            false,           // no transpose
+            stride_scores,
+            stride_qk,
+            stride_qk,
+            batch_heads as u32,
+        );
 
         // --- Reshape: [batch*nh, seq, head_dim] -> [batch*seq, hidden] ---
         {
