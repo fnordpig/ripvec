@@ -686,11 +686,14 @@ fn dispatch_mps_gemm(
     }
 }
 
-/// Maximum batch size for pre-allocated workspace buffers.
+/// Maximum batch size per forward pass.
 ///
-/// Workspace is allocated once for `MAX_BATCH * max_seq_len`. Batches larger
-/// than this are split into sub-batches.
-const MAX_BATCH: i32 = 128;
+/// Smaller batches reduce padding waste: `embed_distributed` grabs 128+
+/// sequences sorted by descending length, then `embed_batch` sub-batches
+/// them here. With MAX_BATCH=32, a 128-sequence grab becomes 4 sub-batches
+/// each padded to their own (shorter) max_seq — much less padding than one
+/// 128-sequence batch padded to the global max.
+const MAX_BATCH: i32 = 32;
 
 /// Maximum sequence length for workspace allocation.
 const MAX_SEQ: i32 = 512;

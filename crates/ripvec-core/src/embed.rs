@@ -297,6 +297,9 @@ impl DistributedState<'_> {
         use std::sync::atomic::Ordering;
 
         let n = self.tokenized.len();
+        // GPU backends grab larger batches to amortize per-call overhead.
+        // MLX's lazy eval graph optimizer benefits from large matrices.
+        // Metal sub-batches internally via MAX_BATCH to limit padding waste.
         let grab_size = if backend.is_gpu() {
             self.batch_size * 4
         } else {
