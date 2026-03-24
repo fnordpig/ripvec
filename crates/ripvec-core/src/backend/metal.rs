@@ -1973,12 +1973,18 @@ impl MetalBackend {
         let batch = encodings.len() as i32;
         let hd = self.hidden_size;
 
-        // Find max sequence length in this batch
-        let max_seq = encodings
+        // Find max sequence length in this batch, rounded up to nearest
+        // multiple of 8. The simdgroup GEMM kernel operates on 8×8 tiles;
+        // padding avoids partial-tile edge effects in the per-head attention
+        // GEMMs where the head stride puts adjacent heads' data at
+        // non-tile-aligned boundaries. The attention mask zeros out padded
+        // positions so they don't affect the result.
+        let max_seq_raw = encodings
             .iter()
             .map(|e| e.input_ids.len())
             .max()
-            .unwrap_or(0) as i32;
+            .unwrap_or(0);
+        let max_seq = max_seq_raw.next_multiple_of(8) as i32;
         let batch_seq = batch * max_seq;
 
         // Build padded input tensors on CPU: [batch, max_seq]
@@ -3489,6 +3495,38 @@ mod tests {
             } else {
                 eprintln!("  FAIL: Metal and CPU diverged! cosine={cosine}");
             }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires model download + cpu feature; run with --nocapture"]
+    #[cfg(feature = "cpu")]
+    fn metal_vs_cpu_sequence_lengths() {
+        let metal = MetalBackend::load("BAAI/bge-small-en-v1.5", &DeviceHint::Auto).unwrap();
+        let cpu =
+            super::super::cpu::CpuBackend::load("BAAI/bge-small-en-v1.5", &super::DeviceHint::Cpu)
+                .unwrap();
+
+        // Test multiple sequence lengths: 4 (not mult of 8), 8, 16, 32
+        for seq_len in [4, 8, 16, 32] {
+            let mut ids: Vec<i64> = vec![101]; // CLS
+            for i in 1..seq_len - 1 {
+                ids.push(2000 + i as i64); // arbitrary word tokens
+            }
+            ids.push(102); // SEP
+
+            let enc = Encoding {
+                input_ids: ids.clone(),
+                attention_mask: vec![1; seq_len],
+                token_type_ids: vec![0; seq_len],
+            };
+
+            let m = metal.embed_batch(&[enc.clone()]).unwrap();
+            let c = cpu.embed_batch(&[enc]).unwrap();
+            let cos: f32 = m[0].iter().zip(&c[0]).map(|(a, b)| a * b).sum();
+            let m_l2: f32 = m[0].iter().map(|x| x * x).sum::<f32>().sqrt();
+            let c_l2: f32 = c[0].iter().map(|x| x * x).sum::<f32>().sqrt();
+            eprintln!("seq={seq_len:>3}: cosine={cos:.6}, metal_L2={m_l2:.4}, cpu_L2={c_l2:.4}");
         }
     }
 }
