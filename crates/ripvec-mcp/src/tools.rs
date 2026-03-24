@@ -108,7 +108,7 @@ pub struct RepoMapParams {
         deserialize_with = "deserialize_number_or_string"
     )]
     pub max_tokens: usize,
-    /// Focus file for topic-sensitive PageRank (relative path).
+    /// Focus file for topic-sensitive `PageRank` (relative path).
     pub focus_file: Option<String>,
 }
 
@@ -449,7 +449,7 @@ impl RipvecServer {
     ///
     /// Renders the most architecturally important files first with their key
     /// definitions, dependency relationships, and function signatures. Supports
-    /// topic-sensitive PageRank when a focus file is provided.
+    /// topic-sensitive `PageRank` when a focus file is provided.
     #[tool(
         name = "get_repo_map",
         description = "Get a PageRank-weighted structural overview of the codebase. \

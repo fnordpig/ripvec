@@ -51,19 +51,42 @@ impl rmcp::ServerHandler for RipvecServer {
                 .build(),
         )
         .with_instructions(
-            "Semantic code search powered by vector embeddings. Use ripvec when you need to \
-             find code by MEANING, not by exact text match.\n\n\
-             WHEN TO USE:\n\
-             - \"Find functions that handle error recovery\" → search_code\n\
-             - \"Find documentation about authentication\" → search_text\n\
-             - \"What code is similar to this function?\" → find_similar\n\
-             - After editing files, refresh the index → reindex\n\
-             - Check if index is ready → index_status\n\n\
+            "Semantic code search and structural analysis powered by vector embeddings \
+             and PageRank-weighted dependency graphs.\n\n\
+             WORKFLOW — start broad, then narrow:\n\
+             1. get_repo_map → understand architecture (which files matter, how they connect)\n\
+             2. search_code → find specific implementations by meaning\n\
+             3. Use LSP tools (hover, findReferences) on the results for precise navigation\n\n\
+             TOOLS:\n\
+             - get_repo_map: START HERE for architecture questions. Returns PageRank-ranked \
+               files with signatures and dependency relationships. Use focus_file to zoom \
+               into a specific file's neighborhood (e.g., when editing backend/metal.rs, \
+               focus on it to see what depends on it and what it depends on).\n\
+             - search_code: Find code by MEANING, not text. \"error handling in embeddings\" \
+               finds the actual error handling code. Results include full source in markdown \
+               fenced blocks — no need to read_file afterward.\n\
+             - search_text: Same as search_code but for prose/documentation.\n\
+             - find_similar: Given a file+line, find structurally similar code elsewhere.\n\
+             - reindex: Force re-embedding after bulk changes. Normally auto-updates (2s debounce).\n\
+             - index_status: Check if the index is ready and how many chunks are indexed.\n\n\
+             COMBINING WITH LSP:\n\
+             - search_code returns lsp_location fields → pass directly to LSP goToDefinition \
+               or findReferences for precise symbol navigation\n\
+             - get_repo_map shows which files are structurally central → use LSP documentSymbol \
+               on those files for detailed exploration\n\
+             - After finding code with search_code, use LSP incomingCalls/outgoingCalls to \
+               trace the call hierarchy\n\n\
+             EXAMPLES:\n\
+             - \"How is the embedding pipeline structured?\" → get_repo_map (shows embed.rs as \
+               central, its callers and callees)\n\
+             - \"Find the GEMM kernel dispatch code\" → search_code(\"GEMM kernel dispatch\")\n\
+             - \"What files depend on the EmbedBackend trait?\" → get_repo_map(focus_file: \
+               \"crates/ripvec-core/src/backend/mod.rs\") → shows callers\n\
+             - \"Find code similar to the attention forward pass\" → find_similar(file, line)\n\n\
              TIPS:\n\
-             - Results include lsp_location fields — pass directly to LSP tools for hover/references\n\
              - Use natural language queries, not regex or exact code\n\
-             - search_code uses code-optimized embeddings; search_text is for prose/docs\n\
-             - The index updates automatically when files change (2s debounce)",
+             - search_code returns full code blocks — review them before calling read_file\n\
+             - The index and repo map update automatically when files change",
         )
     }
 
