@@ -1105,6 +1105,180 @@ kernel void gemm_batched_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// FP16 mixed-precision GEMM: A (FP32 activations → half) × B (half weights) → C (FP32)
+//
+// Same tile/dispatch structure as gemm_kernel but:
+//   - B buffer is device half* (pre-converted weights)
+//   - A is loaded as float then narrowed to half for simdgroup multiply
+//   - Accumulator C stays float for numerical stability
+//   - half×half→float matmul uses hardware FP16 units
+//
+// Register budget per thread: A_tile(half,128B) + B_tile(half,128B) +
+// C_acc(float,256B) = 512B vs 768B for all-FP32 → ~1.5× occupancy.
+// ---------------------------------------------------------------------------
+
+kernel void gemm_fp16_kernel(
+    device float* A          [[buffer(0)]],   // activations [M, K] in FP32
+    device half* B           [[buffer(1)]],    // weights [N, K] or [K, N] in FP16
+    device float* C          [[buffer(2)]],   // output [M, N] in FP32
+    constant uint& M         [[buffer(3)]],
+    constant uint& N         [[buffer(4)]],
+    constant uint& K         [[buffer(5)]],
+    constant uint& transB    [[buffer(6)]],
+    uint2 tg_pos             [[threadgroup_position_in_grid]],
+    ushort simd_id           [[simdgroup_index_in_threadgroup]],
+    ushort lane_id           [[thread_index_in_simdgroup]]
+) {
+    ushort2 morton_offset = morton_order(lane_id);
+    ushort2 sid(simd_id % (TILE_N / 8), simd_id / (TILE_N / 8));
+
+    uint M_offset = tg_pos.y * TILE_M;
+    uint N_offset = tg_pos.x * TILE_N;
+
+    if (M_offset + sid.y * 8 >= M || N_offset + sid.x * 8 >= N) return;
+
+    ushort2 offset_in_group(sid.x * 8 + morton_offset.x,
+                            sid.y * 8 + morton_offset.y);
+    uint my_row = M_offset + offset_in_group.y;
+    uint my_col = N_offset + offset_in_group.x;
+
+    simdgroup_matrix_storage<float> C_acc;
+    *(C_acc.thread_elements()) = float2(0.0);
+
+    for (uint k = 0; k < K; k += 8) {
+        simdgroup_matrix_storage<half> A_tile, B_tile;
+
+        // Load A (FP32 activations) directly into half tile — the templated
+        // load<float> reads 2 floats and converts to half in-register,
+        // avoiding an intermediate simdgroup_matrix_storage<float>.
+        if (my_row < M) {
+            uint2 A_off(k + morton_offset.x, my_row);
+            device float* A_src = simdgroup_matrix_storage<float>::apply_offset(
+                A, K, A_off);
+            A_tile.load(A_src, K, ushort2(0, 0));
+        } else {
+            *(A_tile.thread_elements()) = half2(0.0h);
+        }
+
+        // Load B (FP16 weights) directly
+        if (transB) {
+            if (my_col < N) {
+                uint2 B_off(my_col, k + morton_offset.y);
+                device half* B_src = simdgroup_matrix_storage<half>::apply_offset(
+                    B, K, B_off, true);
+                B_tile.load(B_src, K, ushort2(0, 0), true);
+            } else {
+                *(B_tile.thread_elements()) = half2(0.0h);
+            }
+        } else {
+            if (my_col < N) {
+                uint2 B_off(my_col, k + morton_offset.y);
+                device half* B_src = simdgroup_matrix_storage<half>::apply_offset(
+                    B, N, B_off);
+                B_tile.load(B_src, N, ushort2(0, 0));
+            } else {
+                *(B_tile.thread_elements()) = half2(0.0h);
+            }
+        }
+
+        // half × half → float accumulation
+        C_acc.multiply(A_tile, B_tile, true);
+    }
+
+    if (my_row < M && my_col < N) {
+        uint2 C_off(my_col, my_row);
+        device float* C_dst = simdgroup_matrix_storage<float>::apply_offset(
+            C, N, C_off);
+        C_acc.store(C_dst, N, ushort2(0, 0));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Batched FP16 mixed-precision GEMM: same as gemm_fp16_kernel but with batch
+// dimension in grid.z. A strides are in float elements, B strides are in half
+// elements, C strides are in float elements.
+// ---------------------------------------------------------------------------
+
+kernel void gemm_batched_fp16_kernel(
+    device float* A          [[buffer(0)]],   // activations in FP32
+    device half* B           [[buffer(1)]],    // weights in FP16
+    device float* C          [[buffer(2)]],   // output in FP32
+    constant uint& M         [[buffer(3)]],
+    constant uint& N         [[buffer(4)]],
+    constant uint& K         [[buffer(5)]],
+    constant uint& transB    [[buffer(6)]],
+    constant uint& stride_A  [[buffer(7)]],   // float elements between batch slices of A
+    constant uint& stride_B  [[buffer(8)]],   // half elements between batch slices of B
+    constant uint& stride_C  [[buffer(9)]],   // float elements between batch slices of C
+    uint3 tg_pos             [[threadgroup_position_in_grid]],
+    ushort simd_id           [[simdgroup_index_in_threadgroup]],
+    ushort lane_id           [[thread_index_in_simdgroup]]
+) {
+    uint batch_idx = tg_pos.z;
+    device float* A_batch = A + batch_idx * stride_A;
+    device half* B_batch = B + batch_idx * stride_B;
+    device float* C_batch = C + batch_idx * stride_C;
+
+    ushort2 morton_offset = morton_order(lane_id);
+    ushort2 sid(simd_id % (TILE_N / 8), simd_id / (TILE_N / 8));
+
+    uint M_offset = tg_pos.y * TILE_M;
+    uint N_offset = tg_pos.x * TILE_N;
+
+    if (M_offset + sid.y * 8 >= M || N_offset + sid.x * 8 >= N) return;
+
+    ushort2 offset_in_group(sid.x * 8 + morton_offset.x,
+                            sid.y * 8 + morton_offset.y);
+    uint my_row = M_offset + offset_in_group.y;
+    uint my_col = N_offset + offset_in_group.x;
+
+    simdgroup_matrix_storage<float> C_acc;
+    *(C_acc.thread_elements()) = float2(0.0);
+
+    for (uint k = 0; k < K; k += 8) {
+        simdgroup_matrix_storage<half> A_tile, B_tile;
+
+        if (my_row < M) {
+            uint2 A_off(k + morton_offset.x, my_row);
+            device float* A_src = simdgroup_matrix_storage<float>::apply_offset(
+                A_batch, K, A_off);
+            A_tile.load(A_src, K, ushort2(0, 0));
+        } else {
+            *(A_tile.thread_elements()) = half2(0.0h);
+        }
+
+        if (transB) {
+            if (my_col < N) {
+                uint2 B_off(my_col, k + morton_offset.y);
+                device half* B_src = simdgroup_matrix_storage<half>::apply_offset(
+                    B_batch, K, B_off, true);
+                B_tile.load(B_src, K, ushort2(0, 0), true);
+            } else {
+                *(B_tile.thread_elements()) = half2(0.0h);
+            }
+        } else {
+            if (my_col < N) {
+                uint2 B_off(my_col, k + morton_offset.y);
+                device half* B_src = simdgroup_matrix_storage<half>::apply_offset(
+                    B_batch, N, B_off);
+                B_tile.load(B_src, N, ushort2(0, 0));
+            } else {
+                *(B_tile.thread_elements()) = half2(0.0h);
+            }
+        }
+
+        C_acc.multiply(A_tile, B_tile, true);
+    }
+
+    if (my_row < M && my_col < N) {
+        uint2 C_off(my_col, my_row);
+        device float* C_dst = simdgroup_matrix_storage<float>::apply_offset(
+            C_batch, N, C_off);
+        C_acc.store(C_dst, N, ushort2(0, 0));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Fused FlashAttention with simdgroup hardware matrix multiply.
 //
 // Q@K^T and P@V use simdgroup_matrix_multiply_accumulate (8×8 tile FMA).

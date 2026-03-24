@@ -144,11 +144,7 @@ struct KernelPipelines {
     l2_normalize: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Build float attention mask from int mask.
     build_attn_mask: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    /// Convert FP32 to FP16.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "available for future FP16 GEMM optimization")
-    )]
+    /// Convert FP32 to FP16 (used by [`MetalBackend::create_fp16_weights`]).
     f32_to_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Add bias in-place: `x[idx] += bias[idx % cols]`.
     add_bias: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -166,10 +162,34 @@ struct KernelPipelines {
     head_reshape: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Two-input `SwiGLU`: `output = value * silu(gate)` with separate buffers.
     swiglu_two_input: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    /// GEMM kernel using `simdgroup_matrix_multiply_accumulate`.
+    /// FP32 GEMM kernel using `simdgroup_matrix_multiply_accumulate`.
+    ///
+    /// Superseded by [`Self::gemm_fp16`] for weight GEMMs; retained for
+    /// tests and any future activation-activation non-batched GEMMs.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "weight GEMMs now use gemm_fp16; kept for tests and future use"
+        )
+    )]
     gemm: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Batched GEMM: same kernel with z-dimension for batch/head index.
     gemm_batched: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// FP16 mixed-precision GEMM: FP32 activations x FP16 weights -> FP32 output.
+    ///
+    /// Uses `half x half -> float` hardware matmul with FP32 accumulator.
+    /// Reduces register pressure ~1.5x vs all-FP32, improving GPU occupancy.
+    gemm_fp16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Batched FP16 mixed-precision GEMM with z-dimension for batch/head index.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "attention GEMMs are activation×activation (FP32); reserved for future weight-batched paths"
+        )
+    )]
+    gemm_batched_fp16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Fused `FlashAttention`: Q@K^T -> scale -> mask -> softmax -> @V in one kernel.
     #[cfg_attr(
         not(test),
@@ -214,6 +234,8 @@ impl KernelPipelines {
             swiglu_two_input: p("swiglu_two_input_kernel")?,
             gemm: create_pipeline(device, &gemm_library, "gemm_kernel")?,
             gemm_batched: create_pipeline(device, &gemm_library, "gemm_batched_kernel")?,
+            gemm_fp16: create_pipeline(device, &gemm_library, "gemm_fp16_kernel")?,
+            gemm_batched_fp16: create_pipeline(device, &gemm_library, "gemm_batched_fp16_kernel")?,
             flash_attention: create_pipeline(device, &gemm_library, "flash_attention_kernel")?,
         })
     }
@@ -273,14 +295,24 @@ fn dispatch_rows(
     encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
 }
 
-/// Dispatch a GEMM kernel: C\[M,N\] = A\[M,K\] * B\[K,N\] (or B^T when `trans_b`).
+/// Dispatch a FP32 GEMM kernel: C\[M,N\] = A\[M,K\] * B\[K,N\] (or B^T when `trans_b`).
 ///
 /// Each threadgroup computes a 32x32 output tile using 16 SIMD groups (4x4
 /// arrangement of 8x8 tiles). Grid is `ceil(N/32) x ceil(M/32)` threadgroups.
 ///
+/// Superseded by [`dispatch_gemm_fp16`] for weight GEMMs in production; retained
+/// for tests that verify FP32 GEMM correctness.
+///
 /// # Safety
 ///
 /// Caller must ensure buffer offsets and sizes are valid.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "weight GEMMs now use dispatch_gemm_fp16; kept for tests"
+    )
+)]
 #[expect(
     unsafe_code,
     clippy::too_many_arguments,
@@ -410,6 +442,88 @@ fn dispatch_gemm_batched(
         width: grid_x,
         height: grid_y,
         depth: batch_count as usize,
+    };
+    let threads_per_tg = MTLSize {
+        width: SIMD_GROUPS_PER_TG * THREADS_PER_SIMD,
+        height: 1,
+        depth: 1,
+    };
+
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_tg);
+}
+
+/// Dispatch FP16 mixed-precision GEMM: C\[M,N\] = A\[M,K\] * B\[K,N\] (or B^T).
+///
+/// A is FP32 activations (converted to half inside the kernel), B is FP16
+/// weights (pre-converted at load time), C is FP32 output. The `b_offset`
+/// is in **bytes** into the FP16 buffer (caller should pass `f32_offset / 2`).
+///
+/// Same threadgroup/tile layout as [`dispatch_gemm`].
+///
+/// # Safety
+///
+/// Caller must ensure buffer offsets and sizes are valid.
+#[expect(
+    unsafe_code,
+    clippy::too_many_arguments,
+    clippy::borrow_as_ptr,
+    reason = "Metal buffer binding requires unsafe setBuffer/setBytes calls with raw pointers"
+)]
+fn dispatch_gemm_fp16(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    a_buffer: &ProtocolObject<dyn MTLBuffer>,
+    a_offset: usize,
+    b_buffer: &ProtocolObject<dyn MTLBuffer>,
+    b_offset: usize,
+    c_buffer: &ProtocolObject<dyn MTLBuffer>,
+    c_offset: usize,
+    m: u32,
+    n: u32,
+    k: u32,
+    trans_b: bool,
+) {
+    const TILE_M: usize = 32;
+    const TILE_N: usize = 32;
+    const SIMD_GROUPS_PER_TG: usize = 16;
+    const THREADS_PER_SIMD: usize = 32;
+
+    encoder.setComputePipelineState(pipeline);
+
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(a_buffer), a_offset, 0);
+        encoder.setBuffer_offset_atIndex(Some(b_buffer), b_offset, 1);
+        encoder.setBuffer_offset_atIndex(Some(c_buffer), c_offset, 2);
+        encoder.setBytes_length_atIndex(
+            std::ptr::NonNull::new(&m as *const u32 as *mut _).unwrap(),
+            core::mem::size_of::<u32>(),
+            3,
+        );
+        encoder.setBytes_length_atIndex(
+            std::ptr::NonNull::new(&n as *const u32 as *mut _).unwrap(),
+            core::mem::size_of::<u32>(),
+            4,
+        );
+        encoder.setBytes_length_atIndex(
+            std::ptr::NonNull::new(&k as *const u32 as *mut _).unwrap(),
+            core::mem::size_of::<u32>(),
+            5,
+        );
+        let trans_b_u32: u32 = u32::from(trans_b);
+        encoder.setBytes_length_atIndex(
+            std::ptr::NonNull::new(&trans_b_u32 as *const u32 as *mut _).unwrap(),
+            core::mem::size_of::<u32>(),
+            6,
+        );
+    }
+
+    let grid_x = (n as usize).div_ceil(TILE_N);
+    let grid_y = (m as usize).div_ceil(TILE_M);
+
+    let threadgroups = MTLSize {
+        width: grid_x,
+        height: grid_y,
+        depth: 1,
     };
     let threads_per_tg = MTLSize {
         width: SIMD_GROUPS_PER_TG * THREADS_PER_SIMD,
@@ -1240,6 +1354,14 @@ pub struct MetalBackend {
     /// Fused weight buffers allocated at load time (`ClassicBert`: Q+K+V concatenated).
     /// Kept alive so the [`WeightRef`]s pointing into them remain valid.
     fused_weights: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    /// FP16 copy of `weight_buffer`, converted on GPU at load time.
+    ///
+    /// Every f32 weight becomes an f16 half at `offset / 2`. Used by FP16
+    /// mixed-precision GEMM kernels to reduce register pressure and improve
+    /// GPU occupancy (~1.5x fewer registers per SIMD group).
+    fp16_weight_buffer: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    /// FP16 copies of `fused_weights` buffers, one per fused buffer.
+    fp16_fused_weights: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
     /// Hidden dimension for output vector size.
     hidden_size: i32,
     /// Number of attention heads.
@@ -1361,6 +1483,8 @@ impl MetalBackend {
             workspace,
             rope_cache,
             fused_weights: Vec::new(),
+            fp16_weight_buffer: None,
+            fp16_fused_weights: Vec::new(),
             hidden_size,
             num_heads,
             head_dim,
@@ -1375,6 +1499,11 @@ impl MetalBackend {
             backend.fuse_qkv_weights()?;
         }
 
+        // Pre-convert all weights to FP16 on GPU for mixed-precision GEMM.
+        // This runs the f32_to_f16 kernel on the entire weight buffer and each
+        // fused buffer, storing half-precision copies alongside the originals.
+        backend.create_fp16_weights()?;
+
         tracing::info!(
             device = %backend.device.name(),
             chip_family = ?backend.chip_family,
@@ -1384,8 +1513,9 @@ impl MetalBackend {
             layers = config.num_hidden_layers,
             variant = ?variant,
             weights_bytes,
+            fp16_weights_bytes = weights_bytes / 2,
             fused_buffers = backend.fused_weights.len(),
-            "Metal backend initialized with zero-copy weights + 20 MSL kernels"
+            "Metal backend initialized with zero-copy weights + FP16 GEMM + 22 MSL kernels"
         );
 
         Ok(backend)
@@ -1519,6 +1649,94 @@ impl MetalBackend {
         }
     }
 
+    /// Get the FP16 Metal buffer backing a [`WeightRef`].
+    ///
+    /// Returns the half-precision equivalent of [`Self::weight_buf`]. The
+    /// byte offset into the returned buffer is `wr.offset / 2` (since each
+    /// 4-byte float becomes a 2-byte half at the same element index).
+    fn fp16_weight_buf(&self, wr: &WeightRef) -> &ProtocolObject<dyn MTLBuffer> {
+        match wr.buffer_idx {
+            None => self
+                .fp16_weight_buffer
+                .as_ref()
+                .expect("fp16_weight_buffer created at load time"),
+            Some(idx) => &self.fp16_fused_weights[idx],
+        }
+    }
+
+    /// Convert a single FP32 Metal buffer to FP16 on GPU using the `f32_to_f16` kernel.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "weight buffer element count fits in i32 (max ~50M floats for a 200MB model)"
+    )]
+    fn convert_buffer_to_fp16(
+        &self,
+        src: &ProtocolObject<dyn MTLBuffer>,
+    ) -> crate::Result<Retained<ProtocolObject<dyn MTLBuffer>>> {
+        use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder};
+
+        let num_floats = src.length() / 4;
+        let fp16_size = num_floats * 2;
+
+        let fp16_buf = self
+            .device
+            .newBufferWithLength_options(fp16_size, MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| crate::Error::Metal("FP16 buffer allocation failed".into()))?;
+
+        let cmd_buf = self
+            .queue
+            .commandBuffer()
+            .ok_or_else(|| crate::Error::Metal("command buffer creation failed".into()))?;
+        let enc = cmd_buf
+            .computeCommandEncoder()
+            .ok_or_else(|| crate::Error::Metal("compute encoder creation failed".into()))?;
+
+        enc.setComputePipelineState(&self.kernels.f32_to_f16);
+        set_buffer(&enc, &fp16_buf, 0, 0);
+        set_buffer(&enc, src, 0, 1);
+        set_i32_param(&enc, num_floats as i32, 2);
+        dispatch_1d(&enc, &self.kernels.f32_to_f16, num_floats);
+        enc.endEncoding();
+
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+
+        Ok(fp16_buf)
+    }
+
+    /// Pre-convert all weight buffers to FP16 on GPU.
+    ///
+    /// Converts the main `weight_buffer` (zero-copy mmap) and all `fused_weights`
+    /// buffers using the `f32_to_f16` compute kernel. The resulting half-precision
+    /// buffers have the same element layout but half the byte size.
+    fn create_fp16_weights(&mut self) -> crate::Result<()> {
+        // Convert main weight buffer
+        let fp16_main = self.convert_buffer_to_fp16(&self.weight_buffer)?;
+        tracing::debug!(
+            fp32_bytes = self.weight_buffer.length(),
+            fp16_bytes = fp16_main.length(),
+            "converted weight_buffer to FP16"
+        );
+        self.fp16_weight_buffer = Some(fp16_main);
+
+        // Convert each fused weight buffer
+        let mut fp16_fused = Vec::with_capacity(self.fused_weights.len());
+        for (i, fused_buf) in self.fused_weights.iter().enumerate() {
+            let fp16_buf = self.convert_buffer_to_fp16(fused_buf)?;
+            tracing::debug!(
+                idx = i,
+                fp32_bytes = fused_buf.length(),
+                fp16_bytes = fp16_buf.length(),
+                "converted fused_weights[{i}] to FP16"
+            );
+            fp16_fused.push(fp16_buf);
+        }
+        self.fp16_fused_weights = fp16_fused;
+
+        Ok(())
+    }
+
     /// Encode the attention sub-layer for one transformer layer.
     ///
     /// Reads from `input` buffer, writes result to `output` buffer.
@@ -1569,13 +1787,14 @@ impl MetalBackend {
         // --- Fused QKV GEMM: input @ qkv_weight^T -> workspace.qkv ---
         // Both variants now have a single [3*hidden, hidden] qkv_weight
         // (NomicBert natively, ClassicBert via fuse_qkv_weights at load time).
-        dispatch_gemm(
+        // Uses FP16 mixed-precision: FP32 activations × FP16 weights → FP32 output.
+        dispatch_gemm_fp16(
             encoder,
-            &self.kernels.gemm,
+            &self.kernels.gemm_fp16,
             input,
             0,
-            self.weight_buf(&attn.qkv_weight),
-            attn.qkv_weight.offset,
+            self.fp16_weight_buf(&attn.qkv_weight),
+            attn.qkv_weight.offset / 2,
             &self.workspace.qkv,
             0,
             batch_seq as u32,
@@ -1733,13 +1952,14 @@ impl MetalBackend {
         }
 
         // --- Output projection: context @ output_weight^T -> projected ---
-        dispatch_gemm(
+        // FP16 mixed-precision: FP32 activations × FP16 weights → FP32 output.
+        dispatch_gemm_fp16(
             encoder,
-            &self.kernels.gemm,
+            &self.kernels.gemm_fp16,
             &self.workspace.context,
             0,
-            &self.weight_buffer,
-            attn.output_weight.offset,
+            self.fp16_weight_buf(&attn.output_weight),
+            attn.output_weight.offset / 2,
             &self.workspace.projected,
             0,
             batch_seq as u32,
@@ -1844,13 +2064,14 @@ impl MetalBackend {
                 let pad_inter = (inter_dim as usize).next_multiple_of(8) as u32;
 
                 // Intermediate projection: input @ intermediate_weight^T -> ffn_inter
-                dispatch_gemm(
+                // FP16 mixed-precision: FP32 activations × FP16 weights → FP32 output.
+                dispatch_gemm_fp16(
                     encoder,
-                    &self.kernels.gemm,
+                    &self.kernels.gemm_fp16,
                     input,
                     0,
-                    &self.weight_buffer,
-                    ffn.intermediate_weight.offset,
+                    self.fp16_weight_buf(&ffn.intermediate_weight),
+                    ffn.intermediate_weight.offset / 2,
                     &self.workspace.ffn_inter,
                     0,
                     batch_seq as u32,
@@ -1876,13 +2097,14 @@ impl MetalBackend {
                 }
 
                 // Output projection: ffn_inter @ output_weight^T -> scratch
-                dispatch_gemm(
+                // FP16 mixed-precision: FP32 activations × FP16 weights → FP32 output.
+                dispatch_gemm_fp16(
                     encoder,
-                    &self.kernels.gemm,
+                    &self.kernels.gemm_fp16,
                     &self.workspace.ffn_inter,
                     0,
-                    &self.weight_buffer,
-                    ffn.output_weight.offset,
+                    self.fp16_weight_buf(&ffn.output_weight),
+                    ffn.output_weight.offset / 2,
                     &self.workspace.scratch,
                     0,
                     batch_seq as u32,
@@ -1903,13 +2125,14 @@ impl MetalBackend {
                 // Then swiglu_two_input_kernel combines them element-wise.
 
                 // fc11 (value): input @ fc11_weight^T -> ffn_inter
-                dispatch_gemm(
+                // FP16 mixed-precision: FP32 activations × FP16 weights → FP32 output.
+                dispatch_gemm_fp16(
                     encoder,
-                    &self.kernels.gemm,
+                    &self.kernels.gemm_fp16,
                     input,
                     0,
-                    &self.weight_buffer,
-                    ffn.intermediate_weight.offset,
+                    self.fp16_weight_buf(&ffn.intermediate_weight),
+                    ffn.intermediate_weight.offset / 2,
                     &self.workspace.ffn_inter,
                     0,
                     batch_seq as u32,
@@ -1919,14 +2142,15 @@ impl MetalBackend {
                 );
 
                 // fc12 (gate): input @ gate_weight^T -> activated
+                // FP16 mixed-precision: FP32 activations × FP16 weights → FP32 output.
                 if let Some(ref gate) = ffn.gate_weight {
-                    dispatch_gemm(
+                    dispatch_gemm_fp16(
                         encoder,
-                        &self.kernels.gemm,
+                        &self.kernels.gemm_fp16,
                         input,
                         0,
-                        &self.weight_buffer,
-                        gate.offset,
+                        self.fp16_weight_buf(gate),
+                        gate.offset / 2,
                         &self.workspace.activated,
                         0,
                         batch_seq as u32,
@@ -1946,13 +2170,14 @@ impl MetalBackend {
                 dispatch_1d(encoder, &self.kernels.swiglu_two_input, total_act as usize);
 
                 // Output projection: activated @ output_weight^T -> scratch
-                dispatch_gemm(
+                // FP16 mixed-precision: FP32 activations × FP16 weights → FP32 output.
+                dispatch_gemm_fp16(
                     encoder,
-                    &self.kernels.gemm,
+                    &self.kernels.gemm_fp16,
                     &self.workspace.activated,
                     0,
-                    &self.weight_buffer,
-                    ffn.output_weight.offset,
+                    self.fp16_weight_buf(&ffn.output_weight),
+                    ffn.output_weight.offset / 2,
                     &self.workspace.scratch,
                     0,
                     batch_seq as u32,
@@ -2988,6 +3213,97 @@ mod tests {
                 (got - exp).abs()
             );
         }
+    }
+
+    #[test]
+    fn metal_gemm_fp16_mixed_precision() {
+        // Verify FP16 mixed-precision GEMM matches FP32 within half-precision tolerance.
+        // Uses BGE-small dimensions: M=64, N=384, K=384, transB=true.
+        let device = create_device().unwrap();
+        let queue = create_queue(&device).unwrap();
+        let lib = compile_library(&device, super::super::metal_kernels::KERNELS).unwrap();
+        let f32_to_f16_pipeline = create_pipeline(&device, &lib, "f32_to_f16_kernel").unwrap();
+        let gemm_lib = compile_library(&device, super::super::metal_kernels::GEMM_KERNEL).unwrap();
+        let fp16_pipeline = create_pipeline(&device, &gemm_lib, "gemm_fp16_kernel").unwrap();
+
+        let m: u32 = 64;
+        let n: u32 = 384;
+        let k: u32 = 384;
+
+        let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 - 8.0) * 0.01).collect();
+        let b_data: Vec<f32> = (0..n * k).map(|i| ((i % 13) as f32 - 6.0) * 0.01).collect();
+
+        let a_buf = make_f32_buffer(&device, &a_data);
+        let b_f32_buf = make_f32_buffer(&device, &b_data);
+
+        // Convert B to FP16 on GPU using the f32_to_f16 kernel
+        let b_num_floats = (n * k) as usize;
+        let b_fp16_buf = device
+            .newBufferWithLength_options(b_num_floats * 2, MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        {
+            let cmd = queue.commandBuffer().unwrap();
+            let enc = cmd.computeCommandEncoder().unwrap();
+            enc.setComputePipelineState(&f32_to_f16_pipeline);
+            set_buffer(&enc, &b_fp16_buf, 0, 0);
+            set_buffer(&enc, &b_f32_buf, 0, 1);
+            set_i32_param(&enc, b_num_floats as i32, 2);
+            dispatch_1d(&enc, &f32_to_f16_pipeline, b_num_floats);
+            enc.endEncoding();
+            cmd.commit();
+            cmd.waitUntilCompleted();
+        }
+
+        let buf_elems = m as usize * n as usize;
+        let c_buf = make_zero_buffer(&device, buf_elems);
+
+        let cmd_buf = queue.commandBuffer().unwrap();
+        let encoder = cmd_buf.computeCommandEncoder().unwrap();
+
+        dispatch_gemm_fp16(
+            &encoder,
+            &fp16_pipeline,
+            &a_buf,
+            0,
+            &b_fp16_buf,
+            0,
+            &c_buf,
+            0,
+            m,
+            n,
+            k,
+            true,
+        );
+
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+
+        let result = read_f32_buffer(&c_buf, buf_elems);
+        let expected = cpu_matmul_transb(&a_data, &b_data, m as usize, n as usize, k as usize);
+
+        // FP16 mixed precision introduces rounding — allow ~1e-2 tolerance
+        // (half precision has ~3 decimal digits of mantissa)
+        let spots = [(0, 0), (0, 383), (31, 192), (63, 0), (63, 383), (32, 128)];
+        for (i, j) in spots {
+            let got = result[i * n as usize + j];
+            let exp = expected[i * n as usize + j];
+            assert!(
+                (got - exp).abs() < 1e-2,
+                "C[{i},{j}]: expected {exp:.6}, got {got:.6}, diff={:.6}",
+                (got - exp).abs()
+            );
+        }
+
+        // Also verify overall L2 error is small
+        let mut sum_sq_err = 0.0_f64;
+        let mut sum_sq_ref = 0.0_f64;
+        for (g, e) in result.iter().zip(expected.iter()) {
+            sum_sq_err += ((*g as f64) - (*e as f64)).powi(2);
+            sum_sq_ref += (*e as f64).powi(2);
+        }
+        let rel_err = (sum_sq_err / sum_sq_ref.max(1e-30)).sqrt();
+        assert!(rel_err < 1e-2, "relative L2 error too large: {rel_err:.6}");
     }
 
     // -----------------------------------------------------------------------
