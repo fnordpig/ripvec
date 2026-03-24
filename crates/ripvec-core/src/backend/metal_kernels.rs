@@ -162,7 +162,9 @@ kernel void gelu_kernel(
 ) {
     if (i >= uint(n)) return;
     float v = x[i];
-    x[i] = 0.5 * v * (1.0 + tanh(0.7978845608 * (v + 0.044715 * v * v * v)));
+    float inner = 0.7978845608 * (v + 0.044715 * v * v * v);
+    inner = clamp(inner, -10.0f, 10.0f);
+    x[i] = 0.5 * v * (1.0 + tanh(inner));
 }
 
 // ---------------------------------------------------------------------------
@@ -360,7 +362,12 @@ kernel void fused_bias_gelu_kernel(
     if (idx >= uint(rows * cols)) return;
     int col = int(idx) % cols;
     float v = x[idx] + bias[col];
-    x[idx] = 0.5 * v * (1.0 + tanh(0.7978845608 * (v + 0.044715 * v * v * v)));
+    // Clamp tanh argument to [-10, 10] to avoid NaN from GPU tanh
+    // approximation on large inputs. For |v| > ~5, GELU ≈ v (positive)
+    // or 0 (negative), so clamping tanh to ±1 is mathematically exact.
+    float inner = 0.7978845608 * (v + 0.044715 * v * v * v);
+    inner = clamp(inner, -10.0f, 10.0f);
+    x[idx] = 0.5 * v * (1.0 + tanh(inner));
 }
 
 // ---------------------------------------------------------------------------
@@ -955,6 +962,10 @@ kernel void gemm_kernel(
     ushort2 offset_in_group(sid.x * 8 + morton_offset.x,
                             sid.y * 8 + morton_offset.y);
 
+    // Per-thread global position for bounds checking
+    uint my_row = M_offset + offset_in_group.y;
+    uint my_col = N_offset + offset_in_group.x;
+
     // Initialize accumulator to zero
     simdgroup_matrix_storage<float> C_acc;
     *(C_acc.thread_elements()) = float2(0.0);
@@ -965,38 +976,46 @@ kernel void gemm_kernel(
 
         // --- Load A tile ---
         // A is [M, K] row-major. We want the 8x8 block at (global_row, k).
-        // Each thread offsets by its Morton position:
-        //   A_offset = (k + morton_offset.x, M_offset + offset_in_group.y)
-        uint2 A_offset(k + morton_offset.x, M_offset + offset_in_group.y);
-        device float* A_src = simdgroup_matrix_storage<float>::apply_offset(
-            A, K, A_offset);
-        A_tile.load(A_src, K, ushort2(0, 0));
+        if (my_row < M) {
+            uint2 A_offset(k + morton_offset.x, my_row);
+            device float* A_src = simdgroup_matrix_storage<float>::apply_offset(
+                A, K, A_offset);
+            A_tile.load(A_src, K, ushort2(0, 0));
+        } else {
+            *(A_tile.thread_elements()) = float2(0.0);
+        }
 
         // --- Load B tile ---
         if (transB) {
-            // B is [N, K] row-major. We want B^T, so logical B^T[k, col].
-            // Load from B[col, k] with transpose=true.
-            // B_offset = (N_offset + offset_in_group.x, k + morton_offset.y)
-            uint2 B_offset(N_offset + offset_in_group.x, k + morton_offset.y);
-            device float* B_src = simdgroup_matrix_storage<float>::apply_offset(
-                B, K, B_offset, true);
-            B_tile.load(B_src, K, ushort2(0, 0), true);
+            if (my_col < N) {
+                uint2 B_offset(my_col, k + morton_offset.y);
+                device float* B_src = simdgroup_matrix_storage<float>::apply_offset(
+                    B, K, B_offset, true);
+                B_tile.load(B_src, K, ushort2(0, 0), true);
+            } else {
+                *(B_tile.thread_elements()) = float2(0.0);
+            }
         } else {
-            // B is [K, N] row-major. Block at (k, global_col).
-            uint2 B_offset(N_offset + offset_in_group.x, k + morton_offset.y);
-            device float* B_src = simdgroup_matrix_storage<float>::apply_offset(
-                B, N, B_offset);
-            B_tile.load(B_src, N, ushort2(0, 0));
+            if (my_col < N) {
+                uint2 B_offset(my_col, k + morton_offset.y);
+                device float* B_src = simdgroup_matrix_storage<float>::apply_offset(
+                    B, N, B_offset);
+                B_tile.load(B_src, N, ushort2(0, 0));
+            } else {
+                *(B_tile.thread_elements()) = float2(0.0);
+            }
         }
 
         // 8x8 multiply-accumulate: C_acc += A_tile * B_tile
         C_acc.multiply(A_tile, B_tile, true);
     }
 
-    // Store the result tile to C[M_offset + offset_y, N_offset + offset_x]
-    uint2 C_offset(N_offset + offset_in_group.x, M_offset + offset_in_group.y);
-    device float* C_dst = simdgroup_matrix_storage<float>::apply_offset(
-        C, N, C_offset);
-    C_acc.store(C_dst, N, ushort2(0, 0));
+    // Store the result tile — skip out-of-bounds threads
+    if (my_row < M && my_col < N) {
+        uint2 C_offset(my_col, my_row);
+        device float* C_dst = simdgroup_matrix_storage<float>::apply_offset(
+            C, N, C_offset);
+        C_acc.store(C_dst, N, ushort2(0, 0));
+    }
 }
 "#;
