@@ -1,0 +1,24 @@
+{
+  "name": "ripvec",
+  "owner": {
+    "name": "fnordpig",
+    "url": "https://github.com/fnordpig"
+  },
+  "metadata": {
+    "description": "Semantic code search plugin for Claude Code — find code by meaning, understand architecture through PageRank dependency graphs",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "ripvec",
+      "source": "./ripvec",
+      "description": "Semantic code search and structural analysis. 6 MCP tools, 3 skills, 2 commands, 1 agent. Requires: cargo install --git https://github.com/fnordpig/ripvec ripvec-mcp",
+      "version": "0.1.0",
+      "author": {
+        "name": "fnordpig"
+      },
+      "keywords": ["search", "semantic", "embeddings", "code-search", "pagerank", "architecture", "tree-sitter", "metal", "gpu"],
+      "category": "code-intelligence"
+    }
+  ]
+}
