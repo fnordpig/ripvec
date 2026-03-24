@@ -686,6 +686,10 @@ mod tests {
     /// relative ordering between different vectors.
     #[test]
     #[ignore = "loads model + embeds; run with --nocapture"]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "top_k and overlap are small counts"
+    )]
     fn mrl_retrieval_recall() {
         let model = "BAAI/bge-small-en-v1.5";
         let backends = crate::backend::detect_backends(model).unwrap();
@@ -701,7 +705,7 @@ mod tests {
             .unwrap();
         eprintln!("Embedding {}", root.display());
         let backend_refs: Vec<&dyn crate::backend::EmbedBackend> =
-            backends.iter().map(|b| b.as_ref()).collect();
+            backends.iter().map(std::convert::AsRef::as_ref).collect();
         let (chunks, embeddings) =
             embed_all(root, &backend_refs, &tokenizer, &cfg, &profiler).unwrap();
         let full_dim = embeddings[0].len();
@@ -769,14 +773,18 @@ mod tests {
         }
     }
 
-    /// MRL retrieval recall test for CodeRankEmbed (768-dim, MRL-trained).
+    /// MRL retrieval recall test for `CodeRankEmbed` (768-dim, MRL-trained).
     ///
-    /// CodeRankEmbed was trained with Matryoshka Representation Learning,
+    /// `CodeRankEmbed` was trained with Matryoshka Representation Learning,
     /// so truncated embeddings should preserve retrieval quality much better
     /// than non-MRL models like BGE-small. Uses code-focused queries with
     /// the required query prefix.
     #[test]
     #[ignore = "loads model + embeds; run with --nocapture"]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "top_k and overlap are small counts"
+    )]
     fn mrl_retrieval_recall_coderank() {
         let model = "nomic-ai/CodeRankEmbed";
         let backends = crate::backend::detect_backends(model).unwrap();
@@ -792,7 +800,7 @@ mod tests {
             .unwrap();
         eprintln!("Embedding {}", root.display());
         let backend_refs: Vec<&dyn crate::backend::EmbedBackend> =
-            backends.iter().map(|b| b.as_ref()).collect();
+            backends.iter().map(std::convert::AsRef::as_ref).collect();
         let (chunks, embeddings) =
             embed_all(root, &backend_refs, &tokenizer, &cfg, &profiler).unwrap();
         let full_dim = embeddings[0].len();

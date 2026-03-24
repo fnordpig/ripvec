@@ -291,10 +291,16 @@ mod tests {
     /// L2-normalize a vector in-place.
     fn l2_normalize(v: &mut [f32]) {
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
-        v.iter_mut().for_each(|x| *x /= norm);
+        for x in v.iter_mut() {
+            *x /= norm;
+        }
     }
 
     #[test]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "test values are small counts and indices"
+    )]
     fn cascade_recall_at_10_vs_full_rank() {
         // Build 200 chunks with 8-dim random-ish embeddings (L2-normalized).
         // Use a deterministic pattern so the test is reproducible.

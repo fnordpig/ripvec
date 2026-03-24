@@ -159,12 +159,9 @@ struct KernelPipelines {
     ///
     /// No longer used in attention (replaced by fused QKV + `qkv_split`), but
     /// kept compiled for potential future use in other reshape operations.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "no longer used after QKV fusion, kept for potential future use"
-        )
+    #[expect(
+        dead_code,
+        reason = "no longer used after QKV fusion, kept for potential future use"
     )]
     head_reshape: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Two-input `SwiGLU`: `output = value * silu(gate)` with separate buffers.
@@ -194,21 +191,15 @@ struct KernelPipelines {
     )]
     gemm_fp16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Batched FP16 mixed-precision GEMM with z-dimension for batch/head index.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "attention GEMMs are activation×activation (FP32); reserved for future weight-batched paths"
-        )
+    #[expect(
+        dead_code,
+        reason = "attention GEMMs are activation×activation (FP32); reserved for future weight-batched paths"
     )]
     gemm_batched_fp16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Fused `FlashAttention`: Q@K^T -> scale -> mask -> softmax -> @V in one kernel.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "batched GEMM is faster for small models; FA reserved for 768-dim+ models"
-        )
+    #[expect(
+        dead_code,
+        reason = "batched GEMM is faster for small models; FA reserved for larger-model deployment"
     )]
     flash_attention: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     // ----- FP16 element-wise kernel variants (bandwidth optimization) -----
@@ -775,8 +766,8 @@ fn dispatch_mps_gemm(
 ///
 /// Smaller batches reduce padding waste: `embed_distributed` grabs 128+
 /// sequences sorted by descending length, then `embed_batch` sub-batches
-/// them here. With MAX_BATCH=32, a 128-sequence grab becomes 4 sub-batches
-/// each padded to their own (shorter) max_seq — much less padding than one
+/// them here. With `MAX_BATCH=32`, a 128-sequence grab becomes 4 sub-batches
+/// each padded to their own (shorter) `max_seq` — much less padding than one
 /// 128-sequence batch padded to the global max.
 const MAX_BATCH: i32 = 32;
 
@@ -3291,6 +3282,10 @@ mod tests {
     }
 
     /// Helper: reference CPU matmul C = A * B (no transpose).
+    #[expect(
+        clippy::many_single_char_names,
+        reason = "conventional matrix algebra notation"
+    )]
     fn cpu_matmul(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
         let mut c = vec![0.0_f32; m * n];
         for i in 0..m {
@@ -3306,6 +3301,10 @@ mod tests {
     }
 
     /// Helper: reference CPU matmul C = A * B^T.
+    #[expect(
+        clippy::many_single_char_names,
+        reason = "conventional matrix algebra notation"
+    )]
     fn cpu_matmul_transb(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
         // B is [N, K] row-major, so B^T[k,n] = B[n,k]
         let mut c = vec![0.0_f32; m * n];
@@ -3388,8 +3387,8 @@ mod tests {
             &c_buf,
             0,
             m,
-            pad_n as u32,
-            pad_k as u32,
+            u32::try_from(pad_n).unwrap(),
+            u32::try_from(pad_k).unwrap(),
             false,
         );
 
@@ -3457,8 +3456,8 @@ mod tests {
             &c_buf,
             0,
             m,
-            pad_n as u32,
-            pad_k as u32,
+            u32::try_from(pad_n).unwrap(),
+            u32::try_from(pad_k).unwrap(),
             true,
         );
 
@@ -3495,8 +3494,12 @@ mod tests {
         let k: u32 = 384;
 
         // Generate deterministic test data (small values to avoid fp precision issues)
-        let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 - 8.0) * 0.01).collect();
-        let b_data: Vec<f32> = (0..n * k).map(|i| ((i % 13) as f32 - 6.0) * 0.01).collect();
+        let a_data: Vec<f32> = (0..m * k)
+            .map(|i| (f32::from((i % 17) as u16) - 8.0) * 0.01)
+            .collect();
+        let b_data: Vec<f32> = (0..n * k)
+            .map(|i| (f32::from((i % 13) as u16) - 6.0) * 0.01)
+            .collect();
 
         // M and N are both multiples of 32 here, no padding needed
         let buf_elems = m as usize * n as usize;
@@ -3558,8 +3561,12 @@ mod tests {
         let n: u32 = 384;
         let k: u32 = 384;
 
-        let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 - 8.0) * 0.01).collect();
-        let b_data: Vec<f32> = (0..n * k).map(|i| ((i % 13) as f32 - 6.0) * 0.01).collect();
+        let a_data: Vec<f32> = (0..m * k)
+            .map(|i| (f32::from((i % 17) as u16) - 8.0) * 0.01)
+            .collect();
+        let b_data: Vec<f32> = (0..n * k)
+            .map(|i| (f32::from((i % 13) as u16) - 6.0) * 0.01)
+            .collect();
 
         let a_buf = make_f32_buffer(&device, &a_data);
         let b_f32_buf = make_f32_buffer(&device, &b_data);
@@ -3575,7 +3582,7 @@ mod tests {
             enc.setComputePipelineState(&f32_to_f16_pipeline);
             set_buffer(&enc, &b_fp16_buf, 0, 0);
             set_buffer(&enc, &b_f32_buf, 0, 1);
-            set_i32_param(&enc, b_num_floats as i32, 2);
+            set_i32_param(&enc, i32::try_from(b_num_floats).unwrap(), 2);
             dispatch_1d(&enc, &f32_to_f16_pipeline, b_num_floats);
             enc.endEncoding();
             cmd.commit();
@@ -3627,602 +3634,11 @@ mod tests {
         let mut sum_sq_err = 0.0_f64;
         let mut sum_sq_ref = 0.0_f64;
         for (g, e) in result.iter().zip(expected.iter()) {
-            sum_sq_err += ((*g as f64) - (*e as f64)).powi(2);
-            sum_sq_ref += (*e as f64).powi(2);
+            sum_sq_err += (f64::from(*g) - f64::from(*e)).powi(2);
+            sum_sq_ref += f64::from(*e).powi(2);
         }
         let rel_err = (sum_sq_err / sum_sq_ref.max(1e-30)).sqrt();
         assert!(rel_err < 1e-2, "relative L2 error too large: {rel_err:.6}");
-    }
-
-    // -----------------------------------------------------------------------
-    // Stage-by-stage diagnostic: bisect the forward pass
-    // -----------------------------------------------------------------------
-
-    /// Helper: read f32 buffer and compute stats (min, max, mean, nonzero count)
-    fn buffer_stats(buf: &ProtocolObject<dyn MTLBuffer>, n: usize) -> (f32, f32, f32, usize) {
-        let data = read_f32_buffer(buf, n);
-        let min = data.iter().copied().fold(f32::INFINITY, f32::min);
-        let max = data.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let sum: f32 = data.iter().sum();
-        let mean = sum / n as f32;
-        let nonzero = data.iter().filter(|&&v| v.abs() > 1e-10).count();
-        (min, max, mean, nonzero)
-    }
-
-    /// Helper: create a new command buffer, encoder pair. Commits and waits on completion.
-    fn run_encoder<F>(queue: &ProtocolObject<dyn MTLCommandQueue>, f: F)
-    where
-        F: FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>),
-    {
-        let cmd_buf = queue.commandBuffer().unwrap();
-        let enc = cmd_buf.computeCommandEncoder().unwrap();
-        f(&enc);
-        enc.endEncoding();
-        cmd_buf.commit();
-        cmd_buf.waitUntilCompleted();
-    }
-
-    /// Helper: create a command buffer for MPS-aware operations. Commits and waits.
-    fn run_cmd_buf<F>(queue: &ProtocolObject<dyn MTLCommandQueue>, f: F)
-    where
-        F: FnOnce(&ProtocolObject<dyn MTLCommandBuffer>),
-    {
-        let cmd_buf = queue.commandBuffer().unwrap();
-        f(&cmd_buf);
-        cmd_buf.commit();
-        cmd_buf.waitUntilCompleted();
-    }
-
-    #[test]
-    #[ignore = "requires model download; run with --nocapture to see diagnostics"]
-    fn metal_forward_pass_stage_diagnostics() {
-        let backend = MetalBackend::load("BAAI/bge-small-en-v1.5", &DeviceHint::Auto).unwrap();
-        eprintln!(
-            "Model loaded: hidden={}, heads={}, head_dim={}, layers={}, variant={:?}",
-            backend.hidden_size,
-            backend.num_heads,
-            backend.head_dim,
-            backend.model.layers.len(),
-            backend.variant
-        );
-
-        // Test input: "Hello world" tokens (CLS, Hello, world, SEP)
-        let enc = Encoding {
-            input_ids: vec![101, 7592, 2088, 102],
-            attention_mask: vec![1, 1, 1, 1],
-            token_type_ids: vec![0, 0, 0, 0],
-        };
-
-        let hd = backend.hidden_size;
-        let batch: i32 = 1;
-        let max_seq: i32 = 4;
-        let batch_seq = batch * max_seq;
-        let n = (batch_seq * hd) as usize;
-
-        // Build padded input tensors
-        let input_ids: Vec<i32> = enc.input_ids.iter().map(|&x| x as i32).collect();
-        let token_type_ids: Vec<i32> = enc.token_type_ids.iter().map(|&x| x as i32).collect();
-        let position_ids: Vec<i32> = (0..max_seq).collect();
-        let attn_mask_int: Vec<i32> = enc.attention_mask.iter().map(|&x| x as i32).collect();
-
-        let input_ids_buf = make_i32_buffer(&backend.device, &input_ids);
-        let token_type_ids_buf = make_i32_buffer(&backend.device, &token_type_ids);
-        let position_ids_buf = make_i32_buffer(&backend.device, &position_ids);
-        let attn_mask_int_buf = make_i32_buffer(&backend.device, &attn_mask_int);
-
-        // ===== STAGE 1: Embedding lookup =====
-        run_encoder(&backend.queue, |enc| {
-            enc.setComputePipelineState(&backend.kernels.embedding_lookup);
-            set_buffer(enc, &backend.workspace.scratch, 0, 0);
-            set_buffer(
-                enc,
-                &backend.weight_buffer,
-                backend.model.embeddings.word_embeddings.offset,
-                1,
-            );
-            set_buffer(enc, &input_ids_buf, 0, 2);
-            set_i32_param(enc, batch_seq, 3);
-            set_i32_param(enc, hd, 4);
-            dispatch_1d(enc, &backend.kernels.embedding_lookup, n);
-        });
-
-        let (min, max, mean, nz) = buffer_stats(&backend.workspace.scratch, n);
-        eprintln!(
-            "STAGE 1 - word embeddings:  min={min:.4}, max={max:.4}, mean={mean:.4}, nonzero={nz}/{n}"
-        );
-        assert!(nz > 0, "STAGE 1 FAILED: word embeddings are all zero!");
-
-        // ===== STAGE 2: Add position + token_type embeddings =====
-        if let Some(ref pos_emb) = backend.model.embeddings.position_embeddings {
-            run_encoder(&backend.queue, |enc| {
-                enc.setComputePipelineState(&backend.kernels.add_embeddings);
-                set_buffer(enc, &backend.workspace.scratch, 0, 0);
-                set_buffer(enc, &backend.weight_buffer, pos_emb.offset, 1);
-                set_buffer(enc, &position_ids_buf, 0, 2);
-                set_i32_param(enc, batch_seq, 3);
-                set_i32_param(enc, hd, 4);
-                dispatch_1d(enc, &backend.kernels.add_embeddings, n);
-            });
-            let (min, max, mean, nz) = buffer_stats(&backend.workspace.scratch, n);
-            eprintln!(
-                "STAGE 2a - +position emb:  min={min:.4}, max={max:.4}, mean={mean:.4}, nonzero={nz}/{n}"
-            );
-        }
-
-        if let Some(ref tok_emb) = backend.model.embeddings.token_type_embeddings {
-            run_encoder(&backend.queue, |enc| {
-                enc.setComputePipelineState(&backend.kernels.add_embeddings);
-                set_buffer(enc, &backend.workspace.scratch, 0, 0);
-                set_buffer(enc, &backend.weight_buffer, tok_emb.offset, 1);
-                set_buffer(enc, &token_type_ids_buf, 0, 2);
-                set_i32_param(enc, batch_seq, 3);
-                set_i32_param(enc, hd, 4);
-                dispatch_1d(enc, &backend.kernels.add_embeddings, n);
-            });
-            let (min, max, mean, nz) = buffer_stats(&backend.workspace.scratch, n);
-            eprintln!(
-                "STAGE 2b - +token_type:    min={min:.4}, max={max:.4}, mean={mean:.4}, nonzero={nz}/{n}"
-            );
-        }
-
-        // ===== STAGE 3: Embedding LayerNorm =====
-        {
-            let eps = backend.model.embeddings.layer_norm_eps;
-            let threads = 256.min(hd as usize);
-            run_encoder(&backend.queue, |enc| {
-                enc.setComputePipelineState(&backend.kernels.layer_norm);
-                set_buffer(enc, &backend.workspace.hidden_a, 0, 0);
-                set_buffer(enc, &backend.workspace.scratch, 0, 1);
-                set_buffer(
-                    enc,
-                    &backend.weight_buffer,
-                    backend.model.embeddings.layer_norm_weight.offset,
-                    2,
-                );
-                set_buffer(
-                    enc,
-                    &backend.weight_buffer,
-                    backend.model.embeddings.layer_norm_bias.offset,
-                    3,
-                );
-                set_i32_param(enc, batch_seq, 4);
-                set_i32_param(enc, hd, 5);
-                set_f32_param(enc, eps, 6);
-                dispatch_rows(
-                    enc,
-                    &backend.kernels.layer_norm,
-                    batch_seq as usize,
-                    threads,
-                );
-            });
-            let (min, max, mean, nz) = buffer_stats(&backend.workspace.hidden_a, n);
-            eprintln!(
-                "STAGE 3 - embedding LN:    min={min:.4}, max={max:.4}, mean={mean:.4}, nonzero={nz}/{n}"
-            );
-            assert!(nz > 0, "STAGE 3 FAILED: post-LN embeddings are all zero!");
-        }
-
-        // Print embedding output for inspection
-        {
-            let metal_flat = read_f32_buffer(&backend.workspace.hidden_a, n);
-            eprintln!("\n  Token 0 (CLS), first 8 dims: {:?}", &metal_flat[..8]);
-            eprintln!(
-                "  Token 1 (Hello), first 8 dims: {:?}",
-                &metal_flat[hd as usize..hd as usize + 8]
-            );
-            let norm: f32 = metal_flat[..hd as usize]
-                .iter()
-                .map(|x| x * x)
-                .sum::<f32>()
-                .sqrt();
-            eprintln!("  Token 0 L2 norm: {norm:.4}");
-        }
-
-        // ===== STAGE 4: Layer 0 attention =====
-        eprintln!("\n--- Layer 0 attention ---");
-        {
-            // Build float attention mask first
-            run_encoder(&backend.queue, |enc| {
-                enc.setComputePipelineState(&backend.kernels.build_attn_mask);
-                set_buffer(enc, &backend.workspace.mask, 0, 0);
-                set_buffer(enc, &attn_mask_int_buf, 0, 1);
-                set_i32_param(enc, batch * max_seq, 2);
-                dispatch_1d(
-                    enc,
-                    &backend.kernels.build_attn_mask,
-                    (batch * max_seq) as usize,
-                );
-            });
-
-            let attn = &backend.model.layers[0].attention;
-            let nh = backend.num_heads;
-            let head_dim_i = backend.head_dim;
-            let pad_hd_i = (hd as usize).next_multiple_of(8) as u32;
-
-            // 4a: Q GEMM
-            run_encoder(&backend.queue, |enc| {
-                dispatch_gemm(
-                    enc,
-                    &backend.kernels.gemm,
-                    &backend.workspace.hidden_a,
-                    0,
-                    &backend.weight_buffer,
-                    attn.qkv_weight.offset,
-                    &backend.workspace.q,
-                    0,
-                    batch_seq as u32,
-                    pad_hd_i,
-                    pad_hd_i,
-                    true,
-                );
-            });
-            let (mn, mx, avg, nz_q) = buffer_stats(&backend.workspace.q, n);
-            eprintln!(
-                "  4a - Q GEMM:         min={mn:.4}, max={mx:.4}, mean={avg:.4}, nz={nz_q}/{n}"
-            );
-
-            // 4b: add Q bias
-            if let Some(ref bias) = attn.qkv_bias {
-                run_encoder(&backend.queue, |enc| {
-                    enc.setComputePipelineState(&backend.kernels.add_bias);
-                    set_buffer(enc, &backend.workspace.q, 0, 0);
-                    set_buffer(enc, &backend.weight_buffer, bias.offset, 1);
-                    set_i32_param(enc, batch_seq, 2);
-                    set_i32_param(enc, hd, 3);
-                    dispatch_1d(enc, &backend.kernels.add_bias, n);
-                });
-                let (mn, mx, avg, nz_q) = buffer_stats(&backend.workspace.q, n);
-                eprintln!(
-                    "  4b - Q+bias:         min={mn:.4}, max={mx:.4}, mean={avg:.4}, nz={nz_q}/{n}"
-                );
-            }
-
-            // 4c: K GEMM + bias
-            if let Some(ref k_weight) = attn.k_weight {
-                run_encoder(&backend.queue, |enc| {
-                    dispatch_gemm(
-                        enc,
-                        &backend.kernels.gemm,
-                        &backend.workspace.hidden_a,
-                        0,
-                        &backend.weight_buffer,
-                        k_weight.offset,
-                        &backend.workspace.k,
-                        0,
-                        batch_seq as u32,
-                        pad_hd_i,
-                        pad_hd_i,
-                        true,
-                    );
-                });
-                if let Some(ref bias) = attn.k_bias {
-                    run_encoder(&backend.queue, |enc| {
-                        enc.setComputePipelineState(&backend.kernels.add_bias);
-                        set_buffer(enc, &backend.workspace.k, 0, 0);
-                        set_buffer(enc, &backend.weight_buffer, bias.offset, 1);
-                        set_i32_param(enc, batch_seq, 2);
-                        set_i32_param(enc, hd, 3);
-                        dispatch_1d(enc, &backend.kernels.add_bias, n);
-                    });
-                }
-            }
-            let (mn, mx, avg, nz_k) = buffer_stats(&backend.workspace.k, n);
-            eprintln!(
-                "  4c - K+bias:         min={mn:.4}, max={mx:.4}, mean={avg:.4}, nz={nz_k}/{n}"
-            );
-
-            // 4d: Head reshape Q -> attn_out, K -> q, V -> k
-            let total_head = (batch * nh * max_seq * head_dim_i) as usize;
-            run_encoder(&backend.queue, |enc| {
-                // Reshape Q: workspace.q -> workspace.attn_out
-                enc.setComputePipelineState(&backend.kernels.head_reshape);
-                set_buffer(enc, &backend.workspace.attn_out, 0, 0);
-                set_buffer(enc, &backend.workspace.q, 0, 1);
-                set_i32_param(enc, batch, 2);
-                set_i32_param(enc, max_seq, 3);
-                set_i32_param(enc, nh, 4);
-                set_i32_param(enc, head_dim_i, 5);
-                dispatch_1d(enc, &backend.kernels.head_reshape, total_head);
-            });
-            let (mn, mx, avg, nz_qr) = buffer_stats(&backend.workspace.attn_out, total_head);
-            eprintln!(
-                "  4d - Q reshaped:     min={mn:.4}, max={mx:.4}, mean={avg:.4}, nz={nz_qr}/{total_head}"
-            );
-
-            // 4e: attention scores Q@K^T (just head 0 for diagnostics)
-            let head_stride_qk_i = (max_seq * head_dim_i) as usize * core::mem::size_of::<f32>();
-            let head_stride_scores_i = (max_seq * max_seq) as usize * core::mem::size_of::<f32>();
-            let scores_per_head = (max_seq * max_seq) as usize;
-            // Reshape K into workspace.q
-            run_encoder(&backend.queue, |enc| {
-                enc.setComputePipelineState(&backend.kernels.head_reshape);
-                set_buffer(enc, &backend.workspace.q, 0, 0);
-                set_buffer(enc, &backend.workspace.k, 0, 1);
-                set_i32_param(enc, batch, 2);
-                set_i32_param(enc, max_seq, 3);
-                set_i32_param(enc, nh, 4);
-                set_i32_param(enc, head_dim_i, 5);
-                dispatch_1d(enc, &backend.kernels.head_reshape, total_head);
-            });
-
-            // Scores for head 0
-            run_encoder(&backend.queue, |enc| {
-                dispatch_gemm(
-                    enc,
-                    &backend.kernels.gemm,
-                    &backend.workspace.attn_out,
-                    0, // Q head 0
-                    &backend.workspace.q,
-                    0, // K head 0
-                    &backend.workspace.scores,
-                    0,
-                    max_seq as u32,
-                    max_seq as u32,
-                    head_dim_i as u32,
-                    true,
-                );
-            });
-            let scores0 = read_f32_buffer(&backend.workspace.scores, scores_per_head);
-            eprintln!("  4e - scores[head0]: {:?}", &scores0);
-
-            // 4f: Apply scale + mask + softmax to head 0
-            run_encoder(&backend.queue, |enc| {
-                let scale = 1.0_f32 / (head_dim_i as f32).sqrt();
-                enc.setComputePipelineState(&backend.kernels.fused_scale_mask_softmax);
-                set_buffer(enc, &backend.workspace.scores, 0, 0);
-                set_buffer(enc, &backend.workspace.mask, 0, 1);
-                set_i32_param(enc, batch, 2);
-                set_i32_param(enc, nh, 3);
-                set_i32_param(enc, max_seq, 4);
-                set_f32_param(enc, scale, 5);
-                let threads = 256.min(max_seq as usize);
-                // Only 1 head's worth of rows (max_seq rows)
-                dispatch_rows(
-                    enc,
-                    &backend.kernels.fused_scale_mask_softmax,
-                    max_seq as usize,
-                    threads,
-                );
-            });
-            let softmax0 = read_f32_buffer(&backend.workspace.scores, scores_per_head);
-            eprintln!("  4f - softmax[head0]: {:?}", &softmax0);
-
-            // Run the full attention layer
-            run_cmd_buf(&backend.queue, |cmd_buf| {
-                backend
-                    .encode_attention(
-                        cmd_buf,
-                        &backend.model.layers[0],
-                        &backend.workspace.hidden_a,
-                        &backend.workspace.hidden_b,
-                        &backend.workspace.mask,
-                        batch,
-                        max_seq,
-                    )
-                    .unwrap();
-            });
-            let (min, max, mean, nz) = buffer_stats(&backend.workspace.hidden_b, n);
-            eprintln!(
-                "  STAGE 4 - layer0 attn:   min={min:.4}, max={max:.4}, mean={mean:.4}, nz={nz}/{n}"
-            );
-
-            // Print per-token stats for attention output
-            for t in 0..max_seq as usize {
-                let start = t * hd as usize;
-                let end = start + hd as usize;
-                let token_data = read_f32_buffer(&backend.workspace.hidden_b, n);
-                let tok = &token_data[start..end];
-                let tok_min = tok.iter().copied().fold(f32::INFINITY, f32::min);
-                let tok_max = tok.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let tok_nan = tok.iter().filter(|v| v.is_nan()).count();
-                eprintln!("    token {t}: min={tok_min:.4}, max={tok_max:.4}, nan={tok_nan}");
-            }
-            assert!(nz > 0, "STAGE 4 FAILED: attention output is all zero!");
-        }
-
-        // ===== STAGE 5: Layer 0 FFN (sub-stages) =====
-        eprintln!("\n--- Layer 0 FFN sub-stages ---");
-        {
-            let ffn = &backend.model.layers[0].ffn;
-            let inter_dim = ffn.intermediate_weight.shape[0] as i32;
-            let pad_hd_f = (hd as usize).next_multiple_of(8) as u32;
-            let pad_inter = (inter_dim as usize).next_multiple_of(8) as u32;
-            let inter_n = (batch_seq * inter_dim) as usize;
-
-            // Print weight offsets for debugging
-            eprintln!(
-                "  FFN weight info: inter_weight offset={}, shape={:?}",
-                ffn.intermediate_weight.offset, ffn.intermediate_weight.shape
-            );
-            if let Some(ref bias) = ffn.intermediate_bias {
-                eprintln!(
-                    "  FFN inter_bias offset={}, shape={:?}",
-                    bias.offset, bias.shape
-                );
-                // Read and print the bias values' range
-                let bias_data = unsafe {
-                    core::slice::from_raw_parts(
-                        (backend.weight_buffer.contents().as_ptr() as *const f32)
-                            .add(bias.offset / 4),
-                        bias.numel,
-                    )
-                };
-                let bias_min = bias_data.iter().copied().fold(f32::INFINITY, f32::min);
-                let bias_max = bias_data.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let bias_nan = bias_data.iter().filter(|v| v.is_nan()).count();
-                eprintln!(
-                    "  FFN inter_bias values: min={bias_min:.4}, max={bias_max:.4}, nan={bias_nan}"
-                );
-            }
-
-            // 5a: Intermediate GEMM: hidden_b → ffn_inter
-            run_encoder(&backend.queue, |enc| {
-                dispatch_gemm(
-                    enc,
-                    &backend.kernels.gemm,
-                    &backend.workspace.hidden_b,
-                    0,
-                    &backend.weight_buffer,
-                    ffn.intermediate_weight.offset,
-                    &backend.workspace.ffn_inter,
-                    0,
-                    batch_seq as u32,
-                    pad_inter,
-                    pad_hd_f,
-                    true,
-                );
-            });
-            let (mn, mx, avg, nz_i) = buffer_stats(&backend.workspace.ffn_inter, inter_n);
-            let nan_i = read_f32_buffer(&backend.workspace.ffn_inter, inter_n)
-                .iter()
-                .filter(|v| v.is_nan())
-                .count();
-            eprintln!(
-                "  5a - intermediate GEMM:  min={mn:.4}, max={mx:.4}, mean={avg:.6}, nz={nz_i}/{inter_n}, nan={nan_i}"
-            );
-
-            // 5b: Fused bias + GELU — save pre-GELU values to find the NaN source
-            let pre_gelu = read_f32_buffer(&backend.workspace.ffn_inter, inter_n);
-            if let Some(ref bias) = ffn.intermediate_bias {
-                // Also read bias values
-                let bias_vals = unsafe {
-                    core::slice::from_raw_parts(
-                        (backend.weight_buffer.contents().as_ptr() as *const f32)
-                            .add(bias.offset / 4),
-                        bias.numel,
-                    )
-                };
-                run_encoder(&backend.queue, |enc| {
-                    enc.setComputePipelineState(&backend.kernels.fused_bias_gelu);
-                    set_buffer(enc, &backend.workspace.ffn_inter, 0, 0);
-                    set_buffer(enc, &backend.weight_buffer, bias.offset, 1);
-                    set_i32_param(enc, batch_seq, 2);
-                    set_i32_param(enc, inter_dim, 3);
-                    dispatch_1d(enc, &backend.kernels.fused_bias_gelu, inter_n);
-                });
-                let post_gelu = read_f32_buffer(&backend.workspace.ffn_inter, inter_n);
-                // Find which element(s) became NaN
-                for (i, (pre, post)) in pre_gelu.iter().zip(post_gelu.iter()).enumerate() {
-                    if post.is_nan() {
-                        let col = i % inter_dim as usize;
-                        let row = i / inter_dim as usize;
-                        let b = bias_vals[col];
-                        let v = pre + b;
-                        eprintln!(
-                            "  NaN at idx={i} (row={row}, col={col}): pre={pre:.6}, bias={b:.6}, v=pre+bias={v:.6}"
-                        );
-                        eprintln!(
-                            "    v^3={:.6}, 0.044715*v^3={:.6}",
-                            v * v * v,
-                            0.044715 * v * v * v
-                        );
-                    }
-                }
-            }
-            let (mn, mx, avg, nz_g) = buffer_stats(&backend.workspace.ffn_inter, inter_n);
-            let nan_g = read_f32_buffer(&backend.workspace.ffn_inter, inter_n)
-                .iter()
-                .filter(|v| v.is_nan())
-                .count();
-            eprintln!(
-                "  5b - after GELU:         min={mn:.4}, max={mx:.4}, mean={avg:.6}, nz={nz_g}/{inter_n}, nan={nan_g}"
-            );
-
-            // 5c: Output GEMM: ffn_inter → scratch
-            run_encoder(&backend.queue, |enc| {
-                dispatch_gemm(
-                    enc,
-                    &backend.kernels.gemm,
-                    &backend.workspace.ffn_inter,
-                    0,
-                    &backend.weight_buffer,
-                    ffn.output_weight.offset,
-                    &backend.workspace.scratch,
-                    0,
-                    batch_seq as u32,
-                    pad_hd_f,
-                    pad_inter,
-                    true,
-                );
-            });
-            let (mn, mx, avg, nz_o) = buffer_stats(&backend.workspace.scratch, n);
-            let nan_o = read_f32_buffer(&backend.workspace.scratch, n)
-                .iter()
-                .filter(|v| v.is_nan())
-                .count();
-            eprintln!(
-                "  5c - output GEMM:        min={mn:.4}, max={mx:.4}, mean={avg:.6}, nz={nz_o}/{n}, nan={nan_o}"
-            );
-
-            // 5d: Full FFN (re-run from scratch to get final output)
-            run_cmd_buf(&backend.queue, |cmd_buf| {
-                backend
-                    .encode_ffn(
-                        cmd_buf,
-                        &backend.model.layers[0].ffn,
-                        &backend.workspace.hidden_b,
-                        &backend.workspace.hidden_a,
-                        batch_seq,
-                    )
-                    .unwrap();
-            });
-            let (min, max, mean, nz) = buffer_stats(&backend.workspace.hidden_a, n);
-            let nan_f = read_f32_buffer(&backend.workspace.hidden_a, n)
-                .iter()
-                .filter(|v| v.is_nan())
-                .count();
-            eprintln!(
-                "  5d - full FFN output:    min={min:.4}, max={max:.4}, mean={mean:.6}, nz={nz}/{n}, nan={nan_f}"
-            );
-
-            // Per-token NaN breakdown
-            let all = read_f32_buffer(&backend.workspace.hidden_a, n);
-            for t in 0..max_seq as usize {
-                let tok = &all[t * hd as usize..(t + 1) * hd as usize];
-                let nan_count = tok.iter().filter(|v| v.is_nan()).count();
-                if nan_count > 0 {
-                    eprintln!(
-                        "    token {t}: {nan_count} NaN values (first 4: {:?})",
-                        &tok[..4]
-                    );
-                }
-            }
-        }
-
-        // ===== STAGE 6: Full embed_batch (all layers + CLS + L2) =====
-        eprintln!("\n--- Full embed_batch ---");
-        let result = backend.embed_batch(&[enc.clone()]).unwrap();
-        let emb = &result[0];
-        let nz = emb.iter().filter(|&&v| v.abs() > 1e-10).count();
-        let l2: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
-        eprintln!(
-            "STAGE 6 - final embedding:  dim={}, nonzero={nz}, L2={l2:.6}",
-            emb.len()
-        );
-        eprintln!("  first 8: {:?}", &emb[..8]);
-
-        assert!(nz > 0, "STAGE 6 FAILED: final embedding is all zero!");
-        assert!((l2 - 1.0).abs() < 0.1, "L2 norm should be ~1.0, got {l2}");
-
-        // Compare against CPU (only if cpu feature enabled)
-        #[cfg(feature = "cpu")]
-        {
-            let cpu_backend = super::super::cpu::CpuBackend::load(
-                "BAAI/bge-small-en-v1.5",
-                &super::DeviceHint::Cpu,
-            )
-            .unwrap();
-            let cpu_result = cpu_backend.embed_batch(&[enc]).unwrap();
-            let cpu_emb = &cpu_result[0];
-            eprintln!("  CPU first 8: {:?}", &cpu_emb[..8]);
-            let cosine: f32 = emb.iter().zip(cpu_emb).map(|(m, c)| m * c).sum();
-            eprintln!("  Metal vs CPU cosine similarity: {cosine:.6}");
-            if cosine > 0.95 {
-                eprintln!("  PASS: Metal matches CPU (cosine > 0.95)");
-            } else {
-                eprintln!("  FAIL: Metal and CPU diverged! cosine={cosine}");
-            }
-        }
     }
 
     #[test]
@@ -4261,7 +3677,7 @@ mod tests {
     /// Measures cosine similarity vs full N-layer embedding.
     fn run_early_exit_sweep(model_repo: &str) {
         let mut backend = MetalBackend::load(model_repo, &DeviceHint::Auto).unwrap();
-        let hd = backend.hidden_size as usize;
+        let hd = usize::try_from(backend.hidden_size).unwrap();
         let num_layers = backend.model.layers.len();
         eprintln!(
             "Model: {model_repo}, hidden={hd}, layers={num_layers}, variant={:?}",
@@ -4278,7 +3694,7 @@ mod tests {
         };
 
         backend.max_layers = None;
-        let full = backend.embed_batch(&[enc.clone()]).unwrap();
+        let full = backend.embed_batch(std::slice::from_ref(&enc)).unwrap();
         let full_emb = &full[0];
         eprintln!(
             "Full embedding: {hd} dims, L2={:.4}\n",
@@ -4290,7 +3706,7 @@ mod tests {
         let layer_steps: Vec<usize> = (1..=num_layers).collect();
         for &layers in &layer_steps {
             backend.max_layers = Some(layers);
-            let result = backend.embed_batch(&[enc.clone()]).unwrap();
+            let result = backend.embed_batch(std::slice::from_ref(&enc)).unwrap();
             let emb = &result[0];
             let cos: f32 = emb.iter().zip(full_emb).map(|(a, b)| a * b).sum();
             eprintln!("  layers={layers:>2}: cosine={cos:.6}");
@@ -4310,7 +3726,7 @@ mod tests {
                 continue;
             }
             backend.max_layers = Some(layers);
-            let result = backend.embed_batch(&[enc.clone()]).unwrap();
+            let result = backend.embed_batch(std::slice::from_ref(&enc)).unwrap();
             let emb = &result[0];
             for &dims in &mrl_dims {
                 let trunc: Vec<f32> = emb[..dims].to_vec();
@@ -4358,15 +3774,16 @@ mod tests {
         let input: Vec<f32> = vec![0.5, -1.2, 3.7, 0.0, -0.8, 2.1, 1.4, -2.5];
         let weight: Vec<f32> = vec![1.0, 0.8, 1.2, 0.9, 1.1, 0.7, 1.3, 0.6];
         let bias: Vec<f32> = vec![0.1, -0.1, 0.2, 0.0, -0.2, 0.3, -0.3, 0.1];
-        let cols = input.len() as i32;
+        let cols = input.len();
+        let cols_i32 = i32::try_from(cols).unwrap();
 
         // --- Run FP32 kernel ---
-        let f32_output_buf = make_zero_buffer(&device, cols as usize);
+        let f32_output_buf = make_zero_buffer(&device, cols);
         let f32_input_buf = make_f32_buffer(&device, &input);
         let f32_weight_buf = make_f32_buffer(&device, &weight);
         let f32_bias_buf = make_f32_buffer(&device, &bias);
         let rows_buf = make_i32_const_buffer(&device, 1);
-        let cols_buf = make_i32_const_buffer(&device, cols);
+        let cols_buf = make_i32_const_buffer(&device, cols_i32);
         let eps_buf = make_f32_const_buffer(&device, 1e-5);
 
         let cmd_buf = queue.commandBuffer().unwrap();
@@ -4387,7 +3804,7 @@ mod tests {
             depth: 1,
         };
         let tg = MTLSize {
-            width: cols as usize,
+            width: cols,
             height: 1,
             depth: 1,
         };
@@ -4395,10 +3812,10 @@ mod tests {
         encoder.endEncoding();
         cmd_buf.commit();
         cmd_buf.waitUntilCompleted();
-        let f32_result = read_f32_buffer(&f32_output_buf, cols as usize);
+        let f32_result = read_f32_buffer(&f32_output_buf, cols);
 
         // --- Run FP16 kernel ---
-        let f16_output_buf = make_zero_f16_buffer(&device, cols as usize);
+        let f16_output_buf = make_zero_f16_buffer(&device, cols);
         let f16_input_buf = make_f16_buffer(&device, &input);
         let f16_weight_buf = make_f16_buffer(&device, &weight);
         let f16_bias_buf = make_f16_buffer(&device, &bias);
@@ -4420,7 +3837,7 @@ mod tests {
         encoder.endEncoding();
         cmd_buf.commit();
         cmd_buf.waitUntilCompleted();
-        let f16_result = read_f16_buffer(&f16_output_buf, cols as usize);
+        let f16_result = read_f16_buffer(&f16_output_buf, cols);
 
         // Compare: max absolute difference should be < 0.01 (half precision tolerance)
         let mut max_diff: f32 = 0.0;
@@ -4442,11 +3859,12 @@ mod tests {
         let pipelines = KernelPipelines::compile(&device).unwrap();
 
         let input: Vec<f32> = vec![0.0, 1.0, -1.0, 2.0, -2.0, 0.5, -0.5, 3.0];
-        let n = input.len() as i32;
+        let n = input.len();
+        let n_i32 = i32::try_from(n).unwrap();
 
         // --- Run FP32 kernel (GELU is in-place, so make a copy) ---
         let f32_buf = make_f32_buffer(&device, &input);
-        let n_buf = make_i32_const_buffer(&device, n);
+        let n_buf = make_i32_const_buffer(&device, n_i32);
         let cmd_buf = queue.commandBuffer().unwrap();
         let encoder = cmd_buf.computeCommandEncoder().unwrap();
         encoder.setComputePipelineState(&pipelines.gelu);
@@ -4454,11 +3872,11 @@ mod tests {
             encoder.setBuffer_offset_atIndex(Some(&f32_buf), 0, 0);
             encoder.setBuffer_offset_atIndex(Some(&n_buf), 0, 1);
         }
-        dispatch_1d(&encoder, &pipelines.gelu, n as usize);
+        dispatch_1d(&encoder, &pipelines.gelu, n);
         encoder.endEncoding();
         cmd_buf.commit();
         cmd_buf.waitUntilCompleted();
-        let f32_result = read_f32_buffer(&f32_buf, n as usize);
+        let f32_result = read_f32_buffer(&f32_buf, n);
 
         // --- Run FP16 kernel ---
         let f16_buf = make_f16_buffer(&device, &input);
@@ -4469,11 +3887,11 @@ mod tests {
             encoder.setBuffer_offset_atIndex(Some(&f16_buf), 0, 0);
             encoder.setBuffer_offset_atIndex(Some(&n_buf), 0, 1);
         }
-        dispatch_1d(&encoder, &pipelines.gelu_f16, n as usize);
+        dispatch_1d(&encoder, &pipelines.gelu_f16, n);
         encoder.endEncoding();
         cmd_buf.commit();
         cmd_buf.waitUntilCompleted();
-        let f16_result = read_f16_buffer(&f16_buf, n as usize);
+        let f16_result = read_f16_buffer(&f16_buf, n);
 
         let mut max_diff: f32 = 0.0;
         for (i, (&f32_val, &f16_val)) in f32_result.iter().zip(f16_result.iter()).enumerate() {
@@ -4497,16 +3915,17 @@ mod tests {
         let residual: Vec<f32> = vec![0.3, 0.7, -0.5, 1.0, -0.3, 0.8, -1.0, 0.4];
         let weight: Vec<f32> = vec![1.0, 0.8, 1.2, 0.9, 1.1, 0.7, 1.3, 0.6];
         let bias: Vec<f32> = vec![0.1, -0.1, 0.2, 0.0, -0.2, 0.3, -0.3, 0.1];
-        let cols = hidden.len() as i32;
+        let cols = hidden.len();
+        let cols_i32 = i32::try_from(cols).unwrap();
 
         // --- FP32 ---
-        let f32_output_buf = make_zero_buffer(&device, cols as usize);
+        let f32_output_buf = make_zero_buffer(&device, cols);
         let f32_hidden_buf = make_f32_buffer(&device, &hidden);
         let f32_residual_buf = make_f32_buffer(&device, &residual);
         let f32_weight_buf = make_f32_buffer(&device, &weight);
         let f32_bias_buf = make_f32_buffer(&device, &bias);
         let rows_buf = make_i32_const_buffer(&device, 1);
-        let cols_buf = make_i32_const_buffer(&device, cols);
+        let cols_buf = make_i32_const_buffer(&device, cols_i32);
         let eps_buf = make_f32_const_buffer(&device, 1e-5);
 
         let cmd_buf = queue.commandBuffer().unwrap();
@@ -4528,7 +3947,7 @@ mod tests {
             depth: 1,
         };
         let tg = MTLSize {
-            width: cols as usize,
+            width: cols,
             height: 1,
             depth: 1,
         };
@@ -4536,10 +3955,10 @@ mod tests {
         encoder.endEncoding();
         cmd_buf.commit();
         cmd_buf.waitUntilCompleted();
-        let f32_result = read_f32_buffer(&f32_output_buf, cols as usize);
+        let f32_result = read_f32_buffer(&f32_output_buf, cols);
 
         // --- FP16 ---
-        let f16_output_buf = make_zero_f16_buffer(&device, cols as usize);
+        let f16_output_buf = make_zero_f16_buffer(&device, cols);
         let f16_hidden_buf = make_f16_buffer(&device, &hidden);
         let f16_residual_buf = make_f16_buffer(&device, &residual);
         let f16_weight_buf = make_f16_buffer(&device, &weight);
@@ -4562,7 +3981,7 @@ mod tests {
         encoder.endEncoding();
         cmd_buf.commit();
         cmd_buf.waitUntilCompleted();
-        let f16_result = read_f16_buffer(&f16_output_buf, cols as usize);
+        let f16_result = read_f16_buffer(&f16_output_buf, cols);
 
         let mut max_diff: f32 = 0.0;
         for (i, (&f32_val, &f16_val)) in f32_result.iter().zip(f16_result.iter()).enumerate() {

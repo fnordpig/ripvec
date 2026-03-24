@@ -221,10 +221,10 @@ pub fn detect_backends(
 
     // Try MLX (Apple Silicon GPU, fallback if Metal unavailable)
     #[cfg(feature = "mlx")]
-    if backends.is_empty() {
-        if let Ok(b) = mlx::MlxBackend::load(model_repo, &DeviceHint::Auto) {
-            backends.push(Box::new(b));
-        }
+    if backends.is_empty()
+        && let Ok(b) = mlx::MlxBackend::load(model_repo, &DeviceHint::Auto)
+    {
+        backends.push(Box::new(b));
     }
 
     // Add CPU as fallback only when no GPU backend was loaded.

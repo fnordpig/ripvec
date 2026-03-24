@@ -7,7 +7,7 @@
 //!
 //! Supports two model families:
 //! - **`ClassicBert`** (BGE models): learned position embeddings, GELU, QKV with bias.
-//! - **`NomicBert`** (CodeRankEmbed, nomic-embed-text): RoPE, SwiGLU, no bias.
+//! - **`NomicBert`** (`CodeRankEmbed`, nomic-embed-text): `RoPE`, `SwiGLU`, no bias.
 //!
 //! Weights are loaded from safetensors files downloaded via `hf-hub` and
 //! manually assigned to a hand-rolled BERT model. The model is wrapped in
@@ -17,8 +17,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use hf_hub::api::sync::Api;
-use mlx_rs::Array;
 use mlx_rs::ops::indexing::TryIndexOp;
+use mlx_rs::Array;
 
 use super::{DeviceHint, EmbedBackend, Encoding};
 
@@ -47,13 +47,13 @@ fn opt_to_fp16(arr: Option<Array>) -> crate::Result<Option<Array>> {
 /// Which BERT variant the loaded weights correspond to.
 ///
 /// `ClassicBert` uses learned position embeddings, GELU activation, and
-/// biased QKV projections. `NomicBert` uses RoPE, SwiGLU, and unbiased
+/// biased QKV projections. `NomicBert` uses `RoPE`, `SwiGLU`, and unbiased
 /// projections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelVariant {
     /// Standard BERT / BGE models (e.g. `BAAI/bge-small-en-v1.5`).
     ClassicBert,
-    /// NomicBert models (e.g. `nomic-ai/CodeRankEmbed`, `nomic-embed-text-v1.5`).
+    /// `NomicBert` models (e.g. `nomic-ai/CodeRankEmbed`, `nomic-embed-text-v1.5`).
     NomicBert,
 }
 
@@ -75,7 +75,7 @@ fn detect_variant(weights: &HashMap<String, Array>) -> ModelVariant {
 
 /// Configuration for a BERT-style encoder model.
 ///
-/// Matches the `config.json` schema from HuggingFace model repos.
+/// Matches the `config.json` schema from `HuggingFace` model repos.
 /// Supports both `ClassicBert` and `NomicBert` config key names.
 #[derive(Debug, Clone)]
 struct BertConfig {
@@ -97,6 +97,10 @@ struct BertConfig {
 
 impl BertConfig {
     /// Parse from a `config.json` value, dispatching on `variant`.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "HuggingFace config ints (hidden_size, num_layers, etc.) always fit in i32"
+    )]
     fn from_json(v: &serde_json::Value, variant: ModelVariant) -> crate::Result<Self> {
         let get_i32 = |key: &str| -> crate::Result<i32> {
             v.get(key)
@@ -179,8 +183,12 @@ struct RopeCache {
 }
 
 impl RopeCache {
-    /// Build the RoPE cache for the given head dimension, base, and max
+    /// Build the `RoPE` cache for the given head dimension, base, and max
     /// sequence length.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "head_dim is always small (≤ 128 for BERT); i32 → f32 is lossless here"
+    )]
     fn new(head_dim: i32, base: f32, max_seq: i32) -> crate::Result<Self> {
         let half_dim = head_dim / 2;
 
@@ -258,11 +266,11 @@ fn apply_rope(q: &Array, k: &Array, cache: &RopeCache) -> crate::Result<(Array, 
 // BERT building blocks (manual weight assignment, no derive macros)
 // ---------------------------------------------------------------------------
 
-/// BERT embeddings layer: word + optional(position + token_type) + LayerNorm.
+/// BERT embeddings layer: word + optional(position + `token_type`) + `LayerNorm`.
 ///
-/// For `ClassicBert`, position and token_type embeddings are summed with word
-/// embeddings. For `NomicBert`, only word embeddings + LayerNorm are used
-/// (positions are handled by RoPE in each attention layer).
+/// For `ClassicBert`, position and `token_type` embeddings are summed with word
+/// embeddings. For `NomicBert`, only word embeddings + `LayerNorm` are used
+/// (positions are handled by `RoPE` in each attention layer).
 #[derive(Debug)]
 struct BertEmbeddings {
     word_embeddings: Array,
@@ -317,7 +325,7 @@ impl BertEmbeddings {
 /// This eliminates 2 kernel launches per layer (24 total for 12-layer BERT).
 ///
 /// For `ClassicBert`, projections include bias terms and no rotary encoding.
-/// For `NomicBert`, projections are unbiased and RoPE is applied to Q and K
+/// For `NomicBert`, projections are unbiased and `RoPE` is applied to Q and K
 /// after reshaping to head layout.
 #[derive(Debug)]
 struct BertSelfAttention {
@@ -332,7 +340,7 @@ struct BertSelfAttention {
     num_heads: i32,
     head_dim: i32,
     layer_norm_eps: f32,
-    /// Pre-computed RoPE cos/sin tables (`NomicBert` only).
+    /// Pre-computed `RoPE` cos/sin tables (`NomicBert` only).
     rope_cache: Option<RopeCache>,
 }
 
@@ -348,11 +356,15 @@ fn linear(input: &Array, weight: &Array, bias: Option<&Array>) -> crate::Result<
 }
 
 impl BertSelfAttention {
-    /// Scaled dot-product multi-head attention with residual + LayerNorm.
+    /// Scaled dot-product multi-head attention with residual + `LayerNorm`.
     ///
-    /// Both variants use post-norm: attention → residual → LayerNorm.
-    /// NomicBert config has `prenorm: false` (same as ClassicBert).
-    /// The only NomicBert differences are RoPE and no bias.
+    /// Both variants use post-norm: attention → residual → `LayerNorm`.
+    /// `NomicBert` config has `prenorm: false` (same as `ClassicBert`).
+    /// The only `NomicBert` differences are `RoPE` and no bias.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "head_dim is always small (≤ 128 for BERT); i32 → f32 is lossless here"
+    )]
     fn forward(&self, hidden: &Array, attention_mask: &Array) -> crate::Result<Array> {
         let batch = hidden.shape()[0];
         let seq_len = hidden.shape()[1];
@@ -414,7 +426,7 @@ impl BertSelfAttention {
 /// Feed-forward network sub-layer within a BERT encoder layer.
 ///
 /// `ClassicBert`: Linear -> GELU -> Linear (all with bias).
-/// `NomicBert`: Linear -> SwiGLU split -> Linear (no bias).
+/// `NomicBert`: Linear -> `SwiGLU` split -> Linear (no bias).
 /// The intermediate weight for `NomicBert` is `[hidden, 2*intermediate]`;
 /// the output is split into gate and value, then `SiLU(gate) * value`.
 #[derive(Debug)]
@@ -426,16 +438,16 @@ struct BertFfn {
     output_ln_weight: Array,
     output_ln_bias: Array,
     layer_norm_eps: f32,
-    /// Model variant (determines GELU vs SwiGLU activation).
+    /// Model variant (determines GELU vs `SwiGLU` activation).
     variant: ModelVariant,
 }
 
 impl BertFfn {
     /// FFN forward pass, dispatching on variant for activation function.
     ///
-    /// Both variants use post-norm: FFN → residual → LayerNorm.
-    /// ClassicBert: GELU activation.
-    /// NomicBert: SwiGLU (value * SiLU(gate), where fc11=value, fc12=gate).
+    /// Both variants use post-norm: FFN → residual → `LayerNorm`.
+    /// `ClassicBert`: GELU activation.
+    /// `NomicBert`: `SwiGLU` (value * SiLU(gate), where fc11=value, fc12=gate).
     fn forward(&self, hidden: &Array) -> crate::Result<Array> {
         // Intermediate projection
         let intermediate = linear(
@@ -546,6 +558,10 @@ impl BertModel {
     ///
     /// Uses [`take_weight`] to move arrays out of the map instead of cloning,
     /// avoiding unnecessary GPU buffer copies.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "weight loading is inherently verbose per-field"
+    )]
     fn from_weights(
         mut weights: HashMap<String, Array>,
         config: &BertConfig,
@@ -603,7 +619,7 @@ impl BertModel {
             None
         };
 
-        let mut layers = Vec::with_capacity(config.num_hidden_layers as usize);
+        let mut layers = Vec::with_capacity(usize::try_from(config.num_hidden_layers).unwrap());
         for i in 0..config.num_hidden_layers {
             let (attention, ffn) = match config.variant {
                 ModelVariant::ClassicBert => {
@@ -751,7 +767,7 @@ impl BertModel {
 /// unified memory and Metal compute shaders, avoiding the CPU bottlenecks
 /// (software GELU, allocation overhead, explicit copies) seen with Candle.
 ///
-/// Supports both `ClassicBert` (BGE) and `NomicBert` (CodeRankEmbed) model
+/// Supports both `ClassicBert` (BGE) and `NomicBert` (`CodeRankEmbed`) model
 /// families, detected automatically from weight names.
 ///
 /// The inner [`BertModel`] is wrapped in `Arc<Mutex<_>>` because MLX's
@@ -771,7 +787,7 @@ impl std::fmt::Debug for MlxBackend {
         f.debug_struct("MlxBackend")
             .field("hidden_size", &self.hidden_size)
             .field("max_position_embeddings", &self.max_position_embeddings)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -831,24 +847,25 @@ impl MlxBackend {
 /// This is pure CPU + memory work (no model needed) so it can run outside
 /// the model mutex.  Returns `(input_ids, attention_mask, token_type_ids)`.
 fn prepare_batch_tensors(encodings: &[Encoding]) -> (Array, Array, Array) {
-    let batch_size = encodings.len() as i32;
+    let batch_size = encodings.len();
     let max_len = encodings
         .iter()
         .map(|e| e.input_ids.len())
         .max()
-        .unwrap_or(0) as i32;
+        .unwrap_or(0);
 
-    let mut ids_flat = vec![0i32; (batch_size * max_len) as usize];
-    let mut mask_flat = vec![0.0_f32; (batch_size * max_len) as usize];
-    let mut types_flat = vec![0i32; (batch_size * max_len) as usize];
+    let total = batch_size * max_len;
+    let mut ids_flat = vec![0i32; total];
+    let mut mask_flat = vec![0.0_f32; total];
+    let mut types_flat = vec![0i32; total];
 
     #[expect(
         clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "token IDs from tokenizer are always non-negative and fit in i32"
+        clippy::cast_precision_loss,
+        reason = "token IDs, masks, and type IDs from tokenizer are always small non-negative values"
     )]
     for (i, enc) in encodings.iter().enumerate() {
-        let offset = i * max_len as usize;
+        let offset = i * max_len;
         for (j, (&id, (&mask, &typ))) in enc
             .input_ids
             .iter()
@@ -861,9 +878,11 @@ fn prepare_batch_tensors(encodings: &[Encoding]) -> (Array, Array, Array) {
         }
     }
 
-    let input_ids = Array::from_slice(&ids_flat, &[batch_size, max_len]);
-    let attention_mask = Array::from_slice(&mask_flat, &[batch_size, max_len]);
-    let token_type_ids = Array::from_slice(&types_flat, &[batch_size, max_len]);
+    let batch_i32 = i32::try_from(batch_size).expect("batch size fits in i32");
+    let len_i32 = i32::try_from(max_len).expect("sequence length fits in i32");
+    let input_ids = Array::from_slice(&ids_flat, &[batch_i32, len_i32]);
+    let attention_mask = Array::from_slice(&mask_flat, &[batch_i32, len_i32]);
+    let token_type_ids = Array::from_slice(&types_flat, &[batch_i32, len_i32]);
 
     (input_ids, attention_mask, token_type_ids)
 }
@@ -880,14 +899,14 @@ impl EmbedBackend for MlxBackend {
     ///
     /// Returns an error if tensor construction or the forward pass fails.
     fn embed_batch(&self, encodings: &[Encoding]) -> crate::Result<Vec<Vec<f32>>> {
-        if encodings.is_empty() {
-            return Ok(vec![]);
-        }
-
         // Sub-batch to reduce padding waste. With 128 sequences sorted by
         // descending length, a single batch pads all to the longest (~512).
         // Sub-batching into 64-sequence groups gives tighter per-group padding.
         const MLX_MAX_BATCH: usize = 64;
+
+        if encodings.is_empty() {
+            return Ok(vec![]);
+        }
         if encodings.len() > MLX_MAX_BATCH {
             let mut all_results = Vec::with_capacity(encodings.len());
             for chunk in encodings.chunks(MLX_MAX_BATCH) {
@@ -938,10 +957,11 @@ impl EmbedBackend for MlxBackend {
 
         let shape = normalized.shape();
         let flat: &[f32] = normalized.as_slice::<f32>();
-        let hidden_dim = self.hidden_size as usize;
+        let hidden_dim = usize::try_from(self.hidden_size).expect("hidden_size is positive");
+        let batch_out = usize::try_from(shape[0]).expect("batch dimension is non-negative");
 
         let mut results = Vec::with_capacity(encodings.len());
-        for i in 0..shape[0] as usize {
+        for i in 0..batch_out {
             let start = i * hidden_dim;
             results.push(flat[start..start + hidden_dim].to_vec());
         }
@@ -968,9 +988,9 @@ impl EmbedBackend for MlxBackend {
         true
     }
 
-    /// Maximum tokens from model config (512 for BERT, 8192 for NomicBert).
+    /// Maximum tokens from model config (512 for BERT, 8192 for `NomicBert`).
     fn max_tokens(&self) -> usize {
-        self.max_position_embeddings as usize
+        usize::try_from(self.max_position_embeddings).expect("max_position_embeddings is positive")
     }
 }
 
