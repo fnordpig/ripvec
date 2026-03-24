@@ -190,8 +190,18 @@ pub fn embed_all(
     let (chunks, sorted_encodings): (Vec<CodeChunk>, Vec<Option<Encoding>>) =
         paired.into_iter().unzip();
 
-    // Phase 4: Distribute pre-tokenized batches across all backends
-    let embeddings = embed_distributed(&sorted_encodings, backends, bs, profiler)?;
+    // Phase 4: Distribute pre-tokenized batches across GPU backends only.
+    // CPU backends are reserved for single-query embedding (AMX, zero overhead).
+    // Including CPU in corpus embedding causes bandwidth contention on Apple
+    // Silicon where CPU and GPU share unified memory.
+    let corpus_backends: Vec<&dyn crate::backend::EmbedBackend> =
+        backends.iter().copied().filter(|b| b.is_gpu()).collect();
+    let corpus_backends = if corpus_backends.is_empty() {
+        backends
+    } else {
+        &corpus_backends
+    };
+    let embeddings = embed_distributed(&sorted_encodings, corpus_backends, bs, profiler)?;
     profiler.embed_done();
 
     // Filter out chunks whose tokenization failed (empty embedding vectors).
@@ -242,12 +252,25 @@ pub fn search(
     // Phases 1, 2, 3, 4: walk, chunk, pre-tokenize, embed all files
     let (chunks, embeddings) = embed_all(root, backends, tokenizer, cfg, profiler)?;
 
-    // Phase 5: Embed query (using the primary backend)
+    // Phase 5: Embed query
+    //
+    // Use the CPU backend for single-query embedding when available.
+    // On Apple Silicon, Accelerate/AMX handles batch=1 with zero dispatch
+    // overhead (just CPU instructions to matrix hardware). The GPU backend
+    // has Metal command buffer submission latency that dominates for batch=1.
+    // This also eliminates GPU bandwidth contention — the GPU is idle during
+    // interactive queries, free for background reindex.
+    let query_backend: &dyn crate::backend::EmbedBackend =
+        if backends.len() > 1 && !backends[backends.len() - 1].is_gpu() {
+            backends[backends.len() - 1]
+        } else {
+            backends[0]
+        };
     let query_embedding = {
         let _span = info_span!("embed_query").entered();
         let _guard = profiler.phase("embed_query");
-        let enc = tokenize(query, tokenizer, cfg.max_tokens, backends[0].max_tokens())?;
-        let mut results = backends[0].embed_batch(&[enc])?;
+        let enc = tokenize(query, tokenizer, cfg.max_tokens, query_backend.max_tokens())?;
+        let mut results = query_backend.embed_batch(&[enc])?;
         results.pop().ok_or_else(|| {
             crate::Error::Other(anyhow::anyhow!("backend returned no embedding for query"))
         })?
