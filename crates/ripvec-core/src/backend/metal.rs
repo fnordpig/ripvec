@@ -209,6 +209,79 @@ struct KernelPipelines {
         )
     )]
     flash_attention: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    // ----- FP16 element-wise kernel variants (bandwidth optimization) -----
+    /// FP16 layer normalization with FP32 accumulator reductions.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "FP16 kernels reserved for future activation-precision pipeline"
+        )
+    )]
+    layer_norm_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// FP16 GELU activation with FP32 compute.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "FP16 kernels reserved for future activation-precision pipeline"
+        )
+    )]
+    gelu_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// FP16 fused bias + GELU with FP32 compute.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "FP16 kernels reserved for future activation-precision pipeline"
+        )
+    )]
+    fused_bias_gelu_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// FP16 fused bias + residual add.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "FP16 kernels reserved for future activation-precision pipeline"
+        )
+    )]
+    fused_bias_residual_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// FP16 fused residual add + layer norm with FP32 accumulator reductions.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "FP16 kernels reserved for future activation-precision pipeline"
+        )
+    )]
+    fused_residual_layernorm_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// FP16 bias add (in-place).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "FP16 kernels reserved for future activation-precision pipeline"
+        )
+    )]
+    add_bias_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// FP16 embedding add.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "FP16 kernels reserved for future activation-precision pipeline"
+        )
+    )]
+    add_embeddings_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// FP16 embedding lookup.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "FP16 kernels reserved for future activation-precision pipeline"
+        )
+    )]
+    embedding_lookup_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 impl KernelPipelines {
@@ -247,6 +320,15 @@ impl KernelPipelines {
             gemm_fp16: create_pipeline(device, &gemm_library, "gemm_fp16_kernel")?,
             gemm_batched_fp16: create_pipeline(device, &gemm_library, "gemm_batched_fp16_kernel")?,
             flash_attention: create_pipeline(device, &gemm_library, "flash_attention_kernel")?,
+            // FP16 element-wise kernel variants
+            layer_norm_f16: p("layer_norm_f16_kernel")?,
+            gelu_f16: p("gelu_f16_kernel")?,
+            fused_bias_gelu_f16: p("fused_bias_gelu_f16_kernel")?,
+            fused_bias_residual_f16: p("fused_bias_residual_f16_kernel")?,
+            fused_residual_layernorm_f16: p("fused_residual_layernorm_f16_kernel")?,
+            add_bias_f16: p("add_bias_f16_kernel")?,
+            add_embeddings_f16: p("add_embeddings_f16_kernel")?,
+            embedding_lookup_f16: p("embedding_lookup_f16_kernel")?,
         })
     }
 }
@@ -2815,6 +2897,35 @@ mod tests {
         assert!(pipelines.build_attn_mask.maxTotalThreadsPerThreadgroup() > 0);
         assert!(pipelines.f32_to_f16.maxTotalThreadsPerThreadgroup() > 0);
         assert!(pipelines.gemm.maxTotalThreadsPerThreadgroup() > 0);
+        // FP16 element-wise variants
+        assert!(pipelines.layer_norm_f16.maxTotalThreadsPerThreadgroup() > 0);
+        assert!(pipelines.gelu_f16.maxTotalThreadsPerThreadgroup() > 0);
+        assert!(
+            pipelines
+                .fused_bias_gelu_f16
+                .maxTotalThreadsPerThreadgroup()
+                > 0
+        );
+        assert!(
+            pipelines
+                .fused_bias_residual_f16
+                .maxTotalThreadsPerThreadgroup()
+                > 0
+        );
+        assert!(
+            pipelines
+                .fused_residual_layernorm_f16
+                .maxTotalThreadsPerThreadgroup()
+                > 0
+        );
+        assert!(pipelines.add_bias_f16.maxTotalThreadsPerThreadgroup() > 0);
+        assert!(pipelines.add_embeddings_f16.maxTotalThreadsPerThreadgroup() > 0);
+        assert!(
+            pipelines
+                .embedding_lookup_f16
+                .maxTotalThreadsPerThreadgroup()
+                > 0
+        );
     }
 
     /// Helper: create a Metal buffer from a slice of f32 values.
@@ -2879,6 +2990,48 @@ mod tests {
     /// Helper: read back f32 values from a Metal buffer.
     fn read_f32_buffer(buffer: &ProtocolObject<dyn MTLBuffer>, n: usize) -> Vec<f32> {
         unsafe { core::slice::from_raw_parts(buffer.contents().as_ptr() as *const f32, n) }.to_vec()
+    }
+
+    /// Helper: create a Metal buffer from f32 data stored as FP16 (half).
+    ///
+    /// Converts each f32 to f16 using `half::f16` and uploads to GPU.
+    fn make_f16_buffer(
+        device: &ProtocolObject<dyn MTLDevice>,
+        data: &[f32],
+    ) -> Retained<ProtocolObject<dyn MTLBuffer>> {
+        let halfs: Vec<u16> = data
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_bits())
+            .collect();
+        let size = (halfs.len() * core::mem::size_of::<u16>()) as NSUInteger;
+        unsafe {
+            device.newBufferWithBytes_length_options(
+                NonNull::new(halfs.as_ptr() as *mut c_void).unwrap(),
+                size,
+                MTLResourceOptions::StorageModeShared,
+            )
+        }
+        .expect("failed to create Metal FP16 buffer")
+    }
+
+    /// Helper: create a zero-initialized Metal buffer of `n` FP16 elements.
+    fn make_zero_f16_buffer(
+        device: &ProtocolObject<dyn MTLDevice>,
+        n: usize,
+    ) -> Retained<ProtocolObject<dyn MTLBuffer>> {
+        let size = (n * core::mem::size_of::<u16>()) as NSUInteger;
+        device
+            .newBufferWithLength_options(size, MTLResourceOptions::StorageModeShared)
+            .expect("failed to create Metal FP16 buffer")
+    }
+
+    /// Helper: read FP16 values from a Metal buffer, returning as f32.
+    fn read_f16_buffer(buffer: &ProtocolObject<dyn MTLBuffer>, n: usize) -> Vec<f32> {
+        let raw =
+            unsafe { core::slice::from_raw_parts(buffer.contents().as_ptr() as *const u16, n) };
+        raw.iter()
+            .map(|&bits| half::f16::from_bits(bits).to_f32())
+            .collect()
     }
 
     #[test]

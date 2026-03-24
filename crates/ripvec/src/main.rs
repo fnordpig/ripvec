@@ -183,6 +183,7 @@ fn load_pipeline(
             window_overlap: args.window_overlap,
         },
         text_mode: args.text_mode,
+        cascade_dim: None,
     };
 
     Ok((backends, tokenizer, search_cfg))
@@ -311,7 +312,7 @@ fn run_interactive(
         format!("{} chunks \u{2502} {}", chunks.len(), breakdown.join(", "))
     };
 
-    let index = ripvec_core::index::SearchIndex::new(chunks, &embeddings);
+    let index = ripvec_core::index::SearchIndex::new(chunks, &embeddings, None);
 
     let mut app = tui::App {
         query: String::new(),

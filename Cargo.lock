@@ -2917,6 +2917,7 @@ dependencies = [
  "criterion",
  "cudarc",
  "dirs",
+ "half",
  "hf-hub",
  "ignore",
  "libc",

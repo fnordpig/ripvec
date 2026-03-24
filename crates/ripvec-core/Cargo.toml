@@ -61,6 +61,7 @@ metal = ["dep:objc2", "dep:objc2-metal", "dep:objc2-foundation", "dep:block2", "
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+half = "2.7.1"
 tempfile.workspace = true
 tokenizers = "0.22.2"
 

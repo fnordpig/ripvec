@@ -48,6 +48,20 @@ kernel void add_one(
 /// - `l2_normalize_kernel` -- per-vector L2 normalization
 /// - `build_attn_mask_kernel` -- build float attention mask from int mask
 /// - `f32_to_f16_kernel` -- convert f32 to f16
+///
+/// ## FP16 element-wise variants (bandwidth optimization)
+///
+/// These kernels operate on `half` inputs/outputs for 2x memory bandwidth
+/// reduction on Apple Silicon. Internal reductions use FP32 accumulators.
+///
+/// - `layer_norm_f16_kernel` -- FP16 layer norm with FP32 reductions
+/// - `gelu_f16_kernel` -- FP16 GELU with FP32 compute
+/// - `fused_bias_gelu_f16_kernel` -- FP16 bias + GELU with FP32 compute
+/// - `fused_bias_residual_f16_kernel` -- FP16 bias + residual add
+/// - `fused_residual_layernorm_f16_kernel` -- FP16 residual + layernorm
+/// - `add_bias_f16_kernel` -- FP16 bias add (in-place)
+/// - `add_embeddings_f16_kernel` -- FP16 embedding add
+/// - `embedding_lookup_f16_kernel` -- FP16 embedding lookup
 pub const KERNELS: &str = r"
 #include <metal_stdlib>
 using namespace metal;
@@ -620,6 +634,227 @@ kernel void head_reshape_kernel(
     // Source: [batch*seq, hidden] = [b*seq + t, h*head_dim + d]
     int src_idx = (b * seq + t) * hidden + h * head_dim + d;
     output[idx] = input[src_idx];
+}
+
+// ===========================================================================
+// FP16 element-wise kernel variants
+//
+// These kernels operate on half-precision (FP16) inputs and outputs for 2x
+// memory bandwidth reduction on Apple Silicon GPUs. Internal reductions
+// (mean, variance in LayerNorm) use FP32 accumulators for numerical stability.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// FP16 Layer normalization with FP32 accumulators for reductions.
+// Input/output/weight/bias are half; mean/variance computed in float.
+// ---------------------------------------------------------------------------
+kernel void layer_norm_f16_kernel(
+    device half* output            [[buffer(0)]],
+    const device half* input       [[buffer(1)]],
+    const device half* weight      [[buffer(2)]],
+    const device half* bias        [[buffer(3)]],
+    constant int& rows             [[buffer(4)]],
+    constant int& cols             [[buffer(5)]],
+    constant float& eps            [[buffer(6)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tpg [[threads_per_threadgroup]]
+) {
+    if (row >= uint(rows)) return;
+    threadgroup float sdata[256];
+
+    // Pass 1: compute mean (FP32 accumulator)
+    float thread_sum = 0.0;
+    for (int i = int(tid); i < cols; i += int(tpg)) {
+        thread_sum += float(input[row * uint(cols) + uint(i)]);
+    }
+    sdata[tid] = thread_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tpg / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float mean = sdata[0] / float(cols);
+
+    // Pass 2: variance (FP32 accumulator)
+    float thread_var = 0.0;
+    for (int i = int(tid); i < cols; i += int(tpg)) {
+        float diff = float(input[row * uint(cols) + uint(i)]) - mean;
+        thread_var += diff * diff;
+    }
+    sdata[tid] = thread_var;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tpg / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_std = rsqrt(sdata[0] / float(cols) + eps);
+
+    // Pass 3: normalize + scale + shift (write as half)
+    for (int i = int(tid); i < cols; i += int(tpg)) {
+        uint idx = row * uint(cols) + uint(i);
+        float val = (float(input[idx]) - mean) * inv_std;
+        output[idx] = half(val * float(weight[i]) + float(bias[i]));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FP16 GELU activation (tanh approximation, in-place).
+// Read as half, compute in float, write as half.
+// ---------------------------------------------------------------------------
+kernel void gelu_f16_kernel(
+    device half* x                 [[buffer(0)]],
+    constant int& n                [[buffer(1)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= uint(n)) return;
+    float v = float(x[i]);
+    float inner = 0.7978845608 * (v + 0.044715 * v * v * v);
+    inner = clamp(inner, -10.0f, 10.0f);
+    x[i] = half(0.5 * v * (1.0 + tanh(inner)));
+}
+
+// ---------------------------------------------------------------------------
+// FP16 fused bias + GELU activation.
+// Read as half, accumulate in float, write as half.
+// ---------------------------------------------------------------------------
+kernel void fused_bias_gelu_f16_kernel(
+    device half* x                 [[buffer(0)]],
+    const device half* bias        [[buffer(1)]],
+    constant int& rows             [[buffer(2)]],
+    constant int& cols             [[buffer(3)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= uint(rows * cols)) return;
+    int col = int(idx) % cols;
+    float v = float(x[idx]) + float(bias[col]);
+    float inner = 0.7978845608 * (v + 0.044715 * v * v * v);
+    inner = clamp(inner, -10.0f, 10.0f);
+    x[idx] = half(0.5 * v * (1.0 + tanh(inner)));
+}
+
+// ---------------------------------------------------------------------------
+// FP16 fused bias + residual add.
+// Simple element-wise: half precision throughout.
+// ---------------------------------------------------------------------------
+kernel void fused_bias_residual_f16_kernel(
+    device half* output            [[buffer(0)]],
+    const device half* input       [[buffer(1)]],
+    const device half* bias        [[buffer(2)]],
+    const device half* residual    [[buffer(3)]],
+    constant int& rows             [[buffer(4)]],
+    constant int& cols             [[buffer(5)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= uint(rows * cols)) return;
+    output[idx] = input[idx] + bias[int(idx) % cols] + residual[idx];
+}
+
+// ---------------------------------------------------------------------------
+// FP16 fused residual add + layer norm.
+// Residual add is element-wise half; reductions use FP32 accumulators.
+// ---------------------------------------------------------------------------
+kernel void fused_residual_layernorm_f16_kernel(
+    device half* output            [[buffer(0)]],
+    const device half* hidden      [[buffer(1)]],
+    const device half* residual    [[buffer(2)]],
+    const device half* weight      [[buffer(3)]],
+    const device half* bias        [[buffer(4)]],
+    constant int& rows             [[buffer(5)]],
+    constant int& cols             [[buffer(6)]],
+    constant float& eps            [[buffer(7)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tpg [[threads_per_threadgroup]]
+) {
+    if (row >= uint(rows)) return;
+    threadgroup float sdata[256];
+
+    // Pass 1: add residual + compute mean (FP32 accumulator)
+    float thread_sum = 0.0;
+    for (int i = int(tid); i < cols; i += int(tpg)) {
+        float val = float(hidden[row * uint(cols) + uint(i)]) + float(residual[row * uint(cols) + uint(i)]);
+        output[row * uint(cols) + uint(i)] = half(val);
+        thread_sum += val;
+    }
+    sdata[tid] = thread_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tpg / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float mean = sdata[0] / float(cols);
+
+    // Pass 2: variance (FP32 accumulator)
+    float thread_var = 0.0;
+    for (int i = int(tid); i < cols; i += int(tpg)) {
+        float diff = float(output[row * uint(cols) + uint(i)]) - mean;
+        thread_var += diff * diff;
+    }
+    sdata[tid] = thread_var;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tpg / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_std = rsqrt(sdata[0] / float(cols) + eps);
+
+    // Pass 3: normalize + scale + shift (write as half)
+    for (int i = int(tid); i < cols; i += int(tpg)) {
+        uint idx = row * uint(cols) + uint(i);
+        float val = (float(output[idx]) - mean) * inv_std;
+        output[idx] = half(val * float(weight[i]) + float(bias[i]));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FP16 add bias: x[idx] += bias[idx % cols] (in-place, half precision)
+// ---------------------------------------------------------------------------
+kernel void add_bias_f16_kernel(
+    device half* x                 [[buffer(0)]],
+    const device half* bias        [[buffer(1)]],
+    constant int& rows             [[buffer(2)]],
+    constant int& cols             [[buffer(3)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= uint(rows * cols)) return;
+    x[idx] += bias[int(idx) % cols];
+}
+
+// ---------------------------------------------------------------------------
+// FP16 add embeddings: output[idx] += table[indices[token] * hidden_dim + dim]
+// Table stays half; output is half.
+// ---------------------------------------------------------------------------
+kernel void add_embeddings_f16_kernel(
+    device half* output            [[buffer(0)]],
+    const device half* table       [[buffer(1)]],
+    const device int* indices      [[buffer(2)]],
+    constant int& batch_seq        [[buffer(3)]],
+    constant int& hidden_dim       [[buffer(4)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= uint(batch_seq * hidden_dim)) return;
+    int token = int(idx) / hidden_dim;
+    int dim = int(idx) % hidden_dim;
+    output[idx] += table[indices[token] * hidden_dim + dim];
+}
+
+// ---------------------------------------------------------------------------
+// FP16 embedding lookup: output[idx] = table[indices[token] * hidden_dim + dim]
+// Table stays half; output is half.
+// ---------------------------------------------------------------------------
+kernel void embedding_lookup_f16_kernel(
+    device half* output            [[buffer(0)]],
+    const device half* table       [[buffer(1)]],
+    const device int* indices      [[buffer(2)]],
+    constant int& batch_seq        [[buffer(3)]],
+    constant int& hidden_dim       [[buffer(4)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= uint(batch_seq * hidden_dim)) return;
+    int token = int(idx) / hidden_dim;
+    int dim = int(idx) % hidden_dim;
+    output[idx] = table[indices[token] * hidden_dim + dim];
 }
 ";
 
