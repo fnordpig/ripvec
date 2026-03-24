@@ -1658,13 +1658,19 @@ impl MetalBackend {
             dispatch_1d(encoder, &self.kernels.rope_cached, total_rope as usize);
         }
 
-        // --- Attention via batched GEMM (faster than FlashAttention for small models) ---
+        // --- Attention via batched GEMM ---
+        // Batched Q@K^T → softmax → batched scores@V.
         //
-        // FlashAttention kernel exists in metal_kernels.rs (flash_attention_kernel)
-        // but uses scalar dot products — slower than simdgroup hardware matmul for
-        // BGE-small's small attention matrices (seq×seq×32). The memory bandwidth
-        // savings don't offset the compute loss. Needs simdgroup matmul integration
-        // to beat the batched GEMM approach. Kept for future larger-model support.
+        // This is FASTER than FlashAttention for BGE-small (head_dim=32) because:
+        // 1. Specialized GEMM kernel with simdgroup matmul runs at peak efficiency
+        // 2. Scores matrix is small (~768KB total) — fits in cache, global bandwidth cheap
+        // 3. Metal overlaps kernel execution (pipelining 3 dispatches)
+        //
+        // FlashAttention kernel (flash_attention_kernel in metal_kernels.rs) was
+        // implemented with simdgroup matmul but benchmarked 116/s vs 148/s for
+        // batched GEMM. The FA kernel's threadgroup barriers and cooperative loads
+        // add overhead that doesn't pay off at this model size. FA will help for
+        // larger models (768-dim+, 64+ head_dim) where scores memory traffic dominates.
         let stride_qk = (max_seq * head_dim) as u32;
         let stride_scores = (max_seq * max_seq) as u32;
 

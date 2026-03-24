@@ -1105,54 +1105,45 @@ kernel void gemm_batched_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// Fused FlashAttention: Q@K^T → scale → mask → softmax → @V in ONE kernel.
+// Fused FlashAttention with simdgroup hardware matrix multiply.
 //
-// Keeps attention scores in threadgroup memory — never written to global.
-// Uses online softmax (running max/sum) to stream over K/V tiles without
-// materializing the full [seq, seq] scores matrix.
+// Q@K^T and P@V use simdgroup_matrix_multiply_accumulate (8×8 tile FMA).
+// Scores stay in threadgroup memory. Online softmax streams over K/V tiles.
 //
-// Grid: (batch*num_heads, ceil(seq/TILE_Q)) — one threadgroup per (head, Q-tile).
-// Each threadgroup has 16 SIMD groups (4×4 arrangement of 8×8 tiles).
+// Grid: (batch*num_heads, ceil(seq/32)) — one threadgroup per (head, Q-tile).
+// 16 SIMD groups per threadgroup (4×4 of 8×8 tiles), 512 threads total.
 //
-// Algorithm (Flash Attention 2, Dao 2023):
-//   For each Q tile:
-//     O=0, l=0, m=-inf
-//     For each K/V tile:
-//       S = Q_tile @ K_tile^T           (simdgroup matmul → threadgroup)
-//       S = S * scale + mask            (element-wise)
-//       m_new = max(m, row_max(S))      (parallel reduction)
-//       P = exp(S - m_new)              (element-wise)
-//       l_new = exp(m-m_new)*l + row_sum(P) (parallel reduction)
-//       O = diag(exp(m-m_new)*l/l_new)*O + (1/l_new)*P@V_tile (simdgroup matmul)
-//       m=m_new, l=l_new
-//     Write O to global memory
+// Threadgroup memory budget (head_dim=32): ~17KB of 32KB limit.
 // ---------------------------------------------------------------------------
 
-constant uint FA_TILE_Q = 32;   // Q rows per threadgroup
-constant uint FA_TILE_K = 32;   // K/V rows per tile (iterated)
+constant uint FA_TQ = 32;   // Q rows per threadgroup
+constant uint FA_TK = 32;   // K/V rows per tile
+constant uint FA_HD = 32;   // head_dim (BGE-small); extend to 64 for CodeRankEmbed
 
 kernel void flash_attention_kernel(
     device float* Q              [[buffer(0)]],
     device float* K              [[buffer(1)]],
     device float* V              [[buffer(2)]],
     device float* O              [[buffer(3)]],
-    const device float* mask     [[buffer(4)]],   // [batch, seq] — 0.0 or -1e9
+    const device float* mask     [[buffer(4)]],
     constant uint& batch         [[buffer(5)]],
     constant uint& num_heads     [[buffer(6)]],
     constant uint& seq_len       [[buffer(7)]],
     constant uint& head_dim      [[buffer(8)]],
     constant float& scale        [[buffer(9)]],
-    uint3 tg_pos                 [[threadgroup_position_in_grid]],
-    uint3 tid3                   [[thread_position_in_threadgroup]],
-    uint3 tpg3                   [[threads_per_threadgroup]]
+    uint2 tg_pos                 [[threadgroup_position_in_grid]],
+    ushort simd_id               [[simdgroup_index_in_threadgroup]],
+    ushort lane_id               [[thread_index_in_simdgroup]]
 ) {
-    uint tid = tid3.x;
-    uint tpg = tpg3.x;
     uint head_idx = tg_pos.x;
     uint q_tile_idx = tg_pos.y;
     uint batch_idx = head_idx / num_heads;
-    uint qr_start = q_tile_idx * FA_TILE_Q;
+    uint qr_start = q_tile_idx * FA_TQ;
     if (qr_start >= seq_len) return;
+
+    // Flat thread ID for cooperative loads (0..511)
+    uint tid = uint(simd_id) * 32 + uint(lane_id);
+    constexpr uint TPG = 512;
 
     uint head_stride = seq_len * head_dim;
     device float* Q_head = Q + head_idx * head_stride;
@@ -1161,139 +1152,161 @@ kernel void flash_attention_kernel(
     device float* O_head = O + head_idx * head_stride;
     const device float* mask_batch = mask + batch_idx * seq_len;
 
-    // Threadgroup memory — budget: 32KB (32768 bytes)
-    // K and V share a buffer (loaded sequentially, not simultaneously).
-    // For head_dim=32: q=4KB, kv=4KB, s=4KB, o=4KB, stats=512B = 16.5KB
-    // For head_dim=64: q=8KB, kv=8KB, s=4KB, o=8KB, stats=512B = 28.5KB
-    threadgroup float q_buf[32 * 64];      // Q tile [TILE_Q, head_dim] — max 8KB
-    threadgroup float kv_buf[32 * 64];     // K then V tile [TILE_K, head_dim] — shared, max 8KB
-    threadgroup float s_buf[32 * 32];      // scores [TILE_Q, TILE_K] — 4KB
-    threadgroup float o_buf[32 * 64];      // output accumulator [TILE_Q, head_dim] — max 8KB
-    threadgroup float m_buf[32];           // running row max [TILE_Q] — 128B
-    threadgroup float l_buf[32];           // running row sum [TILE_Q] — 128B
-    threadgroup float rescale_buf[32];     // per-row rescale factor — 128B
-    threadgroup float inv_l_buf[32];       // per-row 1/l_new — 128B
+    // SIMD group layout: 4×4 of 8×8 sub-tiles within 32×32 output
+    ushort2 morton_off = morton_order(lane_id);
+    ushort2 sid(simd_id % 4, simd_id / 4);
+    // Per-thread position within the 32×32 tile
+    ushort2 tile_pos(sid.x * 8 + morton_off.x, sid.y * 8 + morton_off.y);
 
-    // Initialize running statistics and output
-    for (uint i = tid; i < FA_TILE_Q; i += tpg) {
-        m_buf[i] = -1e30;
-        l_buf[i] = 0.0;
-    }
-    for (uint i = tid; i < FA_TILE_Q * head_dim; i += tpg) {
-        o_buf[i] = 0.0;
-    }
+    // Threadgroup memory (~17KB for head_dim=32)
+    threadgroup float q_tg[FA_TQ * FA_HD];       // Q tile [32, 32] = 4KB
+    threadgroup float kv_tg[FA_TK * FA_HD];      // K then V [32, 32] = 4KB (shared)
+    threadgroup float s_tg[FA_TQ * FA_TK];       // scores [32, 32] = 4KB
+    threadgroup float o_tg[FA_TQ * FA_HD];       // output [32, 32] = 4KB
+    threadgroup float m_tg[FA_TQ];               // row max [32] = 128B
+    threadgroup float l_tg[FA_TQ];               // row sum [32] = 128B
+    threadgroup float rescale_tg[FA_TQ];         // rescale [32] = 128B
+    threadgroup float inv_l_tg[FA_TQ];           // 1/l [32] = 128B
 
-    // Load Q tile (once — reused across all K/V tiles)
-    for (uint i = tid; i < FA_TILE_Q * head_dim; i += tpg) {
-        uint row = i / head_dim;
-        uint col = i % head_dim;
-        uint global_row = qr_start + row;
-        q_buf[i] = (global_row < seq_len) ? Q_head[global_row * head_dim + col] : 0.0;
+    // --- Init ---
+    for (uint i = tid; i < FA_TQ; i += TPG) { m_tg[i] = -1e30; l_tg[i] = 0.0; }
+    for (uint i = tid; i < FA_TQ * FA_HD; i += TPG) { o_tg[i] = 0.0; }
+
+    // --- Load Q tile (once) ---
+    for (uint i = tid; i < FA_TQ * head_dim; i += TPG) {
+        uint row = i / head_dim, col = i % head_dim;
+        uint gr = qr_start + row;
+        q_tg[i] = (gr < seq_len) ? Q_head[gr * head_dim + col] : 0.0;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Iterate over K/V tiles. K and V share kv_buf (loaded sequentially).
-    for (uint kv_start = 0; kv_start < seq_len; kv_start += FA_TILE_K) {
+    // === K/V tile loop ===
+    for (uint kv_start = 0; kv_start < seq_len; kv_start += FA_TK) {
 
-        // --- Load K tile into kv_buf --- (all threads)
-        for (uint i = tid; i < FA_TILE_K * head_dim; i += tpg) {
-            uint row = i / head_dim;
-            uint col = i % head_dim;
-            uint global_row = kv_start + row;
-            kv_buf[i] = (global_row < seq_len) ? K_head[global_row * head_dim + col] : 0.0;
+        // --- Load K tile --- (cooperative, all 512 threads)
+        for (uint i = tid; i < FA_TK * head_dim; i += TPG) {
+            uint row = i / head_dim, col = i % head_dim;
+            uint gr = kv_start + row;
+            kv_tg[i] = (gr < seq_len) ? K_head[gr * head_dim + col] : 0.0;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // --- Phase 1: S = Q @ K^T * scale + mask --- (all threads)
-        for (uint idx = tid; idx < FA_TILE_Q * FA_TILE_K; idx += tpg) {
-            uint qi = idx / FA_TILE_K;
-            uint kj = idx % FA_TILE_K;
-            float dot = 0.0;
-            for (uint d = 0; d < head_dim; d++) {
-                dot += q_buf[qi * head_dim + d] * kv_buf[kj * head_dim + d];
+        // --- Phase 1: S = Q @ K^T via simdgroup matmul → s_tg ---
+        {
+            simdgroup_matrix_storage<float> S_acc;
+            *(S_acc.thread_elements()) = float2(0.0);
+
+            for (uint k = 0; k < head_dim; k += 8) {
+                simdgroup_matrix_storage<float> Q_tile, K_tile;
+
+                // Load Q[tile_pos.y, k+morton.x] from threadgroup
+                threadgroup float* q_src = simdgroup_matrix_storage<float>::apply_offset(
+                    q_tg, (ushort)FA_HD, ushort2(ushort(k) + morton_off.x, tile_pos.y));
+                Q_tile.load(q_src, (ushort)FA_HD, ushort2(0, 0));
+
+                // Load K^T[k+morton.y, tile_pos.x] — transposed from kv_tg
+                threadgroup float* k_src = simdgroup_matrix_storage<float>::apply_offset(
+                    kv_tg, (ushort)FA_HD, ushort2(tile_pos.x, ushort(k) + morton_off.y), true);
+                K_tile.load(k_src, (ushort)FA_HD, ushort2(0, 0), true);
+
+                S_acc.multiply(Q_tile, K_tile, true);
             }
+
+            // Store S to threadgroup s_tg
+            threadgroup float* s_dst = simdgroup_matrix_storage<float>::apply_offset(
+                s_tg, (ushort)FA_TK, tile_pos);
+            S_acc.store(s_dst, (ushort)FA_TK, ushort2(0, 0));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // --- Phase 1b: apply scale + mask --- (all 512 threads, element-wise)
+        for (uint idx = tid; idx < FA_TQ * FA_TK; idx += TPG) {
+            uint qi = idx / FA_TK, kj = idx % FA_TK;
             float mask_val = (qr_start + qi < seq_len && kv_start + kj < seq_len)
                            ? mask_batch[kv_start + kj] : -1e30;
-            s_buf[idx] = dot * scale + mask_val;
+            s_tg[idx] = s_tg[idx] * scale + mask_val;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // --- Phase 2a: Online softmax + compute rescale factors --- (32 threads)
-        // Stores rescale_buf and inv_l_buf for phases 2b and 3.
-        if (tid < FA_TILE_Q && (qr_start + tid) < seq_len) {
+        // --- Phase 2: Online softmax + rescale factors --- (32 threads, per-row)
+        if (tid < FA_TQ && (qr_start + tid) < seq_len) {
             uint qi = tid;
-            float old_m = m_buf[qi];
-            float old_l = l_buf[qi];
+            float old_m = m_tg[qi], old_l = l_tg[qi];
 
-            // Row max of this tile's scores
             float row_max = -1e30;
-            for (uint kj = 0; kj < FA_TILE_K && kv_start + kj < seq_len; kj++) {
-                row_max = max(row_max, s_buf[qi * FA_TILE_K + kj]);
-            }
+            for (uint kj = 0; kj < FA_TK && kv_start + kj < seq_len; kj++)
+                row_max = max(row_max, s_tg[qi * FA_TK + kj]);
             float m_new = max(old_m, row_max);
 
-            // Exp(S - m_new) and row sum
             float row_sum = 0.0;
-            for (uint kj = 0; kj < FA_TILE_K; kj++) {
-                float p = (kv_start + kj < seq_len)
-                        ? exp(s_buf[qi * FA_TILE_K + kj] - m_new)
-                        : 0.0;
-                s_buf[qi * FA_TILE_K + kj] = p;
+            for (uint kj = 0; kj < FA_TK; kj++) {
+                float p = (kv_start + kj < seq_len) ? exp(s_tg[qi * FA_TK + kj] - m_new) : 0.0;
+                s_tg[qi * FA_TK + kj] = p;
                 row_sum += p;
             }
 
             float correction = exp(old_m - m_new);
             float l_new = correction * old_l + row_sum;
-
-            // Rescale factor for previous O: multiply by (correction * old_l / l_new)
-            rescale_buf[qi] = (old_l > 0.0) ? (correction * old_l / max(l_new, 1e-12)) : 0.0;
-            inv_l_buf[qi] = 1.0 / max(l_new, 1e-12);
-
-            m_buf[qi] = m_new;
-            l_buf[qi] = l_new;
+            rescale_tg[qi] = (old_l > 0.0) ? (correction * old_l / max(l_new, 1e-12)) : 0.0;
+            inv_l_tg[qi] = 1.0 / max(l_new, 1e-12);
+            m_tg[qi] = m_new;
+            l_tg[qi] = l_new;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // --- Phase 2b: Rescale O accumulator --- (all threads)
-        for (uint idx = tid; idx < FA_TILE_Q * head_dim; idx += tpg) {
-            uint qi = idx / head_dim;
-            if (qr_start + qi < seq_len) {
-                o_buf[idx] *= rescale_buf[qi];
+        // --- Load V tile --- (overwrites K in kv_tg)
+        for (uint i = tid; i < FA_TK * head_dim; i += TPG) {
+            uint row = i / head_dim, col = i % head_dim;
+            uint gr = kv_start + row;
+            kv_tg[i] = (gr < seq_len) ? V_head[gr * head_dim + col] : 0.0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // --- Phase 3: O = rescale*O + inv_l*(P@V) via simdgroup matmul ---
+        {
+            // P@V: P[32,32] @ V[32,32] → O_contrib[32,32]
+            simdgroup_matrix_storage<float> PV_acc;
+            *(PV_acc.thread_elements()) = float2(0.0);
+
+            for (uint k = 0; k < FA_TK; k += 8) {
+                simdgroup_matrix_storage<float> P_tile, V_tile;
+
+                // Load P from s_tg (softmax output)
+                threadgroup float* p_src = simdgroup_matrix_storage<float>::apply_offset(
+                    s_tg, (ushort)FA_TK, ushort2(ushort(k) + morton_off.x, tile_pos.y));
+                P_tile.load(p_src, (ushort)FA_TK, ushort2(0, 0));
+
+                // Load V from kv_tg (not transposed)
+                threadgroup float* v_src = simdgroup_matrix_storage<float>::apply_offset(
+                    kv_tg, (ushort)FA_HD, ushort2(tile_pos.x, ushort(k) + morton_off.y));
+                V_tile.load(v_src, (ushort)FA_HD, ushort2(0, 0));
+
+                PV_acc.multiply(P_tile, V_tile, true);
             }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // --- Load V tile into kv_buf (overwrites K) --- (all threads)
-        for (uint i = tid; i < FA_TILE_K * head_dim; i += tpg) {
-            uint row = i / head_dim;
-            uint col = i % head_dim;
-            uint global_row = kv_start + row;
-            kv_buf[i] = (global_row < seq_len) ? V_head[global_row * head_dim + col] : 0.0;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+            // Load current O, apply: O_new = rescale * O_prev + inv_l * PV_acc
+            threadgroup float* o_ptr = simdgroup_matrix_storage<float>::apply_offset(
+                o_tg, (ushort)FA_HD, tile_pos);
+            simdgroup_matrix_storage<float> O_prev;
+            O_prev.load(o_ptr, (ushort)FA_HD, ushort2(0, 0));
 
-        // --- Phase 3: O += (1/l) * P @ V --- (all threads)
-        for (uint idx = tid; idx < FA_TILE_Q * head_dim; idx += tpg) {
-            uint qi = idx / head_dim;
-            uint d = idx % head_dim;
-            if (qr_start + qi >= seq_len) continue;
-            float pv = 0.0;
-            for (uint kj = 0; kj < FA_TILE_K; kj++) {
-                pv += s_buf[qi * FA_TILE_K + kj] * kv_buf[kj * head_dim + d];
-            }
-            o_buf[idx] += inv_l_buf[qi] * pv;
+            float rs = rescale_tg[tile_pos.y];
+            float il = inv_l_tg[tile_pos.y];
+            float2 o_old = *(O_prev.thread_elements());
+            float2 pv_new = *(PV_acc.thread_elements());
+            *(O_prev.thread_elements()) = rs * o_old + il * pv_new;
+
+            O_prev.store(o_ptr, (ushort)FA_HD, ushort2(0, 0));
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Write output to global memory
-    for (uint i = tid; i < FA_TILE_Q * head_dim; i += tpg) {
-        uint row = i / head_dim;
-        uint global_row = qr_start + row;
-        if (global_row < seq_len) {
-            uint col = i % head_dim;
-            O_head[global_row * head_dim + col] = o_buf[i];
-        }
+    // --- Write O from threadgroup to global memory --- (cooperative)
+    for (uint i = tid; i < FA_TQ * head_dim; i += TPG) {
+        uint row = i / head_dim, col = i % head_dim;
+        uint gr = qr_start + row;
+        if (gr < seq_len)
+            O_head[gr * head_dim + col] = o_tg[i];
     }
 }
 "#;
