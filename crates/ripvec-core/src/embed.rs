@@ -648,4 +648,117 @@ mod tests {
             assert_eq!(emb.len(), 384, "embedding {i} should be 384-dim");
         }
     }
+
+    /// Truncate an embedding to `dims` dimensions and L2-normalize.
+    fn truncate_and_normalize(emb: &[f32], dims: usize) -> Vec<f32> {
+        let trunc = &emb[..dims];
+        let norm: f32 = trunc.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+        trunc.iter().map(|x| x / norm).collect()
+    }
+
+    /// Rank corpus embeddings against a query, return top-K chunk indices.
+    fn rank_topk(query: &[f32], corpus: &[Vec<f32>], k: usize) -> Vec<usize> {
+        let mut scored: Vec<(usize, f32)> = corpus
+            .iter()
+            .enumerate()
+            .map(|(i, emb)| {
+                let dot: f32 = query.iter().zip(emb).map(|(a, b)| a * b).sum();
+                (i, dot)
+            })
+            .collect();
+        scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.into_iter().take(k).map(|(i, _)| i).collect()
+    }
+
+    /// MRL retrieval recall test: does truncated search retrieve the same results?
+    ///
+    /// Embeds the ripvec codebase at full dimension, then tests whether
+    /// truncating to fewer dimensions retrieves the same top-10 results.
+    /// This is the real MRL quality test — per-vector cosine is trivially 1.0
+    /// but retrieval recall can degrade if the first N dims don't preserve
+    /// relative ordering between different vectors.
+    #[test]
+    #[ignore = "loads model + embeds; run with --nocapture"]
+    fn mrl_retrieval_recall() {
+        let model = "BAAI/bge-small-en-v1.5";
+        let backends = crate::backend::detect_backends(model).unwrap();
+        let tokenizer = crate::tokenize::load_tokenizer(model).unwrap();
+        let cfg = SearchConfig::default();
+        let profiler = crate::profile::Profiler::noop();
+
+        // Embed the ripvec source tree
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        eprintln!("Embedding {}", root.display());
+        let backend_refs: Vec<&dyn crate::backend::EmbedBackend> =
+            backends.iter().map(|b| b.as_ref()).collect();
+        let (chunks, embeddings) =
+            embed_all(root, &backend_refs, &tokenizer, &cfg, &profiler).unwrap();
+        let full_dim = embeddings[0].len();
+        eprintln!(
+            "Corpus: {} chunks, {full_dim}-dim embeddings\n",
+            chunks.len()
+        );
+
+        // Test queries spanning different semantic intents
+        let queries = [
+            "error handling in the embedding pipeline",
+            "tree-sitter chunking and AST parsing",
+            "Metal GPU kernel dispatch",
+            "file watcher for incremental reindex",
+            "cosine similarity ranking",
+        ];
+
+        let top_k = 10;
+        let mrl_dims: Vec<usize> = [32, 64, 128, 192, 256, full_dim]
+            .into_iter()
+            .filter(|&d| d <= full_dim)
+            .collect();
+
+        eprintln!("=== MRL Retrieval Recall@{top_k} (vs full {full_dim}-dim) ===\n");
+
+        for query in &queries {
+            // Embed query at full dim
+            let enc = tokenize(query, &tokenizer, 0, backends[0].max_tokens()).unwrap();
+            let query_emb = backends[0].embed_batch(&[enc]).unwrap().pop().unwrap();
+
+            // Full-dim reference ranking
+            let ref_topk = rank_topk(&query_emb, &embeddings, top_k);
+
+            eprintln!("Query: \"{query}\"");
+            eprintln!(
+                "  Full-dim top-1: {} ({})",
+                chunks[ref_topk[0]].name, chunks[ref_topk[0]].file_path
+            );
+
+            for &dims in &mrl_dims {
+                // Truncate corpus and query
+                let trunc_corpus: Vec<Vec<f32>> = embeddings
+                    .iter()
+                    .map(|e| truncate_and_normalize(e, dims))
+                    .collect();
+                let trunc_query = truncate_and_normalize(&query_emb, dims);
+
+                let trunc_topk = rank_topk(&trunc_query, &trunc_corpus, top_k);
+
+                // Recall@K: how many of the full-dim top-K appear in truncated top-K
+                let overlap = ref_topk.iter().filter(|i| trunc_topk.contains(i)).count();
+                let recall = overlap as f32 / top_k as f32;
+                let marker = if dims == full_dim {
+                    " (ref)"
+                } else if recall >= 0.8 {
+                    " ***"
+                } else {
+                    ""
+                };
+                eprintln!(
+                    "  dims={dims:>3}: Recall@{top_k}={recall:.1} ({overlap}/{top_k}){marker}"
+                );
+            }
+            eprintln!();
+        }
+    }
 }
