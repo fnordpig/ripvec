@@ -633,7 +633,7 @@ kernel void head_reshape_kernel(
 /// Includes the `metal_simdgroup_matrix_storage` header from the
 /// [metal-flash-attention](https://github.com/philipturner/metal-flash-attention)
 /// project (MIT licensed, Copyright 2024 Philip Turner).
-pub const GEMM_KERNEL: &str = r#"
+pub const GEMM_KERNEL: &str = r"
 #include <metal_stdlib>
 using namespace metal;
 
@@ -1309,4 +1309,4 @@ kernel void flash_attention_kernel(
             O_head[gr * head_dim + col] = o_tg[i];
     }
 }
-"#;
+";

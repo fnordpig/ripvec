@@ -153,6 +153,16 @@ struct KernelPipelines {
     /// Add bias in-place: `x[idx] += bias[idx % cols]`.
     add_bias: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Head reshape: `[batch*seq, hidden]` to `[batch*num_heads, seq, head_dim]`.
+    ///
+    /// No longer used in attention (replaced by fused QKV + `qkv_split`), but
+    /// kept compiled for potential future use in other reshape operations.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no longer used after QKV fusion, kept for potential future use"
+        )
+    )]
     head_reshape: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Two-input `SwiGLU`: `output = value * silu(gate)` with separate buffers.
     swiglu_two_input: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -160,7 +170,14 @@ struct KernelPipelines {
     gemm: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Batched GEMM: same kernel with z-dimension for batch/head index.
     gemm_batched: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    /// Fused FlashAttention: Q@K^T → scale → mask → softmax → @V in one kernel.
+    /// Fused `FlashAttention`: Q@K^T -> scale -> mask -> softmax -> @V in one kernel.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "batched GEMM is faster for small models; FA reserved for 768-dim+ models"
+        )
+    )]
     flash_attention: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
@@ -311,7 +328,7 @@ fn dispatch_gemm(
             core::mem::size_of::<u32>(),
             5,
         );
-        let trans_b_u32: u32 = if trans_b { 1 } else { 0 };
+        let trans_b_u32: u32 = u32::from(trans_b);
         encoder.setBytes_length_atIndex(
             std::ptr::NonNull::new(&trans_b_u32 as *const u32 as *mut _).unwrap(),
             core::mem::size_of::<u32>(),
@@ -345,7 +362,6 @@ fn dispatch_gemm(
 #[expect(
     unsafe_code,
     clippy::too_many_arguments,
-    clippy::borrow_as_ptr,
     reason = "Metal buffer binding requires unsafe setBuffer/setBytes calls with raw pointers"
 )]
 fn dispatch_gemm_batched(
@@ -377,18 +393,10 @@ fn dispatch_gemm_batched(
         encoder.setBuffer_offset_atIndex(Some(a_buffer), a_offset, 0);
         encoder.setBuffer_offset_atIndex(Some(b_buffer), b_offset, 1);
         encoder.setBuffer_offset_atIndex(Some(c_buffer), c_offset, 2);
-        let params: [u32; 7] = [
-            m,
-            n,
-            k,
-            if trans_b { 1 } else { 0 },
-            stride_a,
-            stride_b,
-            stride_c,
-        ];
+        let params: [u32; 7] = [m, n, k, u32::from(trans_b), stride_a, stride_b, stride_c];
         for (i, val) in params.iter().enumerate() {
             encoder.setBytes_length_atIndex(
-                std::ptr::NonNull::new(val as *const u32 as *mut _).unwrap(),
+                std::ptr::NonNull::new(std::ptr::from_ref::<u32>(val) as *mut _).unwrap(),
                 core::mem::size_of::<u32>(),
                 3 + i,
             );
@@ -766,18 +774,22 @@ impl BertConfig {
 // Weight references (zero-copy offsets into mmap'd safetensors)
 // ---------------------------------------------------------------------------
 
-/// Reference to a weight tensor within the mmap'd safetensors buffer.
+/// Reference to a weight tensor within a Metal buffer.
 ///
 /// Instead of copying tensor data, `WeightRef` stores the byte offset and
-/// shape so kernels can index directly into the Metal buffer backed by the
-/// mmap'd file.
+/// shape so kernels can index directly into the Metal buffer. For zero-copy
+/// weights this points into the mmap'd safetensors buffer; for fused weights
+/// (e.g. concatenated QKV) it points into an entry in `fused_weights`.
 struct WeightRef {
-    /// Byte offset from the start of the mmap into the safetensors file.
+    /// Byte offset from the start of the backing Metal buffer.
     offset: usize,
     /// Tensor shape (e.g. `[384, 384]`).
     shape: Vec<usize>,
     /// Number of f32 elements.
     numel: usize,
+    /// Which Metal buffer this ref points into.
+    /// `None` = `weight_buffer` (zero-copy mmap), `Some(idx)` = `fused_weights[idx]`.
+    buffer_idx: Option<usize>,
 }
 
 /// Parse safetensors header and extract byte offsets for all weight tensors.
@@ -815,6 +827,7 @@ fn extract_weight_refs(mmap: &[u8]) -> crate::Result<(HashMap<String, WeightRef>
                 offset,
                 shape,
                 numel,
+                buffer_idx: None,
             },
         );
     }
@@ -1110,6 +1123,7 @@ fn take_weight_ref(refs: &HashMap<String, WeightRef>, name: &str) -> crate::Resu
         offset: r.offset,
         shape: r.shape.clone(),
         numel: r.numel,
+        buffer_idx: r.buffer_idx,
     })
 }
 
@@ -1119,6 +1133,7 @@ fn try_take_weight_ref(refs: &HashMap<String, WeightRef>, name: &str) -> Option<
         offset: r.offset,
         shape: r.shape.clone(),
         numel: r.numel,
+        buffer_idx: r.buffer_idx,
     })
 }
 
@@ -1210,10 +1225,6 @@ pub struct MetalBackend {
     /// Command queue for submitting compute work.
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     /// Detected GPU chip family for kernel tuning.
-    #[expect(
-        dead_code,
-        reason = "reserved for future kernel-tuning decisions per chip family"
-    )]
     chip_family: ChipFamily,
     /// Zero-copy Metal buffer wrapping the mmap'd safetensors data.
     /// Must be declared BEFORE `_mmap` so it is dropped first.
@@ -1226,6 +1237,9 @@ pub struct MetalBackend {
     workspace: MetalWorkspace,
     /// Pre-computed `RoPE` cos/sin tables (`NomicBert` only).
     rope_cache: Option<MetalRopeCache>,
+    /// Fused weight buffers allocated at load time (`ClassicBert`: Q+K+V concatenated).
+    /// Kept alive so the [`WeightRef`]s pointing into them remain valid.
+    fused_weights: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
     /// Hidden dimension for output vector size.
     hidden_size: i32,
     /// Number of attention heads.
@@ -1336,19 +1350,8 @@ impl MetalBackend {
             None
         };
 
-        tracing::info!(
-            device = %device.name(),
-            chip_family = ?chip_family,
-            hidden_size,
-            num_heads,
-            head_dim,
-            layers = config.num_hidden_layers,
-            variant = ?variant,
-            weights_bytes = mmap.len(),
-            "Metal backend initialized with zero-copy weights + 20 MSL kernels"
-        );
-
-        Ok(Self {
+        let weights_bytes = mmap.len();
+        let mut backend = Self {
             device,
             queue,
             chip_family,
@@ -1357,13 +1360,163 @@ impl MetalBackend {
             kernels,
             workspace,
             rope_cache,
+            fused_weights: Vec::new(),
             hidden_size,
             num_heads,
             head_dim,
             variant,
             max_position_embeddings,
             _mmap: mmap,
-        })
+        };
+
+        // Fuse Q+K+V weights for ClassicBert so both variants use the same
+        // fast 2-dispatch QKV path (1 fused GEMM + 1 qkv_split).
+        if variant == ModelVariant::ClassicBert {
+            backend.fuse_qkv_weights()?;
+        }
+
+        tracing::info!(
+            device = %backend.device.name(),
+            chip_family = ?backend.chip_family,
+            hidden_size,
+            num_heads,
+            head_dim,
+            layers = config.num_hidden_layers,
+            variant = ?variant,
+            weights_bytes,
+            fused_buffers = backend.fused_weights.len(),
+            "Metal backend initialized with zero-copy weights + 20 MSL kernels"
+        );
+
+        Ok(backend)
+    }
+
+    /// Fuse separate Q, K, V weight matrices into a single `[3*hidden, hidden]`
+    /// tensor per layer, enabling the unified 2-dispatch QKV path.
+    ///
+    /// For `ClassicBert`, the safetensors file stores Q/K/V as three separate
+    /// `[hidden, hidden]` matrices. This method concatenates them into one
+    /// allocated Metal buffer per layer and updates the `WeightRef`s so
+    /// `encode_attention` can use a single fused GEMM + `qkv_split` kernel.
+    ///
+    /// Also fuses Q/K/V biases (`[hidden]` each -> `[3*hidden]`) when present.
+    #[expect(
+        unsafe_code,
+        clippy::cast_sign_loss,
+        reason = "Metal buffer creation requires unsafe FFI; hidden_size is positive"
+    )]
+    fn fuse_qkv_weights(&mut self) -> crate::Result<()> {
+        let hd = self.hidden_size as usize;
+
+        for layer in &mut self.model.layers {
+            let attn = &mut layer.attention;
+
+            // --- Fuse QKV weights ---
+            if attn.k_weight.is_some() && attn.v_weight.is_some() {
+                let q_ref = &attn.qkv_weight;
+                let k_ref = attn.k_weight.as_ref().expect("checked is_some");
+                let v_ref = attn.v_weight.as_ref().expect("checked is_some");
+
+                // Read weight data from the zero-copy mmap buffer.
+                // WeightRef.offset is a BYTE offset; cast to f32 pointer.
+                let base = self.weight_buffer.contents().as_ptr() as *const f32;
+                let q_data =
+                    unsafe { core::slice::from_raw_parts(base.add(q_ref.offset / 4), q_ref.numel) };
+                let k_data =
+                    unsafe { core::slice::from_raw_parts(base.add(k_ref.offset / 4), k_ref.numel) };
+                let v_data =
+                    unsafe { core::slice::from_raw_parts(base.add(v_ref.offset / 4), v_ref.numel) };
+
+                // Concatenate Q, K, V into [3*hidden, hidden] (Q rows, then K, then V)
+                let fused_numel = 3 * hd * hd;
+                let mut fused = Vec::with_capacity(fused_numel);
+                fused.extend_from_slice(q_data);
+                fused.extend_from_slice(k_data);
+                fused.extend_from_slice(v_data);
+
+                // Allocate a new Metal buffer for the fused weight
+                let fused_size = (fused_numel * core::mem::size_of::<f32>()) as NSUInteger;
+                let fused_buf = unsafe {
+                    self.device.newBufferWithBytes_length_options(
+                        std::ptr::NonNull::new(fused.as_ptr() as *mut _)
+                            .ok_or_else(|| crate::Error::Metal("null fused data ptr".into()))?,
+                        fused_size,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                }
+                .ok_or_else(|| crate::Error::Metal("fused QKV weight alloc failed".into()))?;
+
+                let buf_idx = self.fused_weights.len();
+                self.fused_weights.push(fused_buf);
+
+                // Update qkv_weight to point at the fused buffer
+                attn.qkv_weight = WeightRef {
+                    offset: 0,
+                    shape: vec![3 * hd, hd],
+                    numel: fused_numel,
+                    buffer_idx: Some(buf_idx),
+                };
+                attn.k_weight = None;
+                attn.v_weight = None;
+            }
+
+            // --- Fuse QKV biases ---
+            if attn.qkv_bias.is_some() && attn.k_bias.is_some() && attn.v_bias.is_some() {
+                let q_bias = attn.qkv_bias.as_ref().expect("checked is_some");
+                let k_bias = attn.k_bias.as_ref().expect("checked is_some");
+                let v_bias = attn.v_bias.as_ref().expect("checked is_some");
+
+                let base = self.weight_buffer.contents().as_ptr() as *const f32;
+                let q_data =
+                    unsafe { core::slice::from_raw_parts(base.add(q_bias.offset / 4), hd) };
+                let k_data =
+                    unsafe { core::slice::from_raw_parts(base.add(k_bias.offset / 4), hd) };
+                let v_data =
+                    unsafe { core::slice::from_raw_parts(base.add(v_bias.offset / 4), hd) };
+
+                let fused_numel = 3 * hd;
+                let mut fused = Vec::with_capacity(fused_numel);
+                fused.extend_from_slice(q_data);
+                fused.extend_from_slice(k_data);
+                fused.extend_from_slice(v_data);
+
+                let fused_size = (fused_numel * core::mem::size_of::<f32>()) as NSUInteger;
+                let fused_buf = unsafe {
+                    self.device.newBufferWithBytes_length_options(
+                        std::ptr::NonNull::new(fused.as_ptr() as *mut _)
+                            .ok_or_else(|| crate::Error::Metal("null fused bias ptr".into()))?,
+                        fused_size,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                }
+                .ok_or_else(|| crate::Error::Metal("fused QKV bias alloc failed".into()))?;
+
+                let buf_idx = self.fused_weights.len();
+                self.fused_weights.push(fused_buf);
+
+                attn.qkv_bias = Some(WeightRef {
+                    offset: 0,
+                    shape: vec![3 * hd],
+                    numel: fused_numel,
+                    buffer_idx: Some(buf_idx),
+                });
+                attn.k_bias = None;
+                attn.v_bias = None;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get the Metal buffer backing a [`WeightRef`].
+    ///
+    /// Returns `weight_buffer` for zero-copy mmap weights, or the appropriate
+    /// fused buffer for weights concatenated at load time.
+    fn weight_buf(&self, wr: &WeightRef) -> &ProtocolObject<dyn MTLBuffer> {
+        match wr.buffer_idx {
+            None => &self.weight_buffer,
+            Some(idx) => &self.fused_weights[idx],
+        }
     }
 
     /// Encode the attention sub-layer for one transformer layer.
@@ -1371,9 +1524,18 @@ impl MetalBackend {
     /// Reads from `input` buffer, writes result to `output` buffer.
     /// Uses ping-pong workspace buffers for intermediate results.
     ///
-    /// Dispatches: QKV projection -> bias -> QKV split/reshape -> `RoPE` ->
-    /// per-head attention scores -> scale+mask+softmax -> per-head output ->
-    /// reshape -> output projection -> bias+residual+layernorm.
+    /// Both `NomicBert` and `ClassicBert` use the same unified path:
+    /// 1. Fused QKV GEMM: `input @ qkv_weight^T -> workspace.qkv`
+    /// 2. Optional QKV bias add
+    /// 3. `qkv_split` kernel: split `[batch*seq, 3*hidden]` -> Q, K, V
+    /// 4. Optional `RoPE` (`NomicBert` only)
+    /// 5. Batched attention: Q@K^T -> scale+mask+softmax -> @V
+    /// 6. Reshape + output projection + residual + layer norm
+    ///
+    /// `ClassicBert` Q+K+V weights are fused at load time by
+    /// [`Self::fuse_qkv_weights`], so both variants dispatch only 2 kernels
+    /// for the QKV projection (1 GEMM + 1 split) instead of 9 (3 GEMMs + 3
+    /// bias adds + 3 head reshapes).
     #[expect(
         clippy::cast_sign_loss,
         clippy::cast_possible_truncation,
@@ -1404,204 +1566,37 @@ impl MetalBackend {
         let pad_hd = (hd as usize).next_multiple_of(8) as u32;
         let pad_3hd = (3 * hd as usize).next_multiple_of(8) as u32;
 
-        // --- QKV projection ---
-        match self.variant {
-            ModelVariant::NomicBert => {
-                // Fused QKV: one GEMM [batch*seq, hidden] @ [3*hidden, hidden]^T
-                dispatch_gemm(
-                    encoder,
-                    &self.kernels.gemm,
-                    input,
-                    0,
-                    &self.weight_buffer,
-                    attn.qkv_weight.offset,
-                    &self.workspace.qkv,
-                    0,
-                    batch_seq as u32,
-                    pad_3hd,
-                    pad_hd,
-                    true,
-                );
-            }
-            ModelVariant::ClassicBert => {
-                // Separate Q/K/V GEMMs into contiguous qkv buffer
-                // Q -> qkv[..., 0..hidden]
-                // K -> qkv[..., hidden..2*hidden]
-                // V -> qkv[..., 2*hidden..3*hidden]
-                // But GEMM writes at stride N, so we write to separate workspace
-                // buffers and then use qkv_split with head_reshape.
+        // --- Fused QKV GEMM: input @ qkv_weight^T -> workspace.qkv ---
+        // Both variants now have a single [3*hidden, hidden] qkv_weight
+        // (NomicBert natively, ClassicBert via fuse_qkv_weights at load time).
+        dispatch_gemm(
+            encoder,
+            &self.kernels.gemm,
+            input,
+            0,
+            self.weight_buf(&attn.qkv_weight),
+            attn.qkv_weight.offset,
+            &self.workspace.qkv,
+            0,
+            batch_seq as u32,
+            pad_3hd,
+            pad_hd,
+            true,
+        );
 
-                // Q: input @ Q_weight^T -> q workspace
-                dispatch_gemm(
-                    encoder,
-                    &self.kernels.gemm,
-                    input,
-                    0,
-                    &self.weight_buffer,
-                    attn.qkv_weight.offset,
-                    &self.workspace.q,
-                    0,
-                    batch_seq as u32,
-                    pad_hd,
-                    pad_hd,
-                    true,
-                );
-
-                // K: input @ K_weight^T -> k workspace
-                if let Some(ref k_weight) = attn.k_weight {
-                    dispatch_gemm(
-                        encoder,
-                        &self.kernels.gemm,
-                        input,
-                        0,
-                        &self.weight_buffer,
-                        k_weight.offset,
-                        &self.workspace.k,
-                        0,
-                        batch_seq as u32,
-                        pad_hd,
-                        pad_hd,
-                        true,
-                    );
-                }
-
-                // V: input @ V_weight^T -> v workspace
-                if let Some(ref v_weight) = attn.v_weight {
-                    dispatch_gemm(
-                        encoder,
-                        &self.kernels.gemm,
-                        input,
-                        0,
-                        &self.weight_buffer,
-                        v_weight.offset,
-                        &self.workspace.v,
-                        0,
-                        batch_seq as u32,
-                        pad_hd,
-                        pad_hd,
-                        true,
-                    );
-                }
-
-                // Add Q bias
-                if let Some(ref bias) = attn.qkv_bias {
-                    let total = batch_seq * hd;
-                    encoder.setComputePipelineState(&self.kernels.add_bias);
-                    set_buffer(encoder, &self.workspace.q, 0, 0);
-                    set_buffer(encoder, &self.weight_buffer, bias.offset, 1);
-                    set_i32_param(encoder, batch_seq, 2);
-                    set_i32_param(encoder, hd, 3);
-                    dispatch_1d(encoder, &self.kernels.add_bias, total as usize);
-                }
-
-                // Add K bias
-                if let Some(ref bias) = attn.k_bias {
-                    let total = batch_seq * hd;
-                    encoder.setComputePipelineState(&self.kernels.add_bias);
-                    set_buffer(encoder, &self.workspace.k, 0, 0);
-                    set_buffer(encoder, &self.weight_buffer, bias.offset, 1);
-                    set_i32_param(encoder, batch_seq, 2);
-                    set_i32_param(encoder, hd, 3);
-                    dispatch_1d(encoder, &self.kernels.add_bias, total as usize);
-                }
-
-                // Add V bias
-                if let Some(ref bias) = attn.v_bias {
-                    let total = batch_seq * hd;
-                    encoder.setComputePipelineState(&self.kernels.add_bias);
-                    set_buffer(encoder, &self.workspace.v, 0, 0);
-                    set_buffer(encoder, &self.weight_buffer, bias.offset, 1);
-                    set_i32_param(encoder, batch_seq, 2);
-                    set_i32_param(encoder, hd, 3);
-                    dispatch_1d(encoder, &self.kernels.add_bias, total as usize);
-                }
-
-                // Head reshape Q: [batch*seq, hidden] -> [batch*nh, seq, head_dim]
-                // Use scratch as temp, then copy back (q currently has the linear output)
-                let total_head = batch_heads * max_seq * head_dim;
-                encoder.setComputePipelineState(&self.kernels.head_reshape);
-                set_buffer(encoder, &self.workspace.scratch, 0, 0);
-                set_buffer(encoder, &self.workspace.q, 0, 1);
-                set_i32_param(encoder, batch, 2);
-                set_i32_param(encoder, max_seq, 3);
-                set_i32_param(encoder, nh, 4);
-                set_i32_param(encoder, head_dim, 5);
-                dispatch_1d(encoder, &self.kernels.head_reshape, total_head as usize);
-
-                // Copy scratch -> q (swap pointers not possible, so use attn_out as temp for k)
-                // Actually we need all 3 reshaped. Use qkv buffer as scratch space.
-                // scratch now has reshaped Q -> copy to scores (temp), reshape K to scratch, etc.
-                // This is getting complex. Let me use a simpler approach: reshape in-place is
-                // not possible, so use qkv buffer as a large scratch area.
-
-                // Q is now in scratch, we need it in q. Use context as temp for K reshape.
-                // Reshape Q: scratch -> qkv[0..total_head*4]  (reuse qkv buffer for Q)
-                // Actually let's just swap: q has linear Q, scratch has reshaped Q.
-                // We need reshaped Q in self.workspace.q. Copy scratch -> q.
-                // But we can't do a simple copy with existing kernels.
-                // Instead: reshape directly into workspace.attn_out (unused at this point),
-                // then reshape K into workspace.scratch, reshape V into workspace.context.
-                // Then do the attention GEMMs using attn_out(Q), scratch(K), context(V).
-                // After attention is done, attn_out, scratch, context can be repurposed.
-
-                // Reshape Q: q -> attn_out (as temp Q storage)
-                encoder.setComputePipelineState(&self.kernels.head_reshape);
-                set_buffer(encoder, &self.workspace.attn_out, 0, 0);
-                set_buffer(encoder, &self.workspace.q, 0, 1);
-                set_i32_param(encoder, batch, 2);
-                set_i32_param(encoder, max_seq, 3);
-                set_i32_param(encoder, nh, 4);
-                set_i32_param(encoder, head_dim, 5);
-                dispatch_1d(encoder, &self.kernels.head_reshape, total_head as usize);
-
-                // Reshape K: k -> q (reuse q buffer for reshaped K)
-                encoder.setComputePipelineState(&self.kernels.head_reshape);
-                set_buffer(encoder, &self.workspace.q, 0, 0);
-                set_buffer(encoder, &self.workspace.k, 0, 1);
-                set_i32_param(encoder, batch, 2);
-                set_i32_param(encoder, max_seq, 3);
-                set_i32_param(encoder, nh, 4);
-                set_i32_param(encoder, head_dim, 5);
-                dispatch_1d(encoder, &self.kernels.head_reshape, total_head as usize);
-
-                // Reshape V: v -> k (reuse k buffer for reshaped V)
-                encoder.setComputePipelineState(&self.kernels.head_reshape);
-                set_buffer(encoder, &self.workspace.k, 0, 0);
-                set_buffer(encoder, &self.workspace.v, 0, 1);
-                set_i32_param(encoder, batch, 2);
-                set_i32_param(encoder, max_seq, 3);
-                set_i32_param(encoder, nh, 4);
-                set_i32_param(encoder, head_dim, 5);
-                dispatch_1d(encoder, &self.kernels.head_reshape, total_head as usize);
-
-                // Now: attn_out = reshaped Q, q = reshaped K, k = reshaped V
-                // We need Q in q, K in k, V in v for the attention step.
-                // Actually, let's just use these buffers directly in the attention GEMMs
-                // with the right variable names. We'll reference attn_out as Q_buf,
-                // q as K_buf, k as V_buf below.
-
-                // Jump to the attention scores computation below -- but since we're
-                // inside the ClassicBert match arm and need to unify with NomicBert,
-                // we handle this after the match block by documenting the buffer mapping.
-                // For ClassicBert after this block:
-                //   Q is in attn_out, K is in q, V is in k
-            }
+        // --- QKV bias add (if present) ---
+        if let Some(ref bias) = attn.qkv_bias {
+            let total_qkv = batch_seq * 3 * hd;
+            encoder.setComputePipelineState(&self.kernels.add_bias);
+            set_buffer(encoder, &self.workspace.qkv, 0, 0);
+            set_buffer(encoder, self.weight_buf(bias), bias.offset, 1);
+            set_i32_param(encoder, batch_seq, 2);
+            set_i32_param(encoder, 3 * hd, 3);
+            dispatch_1d(encoder, &self.kernels.add_bias, total_qkv as usize);
         }
 
-        // --- QKV split (NomicBert) or already done (ClassicBert) ---
-        // For NomicBert: split qkv [batch*seq, 3*hidden] -> Q,K,V [batch*nh, seq, head_dim]
-        if self.variant == ModelVariant::NomicBert {
-            // Add QKV bias if present
-            if let Some(ref bias) = attn.qkv_bias {
-                let total_qkv = batch_seq * 3 * hd;
-                encoder.setComputePipelineState(&self.kernels.add_bias);
-                set_buffer(encoder, &self.workspace.qkv, 0, 0);
-                set_buffer(encoder, &self.weight_buffer, bias.offset, 1);
-                set_i32_param(encoder, batch_seq, 2);
-                set_i32_param(encoder, 3 * hd, 3);
-                dispatch_1d(encoder, &self.kernels.add_bias, total_qkv as usize);
-            }
-
+        // --- QKV split: [batch*seq, 3*hidden] -> Q,K,V [batch*nh, seq, head_dim] ---
+        {
             let total_head = batch_heads * max_seq * head_dim;
             encoder.setComputePipelineState(&self.kernels.qkv_split);
             set_buffer(encoder, &self.workspace.q, 0, 0);
@@ -1616,16 +1611,8 @@ impl MetalBackend {
             dispatch_1d(encoder, &self.kernels.qkv_split, total_head as usize);
         }
 
-        // Determine which buffers hold Q, K, V after projection + reshape
-        let (q_buf, k_buf, v_buf) = match self.variant {
-            ModelVariant::NomicBert => (&*self.workspace.q, &*self.workspace.k, &*self.workspace.v),
-            ModelVariant::ClassicBert => (
-                // After head_reshape: Q in attn_out, K in q, V in k
-                &*self.workspace.attn_out,
-                &*self.workspace.q,
-                &*self.workspace.k,
-            ),
-        };
+        // After qkv_split, Q/K/V are always in workspace.q/k/v for both variants
+        let (q_buf, k_buf, v_buf) = (&*self.workspace.q, &*self.workspace.k, &*self.workspace.v);
 
         // --- RoPE (NomicBert only) ---
         if let Some(ref rope) = self.rope_cache
@@ -1659,11 +1646,11 @@ impl MetalBackend {
         }
 
         // --- Attention via batched GEMM ---
-        // Batched Q@K^T → softmax → batched scores@V.
+        // Batched Q@K^T -> softmax -> batched scores@V.
         //
         // This is FASTER than FlashAttention for BGE-small (head_dim=32) because:
         // 1. Specialized GEMM kernel with simdgroup matmul runs at peak efficiency
-        // 2. Scores matrix is small (~768KB total) — fits in cache, global bandwidth cheap
+        // 2. Scores matrix is small (~768KB total) -- fits in cache, global bandwidth cheap
         // 3. Metal overlaps kernel execution (pipelining 3 dispatches)
         //
         // FlashAttention kernel (flash_attention_kernel in metal_kernels.rs) was
@@ -1712,10 +1699,7 @@ impl MetalBackend {
             );
         }
 
-        let attn_out_buf = match self.variant {
-            ModelVariant::NomicBert => &*self.workspace.attn_out,
-            ModelVariant::ClassicBert => &*self.workspace.v,
-        };
+        // scores @ V -> attn_out
         dispatch_gemm_batched(
             encoder,
             &self.kernels.gemm_batched,
@@ -1723,7 +1707,7 @@ impl MetalBackend {
             0,
             v_buf,
             0,
-            attn_out_buf,
+            &self.workspace.attn_out,
             0,
             max_seq as u32,
             head_dim as u32,
@@ -1740,7 +1724,7 @@ impl MetalBackend {
             let total_ctx = batch_seq * hd;
             encoder.setComputePipelineState(&self.kernels.attn_reshape);
             set_buffer(encoder, &self.workspace.context, 0, 0);
-            set_buffer(encoder, attn_out_buf, 0, 1);
+            set_buffer(encoder, &self.workspace.attn_out, 0, 1);
             set_i32_param(encoder, batch, 2);
             set_i32_param(encoder, max_seq, 3);
             set_i32_param(encoder, nh, 4);
