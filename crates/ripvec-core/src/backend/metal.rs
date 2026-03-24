@@ -25,12 +25,17 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use hf_hub::api::sync::Api;
+use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSString, NSUInteger};
 use objc2_metal::{
-    MTLBuffer, MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState,
-    MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily, MTLLibrary,
+    MTLResourceOptions, MTLSize,
+};
+use objc2_metal_performance_shaders::{
+    MPSDataType, MPSMatrix, MPSMatrixDescriptor, MPSMatrixMultiplication,
 };
 use safetensors::SafeTensors;
 
@@ -179,7 +184,12 @@ struct KernelPipelines {
     /// FP16 mixed-precision GEMM: FP32 activations x FP16 weights -> FP32 output.
     ///
     /// Uses `half x half -> float` hardware matmul with FP32 accumulator.
-    /// Reduces register pressure ~1.5x vs all-FP32, improving GPU occupancy.
+    /// Superseded by MPS `MPSMatrixMultiplication` for weight GEMMs in production.
+    /// Pipeline is compiled so the kernel remains available for standalone tests.
+    #[expect(
+        dead_code,
+        reason = "weight GEMMs now use MPS; compiled for standalone test availability"
+    )]
     gemm_fp16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Batched FP16 mixed-precision GEMM with z-dimension for batch/head index.
     #[cfg_attr(
@@ -460,9 +470,19 @@ fn dispatch_gemm_batched(
 ///
 /// Same threadgroup/tile layout as [`dispatch_gemm`].
 ///
+/// Superseded by [`dispatch_mps_gemm`] for weight GEMMs in production; retained
+/// for tests and sub-stage diagnostics.
+///
 /// # Safety
 ///
 /// Caller must ensure buffer offsets and sizes are valid.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "weight GEMMs now use MPS; kept for tests and sub-stage diagnostics"
+    )
+)]
 #[expect(
     unsafe_code,
     clippy::too_many_arguments,
@@ -532,6 +552,138 @@ fn dispatch_gemm_fp16(
     };
 
     encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_tg);
+}
+
+/// Create a compute command encoder from a command buffer.
+///
+/// Convenience wrapper that returns a [`crate::Result`] instead of an `Option`.
+fn new_encoder(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+) -> crate::Result<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>> {
+    cmd_buf
+        .computeCommandEncoder()
+        .ok_or_else(|| crate::Error::Metal("failed to create compute encoder".into()))
+}
+
+/// Dispatch a GEMM using Apple's MPS `MPSMatrixMultiplication`.
+///
+/// Encodes C\[M,N\] = alpha * A\[M,K\] * B\[K,N\] (or B^T when `trans_b`) + beta * C
+/// directly onto the command buffer. MPS is hand-tuned per chip family and
+/// typically 2-5x faster than our custom simdgroup GEMM for large weight matrices.
+///
+/// **Important**: MPS encodes directly to the command buffer, not to a compute
+/// encoder. The caller must `endEncoding()` any active compute encoder before
+/// calling this, and create a new encoder afterwards.
+///
+/// For FP16 weights with FP32 activations: pass the FP16 buffer for B and
+/// `MPSDataType::Float16` for `b_data_type`. MPS will produce FP32 output.
+///
+/// # Safety
+///
+/// Caller must ensure buffer offsets and sizes are valid.
+#[expect(
+    unsafe_code,
+    clippy::too_many_arguments,
+    reason = "MPS matrix creation requires unsafe objc2 calls with many dimension parameters"
+)]
+fn dispatch_mps_gemm(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    device: &ProtocolObject<dyn MTLDevice>,
+    a_buffer: &ProtocolObject<dyn MTLBuffer>,
+    a_offset: usize,
+    b_buffer: &ProtocolObject<dyn MTLBuffer>,
+    b_offset: usize,
+    c_buffer: &ProtocolObject<dyn MTLBuffer>,
+    c_offset: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    trans_b: bool,
+    a_data_type: MPSDataType,
+    b_data_type: MPSDataType,
+) {
+    let a_elem_size = if a_data_type == MPSDataType::Float16 {
+        2
+    } else {
+        4
+    };
+    let b_elem_size = if b_data_type == MPSDataType::Float16 {
+        2
+    } else {
+        4
+    };
+
+    // Row bytes = columns * element_size
+    let a_row_bytes = k * a_elem_size;
+    let c_row_bytes = n * 4; // output is always FP32
+
+    // B layout depends on transposition:
+    // - trans_b=true:  B is [N,K] stored row-major, row_bytes = K * elem_size
+    // - trans_b=false: B is [K,N] stored row-major, row_bytes = N * elem_size
+    let (b_rows, b_cols, b_row_bytes) = if trans_b {
+        (n, k, k * b_elem_size)
+    } else {
+        (k, n, n * b_elem_size)
+    };
+
+    unsafe {
+        // Create matrix descriptors
+        let desc_a = MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
+            m as NSUInteger,
+            k as NSUInteger,
+            a_row_bytes as NSUInteger,
+            a_data_type,
+        );
+        let desc_b = MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
+            b_rows as NSUInteger,
+            b_cols as NSUInteger,
+            b_row_bytes as NSUInteger,
+            b_data_type,
+        );
+        let desc_c = MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
+            m as NSUInteger,
+            n as NSUInteger,
+            c_row_bytes as NSUInteger,
+            MPSDataType::Float32,
+        );
+
+        // Wrap Metal buffers as MPS matrices (with byte offsets)
+        let mat_a = MPSMatrix::initWithBuffer_offset_descriptor(
+            MPSMatrix::alloc(),
+            a_buffer,
+            a_offset as NSUInteger,
+            &desc_a,
+        );
+        let mat_b = MPSMatrix::initWithBuffer_offset_descriptor(
+            MPSMatrix::alloc(),
+            b_buffer,
+            b_offset as NSUInteger,
+            &desc_b,
+        );
+        let mat_c = MPSMatrix::initWithBuffer_offset_descriptor(
+            MPSMatrix::alloc(),
+            c_buffer,
+            c_offset as NSUInteger,
+            &desc_c,
+        );
+
+        // Create and encode the multiplication
+        let gemm = MPSMatrixMultiplication::initWithDevice_transposeLeft_transposeRight_resultRows_resultColumns_interiorColumns_alpha_beta(
+            MPSMatrixMultiplication::alloc(),
+            device,
+            false,      // transposeLeft
+            trans_b,    // transposeRight
+            m as NSUInteger,
+            n as NSUInteger,
+            k as NSUInteger,
+            1.0,        // alpha
+            0.0,        // beta
+        );
+
+        gemm.encodeToCommandBuffer_leftMatrix_rightMatrix_resultMatrix(
+            cmd_buf, &mat_a, &mat_b, &mat_c,
+        );
+    }
 }
 
 /// Maximum batch size for pre-allocated workspace buffers.
@@ -1756,23 +1908,21 @@ impl MetalBackend {
     /// bias adds + 3 head reshapes).
     #[expect(
         clippy::cast_sign_loss,
-        clippy::cast_possible_truncation,
         clippy::too_many_arguments,
         clippy::too_many_lines,
         clippy::cast_precision_loss,
-        clippy::similar_names,
-        reason = "monolithic GPU attention dispatch requires many args, lines, and integer casts"
+        reason = "GPU attention dispatch requires many args, lines, and integer casts"
     )]
     fn encode_attention(
         &self,
-        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
         layer: &MetalBertLayer,
         input: &ProtocolObject<dyn MTLBuffer>,
         output: &ProtocolObject<dyn MTLBuffer>,
         mask: &ProtocolObject<dyn MTLBuffer>,
         batch: i32,
         max_seq: i32,
-    ) {
+    ) -> crate::Result<()> {
         let hd = self.hidden_size;
         let nh = self.num_heads;
         let head_dim = self.head_dim;
@@ -1780,258 +1930,237 @@ impl MetalBackend {
         let batch_heads = batch * nh;
         let attn = &layer.attention;
 
-        // Padded dimensions for GEMM (must be multiple of 8 for simdgroup tiles)
-        let pad_hd = (hd as usize).next_multiple_of(8) as u32;
-        let pad_3hd = (3 * hd as usize).next_multiple_of(8) as u32;
-
-        // --- Fused QKV GEMM: input @ qkv_weight^T -> workspace.qkv ---
-        // Both variants now have a single [3*hidden, hidden] qkv_weight
-        // (NomicBert natively, ClassicBert via fuse_qkv_weights at load time).
-        // Uses FP16 mixed-precision: FP32 activations × FP16 weights → FP32 output.
-        dispatch_gemm_fp16(
-            encoder,
-            &self.kernels.gemm_fp16,
+        // --- QKV GEMM via MPS: input @ qkv_weight^T -> workspace.qkv ---
+        // MPS encodes directly to the command buffer (no compute encoder).
+        // FP16 weights: MPS handles mixed-precision internally.
+        dispatch_mps_gemm(
+            cmd_buf,
+            &self.device,
             input,
             0,
             self.fp16_weight_buf(&attn.qkv_weight),
             attn.qkv_weight.offset / 2,
             &self.workspace.qkv,
             0,
-            batch_seq as u32,
-            pad_3hd,
-            pad_hd,
+            batch_seq as usize,
+            (3 * hd) as usize,
+            hd as usize,
             true,
+            MPSDataType::Float32,
+            MPSDataType::Float16,
         );
 
-        // --- QKV bias add (if present) ---
-        if let Some(ref bias) = attn.qkv_bias {
-            let total_qkv = batch_seq * 3 * hd;
-            encoder.setComputePipelineState(&self.kernels.add_bias);
-            set_buffer(encoder, &self.workspace.qkv, 0, 0);
-            set_buffer(encoder, self.weight_buf(bias), bias.offset, 1);
-            set_i32_param(encoder, batch_seq, 2);
-            set_i32_param(encoder, 3 * hd, 3);
-            dispatch_1d(encoder, &self.kernels.add_bias, total_qkv as usize);
-        }
-
-        // --- QKV split: [batch*seq, 3*hidden] -> Q,K,V [batch*nh, seq, head_dim] ---
+        // --- Compute encoder for QKV post-processing + attention ---
         {
-            let total_head = batch_heads * max_seq * head_dim;
-            encoder.setComputePipelineState(&self.kernels.qkv_split);
-            set_buffer(encoder, &self.workspace.q, 0, 0);
-            set_buffer(encoder, &self.workspace.k, 0, 1);
-            set_buffer(encoder, &self.workspace.v, 0, 2);
-            set_buffer(encoder, &self.workspace.qkv, 0, 3);
-            set_i32_param(encoder, batch, 4);
-            set_i32_param(encoder, max_seq, 5);
-            set_i32_param(encoder, hd, 6);
-            set_i32_param(encoder, nh, 7);
-            set_i32_param(encoder, head_dim, 8);
-            dispatch_1d(encoder, &self.kernels.qkv_split, total_head as usize);
-        }
+            let enc = new_encoder(cmd_buf)?;
 
-        // After qkv_split, Q/K/V are always in workspace.q/k/v for both variants
-        let (q_buf, k_buf, v_buf) = (&*self.workspace.q, &*self.workspace.k, &*self.workspace.v);
+            // QKV bias add (if present)
+            if let Some(ref bias) = attn.qkv_bias {
+                let total_qkv = batch_seq * 3 * hd;
+                enc.setComputePipelineState(&self.kernels.add_bias);
+                set_buffer(&enc, &self.workspace.qkv, 0, 0);
+                set_buffer(&enc, self.weight_buf(bias), bias.offset, 1);
+                set_i32_param(&enc, batch_seq, 2);
+                set_i32_param(&enc, 3 * hd, 3);
+                dispatch_1d(&enc, &self.kernels.add_bias, total_qkv as usize);
+            }
 
-        // --- RoPE (NomicBert only) ---
-        if let Some(ref rope) = self.rope_cache
-            && attn.rotary_emb_base.is_some()
-        {
-            let half = head_dim / 2;
-            let num_rows = batch_heads * max_seq;
-            let total_rope = num_rows * half;
+            // QKV split: [batch*seq, 3*hidden] -> Q,K,V [batch*nh, seq, head_dim]
+            {
+                let total_head = batch_heads * max_seq * head_dim;
+                enc.setComputePipelineState(&self.kernels.qkv_split);
+                set_buffer(&enc, &self.workspace.q, 0, 0);
+                set_buffer(&enc, &self.workspace.k, 0, 1);
+                set_buffer(&enc, &self.workspace.v, 0, 2);
+                set_buffer(&enc, &self.workspace.qkv, 0, 3);
+                set_i32_param(&enc, batch, 4);
+                set_i32_param(&enc, max_seq, 5);
+                set_i32_param(&enc, hd, 6);
+                set_i32_param(&enc, nh, 7);
+                set_i32_param(&enc, head_dim, 8);
+                dispatch_1d(&enc, &self.kernels.qkv_split, total_head as usize);
+            }
 
-            // RoPE on Q
-            encoder.setComputePipelineState(&self.kernels.rope_cached);
-            set_buffer(encoder, q_buf, 0, 0);
-            set_buffer(encoder, &rope.cos, 0, 1);
-            set_buffer(encoder, &rope.sin, 0, 2);
-            set_i32_param(encoder, num_rows, 3);
-            set_i32_param(encoder, max_seq, 4);
-            set_i32_param(encoder, head_dim, 5);
-            set_i32_param(encoder, nh, 6);
-            dispatch_1d(encoder, &self.kernels.rope_cached, total_rope as usize);
+            let (q_buf, k_buf, v_buf) =
+                (&*self.workspace.q, &*self.workspace.k, &*self.workspace.v);
 
-            // RoPE on K
-            encoder.setComputePipelineState(&self.kernels.rope_cached);
-            set_buffer(encoder, k_buf, 0, 0);
-            set_buffer(encoder, &rope.cos, 0, 1);
-            set_buffer(encoder, &rope.sin, 0, 2);
-            set_i32_param(encoder, num_rows, 3);
-            set_i32_param(encoder, max_seq, 4);
-            set_i32_param(encoder, head_dim, 5);
-            set_i32_param(encoder, nh, 6);
-            dispatch_1d(encoder, &self.kernels.rope_cached, total_rope as usize);
-        }
+            // RoPE (NomicBert only)
+            if let Some(ref rope) = self.rope_cache
+                && attn.rotary_emb_base.is_some()
+            {
+                let half = head_dim / 2;
+                let num_rows = batch_heads * max_seq;
+                let total_rope = num_rows * half;
 
-        // --- Attention via batched GEMM ---
-        // Batched Q@K^T -> softmax -> batched scores@V.
-        //
-        // This is FASTER than FlashAttention for BGE-small (head_dim=32) because:
-        // 1. Specialized GEMM kernel with simdgroup matmul runs at peak efficiency
-        // 2. Scores matrix is small (~768KB total) -- fits in cache, global bandwidth cheap
-        // 3. Metal overlaps kernel execution (pipelining 3 dispatches)
-        //
-        // FlashAttention kernel (flash_attention_kernel in metal_kernels.rs) was
-        // implemented with simdgroup matmul but benchmarked 116/s vs 148/s for
-        // batched GEMM. The FA kernel's threadgroup barriers and cooperative loads
-        // add overhead that doesn't pay off at this model size. FA will help for
-        // larger models (768-dim+, 64+ head_dim) where scores memory traffic dominates.
-        let stride_qk = (max_seq * head_dim) as u32;
-        let stride_scores = (max_seq * max_seq) as u32;
+                enc.setComputePipelineState(&self.kernels.rope_cached);
+                set_buffer(&enc, q_buf, 0, 0);
+                set_buffer(&enc, &rope.cos, 0, 1);
+                set_buffer(&enc, &rope.sin, 0, 2);
+                set_i32_param(&enc, num_rows, 3);
+                set_i32_param(&enc, max_seq, 4);
+                set_i32_param(&enc, head_dim, 5);
+                set_i32_param(&enc, nh, 6);
+                dispatch_1d(&enc, &self.kernels.rope_cached, total_rope as usize);
 
-        dispatch_gemm_batched(
-            encoder,
-            &self.kernels.gemm_batched,
-            q_buf,
-            0,
-            k_buf,
-            0,
-            &self.workspace.scores,
-            0,
-            max_seq as u32,
-            max_seq as u32,
-            head_dim as u32,
-            true,
-            stride_qk,
-            stride_qk,
-            stride_scores,
-            batch_heads as u32,
-        );
+                enc.setComputePipelineState(&self.kernels.rope_cached);
+                set_buffer(&enc, k_buf, 0, 0);
+                set_buffer(&enc, &rope.cos, 0, 1);
+                set_buffer(&enc, &rope.sin, 0, 2);
+                set_i32_param(&enc, num_rows, 3);
+                set_i32_param(&enc, max_seq, 4);
+                set_i32_param(&enc, head_dim, 5);
+                set_i32_param(&enc, nh, 6);
+                dispatch_1d(&enc, &self.kernels.rope_cached, total_rope as usize);
+            }
 
-        {
-            let scale = 1.0_f32 / (head_dim as f32).sqrt();
-            let total_rows = batch_heads * max_seq;
-            let threads = 256.min(max_seq as usize);
-            encoder.setComputePipelineState(&self.kernels.fused_scale_mask_softmax);
-            set_buffer(encoder, &self.workspace.scores, 0, 0);
-            set_buffer(encoder, mask, 0, 1);
-            set_i32_param(encoder, batch, 2);
-            set_i32_param(encoder, nh, 3);
-            set_i32_param(encoder, max_seq, 4);
-            set_f32_param(encoder, scale, 5);
-            dispatch_rows(
-                encoder,
-                &self.kernels.fused_scale_mask_softmax,
-                total_rows as usize,
-                threads,
+            // --- Attention via batched GEMM (custom kernel -- small per-head matmuls) ---
+            // Keep as custom batched GEMM: MPS doesn't efficiently handle the
+            // strided batched pattern for small per-head matrices.
+            let stride_qk = (max_seq * head_dim) as u32;
+            let stride_scores = (max_seq * max_seq) as u32;
+
+            dispatch_gemm_batched(
+                &enc,
+                &self.kernels.gemm_batched,
+                q_buf,
+                0,
+                k_buf,
+                0,
+                &self.workspace.scores,
+                0,
+                max_seq as u32,
+                max_seq as u32,
+                head_dim as u32,
+                true,
+                stride_qk,
+                stride_qk,
+                stride_scores,
+                batch_heads as u32,
             );
+
+            {
+                let scale = 1.0_f32 / (head_dim as f32).sqrt();
+                let total_rows = batch_heads * max_seq;
+                let threads = 256.min(max_seq as usize);
+                enc.setComputePipelineState(&self.kernels.fused_scale_mask_softmax);
+                set_buffer(&enc, &self.workspace.scores, 0, 0);
+                set_buffer(&enc, mask, 0, 1);
+                set_i32_param(&enc, batch, 2);
+                set_i32_param(&enc, nh, 3);
+                set_i32_param(&enc, max_seq, 4);
+                set_f32_param(&enc, scale, 5);
+                dispatch_rows(
+                    &enc,
+                    &self.kernels.fused_scale_mask_softmax,
+                    total_rows as usize,
+                    threads,
+                );
+            }
+
+            // scores @ V -> attn_out
+            dispatch_gemm_batched(
+                &enc,
+                &self.kernels.gemm_batched,
+                &self.workspace.scores,
+                0,
+                v_buf,
+                0,
+                &self.workspace.attn_out,
+                0,
+                max_seq as u32,
+                head_dim as u32,
+                max_seq as u32,
+                false,
+                stride_scores,
+                stride_qk,
+                stride_qk,
+                batch_heads as u32,
+            );
+
+            // Reshape: [batch*nh, seq, head_dim] -> [batch*seq, hidden]
+            {
+                let total_ctx = batch_seq * hd;
+                enc.setComputePipelineState(&self.kernels.attn_reshape);
+                set_buffer(&enc, &self.workspace.context, 0, 0);
+                set_buffer(&enc, &self.workspace.attn_out, 0, 1);
+                set_i32_param(&enc, batch, 2);
+                set_i32_param(&enc, max_seq, 3);
+                set_i32_param(&enc, nh, 4);
+                set_i32_param(&enc, head_dim, 5);
+                dispatch_1d(&enc, &self.kernels.attn_reshape, total_ctx as usize);
+            }
+
+            enc.endEncoding();
         }
 
-        // scores @ V -> attn_out
-        dispatch_gemm_batched(
-            encoder,
-            &self.kernels.gemm_batched,
-            &self.workspace.scores,
-            0,
-            v_buf,
-            0,
-            &self.workspace.attn_out,
-            0,
-            max_seq as u32,
-            head_dim as u32,
-            max_seq as u32,
-            false,
-            stride_scores,
-            stride_qk,
-            stride_qk,
-            batch_heads as u32,
-        );
-
-        // --- Reshape: [batch*nh, seq, head_dim] -> [batch*seq, hidden] ---
-        {
-            let total_ctx = batch_seq * hd;
-            encoder.setComputePipelineState(&self.kernels.attn_reshape);
-            set_buffer(encoder, &self.workspace.context, 0, 0);
-            set_buffer(encoder, &self.workspace.attn_out, 0, 1);
-            set_i32_param(encoder, batch, 2);
-            set_i32_param(encoder, max_seq, 3);
-            set_i32_param(encoder, nh, 4);
-            set_i32_param(encoder, head_dim, 5);
-            dispatch_1d(encoder, &self.kernels.attn_reshape, total_ctx as usize);
-        }
-
-        // --- Output projection: context @ output_weight^T -> projected ---
-        // FP16 mixed-precision: FP32 activations × FP16 weights → FP32 output.
-        dispatch_gemm_fp16(
-            encoder,
-            &self.kernels.gemm_fp16,
+        // --- Output projection via MPS: context @ output_weight^T -> projected ---
+        dispatch_mps_gemm(
+            cmd_buf,
+            &self.device,
             &self.workspace.context,
             0,
             self.fp16_weight_buf(&attn.output_weight),
             attn.output_weight.offset / 2,
             &self.workspace.projected,
             0,
-            batch_seq as u32,
-            pad_hd,
-            pad_hd,
+            batch_seq as usize,
+            hd as usize,
+            hd as usize,
             true,
+            MPSDataType::Float32,
+            MPSDataType::Float16,
         );
 
-        // --- Bias + residual + LayerNorm ---
-        if let Some(ref bias) = attn.output_bias {
-            // Fused bias + residual: scratch = projected + bias + input
-            let total_proj = batch_seq * hd;
-            encoder.setComputePipelineState(&self.kernels.fused_bias_residual);
-            set_buffer(encoder, &self.workspace.scratch, 0, 0);
-            set_buffer(encoder, &self.workspace.projected, 0, 1);
-            set_buffer(encoder, &self.weight_buffer, bias.offset, 2);
-            set_buffer(encoder, input, 0, 3);
-            set_i32_param(encoder, batch_seq, 4);
-            set_i32_param(encoder, hd, 5);
-            dispatch_1d(
-                encoder,
-                &self.kernels.fused_bias_residual,
-                total_proj as usize,
-            );
+        // --- Bias + residual + LayerNorm (compute encoder) ---
+        {
+            let enc = new_encoder(cmd_buf)?;
 
-            // Layer norm: scratch -> output
-            let eps = attn.layer_norm_eps;
-            let threads = 256.min(hd as usize);
-            encoder.setComputePipelineState(&self.kernels.layer_norm);
-            set_buffer(encoder, output, 0, 0);
-            set_buffer(encoder, &self.workspace.scratch, 0, 1);
-            set_buffer(
-                encoder,
-                &self.weight_buffer,
-                attn.output_ln_weight.offset,
-                2,
-            );
-            set_buffer(encoder, &self.weight_buffer, attn.output_ln_bias.offset, 3);
-            set_i32_param(encoder, batch_seq, 4);
-            set_i32_param(encoder, hd, 5);
-            set_f32_param(encoder, eps, 6);
-            dispatch_rows(
-                encoder,
-                &self.kernels.layer_norm,
-                batch_seq as usize,
-                threads,
-            );
-        } else {
-            // Fused residual + layernorm: output = layernorm(projected + input)
-            let eps = attn.layer_norm_eps;
-            let threads = 256.min(hd as usize);
-            encoder.setComputePipelineState(&self.kernels.fused_residual_layernorm);
-            set_buffer(encoder, output, 0, 0);
-            set_buffer(encoder, &self.workspace.projected, 0, 1);
-            set_buffer(encoder, input, 0, 2);
-            set_buffer(
-                encoder,
-                &self.weight_buffer,
-                attn.output_ln_weight.offset,
-                3,
-            );
-            set_buffer(encoder, &self.weight_buffer, attn.output_ln_bias.offset, 4);
-            set_i32_param(encoder, batch_seq, 5);
-            set_i32_param(encoder, hd, 6);
-            set_f32_param(encoder, eps, 7);
-            dispatch_rows(
-                encoder,
-                &self.kernels.fused_residual_layernorm,
-                batch_seq as usize,
-                threads,
-            );
+            if let Some(ref bias) = attn.output_bias {
+                let total_proj = batch_seq * hd;
+                enc.setComputePipelineState(&self.kernels.fused_bias_residual);
+                set_buffer(&enc, &self.workspace.scratch, 0, 0);
+                set_buffer(&enc, &self.workspace.projected, 0, 1);
+                set_buffer(&enc, &self.weight_buffer, bias.offset, 2);
+                set_buffer(&enc, input, 0, 3);
+                set_i32_param(&enc, batch_seq, 4);
+                set_i32_param(&enc, hd, 5);
+                dispatch_1d(&enc, &self.kernels.fused_bias_residual, total_proj as usize);
+
+                let eps = attn.layer_norm_eps;
+                let threads = 256.min(hd as usize);
+                enc.setComputePipelineState(&self.kernels.layer_norm);
+                set_buffer(&enc, output, 0, 0);
+                set_buffer(&enc, &self.workspace.scratch, 0, 1);
+                set_buffer(&enc, &self.weight_buffer, attn.output_ln_weight.offset, 2);
+                set_buffer(&enc, &self.weight_buffer, attn.output_ln_bias.offset, 3);
+                set_i32_param(&enc, batch_seq, 4);
+                set_i32_param(&enc, hd, 5);
+                set_f32_param(&enc, eps, 6);
+                dispatch_rows(&enc, &self.kernels.layer_norm, batch_seq as usize, threads);
+            } else {
+                let eps = attn.layer_norm_eps;
+                let threads = 256.min(hd as usize);
+                enc.setComputePipelineState(&self.kernels.fused_residual_layernorm);
+                set_buffer(&enc, output, 0, 0);
+                set_buffer(&enc, &self.workspace.projected, 0, 1);
+                set_buffer(&enc, input, 0, 2);
+                set_buffer(&enc, &self.weight_buffer, attn.output_ln_weight.offset, 3);
+                set_buffer(&enc, &self.weight_buffer, attn.output_ln_bias.offset, 4);
+                set_i32_param(&enc, batch_seq, 5);
+                set_i32_param(&enc, hd, 6);
+                set_f32_param(&enc, eps, 7);
+                dispatch_rows(
+                    &enc,
+                    &self.kernels.fused_residual_layernorm,
+                    batch_seq as usize,
+                    threads,
+                );
+            }
+
+            enc.endEncoding();
         }
+
+        Ok(())
     }
 
     /// Encode the feed-forward sub-layer for one transformer layer.
@@ -2045,200 +2174,202 @@ impl MetalBackend {
         clippy::cast_possible_truncation,
         clippy::cast_possible_wrap,
         clippy::too_many_lines,
-        reason = "monolithic GPU FFN dispatch requires many lines and integer casts"
+        reason = "GPU FFN dispatch with alternating MPS/compute requires many lines and casts"
     )]
     fn encode_ffn(
         &self,
-        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
         ffn: &MetalBertFfn,
         input: &ProtocolObject<dyn MTLBuffer>,
         output: &ProtocolObject<dyn MTLBuffer>,
         batch_seq: i32,
-    ) {
+    ) -> crate::Result<()> {
         let hd = self.hidden_size;
-        let pad_hd = (hd as usize).next_multiple_of(8) as u32;
         let inter_dim = ffn.intermediate_weight.shape[0] as i32;
 
         match self.variant {
             ModelVariant::ClassicBert => {
-                let pad_inter = (inter_dim as usize).next_multiple_of(8) as u32;
-
-                // Intermediate projection: input @ intermediate_weight^T -> ffn_inter
-                // FP16 mixed-precision: FP32 activations × FP16 weights → FP32 output.
-                dispatch_gemm_fp16(
-                    encoder,
-                    &self.kernels.gemm_fp16,
+                // --- Intermediate projection via MPS ---
+                dispatch_mps_gemm(
+                    cmd_buf,
+                    &self.device,
                     input,
                     0,
                     self.fp16_weight_buf(&ffn.intermediate_weight),
                     ffn.intermediate_weight.offset / 2,
                     &self.workspace.ffn_inter,
                     0,
-                    batch_seq as u32,
-                    pad_inter,
-                    pad_hd,
+                    batch_seq as usize,
+                    inter_dim as usize,
+                    hd as usize,
                     true,
+                    MPSDataType::Float32,
+                    MPSDataType::Float16,
                 );
 
-                // Fused bias + GELU or just GELU
-                let total_act = batch_seq * inter_dim;
-                if let Some(ref bias) = ffn.intermediate_bias {
-                    encoder.setComputePipelineState(&self.kernels.fused_bias_gelu);
-                    set_buffer(encoder, &self.workspace.ffn_inter, 0, 0);
-                    set_buffer(encoder, &self.weight_buffer, bias.offset, 1);
-                    set_i32_param(encoder, batch_seq, 2);
-                    set_i32_param(encoder, inter_dim, 3);
-                    dispatch_1d(encoder, &self.kernels.fused_bias_gelu, total_act as usize);
-                } else {
-                    encoder.setComputePipelineState(&self.kernels.gelu);
-                    set_buffer(encoder, &self.workspace.ffn_inter, 0, 0);
-                    set_i32_param(encoder, total_act, 1);
-                    dispatch_1d(encoder, &self.kernels.gelu, total_act as usize);
+                // --- Bias + GELU (compute encoder) ---
+                {
+                    let enc = new_encoder(cmd_buf)?;
+                    let total_act = batch_seq * inter_dim;
+                    if let Some(ref bias) = ffn.intermediate_bias {
+                        enc.setComputePipelineState(&self.kernels.fused_bias_gelu);
+                        set_buffer(&enc, &self.workspace.ffn_inter, 0, 0);
+                        set_buffer(&enc, &self.weight_buffer, bias.offset, 1);
+                        set_i32_param(&enc, batch_seq, 2);
+                        set_i32_param(&enc, inter_dim, 3);
+                        dispatch_1d(&enc, &self.kernels.fused_bias_gelu, total_act as usize);
+                    } else {
+                        enc.setComputePipelineState(&self.kernels.gelu);
+                        set_buffer(&enc, &self.workspace.ffn_inter, 0, 0);
+                        set_i32_param(&enc, total_act, 1);
+                        dispatch_1d(&enc, &self.kernels.gelu, total_act as usize);
+                    }
+                    enc.endEncoding();
                 }
 
-                // Output projection: ffn_inter @ output_weight^T -> scratch
-                // FP16 mixed-precision: FP32 activations × FP16 weights → FP32 output.
-                dispatch_gemm_fp16(
-                    encoder,
-                    &self.kernels.gemm_fp16,
+                // --- Output projection via MPS ---
+                dispatch_mps_gemm(
+                    cmd_buf,
+                    &self.device,
                     &self.workspace.ffn_inter,
                     0,
                     self.fp16_weight_buf(&ffn.output_weight),
                     ffn.output_weight.offset / 2,
                     &self.workspace.scratch,
                     0,
-                    batch_seq as u32,
-                    pad_hd,
-                    pad_inter,
+                    batch_seq as usize,
+                    hd as usize,
+                    inter_dim as usize,
                     true,
+                    MPSDataType::Float32,
+                    MPSDataType::Float16,
                 );
             }
             ModelVariant::NomicBert => {
                 // SwiGLU with separate fc11 (value) and fc12 (gate) weights.
-                // Zero-copy prevents concatenating into one [2*inter_dim, hidden]
-                // weight, so we dispatch two GEMMs to separate buffers and use
-                // `swiglu_two_input_kernel` which takes separate value/gate inputs.
-                let pad_inter = (inter_dim as usize).next_multiple_of(8) as u32;
+                // Two MPS GEMMs to separate buffers, then compute SwiGLU element-wise.
 
-                // fc11 (value): input @ fc11_weight^T -> ffn_inter
-                // fc12 (gate):  input @ fc12_weight^T -> activated
-                // Then swiglu_two_input_kernel combines them element-wise.
-
-                // fc11 (value): input @ fc11_weight^T -> ffn_inter
-                // FP16 mixed-precision: FP32 activations × FP16 weights → FP32 output.
-                dispatch_gemm_fp16(
-                    encoder,
-                    &self.kernels.gemm_fp16,
+                // --- fc11 (value) via MPS: input @ fc11_weight^T -> ffn_inter ---
+                dispatch_mps_gemm(
+                    cmd_buf,
+                    &self.device,
                     input,
                     0,
                     self.fp16_weight_buf(&ffn.intermediate_weight),
                     ffn.intermediate_weight.offset / 2,
                     &self.workspace.ffn_inter,
                     0,
-                    batch_seq as u32,
-                    pad_inter,
-                    pad_hd,
+                    batch_seq as usize,
+                    inter_dim as usize,
+                    hd as usize,
                     true,
+                    MPSDataType::Float32,
+                    MPSDataType::Float16,
                 );
 
-                // fc12 (gate): input @ gate_weight^T -> activated
-                // FP16 mixed-precision: FP32 activations × FP16 weights → FP32 output.
+                // --- fc12 (gate) via MPS: input @ gate_weight^T -> activated ---
                 if let Some(ref gate) = ffn.gate_weight {
-                    dispatch_gemm_fp16(
-                        encoder,
-                        &self.kernels.gemm_fp16,
+                    dispatch_mps_gemm(
+                        cmd_buf,
+                        &self.device,
                         input,
                         0,
                         self.fp16_weight_buf(gate),
                         gate.offset / 2,
                         &self.workspace.activated,
                         0,
-                        batch_seq as u32,
-                        pad_inter,
-                        pad_hd,
+                        batch_seq as usize,
+                        inter_dim as usize,
+                        hd as usize,
                         true,
+                        MPSDataType::Float32,
+                        MPSDataType::Float16,
                     );
                 }
 
-                // Two-input SwiGLU: activated = ffn_inter * silu(activated)
-                let total_act = batch_seq * inter_dim;
-                encoder.setComputePipelineState(&self.kernels.swiglu_two_input);
-                set_buffer(encoder, &self.workspace.activated, 0, 0);
-                set_buffer(encoder, &self.workspace.ffn_inter, 0, 1);
-                set_buffer(encoder, &self.workspace.activated, 0, 2);
-                set_i32_param(encoder, total_act, 3);
-                dispatch_1d(encoder, &self.kernels.swiglu_two_input, total_act as usize);
+                // --- SwiGLU (compute encoder) ---
+                {
+                    let enc = new_encoder(cmd_buf)?;
+                    let total_act = batch_seq * inter_dim;
+                    enc.setComputePipelineState(&self.kernels.swiglu_two_input);
+                    set_buffer(&enc, &self.workspace.activated, 0, 0);
+                    set_buffer(&enc, &self.workspace.ffn_inter, 0, 1);
+                    set_buffer(&enc, &self.workspace.activated, 0, 2);
+                    set_i32_param(&enc, total_act, 3);
+                    dispatch_1d(&enc, &self.kernels.swiglu_two_input, total_act as usize);
+                    enc.endEncoding();
+                }
 
-                // Output projection: activated @ output_weight^T -> scratch
-                // FP16 mixed-precision: FP32 activations × FP16 weights → FP32 output.
-                dispatch_gemm_fp16(
-                    encoder,
-                    &self.kernels.gemm_fp16,
+                // --- Output projection via MPS ---
+                dispatch_mps_gemm(
+                    cmd_buf,
+                    &self.device,
                     &self.workspace.activated,
                     0,
                     self.fp16_weight_buf(&ffn.output_weight),
                     ffn.output_weight.offset / 2,
                     &self.workspace.scratch,
                     0,
-                    batch_seq as u32,
-                    pad_hd,
-                    pad_inter,
+                    batch_seq as usize,
+                    hd as usize,
+                    inter_dim as usize,
                     true,
+                    MPSDataType::Float32,
+                    MPSDataType::Float16,
                 );
             }
         }
 
-        // --- Bias + residual + LayerNorm ---
-        if let Some(ref bias) = ffn.output_bias {
-            let total_out = batch_seq * hd;
-            encoder.setComputePipelineState(&self.kernels.fused_bias_residual);
-            set_buffer(encoder, &self.workspace.projected, 0, 0);
-            set_buffer(encoder, &self.workspace.scratch, 0, 1);
-            set_buffer(encoder, &self.weight_buffer, bias.offset, 2);
-            set_buffer(encoder, input, 0, 3);
-            set_i32_param(encoder, batch_seq, 4);
-            set_i32_param(encoder, hd, 5);
-            dispatch_1d(
-                encoder,
-                &self.kernels.fused_bias_residual,
-                total_out as usize,
-            );
+        // --- Bias + residual + LayerNorm (compute encoder) ---
+        {
+            let enc = new_encoder(cmd_buf)?;
 
-            let eps = ffn.layer_norm_eps;
-            let threads = 256.min(hd as usize);
-            encoder.setComputePipelineState(&self.kernels.layer_norm);
-            set_buffer(encoder, output, 0, 0);
-            set_buffer(encoder, &self.workspace.projected, 0, 1);
-            set_buffer(encoder, &self.weight_buffer, ffn.output_ln_weight.offset, 2);
-            set_buffer(encoder, &self.weight_buffer, ffn.output_ln_bias.offset, 3);
-            set_i32_param(encoder, batch_seq, 4);
-            set_i32_param(encoder, hd, 5);
-            set_f32_param(encoder, eps, 6);
-            dispatch_rows(
-                encoder,
-                &self.kernels.layer_norm,
-                batch_seq as usize,
-                threads,
-            );
-        } else {
-            let eps = ffn.layer_norm_eps;
-            let threads = 256.min(hd as usize);
-            encoder.setComputePipelineState(&self.kernels.fused_residual_layernorm);
-            set_buffer(encoder, output, 0, 0);
-            set_buffer(encoder, &self.workspace.scratch, 0, 1);
-            set_buffer(encoder, input, 0, 2);
-            set_buffer(encoder, &self.weight_buffer, ffn.output_ln_weight.offset, 3);
-            set_buffer(encoder, &self.weight_buffer, ffn.output_ln_bias.offset, 4);
-            set_i32_param(encoder, batch_seq, 5);
-            set_i32_param(encoder, hd, 6);
-            set_f32_param(encoder, eps, 7);
-            dispatch_rows(
-                encoder,
-                &self.kernels.fused_residual_layernorm,
-                batch_seq as usize,
-                threads,
-            );
+            if let Some(ref bias) = ffn.output_bias {
+                let total_out = batch_seq * hd;
+                enc.setComputePipelineState(&self.kernels.fused_bias_residual);
+                set_buffer(&enc, &self.workspace.projected, 0, 0);
+                set_buffer(&enc, &self.workspace.scratch, 0, 1);
+                set_buffer(&enc, &self.weight_buffer, bias.offset, 2);
+                set_buffer(&enc, input, 0, 3);
+                set_i32_param(&enc, batch_seq, 4);
+                set_i32_param(&enc, hd, 5);
+                dispatch_1d(&enc, &self.kernels.fused_bias_residual, total_out as usize);
+
+                let eps = ffn.layer_norm_eps;
+                let threads = 256.min(hd as usize);
+                enc.setComputePipelineState(&self.kernels.layer_norm);
+                set_buffer(&enc, output, 0, 0);
+                set_buffer(&enc, &self.workspace.projected, 0, 1);
+                set_buffer(&enc, &self.weight_buffer, ffn.output_ln_weight.offset, 2);
+                set_buffer(&enc, &self.weight_buffer, ffn.output_ln_bias.offset, 3);
+                set_i32_param(&enc, batch_seq, 4);
+                set_i32_param(&enc, hd, 5);
+                set_f32_param(&enc, eps, 6);
+                dispatch_rows(&enc, &self.kernels.layer_norm, batch_seq as usize, threads);
+            } else {
+                let eps = ffn.layer_norm_eps;
+                let threads = 256.min(hd as usize);
+                enc.setComputePipelineState(&self.kernels.fused_residual_layernorm);
+                set_buffer(&enc, output, 0, 0);
+                set_buffer(&enc, &self.workspace.scratch, 0, 1);
+                set_buffer(&enc, input, 0, 2);
+                set_buffer(&enc, &self.weight_buffer, ffn.output_ln_weight.offset, 3);
+                set_buffer(&enc, &self.weight_buffer, ffn.output_ln_bias.offset, 4);
+                set_i32_param(&enc, batch_seq, 5);
+                set_i32_param(&enc, hd, 6);
+                set_f32_param(&enc, eps, 7);
+                dispatch_rows(
+                    &enc,
+                    &self.kernels.fused_residual_layernorm,
+                    batch_seq as usize,
+                    threads,
+                );
+            }
+
+            enc.endEncoding();
         }
+
+        Ok(())
     }
 
     /// Full batched BERT forward pass on Metal.
@@ -2252,22 +2383,24 @@ impl MetalBackend {
     /// - Attention reads `hidden_a`, writes to `hidden_b`.
     /// - FFN reads `hidden_b`, writes back to `hidden_a`.
     /// - Next layer repeats.
+    ///
+    /// Weight GEMMs use MPS `MPSMatrixMultiplication` which encodes directly to
+    /// the command buffer. The forward pass alternates between compute encoders
+    /// (for element-wise ops, attention) and MPS encoding (for weight GEMMs).
     #[expect(
         unsafe_code,
         clippy::cast_possible_truncation,
         clippy::cast_possible_wrap,
         clippy::cast_sign_loss,
         clippy::too_many_lines,
-        reason = "Metal forward pass requires unsafe FFI, integer casts, and monolithic dispatch"
+        reason = "Metal forward pass requires unsafe FFI, integer casts, and multi-encoder dispatch"
     )]
     fn forward_batch(&self, encodings: &[Encoding]) -> crate::Result<Vec<Vec<f32>>> {
-        use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder};
-
         let batch = encodings.len() as i32;
         let hd = self.hidden_size;
 
         // Find max sequence length in this batch, rounded up to nearest
-        // multiple of 8. The simdgroup GEMM kernel operates on 8×8 tiles;
+        // multiple of 8. The simdgroup GEMM kernel operates on 8x8 tiles;
         // padding avoids partial-tile edge effects in the per-head attention
         // GEMMs where the head stride puts adjacent heads' data at
         // non-tile-aligned boundaries. The attention mask zeros out padded
@@ -2324,133 +2457,150 @@ impl MetalBackend {
         let position_ids_buf = make_i32_buf(&position_ids)?;
         let attn_mask_int_buf = make_i32_buf(&attn_mask_int)?;
 
-        // Create command buffer and encoder
+        // Create command buffer
         let cmd_buf = self
             .queue
             .commandBuffer()
             .ok_or_else(|| crate::Error::Metal("failed to create command buffer".into()))?;
-        let enc = cmd_buf
-            .computeCommandEncoder()
-            .ok_or_else(|| crate::Error::Metal("failed to create compute encoder".into()))?;
 
-        // --- Build float attention mask ---
-        let mask_total = batch * max_seq;
-        enc.setComputePipelineState(&self.kernels.build_attn_mask);
-        set_buffer(&enc, &self.workspace.mask, 0, 0);
-        set_buffer(&enc, &attn_mask_int_buf, 0, 1);
-        set_i32_param(&enc, mask_total, 2);
-        dispatch_1d(&enc, &self.kernels.build_attn_mask, mask_total as usize);
-
-        // --- Embeddings: [batch*max_seq, hidden] -> hidden_a ---
-        let n = batch_seq * hd;
-
-        // Word embedding lookup -> scratch
-        enc.setComputePipelineState(&self.kernels.embedding_lookup);
-        set_buffer(&enc, &self.workspace.scratch, 0, 0);
-        set_buffer(
-            &enc,
-            &self.weight_buffer,
-            self.model.embeddings.word_embeddings.offset,
-            1,
-        );
-        set_buffer(&enc, &input_ids_buf, 0, 2);
-        set_i32_param(&enc, batch_seq, 3);
-        set_i32_param(&enc, hd, 4);
-        dispatch_1d(&enc, &self.kernels.embedding_lookup, n as usize);
-
-        // Add position embeddings (ClassicBert only)
-        if let Some(ref pos_emb) = self.model.embeddings.position_embeddings {
-            enc.setComputePipelineState(&self.kernels.add_embeddings);
-            set_buffer(&enc, &self.workspace.scratch, 0, 0);
-            set_buffer(&enc, &self.weight_buffer, pos_emb.offset, 1);
-            set_buffer(&enc, &position_ids_buf, 0, 2);
-            set_i32_param(&enc, batch_seq, 3);
-            set_i32_param(&enc, hd, 4);
-            dispatch_1d(&enc, &self.kernels.add_embeddings, n as usize);
-        }
-
-        // Add token type embeddings
-        if let Some(ref tok_emb) = self.model.embeddings.token_type_embeddings {
-            enc.setComputePipelineState(&self.kernels.add_embeddings);
-            set_buffer(&enc, &self.workspace.scratch, 0, 0);
-            set_buffer(&enc, &self.weight_buffer, tok_emb.offset, 1);
-            set_buffer(&enc, &token_type_ids_buf, 0, 2);
-            set_i32_param(&enc, batch_seq, 3);
-            set_i32_param(&enc, hd, 4);
-            dispatch_1d(&enc, &self.kernels.add_embeddings, n as usize);
-        }
-
-        // Embedding layer norm: scratch -> hidden_a
+        // --- Embeddings (compute encoder) ---
         {
-            let eps = self.model.embeddings.layer_norm_eps;
-            let threads = 256.min(hd as usize);
-            enc.setComputePipelineState(&self.kernels.layer_norm);
-            set_buffer(&enc, &self.workspace.hidden_a, 0, 0);
-            set_buffer(&enc, &self.workspace.scratch, 0, 1);
+            let enc = new_encoder(&cmd_buf)?;
+
+            // Build float attention mask
+            let mask_total = batch * max_seq;
+            enc.setComputePipelineState(&self.kernels.build_attn_mask);
+            set_buffer(&enc, &self.workspace.mask, 0, 0);
+            set_buffer(&enc, &attn_mask_int_buf, 0, 1);
+            set_i32_param(&enc, mask_total, 2);
+            dispatch_1d(&enc, &self.kernels.build_attn_mask, mask_total as usize);
+
+            // Embeddings: [batch*max_seq, hidden] -> hidden_a
+            let n = batch_seq * hd;
+
+            // Word embedding lookup -> scratch
+            enc.setComputePipelineState(&self.kernels.embedding_lookup);
+            set_buffer(&enc, &self.workspace.scratch, 0, 0);
             set_buffer(
                 &enc,
                 &self.weight_buffer,
-                self.model.embeddings.layer_norm_weight.offset,
-                2,
+                self.model.embeddings.word_embeddings.offset,
+                1,
             );
-            set_buffer(
-                &enc,
-                &self.weight_buffer,
-                self.model.embeddings.layer_norm_bias.offset,
-                3,
-            );
-            set_i32_param(&enc, batch_seq, 4);
-            set_i32_param(&enc, hd, 5);
-            set_f32_param(&enc, eps, 6);
-            dispatch_rows(&enc, &self.kernels.layer_norm, batch_seq as usize, threads);
+            set_buffer(&enc, &input_ids_buf, 0, 2);
+            set_i32_param(&enc, batch_seq, 3);
+            set_i32_param(&enc, hd, 4);
+            dispatch_1d(&enc, &self.kernels.embedding_lookup, n as usize);
+
+            // Add position embeddings (ClassicBert only)
+            if let Some(ref pos_emb) = self.model.embeddings.position_embeddings {
+                enc.setComputePipelineState(&self.kernels.add_embeddings);
+                set_buffer(&enc, &self.workspace.scratch, 0, 0);
+                set_buffer(&enc, &self.weight_buffer, pos_emb.offset, 1);
+                set_buffer(&enc, &position_ids_buf, 0, 2);
+                set_i32_param(&enc, batch_seq, 3);
+                set_i32_param(&enc, hd, 4);
+                dispatch_1d(&enc, &self.kernels.add_embeddings, n as usize);
+            }
+
+            // Add token type embeddings
+            if let Some(ref tok_emb) = self.model.embeddings.token_type_embeddings {
+                enc.setComputePipelineState(&self.kernels.add_embeddings);
+                set_buffer(&enc, &self.workspace.scratch, 0, 0);
+                set_buffer(&enc, &self.weight_buffer, tok_emb.offset, 1);
+                set_buffer(&enc, &token_type_ids_buf, 0, 2);
+                set_i32_param(&enc, batch_seq, 3);
+                set_i32_param(&enc, hd, 4);
+                dispatch_1d(&enc, &self.kernels.add_embeddings, n as usize);
+            }
+
+            // Embedding layer norm: scratch -> hidden_a
+            {
+                let eps = self.model.embeddings.layer_norm_eps;
+                let threads = 256.min(hd as usize);
+                enc.setComputePipelineState(&self.kernels.layer_norm);
+                set_buffer(&enc, &self.workspace.hidden_a, 0, 0);
+                set_buffer(&enc, &self.workspace.scratch, 0, 1);
+                set_buffer(
+                    &enc,
+                    &self.weight_buffer,
+                    self.model.embeddings.layer_norm_weight.offset,
+                    2,
+                );
+                set_buffer(
+                    &enc,
+                    &self.weight_buffer,
+                    self.model.embeddings.layer_norm_bias.offset,
+                    3,
+                );
+                set_i32_param(&enc, batch_seq, 4);
+                set_i32_param(&enc, hd, 5);
+                set_f32_param(&enc, eps, 6);
+                dispatch_rows(&enc, &self.kernels.layer_norm, batch_seq as usize, threads);
+            }
+
+            enc.endEncoding();
         }
 
         // --- Transformer layers: ping-pong hidden_a <-> hidden_b ---
+        // Each encode_attention/encode_ffn manages its own compute encoders
+        // and MPS GEMM dispatches internally.
         for layer in &self.model.layers {
             // Attention: hidden_a -> hidden_b
             self.encode_attention(
-                &enc,
+                &cmd_buf,
                 layer,
                 &self.workspace.hidden_a,
                 &self.workspace.hidden_b,
                 &self.workspace.mask,
                 batch,
                 max_seq,
-            );
+            )?;
 
             // FFN: hidden_b -> hidden_a
             self.encode_ffn(
-                &enc,
+                &cmd_buf,
                 &layer.ffn,
                 &self.workspace.hidden_b,
                 &self.workspace.hidden_a,
                 batch_seq,
-            );
+            )?;
         }
 
-        // --- CLS pooling + L2 normalize ---
-        let cls_total = batch * hd;
-        enc.setComputePipelineState(&self.kernels.cls_pool);
-        set_buffer(&enc, &self.workspace.cls, 0, 0);
-        set_buffer(&enc, &self.workspace.hidden_a, 0, 1);
-        set_i32_param(&enc, batch, 2);
-        set_i32_param(&enc, max_seq, 3);
-        set_i32_param(&enc, hd, 4);
-        dispatch_1d(&enc, &self.kernels.cls_pool, cls_total as usize);
-
+        // --- CLS pooling + L2 normalize (compute encoder) ---
         {
-            let threads = 256.min(hd as usize);
-            enc.setComputePipelineState(&self.kernels.l2_normalize);
+            let enc = new_encoder(&cmd_buf)?;
+
+            let cls_total = batch * hd;
+            enc.setComputePipelineState(&self.kernels.cls_pool);
             set_buffer(&enc, &self.workspace.cls, 0, 0);
-            set_i32_param(&enc, batch, 1);
-            set_i32_param(&enc, hd, 2);
-            dispatch_rows(&enc, &self.kernels.l2_normalize, batch as usize, threads);
+            set_buffer(&enc, &self.workspace.hidden_a, 0, 1);
+            set_i32_param(&enc, batch, 2);
+            set_i32_param(&enc, max_seq, 3);
+            set_i32_param(&enc, hd, 4);
+            dispatch_1d(&enc, &self.kernels.cls_pool, cls_total as usize);
+
+            {
+                let threads = 256.min(hd as usize);
+                enc.setComputePipelineState(&self.kernels.l2_normalize);
+                set_buffer(&enc, &self.workspace.cls, 0, 0);
+                set_i32_param(&enc, batch, 1);
+                set_i32_param(&enc, hd, 2);
+                dispatch_rows(&enc, &self.kernels.l2_normalize, batch as usize, threads);
+            }
+
+            enc.endEncoding();
         }
 
-        // End encoding and execute
-        enc.endEncoding();
+        // Execute and wait
+        let wall_start = std::time::Instant::now();
         cmd_buf.commit();
         cmd_buf.waitUntilCompleted();
+        let wall_elapsed = wall_start.elapsed();
+
+        // Report wall time for each forward pass
+        let wall_ms = wall_elapsed.as_secs_f64() * 1000.0;
+        eprintln!("[metal] batch={batch} seq={max_seq} wall={wall_ms:.2}ms");
 
         // Read back CLS embeddings
         let flat_result = unsafe {
@@ -3334,6 +3484,17 @@ mod tests {
         cmd_buf.waitUntilCompleted();
     }
 
+    /// Helper: create a command buffer for MPS-aware operations. Commits and waits.
+    fn run_cmd_buf<F>(queue: &ProtocolObject<dyn MTLCommandQueue>, f: F)
+    where
+        F: FnOnce(&ProtocolObject<dyn MTLCommandBuffer>),
+    {
+        let cmd_buf = queue.commandBuffer().unwrap();
+        f(&cmd_buf);
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+    }
+
     #[test]
     #[ignore = "requires model download; run with --nocapture to see diagnostics"]
     fn metal_forward_pass_stage_diagnostics() {
@@ -3649,16 +3810,18 @@ mod tests {
             eprintln!("  4f - softmax[head0]: {:?}", &softmax0);
 
             // Run the full attention layer
-            run_encoder(&backend.queue, |enc| {
-                backend.encode_attention(
-                    enc,
-                    &backend.model.layers[0],
-                    &backend.workspace.hidden_a,
-                    &backend.workspace.hidden_b,
-                    &backend.workspace.mask,
-                    batch,
-                    max_seq,
-                );
+            run_cmd_buf(&backend.queue, |cmd_buf| {
+                backend
+                    .encode_attention(
+                        cmd_buf,
+                        &backend.model.layers[0],
+                        &backend.workspace.hidden_a,
+                        &backend.workspace.hidden_b,
+                        &backend.workspace.mask,
+                        batch,
+                        max_seq,
+                    )
+                    .unwrap();
             });
             let (min, max, mean, nz) = buffer_stats(&backend.workspace.hidden_b, n);
             eprintln!(
@@ -3814,14 +3977,16 @@ mod tests {
             );
 
             // 5d: Full FFN (re-run from scratch to get final output)
-            run_encoder(&backend.queue, |enc| {
-                backend.encode_ffn(
-                    enc,
-                    &backend.model.layers[0].ffn,
-                    &backend.workspace.hidden_b,
-                    &backend.workspace.hidden_a,
-                    batch_seq,
-                );
+            run_cmd_buf(&backend.queue, |cmd_buf| {
+                backend
+                    .encode_ffn(
+                        cmd_buf,
+                        &backend.model.layers[0].ffn,
+                        &backend.workspace.hidden_b,
+                        &backend.workspace.hidden_a,
+                        batch_seq,
+                    )
+                    .unwrap();
             });
             let (min, max, mean, nz) = buffer_stats(&backend.workspace.hidden_a, n);
             let nan_f = read_f32_buffer(&backend.workspace.hidden_a, n)

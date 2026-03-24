@@ -42,6 +42,9 @@ objc2-foundation = { version = "0.3", optional = true, features = [
     "NSString", "NSError", "NSObject",
 ] }
 block2 = { version = "0.6", optional = true }
+objc2-metal-performance-shaders = { version = "0.3", optional = true, features = [
+    "MPSMatrixMultiplication", "MPSMatrix", "MPSKernel", "MPSCore", "MPSCoreTypes",
+] }
 blake3 = "1.8.3"
 rkyv = { version = "0.8.15", features = ["bytecheck"] }
 dirs = "6.0.0"
@@ -54,7 +57,7 @@ cuda = ["dep:cudarc"]
 cpu = ["ndarray/blas", "dep:blas-src", "dep:openblas-src"]
 cpu-accelerate = ["ndarray/blas", "dep:accelerate-src"]
 mlx = ["dep:mlx-rs"]
-metal = ["dep:objc2", "dep:objc2-metal", "dep:objc2-foundation", "dep:block2"]
+metal = ["dep:objc2", "dep:objc2-metal", "dep:objc2-foundation", "dep:block2", "dep:objc2-metal-performance-shaders"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
