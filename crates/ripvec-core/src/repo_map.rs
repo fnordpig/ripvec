@@ -409,14 +409,19 @@ fn pagerank(n: usize, edges: &[(u32, u32, u32)], focus: Option<usize>) -> Vec<f3
         }
     }
 
-    // Personalization vector
+    // Personalization vector: for topic-sensitive PageRank, blend
+    // 70% focus on the target file with 30% uniform. Pure focus
+    // (100%) starves unreachable nodes to rank=0 in sparse graphs.
     let bias: Vec<f32> = if let Some(idx) = focus {
-        let mut b = vec![0.0; n];
+        let uniform = 1.0 / n as f32;
+        let mut b = vec![0.3 * uniform; n];
         if idx < n {
-            b[idx] = 1.0;
-        } else {
-            let uniform = 1.0 / n as f32;
-            b.fill(uniform);
+            b[idx] += 0.7;
+        }
+        // Normalize to sum=1
+        let sum: f32 = b.iter().sum();
+        for v in &mut b {
+            *v /= sum;
         }
         b
     } else {
