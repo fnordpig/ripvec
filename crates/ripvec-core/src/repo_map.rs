@@ -1032,20 +1032,67 @@ mod tests {
     #[test]
     #[ignore = "runs on full ripvec codebase; use --nocapture to see output"]
     fn test_full_repo_map() {
+        use std::time::Instant;
+
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
             .parent()
             .unwrap();
+
+        // Phase 1: build_graph (walk + parse + import resolve + PageRank)
+        let t0 = Instant::now();
         let graph = build_graph(root).expect("build_graph on ripvec root");
-        eprintln!("Files: {}, Edges: {}", graph.files.len(), graph.edges.len());
-        eprintln!("Top 5 by PageRank:");
+        let build_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        // Phase 2: render (default, no focus)
+        let t1 = Instant::now();
+        let rendered = render(&graph, 2000, None);
+        let render_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+        // Phase 3: render (topic-sensitive, focused on highest-ranked file)
+        let t2 = Instant::now();
+        let focus_idx = graph
+            .base_ranks
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i);
+        let focused = render(&graph, 2000, focus_idx);
+        let focus_ms = t2.elapsed().as_secs_f64() * 1000.0;
+
+        eprintln!("\n=== Repo Map Performance ===");
+        eprintln!(
+            "Files: {}, Edges: {}, Defs: {}",
+            graph.files.len(),
+            graph.edges.len(),
+            graph.files.iter().map(|f| f.defs.len()).sum::<usize>()
+        );
+        eprintln!("build_graph:     {build_ms:.1}ms (walk + parse + resolve + PageRank)");
+        eprintln!(
+            "render(default): {render_ms:.3}ms ({} chars, ~{} tokens)",
+            rendered.len(),
+            rendered.len() / 4
+        );
+        eprintln!(
+            "render(focused): {focus_ms:.3}ms ({} chars, ~{} tokens)",
+            focused.len(),
+            focused.len() / 4
+        );
+
+        eprintln!("\nTop 5 by PageRank:");
         let mut ranked: Vec<(usize, f32)> = graph.base_ranks.iter().copied().enumerate().collect();
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         for (i, rank) in ranked.iter().take(5) {
             eprintln!("  {:.4} {}", rank, graph.files[*i].path);
         }
-        let rendered = render(&graph, 2000, None);
-        eprintln!("\n{rendered}");
+
+        eprintln!("\n=== Default Render ===\n{rendered}");
+        eprintln!(
+            "\n=== Focused Render (on {}) ===\n{focused}",
+            focus_idx
+                .map(|i| graph.files[i].path.as_str())
+                .unwrap_or("none")
+        );
     }
 }
