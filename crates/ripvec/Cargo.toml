@@ -31,11 +31,12 @@ notify = "8.2.0"
 default = []
 cuda = ["ripvec-core/cuda"]
 mlx = ["ripvec-core/mlx"]
+metal = ["ripvec-core/metal"]
 cpu = ["ripvec-core/cpu"]
 
 # Auto-enable platform-appropriate backends
 [target.'cfg(target_os = "macos")'.dependencies]
-ripvec-core = { path = "../ripvec-core", features = ["mlx", "cpu-accelerate"] }
+ripvec-core = { path = "../ripvec-core", features = ["metal", "mlx", "cpu-accelerate"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 ripvec-core = { path = "../ripvec-core", features = ["cpu"] }
