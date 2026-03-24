@@ -51,42 +51,58 @@ impl rmcp::ServerHandler for RipvecServer {
                 .build(),
         )
         .with_instructions(
-            "Semantic code search and structural analysis powered by vector embeddings \
-             and PageRank-weighted dependency graphs.\n\n\
-             WORKFLOW — start broad, then narrow:\n\
-             1. get_repo_map → understand architecture (which files matter, how they connect)\n\
-             2. search_code → find specific implementations by meaning\n\
-             3. Use LSP tools (hover, findReferences) on the results for precise navigation\n\n\
-             TOOLS:\n\
-             - get_repo_map: START HERE for architecture questions. Returns PageRank-ranked \
-               files with signatures and dependency relationships. Use focus_file to zoom \
-               into a specific file's neighborhood (e.g., when editing backend/metal.rs, \
-               focus on it to see what depends on it and what it depends on).\n\
-             - search_code: Find code by MEANING, not text. \"error handling in embeddings\" \
-               finds the actual error handling code. Results include full source in markdown \
-               fenced blocks — no need to read_file afterward.\n\
-             - search_text: Same as search_code but for prose/documentation.\n\
-             - find_similar: Given a file+line, find structurally similar code elsewhere.\n\
-             - reindex: Force re-embedding after bulk changes. Normally auto-updates (2s debounce).\n\
-             - index_status: Check if the index is ready and how many chunks are indexed.\n\n\
-             COMBINING WITH LSP:\n\
-             - search_code returns lsp_location fields → pass directly to LSP goToDefinition \
-               or findReferences for precise symbol navigation\n\
-             - get_repo_map shows which files are structurally central → use LSP documentSymbol \
-               on those files for detailed exploration\n\
-             - After finding code with search_code, use LSP incomingCalls/outgoingCalls to \
-               trace the call hierarchy\n\n\
-             EXAMPLES:\n\
-             - \"How is the embedding pipeline structured?\" → get_repo_map (shows embed.rs as \
-               central, its callers and callees)\n\
-             - \"Find the GEMM kernel dispatch code\" → search_code(\"GEMM kernel dispatch\")\n\
-             - \"What files depend on the EmbedBackend trait?\" → get_repo_map(focus_file: \
-               \"crates/ripvec-core/src/backend/mod.rs\") → shows callers\n\
-             - \"Find code similar to the attention forward pass\" → find_similar(file, line)\n\n\
-             TIPS:\n\
-             - Use natural language queries, not regex or exact code\n\
-             - search_code returns full code blocks — review them before calling read_file\n\
-             - The index and repo map update automatically when files change",
+            "Semantic code search and structural analysis. Finds code by MEANING \
+             (not text match) using vector embeddings and PageRank dependency graphs.\n\n\
+             ## WORKFLOW: broad → narrow\n\
+             1. get_repo_map → architecture overview (which files matter most)\n\
+             2. search_code / search_text → find specific code by meaning\n\
+             3. LSP tools → precise navigation (definitions, references, calls)\n\n\
+             ## TOOLS\n\n\
+             **get_repo_map** — START HERE for orientation.\n\
+             Returns files ranked by structural importance (PageRank on import graph) \
+             with signatures, callers, and callees. Use focus_file when editing a \
+             specific file to see its dependency neighborhood.\n\n\
+             **search_code** — semantic search over code.\n\
+             Understands meaning: \"retry logic with exponential backoff\" finds the \
+             actual retry implementation even if the code never uses those exact words. \
+             Results include full source in fenced code blocks.\n\n\
+             **search_text** — semantic search over documentation and comments.\n\n\
+             **find_similar** — given a file and line, find structurally similar code.\n\n\
+             **reindex** — force re-embedding. Normally auto-updates on file change.\n\n\
+             **index_status** — check readiness and chunk count.\n\n\
+             ## WHEN TO USE (by language / task)\n\n\
+             Rust:\n\
+             - \"How does the trait system work here?\" → get_repo_map (shows trait defs + impls)\n\
+             - \"Find error handling with thiserror\" → search_code\n\
+             - \"What implements EmbedBackend?\" → search_code then LSP findReferences\n\n\
+             TypeScript / React:\n\
+             - \"Find components that handle form validation\" → search_code\n\
+             - \"How are API routes organized?\" → get_repo_map (shows route files ranked)\n\
+             - \"Find hooks similar to useAuth\" → find_similar on useAuth.ts\n\n\
+             Python / Django / FastAPI:\n\
+             - \"Find database migration logic\" → search_code(\"database migration\")\n\
+             - \"Which views handle authentication?\" → search_code(\"authentication middleware\")\n\
+             - \"Show the project structure\" → get_repo_map\n\n\
+             SQL / dbt:\n\
+             - \"Find queries that join users and orders\" → search_code(\"join users orders\")\n\
+             - \"Which models depend on the staging layer?\" → get_repo_map (PageRank shows \
+               downstream dependencies)\n\
+             - \"Find slowly changing dimension logic\" → search_code(\"SCD type 2\")\n\n\
+             Full-stack:\n\
+             - \"How does the frontend call the backend?\" → get_repo_map (shows API boundary)\n\
+             - \"Find WebSocket handling\" → search_code(\"WebSocket connection handler\")\n\
+             - \"What's similar to the payment processing flow?\" → find_similar\n\n\
+             ## COMBINING WITH OTHER TOOLS\n\n\
+             search_code results include lsp_location → pass to LSP goToDefinition, \
+             findReferences, incomingCalls.\n\
+             get_repo_map identifies central files → use LSP documentSymbol for details.\n\
+             After search_code, use Grep for exact string matches within the found files.\n\
+             Results include full code — review before calling read_file.\n\n\
+             ## TIPS\n\
+             - Natural language queries work best (not regex or exact code)\n\
+             - search_code with --code flag uses CodeRankEmbed (optimized for code)\n\
+             - Index auto-updates when files change (2s debounce)\n\
+             - focus_file on get_repo_map: great when you're editing a specific file",
         )
     }
 
