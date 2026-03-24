@@ -884,6 +884,19 @@ impl EmbedBackend for MlxBackend {
             return Ok(vec![]);
         }
 
+        // Sub-batch to reduce padding waste. With 128 sequences sorted by
+        // descending length, a single batch pads all to the longest (~512).
+        // Sub-batching into 64-sequence groups gives tighter per-group padding.
+        const MLX_MAX_BATCH: usize = 64;
+        if encodings.len() > MLX_MAX_BATCH {
+            let mut all_results = Vec::with_capacity(encodings.len());
+            for chunk in encodings.chunks(MLX_MAX_BATCH) {
+                let mut results = self.embed_batch(chunk)?;
+                all_results.append(&mut results);
+            }
+            return Ok(all_results);
+        }
+
         // Phase 1: Tensor prep (no lock needed)
         let (input_ids, attention_mask, token_type_ids) = prepare_batch_tensors(encodings);
         // Attention mask to FP16 — float tensor used in matmul-heavy attention
