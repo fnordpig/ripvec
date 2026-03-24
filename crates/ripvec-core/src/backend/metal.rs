@@ -1527,6 +1527,9 @@ pub struct MetalBackend {
     variant: ModelVariant,
     /// Maximum sequence length supported by the model.
     max_position_embeddings: i32,
+    /// Optional early exit: run only this many encoder layers.
+    /// `None` runs all layers. Used for fast query embedding.
+    max_layers: Option<usize>,
     /// Memory-mapped safetensors file backing the Metal buffer.
     /// Must be declared AFTER `weight_buffer` to ensure correct drop order
     /// (buffer dropped before mmap).
@@ -1645,6 +1648,7 @@ impl MetalBackend {
             head_dim,
             variant,
             max_position_embeddings,
+            max_layers: None,
             _mmap: mmap,
         };
 
@@ -2548,7 +2552,11 @@ impl MetalBackend {
         // --- Transformer layers: ping-pong hidden_a <-> hidden_b ---
         // Each encode_attention/encode_ffn manages its own compute encoders
         // and MPS GEMM dispatches internally.
-        for layer in &self.model.layers {
+        let num_layers = self
+            .max_layers
+            .unwrap_or(self.model.layers.len())
+            .min(self.model.layers.len());
+        for layer in &self.model.layers[..num_layers] {
             // Attention: hidden_a -> hidden_b
             self.encode_attention(
                 &cmd_buf,
@@ -4073,6 +4081,96 @@ mod tests {
             let m_l2: f32 = m[0].iter().map(|x| x * x).sum::<f32>().sqrt();
             let c_l2: f32 = c[0].iter().map(|x| x * x).sum::<f32>().sqrt();
             eprintln!("seq={seq_len:>3}: cosine={cos:.6}, metal_L2={m_l2:.4}, cpu_L2={c_l2:.4}");
+        }
+    }
+
+    /// Sweep early exit layers and MRL truncation dims on BGE-small.
+    /// Measures cosine similarity vs full 12-layer 384-dim embedding.
+    #[test]
+    #[ignore = "requires model download; run with --nocapture"]
+    fn early_exit_and_mrl_quality() {
+        // Get full 12-layer reference embedding
+        let mut backend = MetalBackend::load("BAAI/bge-small-en-v1.5", &DeviceHint::Auto).unwrap();
+        let enc = Encoding {
+            input_ids: vec![
+                101, 2023, 2003, 1037, 3231, 1997, 3642, 2007, 3674, 9303, 2015, 1998, 4972, 102,
+            ], // "this is a sample of code with variables and functions"
+            attention_mask: vec![1; 14],
+            token_type_ids: vec![0; 14],
+        };
+
+        backend.max_layers = None;
+        let full = backend.embed_batch(&[enc.clone()]).unwrap();
+        let full_emb = &full[0];
+        let hd = full_emb.len();
+        eprintln!(
+            "Full embedding: {hd} dims, L2={:.4}",
+            full_emb.iter().map(|x| x * x).sum::<f32>().sqrt()
+        );
+
+        // --- Early exit sweep ---
+        eprintln!("\n=== Early Exit (layers 1-12, cosine vs 12-layer) ===");
+        for layers in [1, 2, 3, 4, 6, 8, 10, 12] {
+            backend.max_layers = Some(layers);
+            let result = backend.embed_batch(&[enc.clone()]).unwrap();
+            let emb = &result[0];
+            // Cosine with full embedding
+            let cos: f32 = emb.iter().zip(full_emb).map(|(a, b)| a * b).sum();
+            eprintln!("  layers={layers:>2}: cosine={cos:.6}");
+        }
+
+        // --- MRL truncation sweep (on full 12-layer embedding) ---
+        eprintln!("\n=== MRL Truncation (dims, cosine vs full-dim) ===");
+        eprintln!("  (Truncate to first N dims, re-normalize, compare)");
+        backend.max_layers = None;
+        let full2 = backend.embed_batch(&[enc.clone()]).unwrap();
+        let full_emb2 = &full2[0];
+        for dims in [32, 64, 96, 128, 192, 256, 384] {
+            let trunc: Vec<f32> = full_emb2[..dims].to_vec();
+            let norm: f32 = trunc.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+            let trunc_norm: Vec<f32> = trunc.iter().map(|x| x / norm).collect();
+            // Compare truncated vs full (first `dims` elements of full, re-normalized)
+            // For MRL, we compare against the FULL embedding to see directional alignment
+            let cos: f32 = trunc_norm
+                .iter()
+                .zip(&full_emb2[..dims])
+                .map(|(a, b)| a * b)
+                .sum::<f32>()
+                / full_emb2[..dims]
+                    .iter()
+                    .map(|x| x * x)
+                    .sum::<f32>()
+                    .sqrt()
+                    .max(1e-12);
+            eprintln!("  dims={dims:>3}: cosine_vs_full_trunc={cos:.6}");
+        }
+
+        // --- Combined: early exit + truncation ---
+        eprintln!("\n=== Combined: Early Exit + Truncation ===");
+        eprintln!("  (layers × dims → cosine vs full-12-layer-384-dim)");
+        for layers in [2, 4, 6, 12] {
+            backend.max_layers = Some(layers);
+            let result = backend.embed_batch(&[enc.clone()]).unwrap();
+            let emb = &result[0];
+            for dims in [64, 128, 384] {
+                let trunc: Vec<f32> = emb[..dims].to_vec();
+                let norm: f32 = trunc.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+                let trunc_norm: Vec<f32> = trunc.iter().map(|x| x / norm).collect();
+                // Compare against full-12-384 embedding truncated to same dims
+                let full_trunc_norm: f32 = full_emb[..dims]
+                    .iter()
+                    .map(|x| x * x)
+                    .sum::<f32>()
+                    .sqrt()
+                    .max(1e-12);
+                let cos: f32 = trunc_norm
+                    .iter()
+                    .zip(&full_emb[..dims])
+                    .map(|(a, b)| a * b)
+                    .sum::<f32>()
+                    / full_trunc_norm;
+                eprintln!("  layers={layers:>2} dims={dims:>3}: cosine={cos:.6}");
+            }
         }
     }
 }
