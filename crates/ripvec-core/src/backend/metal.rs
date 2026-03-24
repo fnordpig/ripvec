@@ -145,6 +145,8 @@ struct KernelPipelines {
     attn_reshape: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// CLS pooling (extract row 0 per batch element).
     cls_pool: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Mean pooling: attention-mask-weighted average of all tokens.
+    mean_pool: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// L2 normalize each row.
     l2_normalize: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Build float attention mask from int mask.
@@ -4322,5 +4324,309 @@ mod tests {
     #[ignore = "requires model download; run with --nocapture"]
     fn early_exit_coderank() {
         run_early_exit_sweep("nomic-ai/CodeRankEmbed");
+    }
+
+    // -----------------------------------------------------------------------
+    // FP16 kernel correctness tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn metal_layer_norm_f16_vs_f32() {
+        let device = create_device().unwrap();
+        let queue = create_queue(&device).unwrap();
+        let pipelines = KernelPipelines::compile(&device).unwrap();
+
+        // Use a realistic hidden-size vector (8 elements, non-trivial values)
+        let input: Vec<f32> = vec![0.5, -1.2, 3.7, 0.0, -0.8, 2.1, 1.4, -2.5];
+        let weight: Vec<f32> = vec![1.0, 0.8, 1.2, 0.9, 1.1, 0.7, 1.3, 0.6];
+        let bias: Vec<f32> = vec![0.1, -0.1, 0.2, 0.0, -0.2, 0.3, -0.3, 0.1];
+        let cols = input.len() as i32;
+
+        // --- Run FP32 kernel ---
+        let f32_output_buf = make_zero_buffer(&device, cols as usize);
+        let f32_input_buf = make_f32_buffer(&device, &input);
+        let f32_weight_buf = make_f32_buffer(&device, &weight);
+        let f32_bias_buf = make_f32_buffer(&device, &bias);
+        let rows_buf = make_i32_const_buffer(&device, 1);
+        let cols_buf = make_i32_const_buffer(&device, cols);
+        let eps_buf = make_f32_const_buffer(&device, 1e-5);
+
+        let cmd_buf = queue.commandBuffer().unwrap();
+        let encoder = cmd_buf.computeCommandEncoder().unwrap();
+        encoder.setComputePipelineState(&pipelines.layer_norm);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(&f32_output_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(&f32_input_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&f32_weight_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(&f32_bias_buf), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(&rows_buf), 0, 4);
+            encoder.setBuffer_offset_atIndex(Some(&cols_buf), 0, 5);
+            encoder.setBuffer_offset_atIndex(Some(&eps_buf), 0, 6);
+        }
+        let grid = MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: cols as usize,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+        let f32_result = read_f32_buffer(&f32_output_buf, cols as usize);
+
+        // --- Run FP16 kernel ---
+        let f16_output_buf = make_zero_f16_buffer(&device, cols as usize);
+        let f16_input_buf = make_f16_buffer(&device, &input);
+        let f16_weight_buf = make_f16_buffer(&device, &weight);
+        let f16_bias_buf = make_f16_buffer(&device, &bias);
+        // Reuse rows_buf, cols_buf, eps_buf (same constants)
+
+        let cmd_buf = queue.commandBuffer().unwrap();
+        let encoder = cmd_buf.computeCommandEncoder().unwrap();
+        encoder.setComputePipelineState(&pipelines.layer_norm_f16);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(&f16_output_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(&f16_input_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&f16_weight_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(&f16_bias_buf), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(&rows_buf), 0, 4);
+            encoder.setBuffer_offset_atIndex(Some(&cols_buf), 0, 5);
+            encoder.setBuffer_offset_atIndex(Some(&eps_buf), 0, 6);
+        }
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+        let f16_result = read_f16_buffer(&f16_output_buf, cols as usize);
+
+        // Compare: max absolute difference should be < 0.01 (half precision tolerance)
+        let mut max_diff: f32 = 0.0;
+        for (i, (&f32_val, &f16_val)) in f32_result.iter().zip(f16_result.iter()).enumerate() {
+            let diff = (f32_val - f16_val).abs();
+            max_diff = max_diff.max(diff);
+            assert!(
+                diff < 0.01,
+                "layer_norm FP16 vs FP32 mismatch at index {i}: f32={f32_val}, f16={f16_val}, diff={diff}"
+            );
+        }
+        eprintln!("layer_norm FP16 max diff: {max_diff:.6}");
+    }
+
+    #[test]
+    fn metal_gelu_f16_vs_f32() {
+        let device = create_device().unwrap();
+        let queue = create_queue(&device).unwrap();
+        let pipelines = KernelPipelines::compile(&device).unwrap();
+
+        let input: Vec<f32> = vec![0.0, 1.0, -1.0, 2.0, -2.0, 0.5, -0.5, 3.0];
+        let n = input.len() as i32;
+
+        // --- Run FP32 kernel (GELU is in-place, so make a copy) ---
+        let f32_buf = make_f32_buffer(&device, &input);
+        let n_buf = make_i32_const_buffer(&device, n);
+        let cmd_buf = queue.commandBuffer().unwrap();
+        let encoder = cmd_buf.computeCommandEncoder().unwrap();
+        encoder.setComputePipelineState(&pipelines.gelu);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(&f32_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(&n_buf), 0, 1);
+        }
+        dispatch_1d(&encoder, &pipelines.gelu, n as usize);
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+        let f32_result = read_f32_buffer(&f32_buf, n as usize);
+
+        // --- Run FP16 kernel ---
+        let f16_buf = make_f16_buffer(&device, &input);
+        let cmd_buf = queue.commandBuffer().unwrap();
+        let encoder = cmd_buf.computeCommandEncoder().unwrap();
+        encoder.setComputePipelineState(&pipelines.gelu_f16);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(&f16_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(&n_buf), 0, 1);
+        }
+        dispatch_1d(&encoder, &pipelines.gelu_f16, n as usize);
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+        let f16_result = read_f16_buffer(&f16_buf, n as usize);
+
+        let mut max_diff: f32 = 0.0;
+        for (i, (&f32_val, &f16_val)) in f32_result.iter().zip(f16_result.iter()).enumerate() {
+            let diff = (f32_val - f16_val).abs();
+            max_diff = max_diff.max(diff);
+            assert!(
+                diff < 0.01,
+                "GELU FP16 vs FP32 mismatch at index {i}: f32={f32_val}, f16={f16_val}, diff={diff}"
+            );
+        }
+        eprintln!("GELU FP16 max diff: {max_diff:.6}");
+    }
+
+    #[test]
+    fn metal_fused_residual_layernorm_f16_vs_f32() {
+        let device = create_device().unwrap();
+        let queue = create_queue(&device).unwrap();
+        let pipelines = KernelPipelines::compile(&device).unwrap();
+
+        let hidden: Vec<f32> = vec![0.5, -1.2, 3.7, 0.0, -0.8, 2.1, 1.4, -2.5];
+        let residual: Vec<f32> = vec![0.3, 0.7, -0.5, 1.0, -0.3, 0.8, -1.0, 0.4];
+        let weight: Vec<f32> = vec![1.0, 0.8, 1.2, 0.9, 1.1, 0.7, 1.3, 0.6];
+        let bias: Vec<f32> = vec![0.1, -0.1, 0.2, 0.0, -0.2, 0.3, -0.3, 0.1];
+        let cols = hidden.len() as i32;
+
+        // --- FP32 ---
+        let f32_output_buf = make_zero_buffer(&device, cols as usize);
+        let f32_hidden_buf = make_f32_buffer(&device, &hidden);
+        let f32_residual_buf = make_f32_buffer(&device, &residual);
+        let f32_weight_buf = make_f32_buffer(&device, &weight);
+        let f32_bias_buf = make_f32_buffer(&device, &bias);
+        let rows_buf = make_i32_const_buffer(&device, 1);
+        let cols_buf = make_i32_const_buffer(&device, cols);
+        let eps_buf = make_f32_const_buffer(&device, 1e-5);
+
+        let cmd_buf = queue.commandBuffer().unwrap();
+        let encoder = cmd_buf.computeCommandEncoder().unwrap();
+        encoder.setComputePipelineState(&pipelines.fused_residual_layernorm);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(&f32_output_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(&f32_hidden_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&f32_residual_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(&f32_weight_buf), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(&f32_bias_buf), 0, 4);
+            encoder.setBuffer_offset_atIndex(Some(&rows_buf), 0, 5);
+            encoder.setBuffer_offset_atIndex(Some(&cols_buf), 0, 6);
+            encoder.setBuffer_offset_atIndex(Some(&eps_buf), 0, 7);
+        }
+        let grid = MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: cols as usize,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+        let f32_result = read_f32_buffer(&f32_output_buf, cols as usize);
+
+        // --- FP16 ---
+        let f16_output_buf = make_zero_f16_buffer(&device, cols as usize);
+        let f16_hidden_buf = make_f16_buffer(&device, &hidden);
+        let f16_residual_buf = make_f16_buffer(&device, &residual);
+        let f16_weight_buf = make_f16_buffer(&device, &weight);
+        let f16_bias_buf = make_f16_buffer(&device, &bias);
+
+        let cmd_buf = queue.commandBuffer().unwrap();
+        let encoder = cmd_buf.computeCommandEncoder().unwrap();
+        encoder.setComputePipelineState(&pipelines.fused_residual_layernorm_f16);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(&f16_output_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(&f16_hidden_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&f16_residual_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(&f16_weight_buf), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(&f16_bias_buf), 0, 4);
+            encoder.setBuffer_offset_atIndex(Some(&rows_buf), 0, 5);
+            encoder.setBuffer_offset_atIndex(Some(&cols_buf), 0, 6);
+            encoder.setBuffer_offset_atIndex(Some(&eps_buf), 0, 7);
+        }
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+        let f16_result = read_f16_buffer(&f16_output_buf, cols as usize);
+
+        let mut max_diff: f32 = 0.0;
+        for (i, (&f32_val, &f16_val)) in f32_result.iter().zip(f16_result.iter()).enumerate() {
+            let diff = (f32_val - f16_val).abs();
+            max_diff = max_diff.max(diff);
+            assert!(
+                diff < 0.01,
+                "fused_residual_layernorm FP16 vs FP32 mismatch at index {i}: f32={f32_val}, f16={f16_val}, diff={diff}"
+            );
+        }
+        eprintln!("fused_residual_layernorm FP16 max diff: {max_diff:.6}");
+    }
+
+    #[test]
+    fn metal_fused_bias_residual_f16_vs_f32() {
+        let device = create_device().unwrap();
+        let queue = create_queue(&device).unwrap();
+        let pipelines = KernelPipelines::compile(&device).unwrap();
+
+        let input: Vec<f32> = vec![1.0, -2.0, 3.0, -4.0];
+        let bias: Vec<f32> = vec![0.1, -0.2, 0.3, -0.4];
+        let residual: Vec<f32> = vec![0.5, 0.5, 0.5, 0.5];
+        let cols = 4_i32;
+        let rows = 1_i32;
+
+        // --- FP32 ---
+        let f32_output_buf = make_zero_buffer(&device, 4);
+        let f32_input_buf = make_f32_buffer(&device, &input);
+        let f32_bias_buf = make_f32_buffer(&device, &bias);
+        let f32_residual_buf = make_f32_buffer(&device, &residual);
+        let rows_buf = make_i32_const_buffer(&device, rows);
+        let cols_buf = make_i32_const_buffer(&device, cols);
+
+        let cmd_buf = queue.commandBuffer().unwrap();
+        let encoder = cmd_buf.computeCommandEncoder().unwrap();
+        encoder.setComputePipelineState(&pipelines.fused_bias_residual);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(&f32_output_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(&f32_input_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&f32_bias_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(&f32_residual_buf), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(&rows_buf), 0, 4);
+            encoder.setBuffer_offset_atIndex(Some(&cols_buf), 0, 5);
+        }
+        dispatch_1d(&encoder, &pipelines.fused_bias_residual, 4);
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+        let f32_result = read_f32_buffer(&f32_output_buf, 4);
+
+        // --- FP16 ---
+        let f16_output_buf = make_zero_f16_buffer(&device, 4);
+        let f16_input_buf = make_f16_buffer(&device, &input);
+        let f16_bias_buf = make_f16_buffer(&device, &bias);
+        let f16_residual_buf = make_f16_buffer(&device, &residual);
+
+        let cmd_buf = queue.commandBuffer().unwrap();
+        let encoder = cmd_buf.computeCommandEncoder().unwrap();
+        encoder.setComputePipelineState(&pipelines.fused_bias_residual_f16);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(&f16_output_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(&f16_input_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&f16_bias_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(&f16_residual_buf), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(&rows_buf), 0, 4);
+            encoder.setBuffer_offset_atIndex(Some(&cols_buf), 0, 5);
+        }
+        dispatch_1d(&encoder, &pipelines.fused_bias_residual_f16, 4);
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+        let f16_result = read_f16_buffer(&f16_output_buf, 4);
+
+        let mut max_diff: f32 = 0.0;
+        for (i, (&f32_val, &f16_val)) in f32_result.iter().zip(f16_result.iter()).enumerate() {
+            let diff = (f32_val - f16_val).abs();
+            max_diff = max_diff.max(diff);
+            assert!(
+                diff < 0.01,
+                "fused_bias_residual FP16 vs FP32 mismatch at index {i}: f32={f32_val}, f16={f16_val}, diff={diff}"
+            );
+        }
+        eprintln!("fused_bias_residual FP16 max diff: {max_diff:.6}");
     }
 }
