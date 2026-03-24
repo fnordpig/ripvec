@@ -227,13 +227,17 @@ pub fn detect_backends(
         }
     }
 
-    // Always add CPU as the last backend. Even when a GPU is present,
-    // the CPU backend is used for single-query embedding via AMX/Accelerate
-    // (batch=1, zero dispatch overhead, no GPU bandwidth contention).
-    // `embed_distributed` only uses the GPU for corpus embedding; the search
-    // function routes single queries to the last non-GPU backend.
+    // Add CPU as fallback only when no GPU backend was loaded.
+    // On Apple Silicon, running CPU + MLX concurrently is slower than
+    // MLX alone because they share the same physical cores and memory.
+    // On discrete GPU systems (CUDA), CPU would be a useful helper.
+    #[cfg_attr(
+        not(feature = "cpu"),
+        expect(unused_variables, reason = "used when cpu feature is enabled")
+    )]
+    let has_gpu = backends.iter().any(|b| b.is_gpu());
     #[cfg(feature = "cpu")]
-    if let Ok(b) = cpu::CpuBackend::load(model_repo, &DeviceHint::Cpu) {
+    if !has_gpu && let Ok(b) = cpu::CpuBackend::load(model_repo, &DeviceHint::Cpu) {
         backends.push(Box::new(b));
     }
 
