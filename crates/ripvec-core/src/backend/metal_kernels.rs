@@ -510,6 +510,35 @@ kernel void cls_pool_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Mean pooling: average non-padded tokens weighted by attention mask.
+// output[b, d] = sum_t(hidden[b, t, d] * mask[b, t]) / sum_t(mask[b, t])
+// One thread per (batch, dim) element.
+// ---------------------------------------------------------------------------
+kernel void mean_pool_kernel(
+    device float* output           [[buffer(0)]],
+    const device float* hidden     [[buffer(1)]],
+    const device float* mask       [[buffer(2)]],
+    constant int& batch            [[buffer(3)]],
+    constant int& seq              [[buffer(4)]],
+    constant int& hidden_dim       [[buffer(5)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    int total = batch * hidden_dim;
+    if (idx >= uint(total)) return;
+    int b = int(idx) / hidden_dim;
+    int d = int(idx) % hidden_dim;
+
+    float sum_val = 0.0;
+    float sum_mask = 0.0;
+    for (int t = 0; t < seq; t++) {
+        float m = mask[b * seq + t];
+        sum_val += hidden[b * seq * hidden_dim + t * hidden_dim + d] * m;
+        sum_mask += m;
+    }
+    output[idx] = (sum_mask > 0.0) ? (sum_val / sum_mask) : 0.0;
+}
+
+// ---------------------------------------------------------------------------
 // L2 normalize each row of a [rows, cols] matrix in-place.
 // One threadgroup per row; threadgroup memory for sum-of-squares reduction.
 // ---------------------------------------------------------------------------

@@ -311,6 +311,7 @@ impl KernelPipelines {
             qkv_split: p("qkv_split_kernel")?,
             attn_reshape: p("attn_reshape_kernel")?,
             cls_pool: p("cls_pool_kernel")?,
+            mean_pool: p("mean_pool_kernel")?,
             l2_normalize: p("l2_normalize_kernel")?,
             build_attn_mask: p("build_attn_mask_kernel")?,
             f32_to_f16: p("f32_to_f16_kernel")?,
@@ -2662,18 +2663,35 @@ impl MetalBackend {
             )?;
         }
 
-        // --- CLS pooling + L2 normalize (compute encoder) ---
+        // --- Pooling + L2 normalize (compute encoder) ---
+        // NomicBert uses mean pooling; ClassicBert uses CLS pooling.
         {
             let enc = new_encoder(&cmd_buf)?;
 
-            let cls_total = batch * hd;
-            enc.setComputePipelineState(&self.kernels.cls_pool);
-            set_buffer(&enc, &self.workspace.cls, 0, 0);
-            set_buffer(&enc, &self.workspace.hidden_a, 0, 1);
-            set_i32_param(&enc, batch, 2);
-            set_i32_param(&enc, max_seq, 3);
-            set_i32_param(&enc, hd, 4);
-            dispatch_1d(&enc, &self.kernels.cls_pool, cls_total as usize);
+            let pool_total = batch * hd;
+            match self.variant {
+                ModelVariant::NomicBert => {
+                    // Mean pooling: weighted average of non-padded tokens
+                    enc.setComputePipelineState(&self.kernels.mean_pool);
+                    set_buffer(&enc, &self.workspace.cls, 0, 0);
+                    set_buffer(&enc, &self.workspace.hidden_a, 0, 1);
+                    set_buffer(&enc, &self.workspace.mask, 0, 2);
+                    set_i32_param(&enc, batch, 3);
+                    set_i32_param(&enc, max_seq, 4);
+                    set_i32_param(&enc, hd, 5);
+                    dispatch_1d(&enc, &self.kernels.mean_pool, pool_total as usize);
+                }
+                ModelVariant::ClassicBert => {
+                    // CLS pooling: take first token
+                    enc.setComputePipelineState(&self.kernels.cls_pool);
+                    set_buffer(&enc, &self.workspace.cls, 0, 0);
+                    set_buffer(&enc, &self.workspace.hidden_a, 0, 1);
+                    set_i32_param(&enc, batch, 2);
+                    set_i32_param(&enc, max_seq, 3);
+                    set_i32_param(&enc, hd, 4);
+                    dispatch_1d(&enc, &self.kernels.cls_pool, pool_total as usize);
+                }
+            }
 
             {
                 let threads = 256.min(hd as usize);
