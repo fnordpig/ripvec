@@ -387,15 +387,19 @@ pub trait Driver: Send + Sync {
 
 /// Batch input tensors on device, produced by [`Driver::prepare_batch`].
 ///
-/// All tensors are padded to `max_seq` tokens per sequence.
+/// Supports both padded and unpadded modes:
+/// - **Padded**: all sequences padded to `max_seq`. `cu_seqlens` is `None`.
+/// - **Unpadded**: sequences concatenated without padding. `cu_seqlens`
+///   contains cumulative lengths `[0, len0, len0+len1, ...]` so attention
+///   knows where each sequence starts. Eliminates ALL padding compute.
 pub struct BatchInputs<T> {
-    /// Token IDs `[batch * max_seq]` as int32 on device.
+    /// Token IDs — `[batch * max_seq]` (padded) or `[total_tokens]` (unpadded).
     pub input_ids: T,
-    /// Attention mask `[batch * max_seq]` as int32 (0 or 1).
+    /// Attention mask `[batch * max_seq]` as int32 (0 or 1). Unused in unpadded mode.
     pub attention_mask: T,
-    /// Token type IDs `[batch * max_seq]` as int32.
+    /// Token type IDs — same layout as `input_ids`.
     pub token_type_ids: T,
-    /// Position IDs `[batch * max_seq]` as int32.
+    /// Position IDs — same layout as `input_ids`.
     pub position_ids: T,
     /// Float attention bias mask `[batch * max_seq]` (0.0 or -1e9) for softmax.
     pub float_mask: T,
@@ -403,6 +407,15 @@ pub struct BatchInputs<T> {
     pub pooling_mask: T,
     /// Number of sequences in this batch.
     pub batch: usize,
-    /// Maximum sequence length (all sequences padded to this).
+    /// Maximum sequence length (all sequences padded to this). In unpadded mode,
+    /// this is the longest sequence (used for workspace sizing, not padding).
     pub max_seq: usize,
+    /// Total actual tokens across all sequences (no padding).
+    pub total_tokens: usize,
+    /// Per-sequence lengths: `[batch]` — each element is the actual token count.
+    pub seq_lengths: Vec<usize>,
+    /// Cumulative sequence lengths for unpadded attention: `[batch + 1]`.
+    /// `cu_seqlens[i]..cu_seqlens[i+1]` is the token range for sequence `i`.
+    /// `None` in padded mode (all sequences padded to max_seq).
+    pub cu_seqlens: Option<Vec<usize>>,
 }

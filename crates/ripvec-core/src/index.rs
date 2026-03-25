@@ -129,7 +129,7 @@ impl SearchIndex {
             .enumerate()
             .filter(|(_, score)| *score >= threshold)
             .collect();
-        results.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
         results
     }
 
@@ -184,8 +184,7 @@ impl SearchIndex {
 
         // Get top pre_filter_k indices
         let mut candidates: Vec<(usize, f32)> = scores.iter().copied().enumerate().collect();
-        candidates
-            .sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
         candidates.truncate(pre_filter_k);
 
         // Phase 2: re-rank candidates with full-dimension dot products
@@ -198,8 +197,7 @@ impl SearchIndex {
             })
             .filter(|(_, s)| *s >= threshold)
             .collect();
-        reranked
-            .sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        reranked.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
         reranked.truncate(top_k);
         reranked
     }

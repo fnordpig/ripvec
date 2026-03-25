@@ -659,11 +659,7 @@ pub fn render(graph: &RepoGraph, max_tokens: usize, focus: Option<usize>) -> Str
 
     // Sort file indices by rank descending
     let mut sorted: Vec<usize> = (0..n).collect();
-    sorted.sort_by(|&a, &b| {
-        ranks[b]
-            .partial_cmp(&ranks[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    sorted.sort_by(|&a, &b| ranks[b].total_cmp(&ranks[a]));
 
     let mut output = String::new();
     let mut used_tokens = 0;
@@ -1087,7 +1083,7 @@ mod tests {
 
         eprintln!("\nTop 5 by PageRank:");
         let mut ranked: Vec<(usize, f32)> = graph.base_ranks.iter().copied().enumerate().collect();
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
         for (i, rank) in ranked.iter().take(5) {
             eprintln!("  {:.4} {}", rank, graph.files[*i].path);
         }

@@ -502,6 +502,127 @@ pub fn load_classic_metal(model_repo: &str) -> crate::Result<Box<dyn EmbedBacken
     )))
 }
 
+// ---------------------------------------------------------------------------
+// ClassicBert loader (CPU driver/arch system)
+// ---------------------------------------------------------------------------
+
+/// Load a `ClassicBert` model (e.g. `BAAI/bge-small-en-v1.5`) on the CPU backend
+/// via the driver/arch system.
+///
+/// Downloads the model from Hugging Face Hub (cached after first download),
+/// reads safetensors weights into `Vec<f32>` tensors, fuses Q/K/V per layer,
+/// and builds a [`GenericBackend`] pairing a
+/// [`CpuDriver`](driver::cpu::CpuDriver) with a
+/// [`ClassicBertArch`](arch::classic_bert::ClassicBertArch).
+///
+/// # Errors
+///
+/// Returns an error if the model cannot be downloaded or weight loading fails.
+#[cfg(any(feature = "cpu", feature = "cpu-accelerate"))]
+pub fn load_classic_cpu(model_repo: &str) -> crate::Result<Box<dyn EmbedBackend>> {
+    use driver::cpu::{ClassicBertConfig, CpuDriver};
+    use generic::GenericBackend;
+    use hf_hub::api::sync::Api;
+
+    let api = Api::new().map_err(|e| crate::Error::Download(e.to_string()))?;
+    let repo = api.model(model_repo.to_string());
+
+    let config_path = repo
+        .get("config.json")
+        .map_err(|e| crate::Error::Download(e.to_string()))?;
+    let weights_path = repo
+        .get("model.safetensors")
+        .map_err(|e| crate::Error::Download(e.to_string()))?;
+
+    // Parse config.json
+    let config_str = std::fs::read_to_string(&config_path).map_err(|e| crate::Error::Io {
+        path: config_path.display().to_string(),
+        source: e,
+    })?;
+    let config_json: serde_json::Value = serde_json::from_str(&config_str)
+        .map_err(|e| crate::Error::Other(anyhow::anyhow!("config parse error: {e}")))?;
+    let config = ClassicBertConfig::from_json(&config_json)?;
+    let max_tokens = config.max_position_embeddings;
+
+    let driver = CpuDriver::new()?;
+    let (arch, mmap) = driver.load_classic_bert_weights(&weights_path, &config)?;
+
+    tracing::info!(
+        model_repo,
+        hidden = config.hidden_size,
+        layers = config.num_hidden_layers,
+        heads = config.num_attention_heads,
+        intermediate = config.intermediate_size,
+        max_tokens,
+        "ClassicBert loaded on CPU (driver/arch)"
+    );
+
+    Ok(Box::new(GenericBackend::new(
+        driver, arch, max_tokens, false, mmap,
+    )))
+}
+
+// ---------------------------------------------------------------------------
+// NomicBert loader (CPU driver/arch system)
+// ---------------------------------------------------------------------------
+
+/// Load a `NomicBert` model (e.g. `nomic-ai/CodeRankEmbed`) on the CPU backend
+/// via the driver/arch system.
+///
+/// Downloads the model from Hugging Face Hub (cached after first download),
+/// reads safetensors weights into `Vec<f32>` tensors, builds a `RoPE` cache,
+/// and builds a [`GenericBackend`] pairing a
+/// [`CpuDriver`](driver::cpu::CpuDriver) with a
+/// [`NomicBertArch`](arch::nomic_bert::NomicBertArch).
+///
+/// # Errors
+///
+/// Returns an error if the model cannot be downloaded or weight loading fails.
+#[cfg(any(feature = "cpu", feature = "cpu-accelerate"))]
+pub fn load_nomic_cpu(model_repo: &str) -> crate::Result<Box<dyn EmbedBackend>> {
+    use driver::cpu::{CpuDriver, NomicBertConfig};
+    use generic::GenericBackend;
+    use hf_hub::api::sync::Api;
+
+    let api = Api::new().map_err(|e| crate::Error::Download(e.to_string()))?;
+    let repo = api.model(model_repo.to_string());
+
+    let config_path = repo
+        .get("config.json")
+        .map_err(|e| crate::Error::Download(e.to_string()))?;
+    let weights_path = repo
+        .get("model.safetensors")
+        .map_err(|e| crate::Error::Download(e.to_string()))?;
+
+    // Parse config.json
+    let config_str = std::fs::read_to_string(&config_path).map_err(|e| crate::Error::Io {
+        path: config_path.display().to_string(),
+        source: e,
+    })?;
+    let config_json: serde_json::Value = serde_json::from_str(&config_str)
+        .map_err(|e| crate::Error::Other(anyhow::anyhow!("config parse error: {e}")))?;
+    let config = NomicBertConfig::from_json(&config_json)?;
+    let max_tokens = config.max_position_embeddings;
+
+    let driver = CpuDriver::new()?;
+    let (arch, mmap) = driver.load_nomic_bert_weights(&weights_path, &config)?;
+
+    tracing::info!(
+        model_repo,
+        hidden = config.hidden_size,
+        layers = config.num_hidden_layers,
+        heads = config.num_attention_heads,
+        intermediate = config.intermediate_size,
+        max_tokens,
+        rope_theta = config.rotary_emb_base,
+        "NomicBert loaded on CPU (driver/arch)"
+    );
+
+    Ok(Box::new(GenericBackend::new(
+        driver, arch, max_tokens, false, mmap,
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1056,5 +1177,61 @@ mod tests {
             throughput
         );
         assert_eq!(bench_result.len(), 32);
+    }
+
+    /// Load `ClassicBert` (`BAAI/bge-small-en-v1.5`) on CPU via the driver/arch system.
+    ///
+    /// Verifies that the full pipeline produces a 384-dim L2-normalized vector
+    /// and compares against the monolithic CPU backend for numerical equivalence.
+    #[cfg(any(feature = "cpu", feature = "cpu-accelerate"))]
+    #[test]
+    #[ignore = "requires model download (~33MB)"]
+    fn classic_bert_cpu_driver_arch() {
+        let model_repo = "BAAI/bge-small-en-v1.5";
+
+        // Load via new driver/arch system
+        let backend = load_classic_cpu(model_repo).expect("load_classic_cpu failed");
+        assert!(!backend.is_gpu(), "CPU backend should not be GPU");
+
+        let enc = Encoding {
+            input_ids: vec![101, 2023, 2003, 1037, 3231, 102],
+            attention_mask: vec![1, 1, 1, 1, 1, 1],
+            token_type_ids: vec![0, 0, 0, 0, 0, 0],
+        };
+
+        // Basic forward pass
+        let result = backend.embed_batch(&[enc.clone()]).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 384);
+
+        let l2: f32 = result[0].iter().map(|x| x * x).sum::<f32>().sqrt();
+        eprintln!(
+            "ClassicBert CPU driver/arch: L2={l2:.4}, first 5: {:?}",
+            &result[0][..5]
+        );
+        assert!(
+            (l2 - 1.0).abs() < 0.01,
+            "embedding should be L2-normalized, got L2={l2}"
+        );
+
+        // Compare against monolithic CPU backend (reference)
+        #[cfg(feature = "cpu")]
+        {
+            let cpu_mono = cpu::CpuBackend::load(model_repo, &DeviceHint::Cpu)
+                .expect("monolithic CPU load failed");
+            let cpu_result = cpu_mono.embed_batch(&[enc]).unwrap();
+            eprintln!("Mono first 5: {:?}", &cpu_result[0][..5]);
+            eprintln!("New  first 5: {:?}", &result[0][..5]);
+            let cosine: f32 = result[0]
+                .iter()
+                .zip(&cpu_result[0])
+                .map(|(a, b)| a * b)
+                .sum();
+            eprintln!("cosine(driver/arch, monolithic) = {cosine:.6}");
+            assert!(
+                cosine > 0.999,
+                "cosine similarity vs monolithic CPU should be >0.999, got {cosine}"
+            );
+        }
     }
 }

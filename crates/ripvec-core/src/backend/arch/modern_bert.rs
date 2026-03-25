@@ -452,7 +452,7 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
             .max_layers
             .unwrap_or(w.layers.len())
             .min(w.layers.len());
-        for (layer_idx, layer) in w.layers[..num_layers].iter().enumerate() {
+        for layer in &w.layers[..num_layers] {
             let rope = if layer.is_global {
                 &self.global_rope
             } else {

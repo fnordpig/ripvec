@@ -550,6 +550,10 @@ impl Driver for CpuDriver {
             .map(|&m| if m > 0.5 { 1.0 } else { 0.0 })
             .collect();
 
+        // Per-sequence lengths and total token count.
+        let seq_lengths: Vec<usize> = encodings.iter().map(|e| e.input_ids.len()).collect();
+        let total_tokens: usize = seq_lengths.iter().sum();
+
         Ok(BatchInputs {
             input_ids,
             attention_mask: attn_mask_int,
@@ -559,6 +563,9 @@ impl Driver for CpuDriver {
             pooling_mask,
             batch,
             max_seq,
+            total_tokens,
+            seq_lengths,
+            cu_seqlens: None, // padded mode
         })
     }
 

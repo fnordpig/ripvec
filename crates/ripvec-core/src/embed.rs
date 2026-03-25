@@ -276,11 +276,7 @@ pub fn search(
         scored
     };
 
-    results.sort_unstable_by(|a, b| {
-        b.similarity
-            .partial_cmp(&a.similarity)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    results.sort_unstable_by(|a, b| b.similarity.total_cmp(&a.similarity));
     if top_k > 0 {
         results.truncate(top_k);
     }
@@ -596,6 +592,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "cpu")]
     #[ignore = "loads model + embeds full source tree; run with `cargo test -- --ignored`"]
     fn search_with_backend_trait() {
         let backend = crate::backend::load_backend(
@@ -667,7 +664,7 @@ mod tests {
                 (i, dot)
             })
             .collect();
-        scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
         scored.into_iter().take(k).map(|(i, _)| i).collect()
     }
 

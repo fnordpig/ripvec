@@ -17,9 +17,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::AnyThread;
 use objc2_foundation::{NSString, NSUInteger};
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
@@ -32,6 +32,7 @@ use objc2_metal_performance_shaders::{
 use safetensors::SafeTensors;
 
 use super::{BatchInputs, Driver};
+use crate::backend::Encoding;
 use crate::backend::arch::classic_bert::{
     ClassicBertArch, ClassicBertLayerWeights, ClassicBertWeights,
 };
@@ -39,7 +40,6 @@ use crate::backend::arch::modern_bert::{
     ModernBertArch, ModernBertLayerWeights, ModernBertWeights, RopeCache,
 };
 use crate::backend::arch::nomic_bert::{NomicBertArch, NomicBertLayerWeights, NomicBertWeights};
-use crate::backend::Encoding;
 
 // ---------------------------------------------------------------------------
 // CoreGraphics linkage (required for MTLCreateSystemDefaultDevice)
@@ -1661,6 +1661,10 @@ impl Driver for MetalDriver {
             .collect();
         let pooling_mask_buf = make_f32_buffer(&self.device, &pooling_mask)?;
 
+        // Compute per-sequence lengths and total actual tokens
+        let seq_lengths: Vec<usize> = encodings.iter().map(|e| e.input_ids.len()).collect();
+        let total_tokens: usize = seq_lengths.iter().sum();
+
         Ok(BatchInputs {
             input_ids: MetalTensor::new(input_ids_buf, 0),
             attention_mask: MetalTensor::new(attn_mask_int_buf, 0),
@@ -1670,6 +1674,9 @@ impl Driver for MetalDriver {
             pooling_mask: MetalTensor::new(pooling_mask_buf, 0),
             batch,
             max_seq,
+            total_tokens,
+            seq_lengths,
+            cu_seqlens: None, // Padded mode for now
         })
     }
 
