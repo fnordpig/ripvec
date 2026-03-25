@@ -685,11 +685,17 @@ impl MetalDriver {
         let cursor = self.pool_cursor.get();
         let mut pool = self.pool.borrow_mut();
 
-        if cursor < pool.len() && pool[cursor].length() as usize >= needed {
-            // Reuse existing pooled buffer
-            let buffer = pool[cursor].clone();
-            self.pool_cursor.set(cursor + 1);
-            return Ok(MetalTensor::new(buffer, 0));
+        if cursor < pool.len() {
+            let pool_size = pool[cursor].length() as usize;
+            // Reuse if buffer is within 50% of needed size. Oversized buffers
+            // cause MPS hangs (batch=1 reusing batch=32 buffer → GPU processes
+            // the full buffer length). Exact-match is too strict (prevents reuse
+            // across sub-batches with slightly different padding).
+            if pool_size >= needed && pool_size <= needed + needed / 2 {
+                let buffer = pool[cursor].clone();
+                self.pool_cursor.set(cursor + 1);
+                return Ok(MetalTensor::new(buffer, 0));
+            }
         }
 
         // Allocate new buffer

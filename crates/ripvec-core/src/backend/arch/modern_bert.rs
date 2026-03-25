@@ -435,12 +435,15 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
         let batch = encodings.len();
         let hidden = w.hidden_dim;
 
-        // Unpadded mode: tokens concatenated without padding.
-        // Linear layers (GEMM, LN, GELU) process total_tokens rows — no wasted compute.
-        // Attention pads/unpads around per-head operations via pad_to_batch/unpad_from_batch.
-        let inputs = driver.prepare_batch_unpadded(encodings)?;
-        let total_tokens = inputs.total_tokens;
-        let max_seq = inputs.max_seq;
+        // TEMPORARY: padded mode to debug the query hang.
+        let max_seq = encodings
+            .iter()
+            .map(|e| e.input_ids.len())
+            .max()
+            .unwrap_or(0)
+            .next_multiple_of(8);
+        let total_tokens = batch * max_seq;
+        let inputs = driver.prepare_batch(encodings, max_seq)?;
 
         // Enter batched mode: all GPU ops encode into ONE command buffer.
         driver.begin_batch()?;
