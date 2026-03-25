@@ -559,6 +559,10 @@ pub struct MetalDriver {
     kernels: KernelPipelines,
     /// Shared command buffer for batched mode. `None` = per-call mode.
     batch_cmd: std::cell::RefCell<Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>>,
+    /// Persistent compute encoder for batched mode. Reused across run_compute
+    /// calls to avoid encoder creation overhead (~221 encoders → 1 per layer).
+    /// Closed before MPS calls (which encode directly to command buffer).
+    batch_enc: std::cell::RefCell<Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>>,
 }
 
 impl MetalDriver {
@@ -577,6 +581,7 @@ impl MetalDriver {
             queue,
             kernels,
             batch_cmd: std::cell::RefCell::new(None),
+            batch_enc: std::cell::RefCell::new(None),
         })
     }
 
@@ -595,6 +600,8 @@ impl MetalDriver {
     ///
     /// Returns an error if no batch is active.
     pub fn end_batch(&self) -> crate::Result<()> {
+        // Flush any open compute encoder before committing
+        self.flush_compute_encoder();
         let cmd =
             self.batch_cmd.borrow_mut().take().ok_or_else(|| {
                 crate::Error::Metal("end_batch called without begin_batch".into())
@@ -633,20 +640,25 @@ impl MetalDriver {
 
     /// Execute a compute operation.
     ///
-    /// In batched mode: encodes into the shared command buffer (no commit).
+    /// In batched mode: reuses a persistent encoder (created on first call,
+    /// closed before MPS). This eliminates per-operation encoder overhead
+    /// (~221 encoders → ~12 per forward pass, one per MPS boundary).
     /// In per-call mode: creates a new command buffer, commits, and waits.
     fn run_compute<F>(&self, f: F) -> crate::Result<()>
     where
         F: FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>) -> crate::Result<()>,
     {
-        let is_batched = self.batch_cmd.borrow().is_some();
-        if is_batched {
-            let batch = self.batch_cmd.borrow();
-            let cmd_buf = batch.as_ref().unwrap();
-            let enc = new_encoder(cmd_buf)?;
-            f(&enc)?;
-            enc.endEncoding();
-            drop(batch);
+        if self.batch_cmd.borrow().is_some() {
+            // Ensure persistent encoder exists
+            if self.batch_enc.borrow().is_none() {
+                let batch = self.batch_cmd.borrow();
+                let cmd_buf = batch.as_ref().unwrap();
+                let enc = new_encoder(cmd_buf)?;
+                drop(batch);
+                *self.batch_enc.borrow_mut() = Some(enc);
+            }
+            let enc_ref = self.batch_enc.borrow();
+            f(enc_ref.as_ref().unwrap())?;
             Ok(())
         } else {
             let cmd_buf = new_command_buffer(&self.queue)?;
@@ -659,20 +671,30 @@ impl MetalDriver {
         }
     }
 
+    /// Close the persistent compute encoder (if open).
+    /// Must be called before MPS encoding (which needs the encoder closed).
+    fn flush_compute_encoder(&self) {
+        if let Some(enc) = self.batch_enc.borrow_mut().take() {
+            enc.endEncoding();
+        }
+    }
+
     /// Execute an MPS operation (encodes directly to command buffer).
     ///
-    /// In batched mode: encodes into the shared command buffer (no commit).
-    /// In per-call mode: creates a new command buffer, commits, and waits.
+    /// In batched mode: closes any open compute encoder first, then encodes
+    /// MPS directly to the shared command buffer. A new compute encoder
+    /// will be created on the next `run_compute` call.
     fn run_mps<F>(&self, f: F) -> crate::Result<()>
     where
         F: FnOnce(&ProtocolObject<dyn MTLCommandBuffer>) -> crate::Result<()>,
     {
-        let batch = self.batch_cmd.borrow();
-        if let Some(ref cmd_buf) = *batch {
-            f(cmd_buf)?;
+        if self.batch_cmd.borrow().is_some() {
+            // Must close compute encoder before MPS encoding
+            self.flush_compute_encoder();
+            let batch = self.batch_cmd.borrow();
+            f(batch.as_ref().unwrap())?;
             Ok(())
         } else {
-            drop(batch);
             let cmd_buf = new_command_buffer(&self.queue)?;
             f(&cmd_buf)?;
             cmd_buf.commit();
@@ -1454,6 +1476,8 @@ impl Driver for MetalDriver {
         // read stale data from uncommitted command buffers).
         let is_batched = self.batch_cmd.borrow().is_some();
         if is_batched {
+            // Must close compute encoder before creating blit encoder
+            self.flush_compute_encoder();
             let batch = self.batch_cmd.borrow();
             let cmd_buf = batch.as_ref().unwrap();
             let blit = cmd_buf
