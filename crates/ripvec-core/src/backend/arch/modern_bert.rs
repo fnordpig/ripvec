@@ -410,11 +410,12 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
             .map(|e| e.input_ids.len())
             .max()
             .unwrap_or(0)
-            .next_multiple_of(8); // Pad for GEMM alignment.
+            .next_multiple_of(8);
         let total_tokens = batch * max_seq;
         let hidden = w.hidden_dim;
 
-        // Prepare batch inputs on device (per-call — must complete before batch).
+        // TODO(unpadding): switch to prepare_batch_unpadded once pad_to_batch/
+        // unpad_from_batch are wired into the attention sublayer.
         let inputs = driver.prepare_batch(encodings, max_seq)?;
 
         // Enter batched mode: all GPU ops encode into ONE command buffer.

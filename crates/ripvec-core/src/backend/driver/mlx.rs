@@ -159,6 +159,67 @@ impl Driver for MlxDriver {
         })
     }
 
+    fn pad_to_batch(
+        &self,
+        flat: &MlxTensor,
+        padded: &mut MlxTensor,
+        seq_lengths: &[usize],
+        max_seq: usize,
+        dim: usize,
+    ) -> crate::Result<()> {
+        // Perform on CPU — pad/unpad is a small, infrequent operation.
+        // The large GEMMs remain fully lazy in MLX.
+        let batch = seq_lengths.len();
+        let total_out = batch * max_seq * dim;
+        let mut out = vec![0.0_f32; total_out];
+
+        // Eval flat to read data — synchronisation point.
+        flat.0.eval().map_err(mlx_err)?;
+        let flat_data: &[f32] = flat.0.as_slice();
+
+        let mut offset = 0;
+        for (b, &len) in seq_lengths.iter().enumerate() {
+            for t in 0..len {
+                let src = (offset + t) * dim;
+                let dst = (b * max_seq + t) * dim;
+                out[dst..dst + dim].copy_from_slice(&flat_data[src..src + dim]);
+            }
+            offset += len;
+        }
+        *padded = MlxTensor(Array::from_slice(&out, &[total_out as i32]));
+        Ok(())
+    }
+
+    fn unpad_from_batch(
+        &self,
+        padded: &MlxTensor,
+        flat: &mut MlxTensor,
+        seq_lengths: &[usize],
+        max_seq: usize,
+        dim: usize,
+    ) -> crate::Result<()> {
+        // Perform on CPU — pad/unpad is a small, infrequent operation.
+        let batch = seq_lengths.len();
+        let total_tokens: usize = seq_lengths.iter().sum();
+        let mut out = vec![0.0_f32; total_tokens * dim];
+
+        // Eval padded to read data — synchronisation point.
+        padded.0.eval().map_err(mlx_err)?;
+        let padded_data: &[f32] = padded.0.as_slice();
+
+        let mut offset = 0;
+        for (b, &len) in seq_lengths.iter().enumerate() {
+            for t in 0..len {
+                let src = (b * max_seq + t) * dim;
+                let dst = (offset + t) * dim;
+                out[dst..dst + dim].copy_from_slice(&padded_data[src..src + dim]);
+            }
+            offset += len;
+        }
+        *flat = MlxTensor(Array::from_slice(&out, &[(total_tokens * dim) as i32]));
+        Ok(())
+    }
+
     fn embedding_lookup(
         &self,
         word_ids: &MlxTensor,

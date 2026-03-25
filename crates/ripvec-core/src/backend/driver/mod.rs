@@ -82,6 +82,52 @@ pub trait Driver: Send + Sync {
         max_seq: usize,
     ) -> crate::Result<BatchInputs<Self::Tensor>>;
 
+    /// Prepare a batch WITHOUT padding — concatenate all tokens flat.
+    ///
+    /// Returns `BatchInputs` with `total_tokens` actual tokens (no padding),
+    /// `cu_seqlens` for attention boundaries, and per-token position IDs.
+    /// Linear layers (GEMM, LN, GELU) process `total_tokens` rows.
+    /// Attention must pad/unpad around the per-head operations.
+    fn prepare_batch_unpadded(
+        &self,
+        encodings: &[Encoding],
+    ) -> crate::Result<BatchInputs<Self::Tensor>> {
+        // Default: fall back to padded (backends override for unpadded support)
+        let max_seq = encodings
+            .iter()
+            .map(|e| e.input_ids.len())
+            .max()
+            .unwrap_or(0)
+            .next_multiple_of(8);
+        self.prepare_batch(encodings, max_seq)
+    }
+
+    /// Scatter flat `[total_tokens, dim]` tensor into padded `[batch, max_seq, dim]`.
+    ///
+    /// Used before attention: linear layers produce unpadded output, but the
+    /// QKV split + batched attention GEMM need aligned `[batch*heads, seq, head_dim]`.
+    /// Padding positions are zeroed.
+    fn pad_to_batch(
+        &self,
+        flat: &Self::Tensor,
+        padded: &mut Self::Tensor,
+        seq_lengths: &[usize],
+        max_seq: usize,
+        dim: usize,
+    ) -> crate::Result<()>;
+
+    /// Gather padded `[batch, max_seq, dim]` back to flat `[total_tokens, dim]`.
+    ///
+    /// Used after attention: extracts only the real tokens, discarding padding.
+    fn unpad_from_batch(
+        &self,
+        padded: &Self::Tensor,
+        flat: &mut Self::Tensor,
+        seq_lengths: &[usize],
+        max_seq: usize,
+        dim: usize,
+    ) -> crate::Result<()>;
+
     // --- Embedding operations ---
 
     /// Word/position/token-type embedding lookup via gather.

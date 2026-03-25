@@ -48,6 +48,8 @@ kernel void add_one(
 /// - `l2_normalize_kernel` -- per-vector L2 normalization
 /// - `build_attn_mask_kernel` -- build float attention mask from int mask
 /// - `f32_to_f16_kernel` -- convert f32 to f16
+/// - `pad_to_batch_kernel` -- scatter flat [total_tokens, dim] to padded [batch, max_seq, dim]
+/// - `unpad_from_batch_kernel` -- gather real tokens from padded layout back to flat
 ///
 /// ## FP16 element-wise variants (bandwidth optimization)
 ///
@@ -1877,5 +1879,54 @@ kernel void flash_attention_kernel(
         if (gr < seq_len)
             O_head[gr * head_dim + col] = o_tg[i];
     }
+}
+
+// ---------------------------------------------------------------------------
+// pad_to_batch_kernel: scatter flat [total_tokens, dim] -> padded [batch, max_seq, dim]
+// ---------------------------------------------------------------------------
+kernel void pad_to_batch_kernel(
+    device float* output,           // [batch * max_seq * dim]
+    const device float* input,      // [total_tokens * dim]
+    const device int* cu_seqlens,   // [batch + 1]
+    constant int& max_seq,
+    constant int& dim,
+    constant int& batch,
+    uint idx [[thread_position_in_grid]]
+) {
+    int total_out = batch * max_seq * dim;
+    if (idx >= uint(total_out)) return;
+    int b = int(idx) / (max_seq * dim);
+    int rem = int(idx) % (max_seq * dim);
+    int t = rem / dim;
+    int d = rem % dim;
+    int seq_start = cu_seqlens[b];
+    int seq_len = cu_seqlens[b + 1] - seq_start;
+    output[idx] = (t < seq_len) ? input[(seq_start + t) * dim + d] : 0.0;
+}
+
+// ---------------------------------------------------------------------------
+// unpad_from_batch_kernel: gather padded [batch, max_seq, dim] -> flat [total_tokens, dim]
+// ---------------------------------------------------------------------------
+kernel void unpad_from_batch_kernel(
+    device float* output,           // [total_tokens * dim]
+    const device float* input,      // [batch * max_seq * dim]
+    const device int* cu_seqlens,   // [batch + 1]
+    constant int& max_seq,
+    constant int& dim,
+    constant int& total_tokens,
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= uint(total_tokens * dim)) return;
+    // Find which batch element this token belongs to
+    int token_idx = int(idx) / dim;
+    int d = int(idx) % dim;
+    // Linear scan for batch index (cu_seqlens is small, max 256 entries)
+    int b = 0;
+    for (int i = 0; i < 256; i++) {
+        if (cu_seqlens[i + 1] <= token_idx) b = i + 1;
+        else break;
+    }
+    int local_t = token_idx - cu_seqlens[b];
+    output[idx] = input[(b * max_seq + local_t) * dim + d];
 }
 ";

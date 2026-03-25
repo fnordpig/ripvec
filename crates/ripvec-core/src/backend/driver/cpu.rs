@@ -569,6 +569,51 @@ impl Driver for CpuDriver {
         })
     }
 
+    fn pad_to_batch(
+        &self,
+        flat: &Vec<f32>,
+        padded: &mut Vec<f32>,
+        seq_lengths: &[usize],
+        max_seq: usize,
+        dim: usize,
+    ) -> crate::Result<()> {
+        let batch = seq_lengths.len();
+        padded.resize(batch * max_seq * dim, 0.0);
+        padded.fill(0.0);
+        let mut offset = 0;
+        for (b, &len) in seq_lengths.iter().enumerate() {
+            for t in 0..len {
+                let src = (offset + t) * dim;
+                let dst = (b * max_seq + t) * dim;
+                padded[dst..dst + dim].copy_from_slice(&flat[src..src + dim]);
+            }
+            offset += len;
+        }
+        Ok(())
+    }
+
+    fn unpad_from_batch(
+        &self,
+        padded: &Vec<f32>,
+        flat: &mut Vec<f32>,
+        seq_lengths: &[usize],
+        max_seq: usize,
+        dim: usize,
+    ) -> crate::Result<()> {
+        let total_tokens: usize = seq_lengths.iter().sum();
+        flat.resize(total_tokens * dim, 0.0);
+        let mut offset = 0;
+        for (b, &len) in seq_lengths.iter().enumerate() {
+            for t in 0..len {
+                let src = (b * max_seq + t) * dim;
+                let dst = (offset + t) * dim;
+                flat[dst..dst + dim].copy_from_slice(&padded[src..src + dim]);
+            }
+            offset += len;
+        }
+        Ok(())
+    }
+
     fn embedding_lookup(
         &self,
         word_ids: &Vec<f32>,

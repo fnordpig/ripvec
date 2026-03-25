@@ -145,6 +145,10 @@ struct KernelPipelines {
     gemm_batched: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Convert FP32 to FP16.
     f32_to_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Scatter flat `[total_tokens, dim]` into padded `[batch, max_seq, dim]`.
+    pad_to_batch: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Gather real tokens from padded `[batch, max_seq, dim]` back to flat.
+    unpad_from_batch: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 impl KernelPipelines {
@@ -179,6 +183,8 @@ impl KernelPipelines {
             rope_cached: p("rope_cached_kernel")?,
             gemm_batched: create_pipeline(device, &gemm_library, "gemm_batched_kernel")?,
             f32_to_f16: p("f32_to_f16_kernel")?,
+            pad_to_batch: p("pad_to_batch_kernel")?,
+            unpad_from_batch: p("unpad_from_batch_kernel")?,
         })
     }
 }
@@ -1677,6 +1683,150 @@ impl Driver for MetalDriver {
             total_tokens,
             seq_lengths,
             cu_seqlens: None, // Padded mode for now
+        })
+    }
+
+    fn prepare_batch_unpadded(
+        &self,
+        encodings: &[Encoding],
+    ) -> crate::Result<BatchInputs<MetalTensor>> {
+        let batch = encodings.len();
+        let seq_lengths: Vec<usize> = encodings.iter().map(|e| e.input_ids.len()).collect();
+        let total_tokens: usize = seq_lengths.iter().sum();
+        let max_seq = seq_lengths
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .next_multiple_of(8);
+
+        // Build cu_seqlens: [0, len0, len0+len1, ...]
+        let mut cu_seqlens = Vec::with_capacity(batch + 1);
+        cu_seqlens.push(0);
+        let mut cumsum = 0;
+        for &len in &seq_lengths {
+            cumsum += len;
+            cu_seqlens.push(cumsum);
+        }
+
+        // Concatenate all tokens flat — NO padding
+        let mut input_ids = Vec::with_capacity(total_tokens);
+        let mut token_type_ids = Vec::with_capacity(total_tokens);
+        let mut position_ids = Vec::with_capacity(total_tokens);
+        let mut pooling_mask = Vec::with_capacity(total_tokens);
+
+        for enc in encodings {
+            for (i, &id) in enc.input_ids.iter().enumerate() {
+                input_ids.push(id as i32);
+                token_type_ids.push(enc.token_type_ids[i] as i32);
+                position_ids.push(i as i32);
+                pooling_mask.push(1.0_f32); // All real tokens
+            }
+        }
+
+        // Upload to GPU
+        let input_ids_buf = make_i32_buffer(&self.device, &input_ids)?;
+        let token_type_ids_buf = make_i32_buffer(&self.device, &token_type_ids)?;
+        let position_ids_buf = make_i32_buffer(&self.device, &position_ids)?;
+        let pooling_mask_buf = make_f32_buffer(&self.device, &pooling_mask)?;
+
+        // Dummy attention mask and float_mask — unused in unpadded mode
+        // (attention uses cu_seqlens + pad_to_batch instead)
+        let dummy_i32 = make_i32_buffer(&self.device, &vec![0_i32; total_tokens])?;
+        let dummy_f32 = alloc_f32_buffer(&self.device, total_tokens)?;
+
+        Ok(BatchInputs {
+            input_ids: MetalTensor::new(input_ids_buf, 0),
+            attention_mask: MetalTensor::new(dummy_i32, 0),
+            token_type_ids: MetalTensor::new(token_type_ids_buf, 0),
+            position_ids: MetalTensor::new(position_ids_buf, 0),
+            float_mask: MetalTensor::new(dummy_f32, 0),
+            pooling_mask: MetalTensor::new(pooling_mask_buf, 0),
+            batch,
+            max_seq,
+            total_tokens,
+            seq_lengths,
+            cu_seqlens: Some(cu_seqlens),
+        })
+    }
+
+    fn pad_to_batch(
+        &self,
+        flat: &MetalTensor,
+        padded: &mut MetalTensor,
+        seq_lengths: &[usize],
+        max_seq: usize,
+        dim: usize,
+    ) -> crate::Result<()> {
+        let batch = seq_lengths.len();
+        let total_out = batch * max_seq * dim;
+
+        // Build cu_seqlens on CPU: [0, len0, len0+len1, ...]
+        let mut cu: Vec<i32> = Vec::with_capacity(batch + 1);
+        cu.push(0);
+        let mut acc: i32 = 0;
+        for &len in seq_lengths {
+            acc += len as i32;
+            cu.push(acc);
+        }
+        let cu_buf = make_i32_buffer(&self.device, &cu)?;
+
+        *padded = self.alloc_tensor(total_out)?;
+        let padded_buf = padded.buffer.clone();
+        let padded_offset = padded.offset;
+        let flat_buf = flat.buffer.clone();
+        let flat_offset = flat.offset;
+
+        self.run_compute(|enc| {
+            enc.setComputePipelineState(&self.kernels.pad_to_batch);
+            set_buffer(enc, &padded_buf, padded_offset, 0);
+            set_buffer(enc, &flat_buf, flat_offset, 1);
+            set_buffer(enc, &cu_buf, 0, 2);
+            set_i32_param(enc, max_seq as i32, 3);
+            set_i32_param(enc, dim as i32, 4);
+            set_i32_param(enc, batch as i32, 5);
+            dispatch_1d(enc, &self.kernels.pad_to_batch, total_out);
+            Ok(())
+        })
+    }
+
+    fn unpad_from_batch(
+        &self,
+        padded: &MetalTensor,
+        flat: &mut MetalTensor,
+        seq_lengths: &[usize],
+        max_seq: usize,
+        dim: usize,
+    ) -> crate::Result<()> {
+        let batch = seq_lengths.len();
+        let total_tokens: usize = seq_lengths.iter().sum();
+
+        // Build cu_seqlens on CPU: [0, len0, len0+len1, ...]
+        let mut cu: Vec<i32> = Vec::with_capacity(batch + 1);
+        cu.push(0);
+        let mut acc: i32 = 0;
+        for &len in seq_lengths {
+            acc += len as i32;
+            cu.push(acc);
+        }
+        let cu_buf = make_i32_buffer(&self.device, &cu)?;
+
+        *flat = self.alloc_tensor(total_tokens * dim)?;
+        let flat_buf = flat.buffer.clone();
+        let flat_offset = flat.offset;
+        let padded_buf = padded.buffer.clone();
+        let padded_offset = padded.offset;
+
+        self.run_compute(|enc| {
+            enc.setComputePipelineState(&self.kernels.unpad_from_batch);
+            set_buffer(enc, &flat_buf, flat_offset, 0);
+            set_buffer(enc, &padded_buf, padded_offset, 1);
+            set_buffer(enc, &cu_buf, 0, 2);
+            set_i32_param(enc, max_seq as i32, 3);
+            set_i32_param(enc, dim as i32, 4);
+            set_i32_param(enc, total_tokens as i32, 5);
+            dispatch_1d(enc, &self.kernels.unpad_from_batch, total_tokens * dim);
+            Ok(())
         })
     }
 
