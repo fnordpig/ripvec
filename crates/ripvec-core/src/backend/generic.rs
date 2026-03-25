@@ -62,10 +62,6 @@ where
     A: ModelArch<D> + Send + Sync + 'static,
 {
     fn embed_batch(&self, encodings: &[Encoding]) -> crate::Result<Vec<Vec<f32>>> {
-        // Sub-batch at MAX_BATCH=32 to reduce padding waste.
-        // Pre-tokenization sorts by descending length, so consecutive
-        // sequences have similar lengths. Smaller sub-batches → tighter
-        // per-batch padding → less wasted compute.
         const MAX_BATCH: usize = 32;
         if encodings.len() <= MAX_BATCH {
             return self.arch.forward(&self.driver, encodings);
