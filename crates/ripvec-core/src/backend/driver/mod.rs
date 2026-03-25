@@ -12,8 +12,12 @@
 //!   can monomorphize and inline driver calls.
 //! - **Send + Sync**: drivers are shared across the pipeline.
 
+#[cfg(any(feature = "cpu", feature = "cpu-accelerate"))]
+pub mod cpu;
 #[cfg(feature = "metal")]
 pub mod metal;
+#[cfg(feature = "mlx")]
+pub mod mlx;
 
 use super::Encoding;
 
