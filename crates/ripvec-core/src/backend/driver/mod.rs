@@ -378,8 +378,10 @@ pub struct BatchInputs<T> {
     pub token_type_ids: T,
     /// Position IDs `[batch * max_seq]` as int32.
     pub position_ids: T,
-    /// Float attention mask `[batch * max_seq]` (0.0 or -10000.0).
+    /// Float attention bias mask `[batch * max_seq]` (0.0 or -1e9) for softmax.
     pub float_mask: T,
+    /// Float pooling mask `[batch * max_seq]` (1.0 or 0.0) for mean pooling.
+    pub pooling_mask: T,
     /// Number of sequences in this batch.
     pub batch: usize,
     /// Maximum sequence length (all sequences padded to this).

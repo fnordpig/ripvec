@@ -442,7 +442,7 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
         };
 
         // Encoder layers (22).
-        for layer in &w.layers {
+        for (layer_idx, layer) in w.layers.iter().enumerate() {
             let rope = if layer.is_global {
                 &self.global_rope
             } else {
@@ -454,6 +454,20 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
             let attn_output =
                 attn_scores_residual(driver, &q, &k, &v, &hidden_states, layer, &inputs, &g)?;
             hidden_states = ffn_sublayer(driver, &attn_output, layer, &g, &w.zero_bias)?;
+
+            // Debug: check hidden_states after each layer
+            if let Ok(h) = driver.to_host(&hidden_states, 1, g.total_tokens * g.hidden) {
+                let nz = h[0].iter().filter(|&&x| x.abs() > 1e-10).count();
+                let nan = h[0].iter().filter(|x| x.is_nan()).count();
+                let max = h[0].iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                eprintln!(
+                    "  layer {layer_idx}: nz={nz}/{}, nan={nan}, max={max:.4}",
+                    g.total_tokens * g.hidden
+                );
+                if nz == 0 {
+                    break;
+                } // stop early if dead
+            }
         }
 
         // Final LayerNorm before pooling.
@@ -468,17 +482,38 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
             w.layer_norm_eps,
         )?;
 
+        // Debug: check after final LN
+        if let Ok(h) = driver.to_host(&hidden_states, 1, total_tokens * hidden) {
+            let nz = h[0].iter().filter(|&&x| x.abs() > 1e-10).count();
+            eprintln!("  final_LN: nz={nz}/{}", total_tokens * hidden);
+        }
+
         // Mean pooling + L2 normalize.
         let mut pooled = driver.alloc_zeros(batch * hidden)?;
         driver.mean_pool(
             &mut pooled,
             &hidden_states,
-            &inputs.float_mask,
+            &inputs.pooling_mask,
             batch,
             max_seq,
             hidden,
         )?;
+
+        // Debug: check after mean pool
+        if let Ok(h) = driver.to_host(&pooled, 1, batch * hidden) {
+            let nz = h[0].iter().filter(|&&x| x.abs() > 1e-10).count();
+            eprintln!("  mean_pool: nz={nz}/{}", batch * hidden);
+        }
+
         driver.l2_normalize(&mut pooled, batch, hidden)?;
+
+        // Debug: check after L2
+        if let Ok(h) = driver.to_host(&pooled, 1, batch * hidden) {
+            let nz = h[0].iter().filter(|&&x| x.abs() > 1e-10).count();
+            let l2: f32 = h[0].iter().map(|x| x * x).sum::<f32>().sqrt();
+            eprintln!("  l2_norm: nz={nz}/{}, L2={l2:.4}", batch * hidden);
+        }
+
         driver.to_host(&pooled, batch, hidden)
     }
 }

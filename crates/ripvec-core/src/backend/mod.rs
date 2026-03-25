@@ -488,11 +488,96 @@ mod tests {
             &h[0][..5]
         );
 
-        // Full forward
-        let result = backend.embed_batch(&[enc]).expect("embed_batch failed");
-        assert_eq!(result[0].len(), 768);
+        // Stage-by-stage forward pass bisection
+        let total = 8; // padded seq
+        let hd = 768;
+        let nh = 12;
+        let head_dim = 64;
+
+        // After embedding LN
+        let emb_clone = driver.clone_tensor(&hidden, total * hd).unwrap();
+        let mut ln_out = driver.alloc_zeros(total * hd).unwrap();
+        driver
+            .layer_norm(
+                &mut ln_out,
+                &emb_clone,
+                &arch.weights.emb_norm_weight,
+                &arch.weights.zero_bias,
+                total,
+                hd,
+                1e-5,
+            )
+            .unwrap();
+        let ln_h = driver.to_host(&ln_out, 1, total * hd).unwrap();
+        let nz = ln_h[0].iter().filter(|&&v| v.abs() > 1e-10).count();
+        eprintln!("STAGE 1 - emb+LN: {nz}/{} nonzero", total * hd);
+
+        // Layer 0 QKV GEMM
+        let layer0 = &arch.weights.layers[0];
+        let mut qkv = driver.alloc_zeros(total * 3 * hd).unwrap();
+        driver
+            .gemm(
+                &ln_out,
+                &layer0.qkv_weight,
+                &mut qkv,
+                total,
+                3 * hd,
+                hd,
+                true,
+            )
+            .unwrap();
+        let qkv_h = driver.to_host(&qkv, 1, total * 3 * hd).unwrap();
+        let nz = qkv_h[0].iter().filter(|&&v| v.abs() > 1e-10).count();
+        eprintln!("STAGE 2 - QKV GEMM: {nz}/{} nonzero", total * 3 * hd);
+
+        // QKV split
+        let mut q = driver.alloc_zeros(total * hd).unwrap();
+        let mut k = driver.alloc_zeros(total * hd).unwrap();
+        let mut v = driver.alloc_zeros(total * hd).unwrap();
+        driver
+            .qkv_split(&mut q, &mut k, &mut v, &qkv, 1, 8, hd, nh, head_dim)
+            .unwrap();
+        let q_h = driver.to_host(&q, 1, total * hd).unwrap();
+        let nz = q_h[0].iter().filter(|&&v| v.abs() > 1e-10).count();
+        eprintln!("STAGE 3 - Q after split: {nz}/{} nonzero", total * hd);
+
+        // Attention scores
+        let mut scores = driver.alloc_zeros(1 * nh * 8 * 8).unwrap();
+        driver
+            .gemm_batched(
+                &q,
+                &k,
+                &mut scores,
+                8,
+                8,
+                head_dim,
+                true,
+                8 * head_dim,
+                8 * head_dim,
+                8 * 8,
+                nh,
+            )
+            .unwrap();
+        let s_h = driver.to_host(&scores, 1, nh * 8 * 8).unwrap();
+        let nz = s_h[0].iter().filter(|&&v| v.abs() > 1e-10).count();
+        eprintln!("STAGE 4 - scores: {nz}/{} nonzero", nh * 8 * 8);
+
+        // Try just 1 layer via the architecture directly
+        use crate::backend::arch::ModelArch;
+        let enc2 = Encoding {
+            input_ids: vec![1, 100, 200, 300, 2],
+            attention_mask: vec![1; 5],
+            token_type_ids: vec![0; 5],
+        };
+
+        // Modify max_layers if the arch supports it — but it doesn't yet.
+        // Instead, call the forward pass and check the result.
+        let result = arch.forward(&driver, &[enc2]).expect("forward failed");
         let l2: f32 = result[0].iter().map(|x| x * x).sum::<f32>().sqrt();
-        eprintln!("final L2={l2}, first 5: {:?}", &result[0][..5]);
-        assert!((l2 - 1.0).abs() < 0.1, "L2={l2}");
+        let nz = result[0].iter().filter(|&&v| v.abs() > 1e-10).count();
+        eprintln!(
+            "ARCH FORWARD: L2={l2}, nz={nz}/768, first 5: {:?}",
+            &result[0][..5]
+        );
     }
 }

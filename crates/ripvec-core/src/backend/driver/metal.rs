@@ -17,9 +17,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
+use objc2::AnyThread;
 use objc2_foundation::{NSString, NSUInteger};
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
@@ -32,10 +32,10 @@ use objc2_metal_performance_shaders::{
 use safetensors::SafeTensors;
 
 use super::{BatchInputs, Driver};
-use crate::backend::Encoding;
 use crate::backend::arch::modern_bert::{
     ModernBertArch, ModernBertLayerWeights, ModernBertWeights, RopeCache,
 };
+use crate::backend::Encoding;
 
 // ---------------------------------------------------------------------------
 // CoreGraphics linkage (required for MTLCreateSystemDefaultDevice)
@@ -512,6 +512,24 @@ fn make_i32_buffer(
     .ok_or_else(|| crate::Error::Metal("input buffer alloc failed".into()))
 }
 
+/// Create a Metal buffer from f32 data.
+#[expect(unsafe_code, reason = "newBufferWithBytes requires unsafe FFI")]
+fn make_f32_buffer(
+    device: &ProtocolObject<dyn MTLDevice>,
+    data: &[f32],
+) -> crate::Result<Retained<ProtocolObject<dyn MTLBuffer>>> {
+    let size = core::mem::size_of_val(data) as NSUInteger;
+    unsafe {
+        device.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new(data.as_ptr() as *mut _)
+                .ok_or_else(|| crate::Error::Metal("null input data".into()))?,
+            size,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+    .ok_or_else(|| crate::Error::Metal("f32 buffer alloc failed".into()))
+}
+
 // ---------------------------------------------------------------------------
 // MetalDriver
 // ---------------------------------------------------------------------------
@@ -947,9 +965,8 @@ impl Driver for MetalDriver {
         let position_ids_buf = make_i32_buffer(&self.device, &position_ids)?;
         let attn_mask_int_buf = make_i32_buffer(&self.device, &attn_mask_int)?;
 
-        // Build float mask
+        // Build float attention bias mask (0.0 for real, -1e9 for pad)
         let float_mask_buf = alloc_f32_buffer(&self.device, total)?;
-
         self.run_compute(|enc| {
             enc.setComputePipelineState(&self.kernels.build_attn_mask);
             set_buffer(enc, &float_mask_buf, 0, 0);
@@ -958,6 +975,13 @@ impl Driver for MetalDriver {
             dispatch_1d(enc, &self.kernels.build_attn_mask, total);
             Ok(())
         })?;
+
+        // Build pooling mask (1.0 for real, 0.0 for pad) — for mean pooling
+        let pooling_mask: Vec<f32> = attn_mask_int
+            .iter()
+            .map(|&m| if m == 1 { 1.0 } else { 0.0 })
+            .collect();
+        let pooling_mask_buf = make_f32_buffer(&self.device, &pooling_mask)?;
 
         Ok(BatchInputs {
             input_ids: MetalTensor {
@@ -978,6 +1002,10 @@ impl Driver for MetalDriver {
             },
             float_mask: MetalTensor {
                 buffer: float_mask_buf,
+                offset: 0,
+            },
+            pooling_mask: MetalTensor {
+                buffer: pooling_mask_buf,
                 offset: 0,
             },
             batch,
