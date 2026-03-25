@@ -10,8 +10,8 @@
 //! [`Driver`](super::super::driver::Driver) primitives into the full forward
 //! pass.
 
-use super::super::driver::{BatchInputs, Driver};
 use super::super::Encoding;
+use super::super::driver::{BatchInputs, Driver};
 use super::ModelArch;
 
 // ---------------------------------------------------------------------------
@@ -480,6 +480,10 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
             .unwrap_or(w.layers.len())
             .min(w.layers.len());
         for layer in &w.layers[..num_layers] {
+            // Reset workspace so this layer reuses buffers from previous layer.
+            // Without this, 22 layers accumulate ~22GB of workspace buffers.
+            driver.reset_layer_workspace();
+
             let rope = if layer.is_global {
                 &self.global_rope
             } else {

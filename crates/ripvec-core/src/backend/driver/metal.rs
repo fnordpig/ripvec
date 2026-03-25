@@ -695,11 +695,18 @@ impl MetalDriver {
         // Allocate new buffer
         let buffer = alloc_f32_buffer(&self.device, n)?;
 
-        // Add to pool for future reuse
-        if cursor < pool.len() {
-            pool[cursor] = buffer.clone();
-        } else {
-            pool.push(buffer.clone());
+        // Add to pool for future reuse — but cap pool size to avoid OOM.
+        // ModernBERT 22 layers × ~15 allocs/layer = ~330 tensors per forward.
+        // Without a cap, the pool holds ALL of them (including 400MB score buffers).
+        // Cap at ~30 (one layer's worth) — subsequent layers reuse the same slots
+        // after begin_batch resets the cursor.
+        const MAX_POOL: usize = 30;
+        if cursor < MAX_POOL {
+            if cursor < pool.len() {
+                pool[cursor] = buffer.clone();
+            } else {
+                pool.push(buffer.clone());
+            }
         }
         self.pool_cursor.set(cursor + 1);
 
@@ -1561,6 +1568,14 @@ impl Driver for MetalDriver {
 
     fn end_batch(&self) -> crate::Result<()> {
         self.end_batch()
+    }
+
+    fn reset_layer_workspace(&self) {
+        // Reset pool cursor so the next layer reuses the same buffer slots.
+        // Without this, 22-layer ModernBERT accumulates 22 × ~1GB of workspace
+        // buffers (including 400MB attention score matrices). With this, peak
+        // memory is ~1GB (one layer's worth).
+        self.pool_cursor.set(0);
     }
 
     fn alloc_zeros(&self, n: usize) -> crate::Result<MetalTensor> {

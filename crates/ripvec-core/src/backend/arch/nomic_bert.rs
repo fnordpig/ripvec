@@ -95,7 +95,12 @@ pub struct NomicBertArch<T> {
 struct EncoderGeometry {
     batch: usize,
     max_seq: usize,
+    /// Actual tokens across all sequences (no padding). Used for linear ops.
     total_tokens: usize,
+    /// Padded total: `batch * max_seq`. Used for attention layout.
+    padded_tokens: usize,
+    /// Per-sequence lengths for pad/unpad.
+    seq_lengths: Vec<usize>,
     hidden: usize,
     num_heads: usize,
     head_dim: usize,
@@ -108,9 +113,11 @@ struct EncoderGeometry {
 // Attention sublayer — QKV + RoPE + scores + output + residual + LN
 // ---------------------------------------------------------------------------
 
-/// QKV projection + split + `RoPE` (no pre-norm -- post-norm architecture).
+/// QKV projection (unpadded) + pad + split + `RoPE` (no pre-norm -- post-norm architecture).
 ///
 /// Computes QKV directly from `hidden_states` without a preceding `LayerNorm`.
+/// QKV GEMM runs on `total_tokens` (unpadded), then pads to `batch*max_seq`
+/// for `qkv_split` and attention.
 /// Returns `(q, k, v)` each `[batch*num_heads, seq, head_dim]`.
 fn attn_qkv_rope<D: Driver>(
     driver: &D,
@@ -120,6 +127,7 @@ fn attn_qkv_rope<D: Driver>(
     weights: &NomicBertWeights<D::Tensor>,
 ) -> crate::Result<(D::Tensor, D::Tensor, D::Tensor)> {
     // QKV projection: [total_tokens, hidden] @ [3*hidden, hidden]^T -- no bias.
+    // Uses total_tokens (unpadded) — no wasted compute on padding.
     let mut qkv = driver.alloc_zeros(g.total_tokens * 3 * g.hidden)?;
     driver.gemm(
         hidden_states,
@@ -131,15 +139,27 @@ fn attn_qkv_rope<D: Driver>(
         true,
     )?;
 
+    // Pad QKV from [total_tokens, 3H] to [batch*max_seq, 3H] for attention.
+    // qkv_split needs the padded batch×seq layout to reshape into per-head tensors.
+    let mut qkv_padded = driver.alloc_zeros(g.padded_tokens * 3 * g.hidden)?;
+    driver.pad_to_batch(
+        &qkv,
+        &mut qkv_padded,
+        &g.seq_lengths,
+        g.max_seq,
+        3 * g.hidden,
+    )?;
+
     // Split into Q, K, V each [batch * num_heads, seq, head_dim].
-    let mut q = driver.alloc_zeros(g.total_tokens * g.hidden)?;
-    let mut k = driver.alloc_zeros(g.total_tokens * g.hidden)?;
-    let mut v = driver.alloc_zeros(g.total_tokens * g.hidden)?;
+    let padded = g.padded_tokens;
+    let mut q = driver.alloc_zeros(padded * g.hidden)?;
+    let mut k = driver.alloc_zeros(padded * g.hidden)?;
+    let mut v = driver.alloc_zeros(padded * g.hidden)?;
     driver.qkv_split(
         &mut q,
         &mut k,
         &mut v,
-        &qkv,
+        &qkv_padded,
         g.batch,
         g.max_seq,
         g.hidden,
@@ -171,11 +191,11 @@ fn attn_qkv_rope<D: Driver>(
     Ok((q, k, v))
 }
 
-/// Attention scores + output projection + fused residual + `LayerNorm`.
+/// Attention scores + output projection (padded) + unpad + fused residual + `LayerNorm`.
 ///
 /// Post-norm architecture: `output = LN(output_proj + hidden_states)`.
-/// Uses `fused_residual_layernorm` to combine residual add and `LayerNorm`
-/// in one pass (same as the monolithic path).
+/// Attention operates in padded layout; output projection unpads back to
+/// `[total_tokens, H]` before the residual + `LayerNorm`.
 #[expect(clippy::too_many_arguments, reason = "Q/K/V must be separate tensors")]
 fn attn_scores_residual<D: Driver>(
     driver: &D,
@@ -187,6 +207,8 @@ fn attn_scores_residual<D: Driver>(
     inputs: &BatchInputs<D::Tensor>,
     g: &EncoderGeometry,
 ) -> crate::Result<D::Tensor> {
+    let padded = g.padded_tokens;
+
     // Attention scores: Q @ K^T => [batch * num_heads, seq, seq]
     let mut scores = driver.alloc_zeros(g.batch * g.num_heads * g.max_seq * g.max_seq)?;
     driver.gemm_batched(
@@ -214,7 +236,7 @@ fn attn_scores_residual<D: Driver>(
     )?;
 
     // Weighted sum: scores @ V => [batch * num_heads, seq, head_dim]
-    let mut attn_out = driver.alloc_zeros(g.total_tokens * g.hidden)?;
+    let mut attn_out = driver.alloc_zeros(padded * g.hidden)?;
     driver.gemm_batched(
         &scores,
         v,
@@ -229,8 +251,8 @@ fn attn_scores_residual<D: Driver>(
         g.batch * g.num_heads,
     )?;
 
-    // Reshape heads back to [total_tokens, hidden].
-    let mut context = driver.alloc_zeros(g.total_tokens * g.hidden)?;
+    // Reshape heads back to [padded_tokens, hidden] (still padded).
+    let mut context = driver.alloc_zeros(padded * g.hidden)?;
     driver.attn_reshape(
         &mut context,
         &attn_out,
@@ -240,16 +262,26 @@ fn attn_scores_residual<D: Driver>(
         g.head_dim,
     )?;
 
-    // Output projection: [total_tokens, hidden] @ [hidden, hidden]^T -- no bias.
-    let mut projected = driver.alloc_zeros(g.total_tokens * g.hidden)?;
+    // Output projection on padded layout, then unpad.
+    let mut projected_padded = driver.alloc_zeros(padded * g.hidden)?;
     driver.gemm(
         &context,
         &layer.output_weight,
-        &mut projected,
-        g.total_tokens,
+        &mut projected_padded,
+        padded,
         g.hidden,
         g.hidden,
         true,
+    )?;
+
+    // Unpad: [padded_tokens, H] → [total_tokens, H]
+    let mut projected = driver.alloc_zeros(g.total_tokens * g.hidden)?;
+    driver.unpad_from_batch(
+        &projected_padded,
+        &mut projected,
+        &g.seq_lengths,
+        g.max_seq,
+        g.hidden,
     )?;
 
     // Post-norm: output = LN(projected + hidden_states, norm1_weight, norm1_bias).
@@ -356,17 +388,14 @@ impl<D: Driver> ModelArch<D> for NomicBertArch<D::Tensor> {
     fn forward(&self, driver: &D, encodings: &[Encoding]) -> crate::Result<Vec<Vec<f32>>> {
         let w = &self.weights;
         let batch = encodings.len();
-        let max_seq = encodings
-            .iter()
-            .map(|e| e.input_ids.len())
-            .max()
-            .unwrap_or(0)
-            .next_multiple_of(8); // Pad for GEMM alignment.
-        let total_tokens = batch * max_seq;
         let hidden = w.hidden_dim;
 
-        // Prepare batch inputs on device (per-call -- must complete before batch).
-        let inputs = driver.prepare_batch(encodings, max_seq)?;
+        // Unpadded mode: tokens concatenated without padding.
+        // Linear layers (GEMM, LN, SwiGLU) process total_tokens rows — no wasted compute.
+        // Attention pads/unpads around per-head operations via pad_to_batch/unpad_from_batch.
+        let inputs = driver.prepare_batch_unpadded(encodings)?;
+        let total_tokens = inputs.total_tokens;
+        let max_seq = inputs.max_seq;
 
         // Enter batched mode: all GPU ops encode into ONE command buffer.
         driver.begin_batch()?;
@@ -398,6 +427,8 @@ impl<D: Driver> ModelArch<D> for NomicBertArch<D::Tensor> {
             batch,
             max_seq,
             total_tokens,
+            padded_tokens: batch * max_seq,
+            seq_lengths: inputs.seq_lengths.clone(),
             hidden,
             num_heads: w.num_heads,
             head_dim: w.head_dim,
@@ -408,6 +439,7 @@ impl<D: Driver> ModelArch<D> for NomicBertArch<D::Tensor> {
 
         // Encoder layers (all 12, post-norm architecture).
         for layer in &w.layers {
+            driver.reset_layer_workspace();
             let (q, k, v) = attn_qkv_rope(driver, &hidden_states, layer, &g, w)?;
             let attn_output =
                 attn_scores_residual(driver, &q, &k, &v, &hidden_states, layer, &inputs, &g)?;
@@ -416,11 +448,21 @@ impl<D: Driver> ModelArch<D> for NomicBertArch<D::Tensor> {
 
         // No final norm before pooling (unlike ModernBERT).
 
+        // Pad back to [batch, max_seq, hidden] for mean_pool kernel.
+        let mut padded_for_pool = driver.alloc_zeros(batch * max_seq * hidden)?;
+        driver.pad_to_batch(
+            &hidden_states,
+            &mut padded_for_pool,
+            &inputs.seq_lengths,
+            max_seq,
+            hidden,
+        )?;
+
         // Mean pooling + L2 normalize.
         let mut pooled = driver.alloc_zeros(batch * hidden)?;
         driver.mean_pool(
             &mut pooled,
-            &hidden_states,
+            &padded_for_pool,
             &inputs.pooling_mask,
             batch,
             max_seq,

@@ -88,7 +88,12 @@ pub struct ClassicBertArch<T> {
 struct EncoderGeometry {
     batch: usize,
     max_seq: usize,
+    /// Actual tokens across all sequences (no padding). Used for linear ops.
     total_tokens: usize,
+    /// Padded total: `batch * max_seq`. Used for attention layout.
+    padded_tokens: usize,
+    /// Per-sequence lengths for pad/unpad.
+    seq_lengths: Vec<usize>,
     hidden: usize,
     num_heads: usize,
     head_dim: usize,
@@ -97,18 +102,17 @@ struct EncoderGeometry {
     eps: f32,
 }
 
-/// Run the self-attention sublayer for one encoder layer.
+/// QKV projection (unpadded) + bias + pad + split heads.
 ///
-/// QKV projection -> split heads -> scaled dot-product attention ->
-/// reshape -> output projection -> bias + residual + `LayerNorm`.
-fn attention_sublayer<D: Driver>(
+/// Returns `(q, k, v)` each `[batch*num_heads, seq, head_dim]` in padded layout.
+fn attn_qkv<D: Driver>(
     driver: &D,
     hidden_states: &D::Tensor,
     layer: &ClassicBertLayerWeights<D::Tensor>,
-    inputs: &BatchInputs<D::Tensor>,
     g: &EncoderGeometry,
-) -> crate::Result<D::Tensor> {
+) -> crate::Result<(D::Tensor, D::Tensor, D::Tensor)> {
     // QKV projection: [total_tokens, hidden] @ [3*hidden, hidden]^T
+    // Uses total_tokens (unpadded) — no wasted compute on padding.
     let mut qkv = driver.alloc_zeros(g.total_tokens * 3 * g.hidden)?;
     driver.gemm(
         hidden_states,
@@ -121,15 +125,27 @@ fn attention_sublayer<D: Driver>(
     )?;
     driver.add_bias(&mut qkv, &layer.qkv_bias, g.total_tokens, 3 * g.hidden)?;
 
+    // Pad QKV from [total_tokens, 3H] to [batch*max_seq, 3H] for attention.
+    // qkv_split needs the padded batch×seq layout to reshape into per-head tensors.
+    let mut qkv_padded = driver.alloc_zeros(g.padded_tokens * 3 * g.hidden)?;
+    driver.pad_to_batch(
+        &qkv,
+        &mut qkv_padded,
+        &g.seq_lengths,
+        g.max_seq,
+        3 * g.hidden,
+    )?;
+
     // Split into Q, K, V each [batch * num_heads, seq, head_dim].
-    let mut q = driver.alloc_zeros(g.total_tokens * g.hidden)?;
-    let mut k = driver.alloc_zeros(g.total_tokens * g.hidden)?;
-    let mut v = driver.alloc_zeros(g.total_tokens * g.hidden)?;
+    let padded = g.padded_tokens;
+    let mut q = driver.alloc_zeros(padded * g.hidden)?;
+    let mut k = driver.alloc_zeros(padded * g.hidden)?;
+    let mut v = driver.alloc_zeros(padded * g.hidden)?;
     driver.qkv_split(
         &mut q,
         &mut k,
         &mut v,
-        &qkv,
+        &qkv_padded,
         g.batch,
         g.max_seq,
         g.hidden,
@@ -137,11 +153,28 @@ fn attention_sublayer<D: Driver>(
         g.head_dim,
     )?;
 
+    Ok((q, k, v))
+}
+
+/// Attention scores + output projection (padded) + unpad + bias + residual + `LayerNorm`.
+#[expect(clippy::too_many_arguments, reason = "Q/K/V must be separate tensors")]
+fn attn_scores_residual<D: Driver>(
+    driver: &D,
+    q: &D::Tensor,
+    k: &D::Tensor,
+    v: &D::Tensor,
+    hidden_states: &D::Tensor,
+    layer: &ClassicBertLayerWeights<D::Tensor>,
+    inputs: &BatchInputs<D::Tensor>,
+    g: &EncoderGeometry,
+) -> crate::Result<D::Tensor> {
+    let padded = g.padded_tokens;
+
     // Attention scores: Q @ K^T => [batch * num_heads, seq, seq]
     let mut scores = driver.alloc_zeros(g.batch * g.num_heads * g.max_seq * g.max_seq)?;
     driver.gemm_batched(
-        &q,
-        &k,
+        q,
+        k,
         &mut scores,
         g.max_seq,
         g.max_seq,
@@ -162,10 +195,10 @@ fn attention_sublayer<D: Driver>(
     )?;
 
     // Weighted sum: scores @ V => [batch * num_heads, seq, head_dim]
-    let mut attn_out = driver.alloc_zeros(g.total_tokens * g.hidden)?;
+    let mut attn_out = driver.alloc_zeros(padded * g.hidden)?;
     driver.gemm_batched(
         &scores,
-        &v,
+        v,
         &mut attn_out,
         g.max_seq,
         g.head_dim,
@@ -177,8 +210,8 @@ fn attention_sublayer<D: Driver>(
         g.batch * g.num_heads,
     )?;
 
-    // Reshape heads back to [total_tokens, hidden].
-    let mut context = driver.alloc_zeros(g.total_tokens * g.hidden)?;
+    // Reshape heads back to [padded_tokens, hidden] (still padded).
+    let mut context = driver.alloc_zeros(padded * g.hidden)?;
     driver.attn_reshape(
         &mut context,
         &attn_out,
@@ -188,17 +221,28 @@ fn attention_sublayer<D: Driver>(
         g.head_dim,
     )?;
 
-    // Output projection + bias + residual + LayerNorm.
-    let mut projected = driver.alloc_zeros(g.total_tokens * g.hidden)?;
+    // Output projection on padded layout, then unpad.
+    let mut projected_padded = driver.alloc_zeros(padded * g.hidden)?;
     driver.gemm(
         &context,
         &layer.output_weight,
-        &mut projected,
-        g.total_tokens,
+        &mut projected_padded,
+        padded,
         g.hidden,
         g.hidden,
         true,
     )?;
+
+    // Unpad: [padded_tokens, H] → [total_tokens, H]
+    let mut projected = driver.alloc_zeros(g.total_tokens * g.hidden)?;
+    driver.unpad_from_batch(
+        &projected_padded,
+        &mut projected,
+        &g.seq_lengths,
+        g.max_seq,
+        g.hidden,
+    )?;
+
     driver.add_bias(&mut projected, &layer.output_bias, g.total_tokens, g.hidden)?;
 
     let mut output = driver.alloc_zeros(g.total_tokens * g.hidden)?;
@@ -277,17 +321,14 @@ impl<D: Driver> ModelArch<D> for ClassicBertArch<D::Tensor> {
     fn forward(&self, driver: &D, encodings: &[Encoding]) -> crate::Result<Vec<Vec<f32>>> {
         let w = &self.weights;
         let batch = encodings.len();
-        let max_seq = encodings
-            .iter()
-            .map(|e| e.input_ids.len())
-            .max()
-            .unwrap_or(0)
-            .next_multiple_of(8); // Pad for GEMM alignment.
-        let total_tokens = batch * max_seq;
         let hidden = w.hidden_dim;
 
-        // Prepare batch inputs on device (per-call -- must complete before batch).
-        let inputs = driver.prepare_batch(encodings, max_seq)?;
+        // Unpadded mode: tokens concatenated without padding.
+        // Linear layers (GEMM, LN, GELU) process total_tokens rows — no wasted compute.
+        // Attention pads/unpads around per-head operations via pad_to_batch/unpad_from_batch.
+        let inputs = driver.prepare_batch_unpadded(encodings)?;
+        let total_tokens = inputs.total_tokens;
+        let max_seq = inputs.max_seq;
 
         // Enter batched mode: all GPU ops encode into ONE command buffer.
         driver.begin_batch()?;
@@ -324,6 +365,8 @@ impl<D: Driver> ModelArch<D> for ClassicBertArch<D::Tensor> {
             batch,
             max_seq,
             total_tokens,
+            padded_tokens: batch * max_seq,
+            seq_lengths: inputs.seq_lengths.clone(),
             hidden,
             num_heads: w.num_heads,
             head_dim: w.head_dim,
@@ -334,13 +377,26 @@ impl<D: Driver> ModelArch<D> for ClassicBertArch<D::Tensor> {
 
         // Encoder layers.
         for layer in &w.layers {
-            let attn_output = attention_sublayer(driver, &hidden_states, layer, &inputs, &g)?;
+            driver.reset_layer_workspace();
+            let (q, k, v) = attn_qkv(driver, &hidden_states, layer, &g)?;
+            let attn_output =
+                attn_scores_residual(driver, &q, &k, &v, &hidden_states, layer, &inputs, &g)?;
             hidden_states = ffn_sublayer(driver, &attn_output, layer, &g)?;
         }
 
+        // Pad back to [batch, max_seq, hidden] for cls_pool kernel.
+        let mut padded_for_pool = driver.alloc_zeros(batch * max_seq * hidden)?;
+        driver.pad_to_batch(
+            &hidden_states,
+            &mut padded_for_pool,
+            &inputs.seq_lengths,
+            max_seq,
+            hidden,
+        )?;
+
         // CLS pooling + L2 normalize.
         let mut pooled = driver.alloc_zeros(batch * hidden)?;
-        driver.cls_pool(&mut pooled, &hidden_states, batch, max_seq, hidden)?;
+        driver.cls_pool(&mut pooled, &padded_for_pool, batch, max_seq, hidden)?;
         driver.l2_normalize(&mut pooled, batch, hidden)?;
 
         // End batched mode -- commit all GPU work, wait for completion.

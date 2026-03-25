@@ -47,6 +47,12 @@ pub trait Driver: Send + Sync {
         Ok(())
     }
 
+    /// Reset workspace allocation cursor so the next layer reuses buffers
+    /// from the previous layer. Without this, each of N layers allocates
+    /// fresh buffers, accumulating N × (buffers-per-layer) in memory.
+    /// With this, peak memory is 1 × (buffers-per-layer).
+    fn reset_layer_workspace(&self) {}
+
     // --- Allocation ---
 
     /// Allocate a zero-initialized tensor with `n` float elements on device.
