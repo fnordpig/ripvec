@@ -12,8 +12,8 @@
 //! [`Driver`](super::super::driver::Driver) primitives into the full forward
 //! pass.
 
-use super::super::driver::{BatchInputs, Driver};
 use super::super::Encoding;
+use super::super::driver::{BatchInputs, Driver};
 use super::ModelArch;
 
 // ---------------------------------------------------------------------------
@@ -54,6 +54,8 @@ pub struct NomicBertLayerWeights<T> {
 pub struct NomicBertWeights<T> {
     /// Word embedding table `[vocab_size, hidden]`.
     pub tok_embeddings: T,
+    /// Token type embedding table `[2, hidden]` (optional but present in CodeRankEmbed).
+    pub token_type_embeddings: Option<T>,
     /// Post-embedding `LayerNorm` weight `[hidden]`.
     pub emb_ln_weight: T,
     /// Post-embedding `LayerNorm` bias `[hidden]`.
@@ -369,9 +371,18 @@ impl<D: Driver> ModelArch<D> for NomicBertArch<D::Tensor> {
         // Enter batched mode: all GPU ops encode into ONE command buffer.
         driver.begin_batch()?;
 
-        // Embedding: tok_embeddings + LayerNorm (with bias, no position/token_type).
+        // Embedding: tok_embeddings + token_type + LayerNorm.
         let mut hidden_states =
             driver.embedding_lookup(&inputs.input_ids, &w.tok_embeddings, total_tokens, hidden)?;
+        if let Some(ref tok_type_emb) = w.token_type_embeddings {
+            driver.add_embeddings(
+                &mut hidden_states,
+                tok_type_emb,
+                &inputs.token_type_ids,
+                total_tokens,
+                hidden,
+            )?;
+        }
         let emb_input = driver.clone_tensor(&hidden_states, total_tokens * hidden)?;
         driver.layer_norm(
             &mut hidden_states,

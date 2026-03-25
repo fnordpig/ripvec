@@ -17,9 +17,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
+use objc2::AnyThread;
 use objc2_foundation::{NSString, NSUInteger};
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
@@ -32,11 +32,11 @@ use objc2_metal_performance_shaders::{
 use safetensors::SafeTensors;
 
 use super::{BatchInputs, Driver};
-use crate::backend::Encoding;
 use crate::backend::arch::modern_bert::{
     ModernBertArch, ModernBertLayerWeights, ModernBertWeights, RopeCache,
 };
 use crate::backend::arch::nomic_bert::{NomicBertArch, NomicBertLayerWeights, NomicBertWeights};
+use crate::backend::Encoding;
 
 // ---------------------------------------------------------------------------
 // CoreGraphics linkage (required for MTLCreateSystemDefaultDevice)
@@ -946,6 +946,9 @@ impl MetalDriver {
 
         // 5. Embedding weights
         let tok_emb_offset = get_ref("embeddings.word_embeddings.weight")?.0;
+        let tok_type_offset = refs
+            .get("embeddings.token_type_embeddings.weight")
+            .map(|(off, _)| *off);
         let emb_ln_w_offset = get_ref("emb_ln.weight")?.0;
         let emb_ln_b_offset = get_ref("emb_ln.bias")?.0;
 
@@ -955,6 +958,7 @@ impl MetalDriver {
 
         let weights = NomicBertWeights {
             tok_embeddings: tensor_at(tok_emb_offset),
+            token_type_embeddings: tok_type_offset.map(&tensor_at),
             emb_ln_weight: tensor_at(emb_ln_w_offset),
             emb_ln_bias: tensor_at(emb_ln_b_offset),
             layers,
