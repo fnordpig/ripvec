@@ -17,9 +17,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::AnyThread;
 use objc2_foundation::{NSString, NSUInteger};
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
@@ -32,11 +32,14 @@ use objc2_metal_performance_shaders::{
 use safetensors::SafeTensors;
 
 use super::{BatchInputs, Driver};
+use crate::backend::Encoding;
+use crate::backend::arch::classic_bert::{
+    ClassicBertArch, ClassicBertLayerWeights, ClassicBertWeights,
+};
 use crate::backend::arch::modern_bert::{
     ModernBertArch, ModernBertLayerWeights, ModernBertWeights, RopeCache,
 };
 use crate::backend::arch::nomic_bert::{NomicBertArch, NomicBertLayerWeights, NomicBertWeights};
-use crate::backend::Encoding;
 
 // ---------------------------------------------------------------------------
 // CoreGraphics linkage (required for MTLCreateSystemDefaultDevice)
@@ -975,6 +978,191 @@ impl MetalDriver {
 
         Ok((arch, mmap))
     }
+
+    /// Load `ClassicBert` weights from a safetensors file into [`MetalTensor`]s.
+    ///
+    /// Memory-maps the file and wraps it as a single zero-copy Metal buffer.
+    /// Fuses separate Q, K, V weight matrices into a single `[3*hidden, hidden]`
+    /// tensor (and `[3*hidden]` bias) at load time for a single GEMM per layer.
+    ///
+    /// Returns `(arch, mmap)` — the caller **must** keep `mmap` alive as long as
+    /// the arch's tensors are in use.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be opened/mapped, safetensors parsing
+    /// fails, or any expected weight tensor is missing.
+    #[expect(
+        unsafe_code,
+        reason = "mmap + newBufferWithBytesNoCopy require unsafe FFI; config ints are small"
+    )]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "config ints are small positive values"
+    )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "weight loading is inherently verbose"
+    )]
+    pub fn load_classic_bert_weights(
+        &self,
+        weights_path: &Path,
+        config: &ClassicBertConfig,
+    ) -> crate::Result<(ClassicBertArch<MetalTensor>, memmap2::Mmap)> {
+        // 1. mmap the safetensors file
+        let file = std::fs::File::open(weights_path).map_err(|e| crate::Error::Io {
+            path: weights_path.display().to_string(),
+            source: e,
+        })?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| crate::Error::Io {
+            path: weights_path.display().to_string(),
+            source: e,
+        })?;
+
+        // 2. Create zero-copy Metal buffer
+        let page_size: usize = 16384; // Apple Silicon 16KB pages
+        let aligned_len = mmap.len().next_multiple_of(page_size);
+        let weight_buffer = unsafe {
+            self.device
+                .newBufferWithBytesNoCopy_length_options_deallocator(
+                    std::ptr::NonNull::new(mmap.as_ptr() as *mut _)
+                        .ok_or_else(|| crate::Error::Metal("mmap returned null pointer".into()))?,
+                    aligned_len as NSUInteger,
+                    MTLResourceOptions::StorageModeShared,
+                    None,
+                )
+        }
+        .ok_or_else(|| {
+            crate::Error::Metal(
+                "zero-copy buffer creation failed (pointer not page-aligned?)".into(),
+            )
+        })?;
+
+        // 3. Parse safetensors header to get tensor offsets
+        let tensors = SafeTensors::deserialize(&mmap)
+            .map_err(|e| crate::Error::Metal(format!("safetensors parse: {e}")))?;
+
+        let mmap_base = mmap.as_ptr() as usize;
+        let mut refs: HashMap<String, (usize, Vec<usize>)> = HashMap::new();
+        for (name, view) in tensors.tensors() {
+            let offset = view.data().as_ptr() as usize - mmap_base;
+            let shape: Vec<usize> = view.shape().to_vec();
+            refs.insert(name.clone(), (offset, shape));
+        }
+        drop(tensors);
+
+        // Helper: look up a required weight by name.
+        let get_ref = |name: &str| -> crate::Result<(usize, &[usize])> {
+            let (offset, shape) = refs
+                .get(name)
+                .ok_or_else(|| crate::Error::Metal(format!("missing weight: {name}")))?;
+            Ok((*offset, shape.as_slice()))
+        };
+
+        // Helper: create a MetalTensor pointing into the weight buffer at a byte offset.
+        let tensor_at = |offset: usize| -> MetalTensor {
+            MetalTensor {
+                buffer: weight_buffer.clone(),
+                offset,
+            }
+        };
+
+        // Helper: read raw f32 data from the mmap at a given byte offset and element count.
+        let read_f32 = |offset: usize, n: usize| -> &[f32] {
+            let ptr = unsafe { mmap.as_ptr().add(offset) }.cast::<f32>();
+            unsafe { std::slice::from_raw_parts(ptr, n) }
+        };
+
+        let hidden = config.hidden_size;
+        let num_layers = config.num_hidden_layers;
+        let num_heads = config.num_attention_heads;
+        let head_dim = hidden / num_heads;
+        let intermediate = config.intermediate_size;
+
+        // 4. Build per-layer weights with fused QKV
+        let mut layers = Vec::with_capacity(num_layers);
+        for i in 0..num_layers {
+            let prefix = format!("encoder.layer.{i}");
+
+            // Fuse Q+K+V weights into [3*hidden, hidden] and bias into [3*hidden].
+            let (q_w_off, _) = get_ref(&format!("{prefix}.attention.self.query.weight"))?;
+            let (k_w_off, _) = get_ref(&format!("{prefix}.attention.self.key.weight"))?;
+            let (v_w_off, _) = get_ref(&format!("{prefix}.attention.self.value.weight"))?;
+            let (q_b_off, _) = get_ref(&format!("{prefix}.attention.self.query.bias"))?;
+            let (k_b_off, _) = get_ref(&format!("{prefix}.attention.self.key.bias"))?;
+            let (v_b_off, _) = get_ref(&format!("{prefix}.attention.self.value.bias"))?;
+
+            let qkv_w_size = hidden * hidden; // per Q/K/V
+            let q_w = read_f32(q_w_off, qkv_w_size);
+            let k_w = read_f32(k_w_off, qkv_w_size);
+            let v_w = read_f32(v_w_off, qkv_w_size);
+            let mut fused_qkv_w = Vec::with_capacity(3 * qkv_w_size);
+            fused_qkv_w.extend_from_slice(q_w);
+            fused_qkv_w.extend_from_slice(k_w);
+            fused_qkv_w.extend_from_slice(v_w);
+            let qkv_weight = upload_f32_to_metal(self, &fused_qkv_w)?;
+
+            let q_b = read_f32(q_b_off, hidden);
+            let k_b = read_f32(k_b_off, hidden);
+            let v_b = read_f32(v_b_off, hidden);
+            let mut fused_qkv_b = Vec::with_capacity(3 * hidden);
+            fused_qkv_b.extend_from_slice(q_b);
+            fused_qkv_b.extend_from_slice(k_b);
+            fused_qkv_b.extend_from_slice(v_b);
+            let qkv_bias = upload_f32_to_metal(self, &fused_qkv_b)?;
+
+            let out_w_off = get_ref(&format!("{prefix}.attention.output.dense.weight"))?.0;
+            let out_b_off = get_ref(&format!("{prefix}.attention.output.dense.bias"))?.0;
+            let out_ln_w_off = get_ref(&format!("{prefix}.attention.output.LayerNorm.weight"))?.0;
+            let out_ln_b_off = get_ref(&format!("{prefix}.attention.output.LayerNorm.bias"))?.0;
+            let inter_w_off = get_ref(&format!("{prefix}.intermediate.dense.weight"))?.0;
+            let inter_b_off = get_ref(&format!("{prefix}.intermediate.dense.bias"))?.0;
+            let ffn_out_w_off = get_ref(&format!("{prefix}.output.dense.weight"))?.0;
+            let ffn_out_b_off = get_ref(&format!("{prefix}.output.dense.bias"))?.0;
+            let ffn_ln_w_off = get_ref(&format!("{prefix}.output.LayerNorm.weight"))?.0;
+            let ffn_ln_b_off = get_ref(&format!("{prefix}.output.LayerNorm.bias"))?.0;
+
+            layers.push(ClassicBertLayerWeights {
+                qkv_weight,
+                qkv_bias,
+                output_weight: tensor_at(out_w_off),
+                output_bias: tensor_at(out_b_off),
+                output_ln_weight: tensor_at(out_ln_w_off),
+                output_ln_bias: tensor_at(out_ln_b_off),
+                ffn_inter_weight: tensor_at(inter_w_off),
+                ffn_inter_bias: tensor_at(inter_b_off),
+                ffn_out_weight: tensor_at(ffn_out_w_off),
+                ffn_out_bias: tensor_at(ffn_out_b_off),
+                ffn_ln_weight: tensor_at(ffn_ln_w_off),
+                ffn_ln_bias: tensor_at(ffn_ln_b_off),
+            });
+        }
+
+        // 5. Embedding weights
+        let word_emb_off = get_ref("embeddings.word_embeddings.weight")?.0;
+        let pos_emb_off = get_ref("embeddings.position_embeddings.weight")?.0;
+        let tok_type_emb_off = get_ref("embeddings.token_type_embeddings.weight")?.0;
+        let emb_ln_w_off = get_ref("embeddings.LayerNorm.weight")?.0;
+        let emb_ln_b_off = get_ref("embeddings.LayerNorm.bias")?.0;
+
+        let weights = ClassicBertWeights {
+            word_embeddings: tensor_at(word_emb_off),
+            position_embeddings: tensor_at(pos_emb_off),
+            token_type_embeddings: tensor_at(tok_type_emb_off),
+            emb_ln_weight: tensor_at(emb_ln_w_off),
+            emb_ln_bias: tensor_at(emb_ln_b_off),
+            layers,
+            num_heads,
+            head_dim,
+            hidden_dim: hidden,
+            intermediate_dim: intermediate,
+            layer_norm_eps: config.layer_norm_eps,
+        };
+
+        let arch = ClassicBertArch { weights };
+
+        Ok((arch, mmap))
+    }
 }
 
 /// Build a `RoPE` cos/sin cache for the given theta and sequence length.
@@ -1155,6 +1343,70 @@ impl NomicBertConfig {
                 .or_else(|_| get_f64("layer_norm_eps"))
                 .unwrap_or(1e-12) as f32,
             max_position_embeddings: get_usize("max_position_embeddings").unwrap_or(2048),
+            vocab_size: get_usize("vocab_size")?,
+        })
+    }
+}
+
+/// Parsed `ClassicBert` model configuration from `config.json`.
+///
+/// Contains geometry and hyperparameters needed to build the `ClassicBert`
+/// architecture and load weights (e.g. `BAAI/bge-small-en-v1.5`).
+pub struct ClassicBertConfig {
+    /// Hidden dimension (384 for BGE-small).
+    pub hidden_size: usize,
+    /// FFN intermediate dimension (1536 for BGE-small).
+    pub intermediate_size: usize,
+    /// Number of encoder layers (12 for BGE-small).
+    pub num_hidden_layers: usize,
+    /// Number of attention heads (12 for BGE-small).
+    pub num_attention_heads: usize,
+    /// Layer normalization epsilon (typically 1e-12).
+    pub layer_norm_eps: f32,
+    /// Maximum position embeddings / sequence length (512 for BGE-small).
+    pub max_position_embeddings: usize,
+    /// Vocabulary size (30522 for BGE-small).
+    pub vocab_size: usize,
+}
+
+impl ClassicBertConfig {
+    /// Parse a `ClassicBert` config from a `config.json` value.
+    ///
+    /// Expects standard BERT config keys (`hidden_size`, `intermediate_size`, etc.).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any required field is missing or has an unexpected type.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "config ints are small positive values"
+    )]
+    pub fn from_json(json: &serde_json::Value) -> crate::Result<Self> {
+        let get_usize = |key: &str| -> crate::Result<usize> {
+            json.get(key)
+                .and_then(serde_json::Value::as_u64)
+                .map(|v| v as usize)
+                .ok_or_else(|| {
+                    crate::Error::Metal(format!("config.json missing or invalid: {key}"))
+                })
+        };
+        let get_f64 = |key: &str| -> crate::Result<f64> {
+            json.get(key)
+                .and_then(serde_json::Value::as_f64)
+                .ok_or_else(|| {
+                    crate::Error::Metal(format!("config.json missing or invalid: {key}"))
+                })
+        };
+
+        Ok(Self {
+            hidden_size: get_usize("hidden_size")?,
+            intermediate_size: get_usize("intermediate_size")?,
+            num_hidden_layers: get_usize("num_hidden_layers")?,
+            num_attention_heads: get_usize("num_attention_heads")?,
+            layer_norm_eps: get_f64("layer_norm_eps")
+                .or_else(|_| get_f64("layer_norm_epsilon"))
+                .unwrap_or(1e-12) as f32,
+            max_position_embeddings: get_usize("max_position_embeddings").unwrap_or(512),
             vocab_size: get_usize("vocab_size")?,
         })
     }

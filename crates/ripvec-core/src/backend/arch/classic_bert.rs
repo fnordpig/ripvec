@@ -286,8 +286,11 @@ impl<D: Driver> ModelArch<D> for ClassicBertArch<D::Tensor> {
         let total_tokens = batch * max_seq;
         let hidden = w.hidden_dim;
 
-        // Prepare batch inputs on device.
+        // Prepare batch inputs on device (per-call -- must complete before batch).
         let inputs = driver.prepare_batch(encodings, max_seq)?;
+
+        // Enter batched mode: all GPU ops encode into ONE command buffer.
+        driver.begin_batch()?;
 
         // Embedding: word + position + token_type + LayerNorm.
         let mut hidden_states =
@@ -339,6 +342,10 @@ impl<D: Driver> ModelArch<D> for ClassicBertArch<D::Tensor> {
         let mut pooled = driver.alloc_zeros(batch * hidden)?;
         driver.cls_pool(&mut pooled, &hidden_states, batch, max_seq, hidden)?;
         driver.l2_normalize(&mut pooled, batch, hidden)?;
+
+        // End batched mode -- commit all GPU work, wait for completion.
+        driver.end_batch()?;
+
         driver.to_host(&pooled, batch, hidden)
     }
 }
