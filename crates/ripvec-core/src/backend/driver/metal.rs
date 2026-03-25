@@ -305,6 +305,30 @@ fn dispatch_rows(
     clippy::too_many_arguments,
     reason = "Metal buffer binding requires unsafe setBuffer/setBytes calls with raw pointers"
 )]
+/// Dispatch a single (non-batched) GEMM: C[M,N] = A[M,K] * B[K,N] (or B^T).
+///
+/// Uses the batched kernel with `batch_count=1` and zero strides.
+fn dispatch_gemm(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    a_buffer: &ProtocolObject<dyn MTLBuffer>,
+    a_offset: usize,
+    b_buffer: &ProtocolObject<dyn MTLBuffer>,
+    b_offset: usize,
+    c_buffer: &ProtocolObject<dyn MTLBuffer>,
+    c_offset: usize,
+    m: u32,
+    n: u32,
+    k: u32,
+    trans_b: bool,
+) {
+    dispatch_gemm_batched(
+        encoder, pipeline, a_buffer, a_offset, b_buffer, b_offset, c_buffer, c_offset, m, n, k,
+        trans_b, 0, 0, 0, 1,
+    );
+}
+
+/// Dispatch a batched GEMM with `batch_count` slices at strided offsets.
 fn dispatch_gemm_batched(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
@@ -687,18 +711,19 @@ impl MetalDriver {
 
         if cursor < pool.len() {
             let pool_size = pool[cursor].length() as usize;
-            // Reuse if buffer is within 50% of needed size. Oversized buffers
-            // cause MPS hangs (batch=1 reusing batch=32 buffer → GPU processes
-            // the full buffer length). Exact-match is too strict (prevents reuse
-            // across sub-batches with slightly different padding).
-            if pool_size >= needed && pool_size <= needed + needed / 2 {
+            if pool_size == needed {
+                // Exact match — safe for MPS (which dispatches based on
+                // buffer.length()/rowBytes, not the descriptor's row count).
                 let buffer = pool[cursor].clone();
                 self.pool_cursor.set(cursor + 1);
                 return Ok(MetalTensor::new(buffer, 0));
             }
+            // Size changed (e.g., corpus→query transition).
+            // Truncate stale entries — they'd cause MPS ghost-row hangs.
+            pool.truncate(cursor);
         }
 
-        // Allocate new buffer
+        // Allocate exact-sized buffer.
         let buffer = alloc_f32_buffer(&self.device, n)?;
 
         // Add to pool for future reuse across batches.
@@ -1935,29 +1960,20 @@ impl Driver for MetalDriver {
         k: usize,
         transpose_b: bool,
     ) -> crate::Result<()> {
-        // Use FP16 weights if available (halves memory bandwidth).
-        let b_fp16 = b.fp16.borrow();
-        let (b_buf, b_off, b_dtype) = if let Some(ref fp16_buf) = *b_fp16 {
-            (
-                fp16_buf as &ProtocolObject<dyn MTLBuffer>,
-                0, // FP16 buffer is standalone — data starts at offset 0
-                MPSDataType::Float16,
-            )
-        } else {
-            (
-                &*b.buffer as &ProtocolObject<dyn MTLBuffer>,
-                b.offset,
-                MPSDataType::Float32,
-            )
-        };
+        // MPS GEMM — 2× faster than custom simdgroup on M2 Max. Apple hand-tunes
+        // MPSMatrixMultiplication with undocumented AMX/memory controller access.
+        //
+        // IMPORTANT: MPS dispatches based on buffer.length()/rowBytes, NOT the
+        // descriptor's row count. The pool MUST return exact-sized buffers for
+        // MPS operands to avoid processing ghost rows (→ GPU hang).
         self.run_mps(|cmd_buf| {
             dispatch_mps_gemm(
                 cmd_buf,
                 &self.device,
                 &a.buffer,
                 a.offset,
-                b_buf,
-                b_off,
+                &b.buffer,
+                b.offset,
                 &output.buffer,
                 output.offset,
                 m,
@@ -1965,7 +1981,7 @@ impl Driver for MetalDriver {
                 k,
                 transpose_b,
                 MPSDataType::Float32,
-                b_dtype,
+                MPSDataType::Float32,
             );
             Ok(())
         })
