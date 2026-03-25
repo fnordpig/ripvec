@@ -9,6 +9,7 @@
 
 pub mod classic_bert;
 pub mod modern_bert;
+pub mod nomic_bert;
 
 use super::Encoding;
 use super::driver::Driver;

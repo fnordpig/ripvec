@@ -347,6 +347,66 @@ fn is_modernbert_model(model_repo: &str) -> bool {
         .is_some_and(|t| t == "modernbert")
 }
 
+// ---------------------------------------------------------------------------
+// NomicBert loader (driver/arch system)
+// ---------------------------------------------------------------------------
+
+/// Load a `NomicBert` model (e.g. `CodeRankEmbed`) on the Metal GPU backend.
+///
+/// Downloads the model from Hugging Face Hub (cached after first download),
+/// memory-maps the safetensors weights, and builds a [`GenericBackend`]
+/// pairing a [`MetalDriver`](driver::metal::MetalDriver) with a
+/// [`NomicBertArch`](arch::nomic_bert::NomicBertArch).
+///
+/// # Errors
+///
+/// Returns an error if no Metal device is available, the model cannot be
+/// downloaded, or weight loading fails.
+#[cfg(feature = "metal")]
+pub fn load_nomic_metal(model_repo: &str) -> crate::Result<Box<dyn EmbedBackend>> {
+    use driver::metal::{MetalDriver, NomicBertConfig};
+    use generic::GenericBackend;
+    use hf_hub::api::sync::Api;
+
+    let api = Api::new().map_err(|e| crate::Error::Download(e.to_string()))?;
+    let repo = api.model(model_repo.to_string());
+
+    let config_path = repo
+        .get("config.json")
+        .map_err(|e| crate::Error::Download(e.to_string()))?;
+    let weights_path = repo
+        .get("model.safetensors")
+        .map_err(|e| crate::Error::Download(e.to_string()))?;
+
+    // Parse config.json
+    let config_str = std::fs::read_to_string(&config_path).map_err(|e| crate::Error::Io {
+        path: config_path.display().to_string(),
+        source: e,
+    })?;
+    let config_json: serde_json::Value = serde_json::from_str(&config_str)
+        .map_err(|e| crate::Error::Other(anyhow::anyhow!("config parse error: {e}")))?;
+    let config = NomicBertConfig::from_json(&config_json)?;
+    let max_tokens = config.max_position_embeddings;
+
+    let driver = MetalDriver::new()?;
+    let (arch, mmap) = driver.load_nomic_bert_weights(&weights_path, &config)?;
+
+    tracing::info!(
+        model_repo,
+        hidden = config.hidden_size,
+        layers = config.num_hidden_layers,
+        heads = config.num_attention_heads,
+        intermediate = config.intermediate_size,
+        max_tokens,
+        rope_theta = config.rotary_emb_base,
+        "NomicBert loaded on Metal (driver/arch)"
+    );
+
+    Ok(Box::new(GenericBackend::new(
+        driver, arch, max_tokens, true, mmap,
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,5 +741,117 @@ mod tests {
             throughput
         );
         assert_eq!(result.len(), 32);
+    }
+
+    /// Load `NomicBert` (`CodeRankEmbed`) on Metal via the driver/arch system.
+    ///
+    /// Verifies that the full pipeline produces a 768-dim L2-normalized vector,
+    /// then compares against the monolithic backend for numerical equivalence.
+    /// Also measures throughput (target: >=105/s matching monolithic).
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "requires model download (~100MB)"]
+    fn nomic_bert_driver_arch() {
+        use crate::backend::arch::ModelArch;
+
+        let model_repo = "nomic-ai/CodeRankEmbed";
+
+        // Load via driver/arch system
+        let backend = load_nomic_metal(model_repo).expect("load_nomic_metal failed");
+        assert!(backend.is_gpu(), "Metal backend should be GPU");
+
+        let enc = Encoding {
+            input_ids: vec![1, 100, 200, 300, 2],
+            attention_mask: vec![1; 5],
+            token_type_ids: vec![0; 5],
+        };
+
+        // Basic forward pass
+        let result = backend.embed_batch(&[enc.clone()]).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 768);
+
+        let l2: f32 = result[0].iter().map(|x| x * x).sum::<f32>().sqrt();
+        eprintln!(
+            "NomicBert driver/arch: L2={l2:.4}, first 3: {:?}",
+            &result[0][..3]
+        );
+        assert!(
+            (l2 - 1.0).abs() < 0.01,
+            "embedding should be L2-normalized, got L2={l2}"
+        );
+
+        // Compare against monolithic backend
+        let mono = load_backend(BackendKind::Metal, model_repo, DeviceHint::Auto)
+            .expect("monolithic load failed");
+        let enc2 = Encoding {
+            input_ids: vec![1, 100, 200, 300, 2],
+            attention_mask: vec![1; 5],
+            token_type_ids: vec![0; 5],
+        };
+        let mono_result = mono.embed_batch(&[enc2]).unwrap();
+        let cosine: f32 = result[0]
+            .iter()
+            .zip(&mono_result[0])
+            .map(|(a, b)| a * b)
+            .sum();
+        eprintln!("cosine(driver/arch, monolithic) = {cosine:.6}");
+        assert!(
+            cosine > 0.99,
+            "driver/arch should match monolithic, got cosine={cosine}"
+        );
+
+        // Throughput benchmark
+        eprintln!("\n=== NomicBert Driver/Arch Throughput ===");
+        let driver = crate::backend::driver::metal::MetalDriver::new().unwrap();
+        let config_path = {
+            let api = hf_hub::api::sync::Api::new().unwrap();
+            let repo = api.model(model_repo.to_string());
+            repo.get("config.json").unwrap()
+        };
+        let weights_path = {
+            let api = hf_hub::api::sync::Api::new().unwrap();
+            let repo = api.model(model_repo.to_string());
+            repo.get("model.safetensors").unwrap()
+        };
+        let config_str = std::fs::read_to_string(&config_path).unwrap();
+        let config_json: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+        let config =
+            crate::backend::driver::metal::NomicBertConfig::from_json(&config_json).unwrap();
+        let (arch, _mmap) = driver
+            .load_nomic_bert_weights(&weights_path, &config)
+            .unwrap();
+
+        // Build 32 encodings of varying length
+        let mut encs = Vec::new();
+        for i in 0..32 {
+            let len = 16 + (i * 4); // 16 to 140 tokens
+            let mut ids = vec![1_i64]; // CLS
+            for j in 1..len - 1 {
+                ids.push(100 + j as i64);
+            }
+            ids.push(2); // SEP
+            encs.push(Encoding {
+                input_ids: ids.clone(),
+                attention_mask: vec![1; ids.len()],
+                token_type_ids: vec![0; ids.len()],
+            });
+        }
+
+        // Warmup
+        let _ = arch.forward(&driver, &encs[..4]);
+
+        // Timed run
+        let t0 = std::time::Instant::now();
+        let bench_result = arch.forward(&driver, &encs).unwrap();
+        let elapsed = t0.elapsed();
+        let throughput = encs.len() as f64 / elapsed.as_secs_f64();
+        eprintln!(
+            "  batch={}, time={:.1}ms, throughput={:.1}/s",
+            encs.len(),
+            elapsed.as_secs_f64() * 1000.0,
+            throughput
+        );
+        assert_eq!(bench_result.len(), 32);
     }
 }
