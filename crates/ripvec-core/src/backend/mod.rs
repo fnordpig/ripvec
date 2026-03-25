@@ -4,11 +4,13 @@
 //! MLX) implement, plus the [`Encoding`] input type and [`BackendKind`]
 //! discriminant. Use [`load_backend`] to construct a backend by kind.
 
+pub mod arch;
 pub mod blas_info;
 #[cfg(feature = "cpu")]
 pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+pub mod driver;
 #[cfg(feature = "metal")]
 pub mod metal;
 #[cfg(feature = "metal")]
