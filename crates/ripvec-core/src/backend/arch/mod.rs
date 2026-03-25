@@ -7,6 +7,8 @@
 //! Each architecture (ClassicBert, NomicBert, ModernBert) is implemented once
 //! and works with any driver backend via generics.
 
+pub mod classic_bert;
+
 use super::Encoding;
 use super::driver::Driver;
 

@@ -25,6 +25,29 @@ pub trait Driver: Send + Sync {
     /// Metal: `MTLBuffer` + byte offset. CUDA: `CUdeviceptr`. CPU: `Array2<f32>`.
     type Tensor;
 
+    // --- Allocation ---
+
+    /// Allocate a zero-initialized tensor with `n` float elements on device.
+    ///
+    /// Used by architectures to create workspace buffers (QKV projections,
+    /// attention scores, intermediate activations, etc.).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if device memory allocation fails.
+    fn alloc_zeros(&self, n: usize) -> crate::Result<Self::Tensor>;
+
+    /// Clone a tensor, producing an independent copy of the data.
+    ///
+    /// Used when an operation needs both the original and a mutable output
+    /// referencing the same logical data (e.g., in-place layer normalization
+    /// where input == output).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if device memory allocation or the copy fails.
+    fn clone_tensor(&self, tensor: &Self::Tensor, n: usize) -> crate::Result<Self::Tensor>;
+
     // --- Batch preparation ---
 
     /// Prepare a batch of encodings for inference, returning input tensors on device.
