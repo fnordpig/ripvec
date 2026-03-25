@@ -17,9 +17,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
+use objc2::AnyThread;
 use objc2_foundation::{NSString, NSUInteger};
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
@@ -32,7 +32,6 @@ use objc2_metal_performance_shaders::{
 use safetensors::SafeTensors;
 
 use super::{BatchInputs, Driver};
-use crate::backend::Encoding;
 use crate::backend::arch::classic_bert::{
     ClassicBertArch, ClassicBertLayerWeights, ClassicBertWeights,
 };
@@ -40,6 +39,7 @@ use crate::backend::arch::modern_bert::{
     ModernBertArch, ModernBertLayerWeights, ModernBertWeights, RopeCache,
 };
 use crate::backend::arch::nomic_bert::{NomicBertArch, NomicBertLayerWeights, NomicBertWeights};
+use crate::backend::Encoding;
 
 // ---------------------------------------------------------------------------
 // CoreGraphics linkage (required for MTLCreateSystemDefaultDevice)
@@ -585,6 +585,12 @@ pub struct MetalDriver {
     /// Whether the persistent encoder has been used since last creation.
     /// Avoids unnecessary flush when consecutive MPS calls have no compute between them.
     enc_dirty: std::cell::Cell<bool>,
+    /// Buffer pool: reuse Metal buffers across forward passes.
+    /// Each entry: (capacity_bytes, buffer). `alloc_zeros` takes from pool
+    /// if a buffer with sufficient capacity exists; otherwise allocates new.
+    /// `begin_batch` resets the cursor so buffers are reused next pass.
+    pool: std::cell::RefCell<Vec<Retained<ProtocolObject<dyn MTLBuffer>>>>,
+    pool_cursor: std::cell::Cell<usize>,
 }
 
 impl MetalDriver {
@@ -605,6 +611,8 @@ impl MetalDriver {
             batch_cmd: std::cell::RefCell::new(None),
             batch_enc: std::cell::RefCell::new(None),
             enc_dirty: std::cell::Cell::new(false),
+            pool: std::cell::RefCell::new(Vec::with_capacity(150)),
+            pool_cursor: std::cell::Cell::new(0),
         })
     }
 
@@ -616,6 +624,7 @@ impl MetalDriver {
     pub fn begin_batch(&self) -> crate::Result<()> {
         let cmd = new_command_buffer(&self.queue)?;
         *self.batch_cmd.borrow_mut() = Some(cmd);
+        self.pool_cursor.set(0); // Reset pool — reuse buffers from previous pass
         Ok(())
     }
 
@@ -654,13 +663,40 @@ impl MetalDriver {
         &self.device
     }
 
-    /// Allocate a new [`MetalTensor`] of `n` floats.
+    /// Allocate a [`MetalTensor`] of `n` floats, reusing a pooled buffer if
+    /// possible.
+    ///
+    /// In batched mode: checks the pool for a buffer with sufficient capacity.
+    /// On the first forward pass, buffers are allocated fresh and added to the
+    /// pool. On subsequent passes (after `begin_batch` resets the cursor),
+    /// the same buffers are reused — zero allocation overhead.
     ///
     /// # Errors
     ///
     /// Returns an error if Metal buffer allocation fails.
     pub fn alloc_tensor(&self, n: usize) -> crate::Result<MetalTensor> {
+        let needed = n * core::mem::size_of::<f32>();
+        let cursor = self.pool_cursor.get();
+        let mut pool = self.pool.borrow_mut();
+
+        if cursor < pool.len() && pool[cursor].length() as usize >= needed {
+            // Reuse existing pooled buffer
+            let buffer = pool[cursor].clone();
+            self.pool_cursor.set(cursor + 1);
+            return Ok(MetalTensor::new(buffer, 0));
+        }
+
+        // Allocate new buffer
         let buffer = alloc_f32_buffer(&self.device, n)?;
+
+        // Add to pool for future reuse
+        if cursor < pool.len() {
+            pool[cursor] = buffer.clone();
+        } else {
+            pool.push(buffer.clone());
+        }
+        self.pool_cursor.set(cursor + 1);
+
         Ok(MetalTensor::new(buffer, 0))
     }
 
