@@ -579,9 +579,12 @@ pub struct MetalDriver {
     /// Shared command buffer for batched mode. `None` = per-call mode.
     batch_cmd: std::cell::RefCell<Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>>,
     /// Persistent compute encoder for batched mode. Reused across run_compute
-    /// calls to avoid encoder creation overhead (~221 encoders → 1 per layer).
-    /// Closed before MPS calls (which encode directly to command buffer).
+    /// calls to avoid encoder creation overhead.
+    /// Closed before MPS/blit calls (which encode directly to command buffer).
     batch_enc: std::cell::RefCell<Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>>,
+    /// Whether the persistent encoder has been used since last creation.
+    /// Avoids unnecessary flush when consecutive MPS calls have no compute between them.
+    enc_dirty: std::cell::Cell<bool>,
 }
 
 impl MetalDriver {
@@ -601,6 +604,7 @@ impl MetalDriver {
             kernels,
             batch_cmd: std::cell::RefCell::new(None),
             batch_enc: std::cell::RefCell::new(None),
+            enc_dirty: std::cell::Cell::new(false),
         })
     }
 
@@ -619,8 +623,11 @@ impl MetalDriver {
     ///
     /// Returns an error if no batch is active.
     pub fn end_batch(&self) -> crate::Result<()> {
-        // Flush any open compute encoder before committing
-        self.flush_compute_encoder();
+        // Force-close any open compute encoder before committing
+        if let Some(enc) = self.batch_enc.borrow_mut().take() {
+            enc.endEncoding();
+        }
+        self.enc_dirty.set(false);
         let cmd =
             self.batch_cmd.borrow_mut().take().ok_or_else(|| {
                 crate::Error::Metal("end_batch called without begin_batch".into())
@@ -707,6 +714,7 @@ impl MetalDriver {
             }
             let enc_ref = self.batch_enc.borrow();
             f(enc_ref.as_ref().unwrap())?;
+            self.enc_dirty.set(true);
             Ok(())
         } else {
             let cmd_buf = new_command_buffer(&self.queue)?;
@@ -719,11 +727,15 @@ impl MetalDriver {
         }
     }
 
-    /// Close the persistent compute encoder (if open).
-    /// Must be called before MPS encoding (which needs the encoder closed).
+    /// Close the persistent compute encoder if it has pending work.
+    /// No-op if clean (avoids unnecessary encoder tear-down between
+    /// consecutive MPS calls with no intervening compute).
     fn flush_compute_encoder(&self) {
-        if let Some(enc) = self.batch_enc.borrow_mut().take() {
-            enc.endEncoding();
+        if self.enc_dirty.get() {
+            if let Some(enc) = self.batch_enc.borrow_mut().take() {
+                enc.endEncoding();
+            }
+            self.enc_dirty.set(false);
         }
     }
 
