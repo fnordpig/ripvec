@@ -64,7 +64,13 @@ where
     fn embed_batch(&self, encodings: &[Encoding]) -> crate::Result<Vec<Vec<f32>>> {
         const MAX_BATCH: usize = 32;
         if encodings.len() <= MAX_BATCH {
-            return self.arch.forward(&self.driver, encodings);
+            let t = std::time::Instant::now();
+            let r = self.arch.forward(&self.driver, encodings);
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            if ms > 100.0 {
+                eprintln!("[generic] embed_batch n={} took {ms:.0}ms", encodings.len());
+            }
+            return r;
         }
         let mut all = Vec::with_capacity(encodings.len());
         for chunk in encodings.chunks(MAX_BATCH) {

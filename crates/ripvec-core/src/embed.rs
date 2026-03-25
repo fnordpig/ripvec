@@ -243,12 +243,22 @@ pub fn search(
     // Phases 1, 2, 3, 4: walk, chunk, pre-tokenize, embed all files
     let (chunks, embeddings) = embed_all(root, backends, tokenizer, cfg, profiler)?;
 
+    let t_query_start = std::time::Instant::now();
+
     // Phase 5: Embed query (using the primary backend)
     let query_embedding = {
         let _span = info_span!("embed_query").entered();
         let _guard = profiler.phase("embed_query");
+        let t_tok = std::time::Instant::now();
         let enc = tokenize(query, tokenizer, cfg.max_tokens, backends[0].max_tokens())?;
+        let tok_ms = t_tok.elapsed().as_secs_f64() * 1000.0;
+        let t_emb = std::time::Instant::now();
         let mut results = backends[0].embed_batch(&[enc])?;
+        let emb_ms = t_emb.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "[search] query: tokenize={tok_ms:.1}ms embed={emb_ms:.1}ms total_since_embed_all={:.1}ms",
+            t_query_start.elapsed().as_secs_f64() * 1000.0
+        );
         results.pop().ok_or_else(|| {
             crate::Error::Other(anyhow::anyhow!("backend returned no embedding for query"))
         })?
