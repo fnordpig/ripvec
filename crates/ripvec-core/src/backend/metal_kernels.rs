@@ -1018,6 +1018,55 @@ kernel void embedding_lookup_f16_kernel(
     int dim = int(idx) % hidden_dim;
     output[idx] = table[indices[token] * hidden_dim + dim];
 }
+
+// ---------------------------------------------------------------------------
+// Scatter flat [total_tokens, dim] to padded [batch, max_seq, dim].
+// Padding positions are zeroed.
+// ---------------------------------------------------------------------------
+kernel void pad_to_batch_kernel(
+    device float* output           [[buffer(0)]],
+    const device float* input      [[buffer(1)]],
+    const device int* cu_seqlens   [[buffer(2)]],
+    constant int& max_seq          [[buffer(3)]],
+    constant int& dim_val          [[buffer(4)]],
+    constant int& batch            [[buffer(5)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    int total_out = batch * max_seq * dim_val;
+    if (idx >= uint(total_out)) return;
+    int b = int(idx) / (max_seq * dim_val);
+    int rem = int(idx) % (max_seq * dim_val);
+    int t = rem / dim_val;
+    int d = rem % dim_val;
+    int seq_start = cu_seqlens[b];
+    int seq_len = cu_seqlens[b + 1] - seq_start;
+    output[idx] = (t < seq_len) ? input[(seq_start + t) * dim_val + d] : 0.0;
+}
+
+// ---------------------------------------------------------------------------
+// Gather real tokens from padded [batch, max_seq, dim] to flat [total_tokens, dim].
+// ---------------------------------------------------------------------------
+kernel void unpad_from_batch_kernel(
+    device float* output           [[buffer(0)]],
+    const device float* input      [[buffer(1)]],
+    const device int* cu_seqlens   [[buffer(2)]],
+    constant int& max_seq          [[buffer(3)]],
+    constant int& dim_val          [[buffer(4)]],
+    constant int& total_tokens     [[buffer(5)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= uint(total_tokens * dim_val)) return;
+    int token_idx = int(idx) / dim_val;
+    int d = int(idx) % dim_val;
+    // Find batch index via linear scan (batch is small, <=32)
+    int b = 0;
+    for (int i = 0; i < 256; i++) {
+        if (cu_seqlens[i + 1] <= token_idx) b = i + 1;
+        else break;
+    }
+    int local_t = token_idx - cu_seqlens[b];
+    output[idx] = input[(b * max_seq + local_t) * dim_val + d];
+}
 ";
 
 /// MSL GEMM kernel using `simdgroup_matrix_multiply_accumulate`.
