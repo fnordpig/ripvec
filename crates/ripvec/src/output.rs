@@ -29,24 +29,51 @@ fn print_plain(results: &[SearchResult]) {
     }
 }
 
+/// Infer a language name from a file path's extension.
+fn language_from_path(file_path: &str) -> &'static str {
+    let ext = std::path::Path::new(file_path)
+        .extension()
+        .and_then(|e| e.to_str());
+    match ext {
+        Some("rs") => "rust",
+        Some("py" | "pyi") => "python",
+        Some("js" | "mjs" | "cjs") => "javascript",
+        Some("ts" | "mts" | "cts") => "typescript",
+        Some("tsx") => "tsx",
+        Some("jsx") => "jsx",
+        Some("go") => "go",
+        Some("java") => "java",
+        Some("c" | "h") => "c",
+        Some("cpp" | "cc" | "cxx" | "hpp" | "hxx") => "cpp",
+        Some("rb") => "ruby",
+        Some("sql") => "sql",
+        Some("toml") => "toml",
+        Some("yaml" | "yml") => "yaml",
+        Some("json") => "json",
+        Some("md" | "markdown") => "markdown",
+        Some("sh" | "bash" | "zsh") => "shell",
+        Some(_) | None => "text",
+    }
+}
+
+/// Print results as JSON Lines (one JSON object per line).
 fn print_json(results: &[SearchResult]) {
-    let items: Vec<serde_json::Value> = results
-        .iter()
-        .map(|r| {
-            serde_json::json!({
-                "name": r.chunk.name,
-                "file": r.chunk.file_path,
-                "start_line": r.chunk.start_line,
-                "end_line": r.chunk.end_line,
-                "similarity": r.similarity,
-                "content": r.chunk.content,
-            })
-        })
-        .collect();
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&items).unwrap_or_default()
-    );
+    for r in results {
+        let obj = serde_json::json!({
+            "file_path": r.chunk.file_path,
+            "start_line": r.chunk.start_line,
+            "end_line": r.chunk.end_line,
+            "name": r.chunk.name,
+            "kind": r.chunk.kind,
+            "similarity": r.similarity,
+            "content": r.chunk.content,
+            "language": language_from_path(&r.chunk.file_path),
+        });
+        // Each line is a compact JSON object (JSON Lines format)
+        if let Ok(line) = serde_json::to_string(&obj) {
+            println!("{line}");
+        }
+    }
 }
 
 fn print_color(results: &[SearchResult]) {

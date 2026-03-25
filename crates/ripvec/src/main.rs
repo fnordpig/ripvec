@@ -184,6 +184,7 @@ fn load_pipeline(
         },
         text_mode: args.text_mode,
         cascade_dim: None,
+        file_type: args.file_type.clone(),
     };
 
     Ok((backends, tokenizer, search_cfg))

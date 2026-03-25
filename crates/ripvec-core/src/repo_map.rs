@@ -490,7 +490,7 @@ pub fn build_graph(root: &Path) -> crate::Result<RepoGraph> {
         source: e,
     })?;
 
-    let all_files = walk::collect_files(&root);
+    let all_files = walk::collect_files(&root, None);
 
     // Build file index mapping canonical paths to indices
     let mut file_index: HashMap<PathBuf, usize> = HashMap::new();

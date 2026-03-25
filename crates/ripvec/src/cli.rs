@@ -45,8 +45,12 @@ pub struct Args {
     #[arg(short, long, default_value = "color")]
     pub format: OutputFormat,
 
+    /// Filter files by type (e.g., rust, python, js). Uses ripgrep's type definitions.
+    #[arg(short = 't', long = "type")]
+    pub file_type: Option<String>,
+
     /// Minimum similarity threshold (0.0 to 1.0).
-    #[arg(short = 't', long, default_value_t = 0.5)]
+    #[arg(short = 'T', long, default_value_t = 0.5)]
     pub threshold: f32,
 
     /// Number of threads for parallel processing (0 = cores).
