@@ -95,6 +95,14 @@ struct KernelPipelines {
     add_bias: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Two-input `SwiGLU`: `output = value * silu(gate)` with separate buffers.
     swiglu_two_input: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Split `[rows, 2*cols]` into two `[rows, cols]` halves.
+    split_gate_value: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Two-input `GeGLU`: `output = gelu(value) * gate` with separate buffers.
+    geglu: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Residual add without bias: `output = hidden + residual`.
+    residual_add: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Fused scale + padding mask + sliding window mask + softmax.
+    fused_scale_mask_softmax_windowed: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// `RoPE` with pre-computed cos/sin tables.
     rope_cached: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Batched GEMM: same kernel with z-dimension for batch/head index.
@@ -126,6 +134,10 @@ impl KernelPipelines {
             build_attn_mask: p("build_attn_mask_kernel")?,
             add_bias: p("add_bias_kernel")?,
             swiglu_two_input: p("swiglu_two_input_kernel")?,
+            split_gate_value: p("split_gate_value_kernel")?,
+            geglu: p("geglu_kernel")?,
+            residual_add: p("residual_add_kernel")?,
+            fused_scale_mask_softmax_windowed: p("fused_scale_mask_softmax_windowed_kernel")?,
             rope_cached: p("rope_cached_kernel")?,
             gemm_batched: create_pipeline(device, &gemm_library, "gemm_batched_kernel")?,
         })
@@ -853,6 +865,38 @@ impl Driver for MetalDriver {
         })
     }
 
+    fn fused_scale_mask_softmax_windowed(
+        &self,
+        scores: &mut MetalTensor,
+        mask: &MetalTensor,
+        batch: usize,
+        num_heads: usize,
+        seq_len: usize,
+        scale: f32,
+        window_size: usize,
+    ) -> crate::Result<()> {
+        let total_rows = batch * num_heads * seq_len;
+        let threads = 256.min(seq_len);
+        let half_window = window_size / 2;
+        self.run_compute(|enc| {
+            enc.setComputePipelineState(&self.kernels.fused_scale_mask_softmax_windowed);
+            set_buffer(enc, &scores.buffer, scores.offset, 0);
+            set_buffer(enc, &mask.buffer, mask.offset, 1);
+            set_i32_param(enc, batch as i32, 2);
+            set_i32_param(enc, num_heads as i32, 3);
+            set_i32_param(enc, seq_len as i32, 4);
+            set_f32_param(enc, scale, 5);
+            set_i32_param(enc, half_window as i32, 6);
+            dispatch_rows(
+                enc,
+                &self.kernels.fused_scale_mask_softmax_windowed,
+                total_rows,
+                threads,
+            );
+            Ok(())
+        })
+    }
+
     fn build_attn_mask(
         &self,
         output: &mut MetalTensor,
@@ -975,6 +1019,45 @@ impl Driver for MetalDriver {
         })
     }
 
+    fn split_gate_value(
+        &self,
+        first: &mut MetalTensor,
+        second: &mut MetalTensor,
+        input: &MetalTensor,
+        rows: usize,
+        cols: usize,
+    ) -> crate::Result<()> {
+        let total = rows * cols;
+        self.run_compute(|enc| {
+            enc.setComputePipelineState(&self.kernels.split_gate_value);
+            set_buffer(enc, &first.buffer, first.offset, 0);
+            set_buffer(enc, &second.buffer, second.offset, 1);
+            set_buffer(enc, &input.buffer, input.offset, 2);
+            set_i32_param(enc, rows as i32, 3);
+            set_i32_param(enc, cols as i32, 4);
+            dispatch_1d(enc, &self.kernels.split_gate_value, total);
+            Ok(())
+        })
+    }
+
+    fn geglu(
+        &self,
+        value: &MetalTensor,
+        gate: &MetalTensor,
+        output: &mut MetalTensor,
+        n: usize,
+    ) -> crate::Result<()> {
+        self.run_compute(|enc| {
+            enc.setComputePipelineState(&self.kernels.geglu);
+            set_buffer(enc, &output.buffer, output.offset, 0);
+            set_buffer(enc, &value.buffer, value.offset, 1);
+            set_buffer(enc, &gate.buffer, gate.offset, 2);
+            set_i32_param(enc, n as i32, 3);
+            dispatch_1d(enc, &self.kernels.geglu, n);
+            Ok(())
+        })
+    }
+
     fn fused_bias_gelu(
         &self,
         x: &mut MetalTensor,
@@ -1040,6 +1123,24 @@ impl Driver for MetalDriver {
             set_i32_param(enc, cols as i32, 6);
             set_f32_param(enc, eps, 7);
             dispatch_rows(enc, &self.kernels.fused_residual_layernorm, rows, threads);
+            Ok(())
+        })
+    }
+
+    fn residual_add(
+        &self,
+        output: &mut MetalTensor,
+        hidden: &MetalTensor,
+        residual: &MetalTensor,
+        n: usize,
+    ) -> crate::Result<()> {
+        self.run_compute(|enc| {
+            enc.setComputePipelineState(&self.kernels.residual_add);
+            set_buffer(enc, &output.buffer, output.offset, 0);
+            set_buffer(enc, &hidden.buffer, hidden.offset, 1);
+            set_buffer(enc, &residual.buffer, residual.offset, 2);
+            set_i32_param(enc, n as i32, 3);
+            dispatch_1d(enc, &self.kernels.residual_add, n);
             Ok(())
         })
     }

@@ -155,6 +155,22 @@ pub trait Driver: Send + Sync {
         scale: f32,
     ) -> crate::Result<()>;
 
+    /// Fused scale + mask + sliding window + softmax for attention scores.
+    ///
+    /// Like [`fused_scale_mask_softmax`](Driver::fused_scale_mask_softmax) but
+    /// additionally masks out positions where `|query_pos - key_pos| > window_size / 2`.
+    /// Used by `ModernBERT`'s local attention layers.
+    fn fused_scale_mask_softmax_windowed(
+        &self,
+        scores: &mut Self::Tensor,
+        mask: &Self::Tensor,
+        batch: usize,
+        num_heads: usize,
+        seq_len: usize,
+        scale: f32,
+        window_size: usize,
+    ) -> crate::Result<()>;
+
     /// Build a float attention mask from an integer mask.
     ///
     /// Converts `[batch * seq]` int mask (0/1) to `[batch * seq]` float mask
@@ -207,6 +223,22 @@ pub trait Driver: Send + Sync {
         num_heads: usize,
     ) -> crate::Result<()>;
 
+    // --- Tensor manipulation ---
+
+    /// Split a `[rows, 2*cols]` matrix into two `[rows, cols]` halves.
+    ///
+    /// Each row of `input` is `[first_half | second_half]`. The first `cols`
+    /// elements go to `first`, the remaining `cols` to `second`.
+    /// Used by `ModernBERT` and `NomicBert` for gated MLP splits.
+    fn split_gate_value(
+        &self,
+        first: &mut Self::Tensor,
+        second: &mut Self::Tensor,
+        input: &Self::Tensor,
+        rows: usize,
+        cols: usize,
+    ) -> crate::Result<()>;
+
     // --- Activations ---
 
     /// GELU activation (Gaussian Error Linear Unit), applied in-place.
@@ -217,6 +249,18 @@ pub trait Driver: Send + Sync {
     /// Used by NomicBert. The gate and value come from splitting the
     /// intermediate projection.
     fn swiglu(
+        &self,
+        value: &Self::Tensor,
+        gate: &Self::Tensor,
+        output: &mut Self::Tensor,
+        n: usize,
+    ) -> crate::Result<()>;
+
+    /// `GeGLU` gated activation: `output = gelu(value) * gate`.
+    ///
+    /// Used by `ModernBERT`. The value and gate come from splitting the
+    /// MLP `Wi` projection output in half.
+    fn geglu(
         &self,
         value: &Self::Tensor,
         gate: &Self::Tensor,
@@ -261,6 +305,17 @@ pub trait Driver: Send + Sync {
         rows: usize,
         cols: usize,
         eps: f32,
+    ) -> crate::Result<()>;
+
+    /// Residual add without bias: `output = hidden + residual`.
+    ///
+    /// Used by `ModernBERT` which has no bias terms.
+    fn residual_add(
+        &self,
+        output: &mut Self::Tensor,
+        hidden: &Self::Tensor,
+        residual: &Self::Tensor,
+        n: usize,
     ) -> crate::Result<()>;
 
     /// Add bias to a matrix row-wise: `x[row] += bias` for each row.

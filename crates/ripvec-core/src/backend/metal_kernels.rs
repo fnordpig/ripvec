@@ -837,6 +837,137 @@ kernel void fused_residual_layernorm_f16_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Split a [rows, 2*cols] matrix into two [rows, cols] halves.
+// Each row: [first_half | second_half]. Used for gated MLP splits.
+// ---------------------------------------------------------------------------
+kernel void split_gate_value_kernel(
+    device float* first            [[buffer(0)]],
+    device float* second           [[buffer(1)]],
+    const device float* input      [[buffer(2)]],
+    constant int& rows             [[buffer(3)]],
+    constant int& cols             [[buffer(4)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    int total = rows * cols;
+    if (idx >= uint(total)) return;
+    int row = int(idx) / cols;
+    int col = int(idx) % cols;
+    int double_cols = 2 * cols;
+    first[idx] = input[row * double_cols + col];
+    second[idx] = input[row * double_cols + cols + col];
+}
+
+// ---------------------------------------------------------------------------
+// GeGLU gated activation: output = gelu(value) * gate
+// Used by ModernBERT's gated MLP.
+// ---------------------------------------------------------------------------
+kernel void geglu_kernel(
+    device float* output           [[buffer(0)]],
+    const device float* value      [[buffer(1)]],
+    const device float* gate       [[buffer(2)]],
+    constant int& n                [[buffer(3)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= uint(n)) return;
+    float v = value[i];
+    float inner = 0.7978845608 * (v + 0.044715 * v * v * v);
+    inner = clamp(inner, -10.0f, 10.0f);
+    float gelu_v = 0.5 * v * (1.0 + tanh(inner));
+    output[i] = gelu_v * gate[i];
+}
+
+// ---------------------------------------------------------------------------
+// Residual add without bias: output = hidden + residual
+// Used by ModernBERT which has no bias terms.
+// ---------------------------------------------------------------------------
+kernel void residual_add_kernel(
+    device float* output           [[buffer(0)]],
+    const device float* hidden     [[buffer(1)]],
+    const device float* residual   [[buffer(2)]],
+    constant int& n                [[buffer(3)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= uint(n)) return;
+    output[i] = hidden[i] + residual[i];
+}
+
+// ---------------------------------------------------------------------------
+// Fused scale + padding mask + sliding window mask + softmax.
+// Like fused_scale_mask_softmax_kernel but additionally masks out positions
+// where |query_pos - key_pos| > half_window.
+// One threadgroup per row.
+// ---------------------------------------------------------------------------
+kernel void fused_scale_mask_softmax_windowed_kernel(
+    device float* scores           [[buffer(0)]],
+    const device float* mask       [[buffer(1)]],
+    constant int& batch            [[buffer(2)]],
+    constant int& num_heads        [[buffer(3)]],
+    constant int& seq              [[buffer(4)]],
+    constant float& scale          [[buffer(5)]],
+    constant int& half_window      [[buffer(6)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tpg [[threads_per_threadgroup]]
+) {
+    int total_rows = batch * num_heads * seq;
+    if (row >= uint(total_rows)) return;
+
+    threadgroup float sdata[256];
+    device float* row_data = scores + row * uint(seq);
+
+    // Decompose row -> batch index and query position
+    int b = int(row) / (num_heads * seq);
+    int q_pos = int(row) % seq;
+
+    // Pass 1: scale + padding mask + window mask + find row max
+    float thread_max = -1e30;
+    for (int i = int(tid); i < seq; i += int(tpg)) {
+        float val = row_data[i] * scale + mask[b * seq + i];
+        // Apply sliding window: mask out positions outside the window
+        int dist = (q_pos > i) ? (q_pos - i) : (i - q_pos);
+        if (dist > half_window) {
+            val = -1e9;
+        }
+        row_data[i] = val;
+        thread_max = max(thread_max, val);
+    }
+
+    // Reduce max
+    sdata[tid] = thread_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tpg / 2; s > 0; s >>= 1) {
+        if (tid < s)
+            sdata[tid] = max(sdata[tid], sdata[tid + s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float row_max = sdata[0];
+
+    // Pass 2: exp(x - max) and sum
+    float thread_sum = 0.0;
+    for (int i = int(tid); i < seq; i += int(tpg)) {
+        float val = exp(row_data[i] - row_max);
+        row_data[i] = val;
+        thread_sum += val;
+    }
+
+    // Reduce sum
+    sdata[tid] = thread_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tpg / 2; s > 0; s >>= 1) {
+        if (tid < s)
+            sdata[tid] += sdata[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float total = sdata[0];
+
+    // Pass 3: normalize
+    float inv_sum = 1.0 / max(total, 1e-12);
+    for (int i = int(tid); i < seq; i += int(tpg)) {
+        row_data[i] *= inv_sum;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // FP16 add bias: x[idx] += bias[idx % cols] (in-place, half precision)
 // ---------------------------------------------------------------------------
 kernel void add_bias_f16_kernel(

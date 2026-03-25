@@ -8,6 +8,7 @@
 //! and works with any driver backend via generics.
 
 pub mod classic_bert;
+pub mod modern_bert;
 
 use super::Encoding;
 use super::driver::Driver;
