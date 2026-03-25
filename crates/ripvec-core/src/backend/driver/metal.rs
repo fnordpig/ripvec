@@ -59,10 +59,26 @@ unsafe extern "C" {}
 /// `MTLBuffer` at different offsets (e.g. weight sub-tensors within a
 /// single memory-mapped safetensors file).
 pub struct MetalTensor {
-    /// The backing Metal buffer.
+    /// The backing Metal buffer (FP32).
     pub buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Byte offset into `buffer` where this tensor's data starts.
     pub offset: usize,
+    /// Optional FP16 version of this tensor's data (for MPS weight GEMMs).
+    /// Created lazily by [`MetalDriver::ensure_fp16`]. When present, `gemm`
+    /// uses this buffer with `MPSDataType::Float16` for the weight matrix,
+    /// halving memory bandwidth.
+    pub fp16: std::cell::RefCell<Option<Retained<ProtocolObject<dyn MTLBuffer>>>>,
+}
+
+impl MetalTensor {
+    /// Create a new tensor with no FP16 companion.
+    fn new(buffer: Retained<ProtocolObject<dyn MTLBuffer>>, offset: usize) -> Self {
+        Self {
+            buffer,
+            offset,
+            fp16: std::cell::RefCell::new(None),
+        }
+    }
 }
 
 // SAFETY: Metal buffers use `StorageModeShared` on Apple Silicon (unified memory).
@@ -127,6 +143,8 @@ struct KernelPipelines {
     rope_cached: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Batched GEMM: same kernel with z-dimension for batch/head index.
     gemm_batched: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Convert FP32 to FP16.
+    f32_to_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 impl KernelPipelines {
@@ -160,6 +178,7 @@ impl KernelPipelines {
             fused_scale_mask_softmax_windowed: p("fused_scale_mask_softmax_windowed_kernel")?,
             rope_cached: p("rope_cached_kernel")?,
             gemm_batched: create_pipeline(device, &gemm_library, "gemm_batched_kernel")?,
+            f32_to_f16: p("f32_to_f16_kernel")?,
         })
     }
 }
@@ -635,7 +654,36 @@ impl MetalDriver {
     /// Returns an error if Metal buffer allocation fails.
     pub fn alloc_tensor(&self, n: usize) -> crate::Result<MetalTensor> {
         let buffer = alloc_f32_buffer(&self.device, n)?;
-        Ok(MetalTensor { buffer, offset: 0 })
+        Ok(MetalTensor::new(buffer, 0))
+    }
+
+    /// Pre-convert a weight tensor to FP16 on the GPU.
+    ///
+    /// The FP16 buffer is stored inside the tensor's `fp16` field and used
+    /// automatically by [`gemm`] for the weight (B) matrix. The FP16 offset
+    /// is `original_offset / 2` (half the bytes per element).
+    pub fn ensure_fp16(&self, tensor: &MetalTensor, num_elements: usize) -> crate::Result<()> {
+        if tensor.fp16.borrow().is_some() {
+            return Ok(());
+        }
+        let fp16_size = (num_elements * 2) as NSUInteger; // 2 bytes per f16
+        let fp16_buf = self
+            .device
+            .newBufferWithLength_options(fp16_size, MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| crate::Error::Metal("fp16 buffer alloc failed".into()))?;
+
+        // Convert on GPU using f32_to_f16 kernel
+        self.run_compute(|enc| {
+            enc.setComputePipelineState(&self.kernels.f32_to_f16);
+            set_buffer(enc, &fp16_buf, 0, 0);
+            set_buffer(enc, &tensor.buffer, tensor.offset, 1);
+            set_i32_param(enc, num_elements as i32, 2);
+            dispatch_1d(enc, &self.kernels.f32_to_f16, num_elements);
+            Ok(())
+        })?;
+
+        *tensor.fp16.borrow_mut() = Some(fp16_buf);
+        Ok(())
     }
 
     /// Execute a compute operation.
@@ -780,12 +828,8 @@ impl MetalDriver {
         };
 
         // Helper: create a MetalTensor pointing into the weight buffer at a byte offset.
-        let tensor_at = |offset: usize| -> MetalTensor {
-            MetalTensor {
-                buffer: weight_buffer.clone(),
-                offset,
-            }
-        };
+        let tensor_at =
+            |offset: usize| -> MetalTensor { MetalTensor::new(weight_buffer.clone(), offset) };
 
         let hidden = config.hidden_size;
         let num_layers = config.num_hidden_layers;
@@ -855,6 +899,7 @@ impl MetalDriver {
             max_layers: None,
         };
 
+        // ModernBERT (768-dim): skip FP16 — RefCell overhead per GEMM exceeds savings.
         Ok((arch, mmap))
     }
 
@@ -930,12 +975,8 @@ impl MetalDriver {
         };
 
         // Helper: create a MetalTensor pointing into the weight buffer at a byte offset.
-        let tensor_at = |offset: usize| -> MetalTensor {
-            MetalTensor {
-                buffer: weight_buffer.clone(),
-                offset,
-            }
-        };
+        let tensor_at =
+            |offset: usize| -> MetalTensor { MetalTensor::new(weight_buffer.clone(), offset) };
 
         let hidden = config.hidden_size;
         let num_layers = config.num_hidden_layers;
@@ -997,7 +1038,8 @@ impl MetalDriver {
         };
 
         let arch = NomicBertArch { weights };
-
+        // NomicBert (768-dim): FP16 weight conversion hurts more than helps
+        // due to RefCell overhead per GEMM exceeding bandwidth savings.
         Ok((arch, mmap))
     }
 
@@ -1082,12 +1124,8 @@ impl MetalDriver {
         };
 
         // Helper: create a MetalTensor pointing into the weight buffer at a byte offset.
-        let tensor_at = |offset: usize| -> MetalTensor {
-            MetalTensor {
-                buffer: weight_buffer.clone(),
-                offset,
-            }
-        };
+        let tensor_at =
+            |offset: usize| -> MetalTensor { MetalTensor::new(weight_buffer.clone(), offset) };
 
         // Helper: read raw f32 data from the mmap at a given byte offset and element count.
         let read_f32 = |offset: usize, n: usize| -> &[f32] {
@@ -1183,6 +1221,17 @@ impl MetalDriver {
 
         let arch = ClassicBertArch { weights };
 
+        // Pre-convert all weight matrices to FP16 for faster MPS GEMMs.
+        for layer in &arch.weights.layers {
+            let h = config.hidden_size;
+            let inter = config.intermediate_size;
+            self.ensure_fp16(&layer.qkv_weight, 3 * h * h)?;
+            self.ensure_fp16(&layer.qkv_bias, 3 * h)?;
+            self.ensure_fp16(&layer.output_weight, h * h)?;
+            self.ensure_fp16(&layer.ffn_inter_weight, inter * h)?;
+            self.ensure_fp16(&layer.ffn_out_weight, h * inter)?;
+        }
+
         Ok((arch, mmap))
     }
 }
@@ -1233,7 +1282,7 @@ fn upload_f32_to_metal(driver: &MetalDriver, data: &[f32]) -> crate::Result<Meta
         )
     }
     .ok_or_else(|| crate::Error::Metal("RoPE buffer alloc failed".into()))?;
-    Ok(MetalTensor { buffer, offset: 0 })
+    Ok(MetalTensor::new(buffer, 0))
 }
 
 /// Parsed `ModernBERT` model configuration from `config.json`.
@@ -1565,30 +1614,12 @@ impl Driver for MetalDriver {
         let pooling_mask_buf = make_f32_buffer(&self.device, &pooling_mask)?;
 
         Ok(BatchInputs {
-            input_ids: MetalTensor {
-                buffer: input_ids_buf,
-                offset: 0,
-            },
-            attention_mask: MetalTensor {
-                buffer: attn_mask_int_buf,
-                offset: 0,
-            },
-            token_type_ids: MetalTensor {
-                buffer: token_type_ids_buf,
-                offset: 0,
-            },
-            position_ids: MetalTensor {
-                buffer: position_ids_buf,
-                offset: 0,
-            },
-            float_mask: MetalTensor {
-                buffer: float_mask_buf,
-                offset: 0,
-            },
-            pooling_mask: MetalTensor {
-                buffer: pooling_mask_buf,
-                offset: 0,
-            },
+            input_ids: MetalTensor::new(input_ids_buf, 0),
+            attention_mask: MetalTensor::new(attn_mask_int_buf, 0),
+            token_type_ids: MetalTensor::new(token_type_ids_buf, 0),
+            position_ids: MetalTensor::new(position_ids_buf, 0),
+            float_mask: MetalTensor::new(float_mask_buf, 0),
+            pooling_mask: MetalTensor::new(pooling_mask_buf, 0),
             batch,
             max_seq,
         })
@@ -1678,14 +1709,29 @@ impl Driver for MetalDriver {
         k: usize,
         transpose_b: bool,
     ) -> crate::Result<()> {
+        // Use FP16 weights if available (halves memory bandwidth).
+        let b_fp16 = b.fp16.borrow();
+        let (b_buf, b_off, b_dtype) = if let Some(ref fp16_buf) = *b_fp16 {
+            (
+                fp16_buf as &ProtocolObject<dyn MTLBuffer>,
+                0, // FP16 buffer is standalone — data starts at offset 0
+                MPSDataType::Float16,
+            )
+        } else {
+            (
+                &*b.buffer as &ProtocolObject<dyn MTLBuffer>,
+                b.offset,
+                MPSDataType::Float32,
+            )
+        };
         self.run_mps(|cmd_buf| {
             dispatch_mps_gemm(
                 cmd_buf,
                 &self.device,
                 &a.buffer,
                 a.offset,
-                &b.buffer,
-                b.offset,
+                b_buf,
+                b_off,
                 &output.buffer,
                 output.offset,
                 m,
@@ -1693,7 +1739,7 @@ impl Driver for MetalDriver {
                 k,
                 transpose_b,
                 MPSDataType::Float32,
-                MPSDataType::Float32,
+                b_dtype,
             );
             Ok(())
         })
