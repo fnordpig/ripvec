@@ -982,7 +982,7 @@ mod tests {
         };
 
         // Basic forward pass
-        let result = backend.embed_batch(&[enc.clone()]).unwrap();
+        let result = backend.embed_batch(std::slice::from_ref(&enc)).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 768);
 
@@ -1001,7 +1001,7 @@ mod tests {
         {
             let cpu = load_backend(BackendKind::Cpu, model_repo, DeviceHint::Cpu)
                 .expect("CPU load failed");
-            let cpu_result = cpu.embed_batch(&[enc.clone()]).unwrap();
+            let cpu_result = cpu.embed_batch(std::slice::from_ref(&enc)).unwrap();
             eprintln!("CPU  first 5: {:?}", &cpu_result[0][..5]);
             eprintln!("NEW  first 5: {:?}", &result[0][..5]);
             let cosine: f32 = result[0]
@@ -1090,7 +1090,7 @@ mod tests {
         };
 
         // Basic forward pass
-        let result = backend.embed_batch(&[enc.clone()]).unwrap();
+        let result = backend.embed_batch(std::slice::from_ref(&enc)).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 384);
 
@@ -1109,7 +1109,7 @@ mod tests {
         {
             let cpu = load_backend(BackendKind::Cpu, model_repo, DeviceHint::Cpu)
                 .expect("CPU load failed");
-            let cpu_result = cpu.embed_batch(&[enc.clone()]).unwrap();
+            let cpu_result = cpu.embed_batch(std::slice::from_ref(&enc)).unwrap();
             eprintln!("CPU  first 5: {:?}", &cpu_result[0][..5]);
             eprintln!("NEW  first 5: {:?}", &result[0][..5]);
             let cosine: f32 = result[0]
@@ -1199,7 +1199,7 @@ mod tests {
         };
 
         // Basic forward pass
-        let result = backend.embed_batch(&[enc.clone()]).unwrap();
+        let result = backend.embed_batch(std::slice::from_ref(&enc)).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 384);
 

@@ -70,7 +70,7 @@ pub fn detect_cpu_vendor() -> CpuVendor {
                 return CpuVendor::Intel;
             }
         }
-        return CpuVendor::Unknown;
+        CpuVendor::Unknown
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]

@@ -819,7 +819,7 @@ mod tests {
         let max_idx = ranks
             .iter()
             .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .max_by(|a, b| a.1.total_cmp(b.1))
             .unwrap()
             .0;
         assert_eq!(max_idx, 3, "node 3 should have highest rank");
@@ -1057,7 +1057,7 @@ mod tests {
             .base_ranks
             .iter()
             .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .max_by(|a, b| a.1.total_cmp(b.1))
             .map(|(i, _)| i);
         let focused = render(&graph, 2000, focus_idx);
         let focus_ms = t2.elapsed().as_secs_f64() * 1000.0;
