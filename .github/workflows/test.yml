@@ -41,7 +41,7 @@ jobs:
       # Cache HuggingFace model downloads (~50MB each) across runs.
       # Key includes model repo names so cache invalidates if models change.
       - name: Cache HuggingFace models
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ env.HF_HOME }}
           key: hf-models-${{ runner.os }}-bge-small-coderank-v1
