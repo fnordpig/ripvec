@@ -956,6 +956,13 @@ mod tests {
             throughput
         );
         assert_eq!(result.len(), 32);
+
+        // Batch=1 timing (critical — CLI query path)
+        let single = vec![encs[0].clone()];
+        let t1 = std::time::Instant::now();
+        let _ = arch.forward(&driver, &single).unwrap();
+        let single_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("  batch=1, time={single_ms:.1}ms");
     }
 
     /// Load `NomicBert` (`CodeRankEmbed`) on Metal via the driver/arch system.
