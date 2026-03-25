@@ -134,64 +134,56 @@ impl rmcp::ServerHandler for RipvecServer {
         }
     }
 
-    fn list_resources(
+    async fn list_resources(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
-    ) -> impl std::future::Future<Output = Result<rmcp::model::ListResourcesResult, rmcp::ErrorData>>
-    + Send
-    + '_ {
-        async move {
-            let resource = rmcp::model::Resource {
-                raw: rmcp::model::RawResource {
-                    uri: "ripvec://repo-map".to_string(),
-                    name: "Repository Structure Map".to_string(),
-                    title: None,
-                    description: Some("PageRank-weighted structural overview".to_string()),
-                    mime_type: Some("text/markdown".to_string()),
-                    size: None,
-                    icons: None,
-                    meta: None,
-                },
-                annotations: None,
-            };
-            Ok(rmcp::model::ListResourcesResult {
-                resources: vec![resource],
-                next_cursor: None,
+    ) -> Result<rmcp::model::ListResourcesResult, rmcp::ErrorData> {
+        let resource = rmcp::model::Resource {
+            raw: rmcp::model::RawResource {
+                uri: "ripvec://repo-map".to_string(),
+                name: "Repository Structure Map".to_string(),
+                title: None,
+                description: Some("PageRank-weighted structural overview".to_string()),
+                mime_type: Some("text/markdown".to_string()),
+                size: None,
+                icons: None,
                 meta: None,
-            })
-        }
+            },
+            annotations: None,
+        };
+        Ok(rmcp::model::ListResourcesResult {
+            resources: vec![resource],
+            next_cursor: None,
+            meta: None,
+        })
     }
 
-    fn read_resource(
+    async fn read_resource(
         &self,
         request: rmcp::model::ReadResourceRequestParams,
         _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
-    ) -> impl std::future::Future<Output = Result<rmcp::model::ReadResourceResult, rmcp::ErrorData>>
-    + Send
-    + '_ {
-        async move {
-            if request.uri != "ripvec://repo-map" {
-                return Err(rmcp::ErrorData::internal_error(
-                    format!("unknown resource URI: {}", request.uri),
-                    None,
-                ));
-            }
-
-            let graph_guard = self
-                .repo_graph
-                .read()
-                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-
-            let rendered = match graph_guard.as_ref() {
-                Some(graph) => ripvec_core::repo_map::render(graph, 1500, None),
-                None => "Repository graph not yet available. Index is still building.".to_string(),
-            };
-
-            Ok(rmcp::model::ReadResourceResult::new(vec![
-                rmcp::model::ResourceContents::text(rendered, "ripvec://repo-map"),
-            ]))
+    ) -> Result<rmcp::model::ReadResourceResult, rmcp::ErrorData> {
+        if request.uri != "ripvec://repo-map" {
+            return Err(rmcp::ErrorData::internal_error(
+                format!("unknown resource URI: {}", request.uri),
+                None,
+            ));
         }
+
+        let graph_guard = self
+            .repo_graph
+            .read()
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+
+        let rendered = match graph_guard.as_ref() {
+            Some(graph) => ripvec_core::repo_map::render(graph, 1500, None),
+            None => "Repository graph not yet available. Index is still building.".to_string(),
+        };
+
+        Ok(rmcp::model::ReadResourceResult::new(vec![
+            rmcp::model::ResourceContents::text(rendered, "ripvec://repo-map"),
+        ]))
     }
 }
 

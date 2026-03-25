@@ -568,7 +568,7 @@ mod tests {
 
     #[test]
     fn test_repo_map_params_defaults() {
-        let json = r#"{}"#;
+        let json = r"{}";
         let params: RepoMapParams = serde_json::from_str(json).unwrap();
         assert_eq!(params.max_tokens, 2000);
         assert!(params.focus_file.is_none());
