@@ -13,8 +13,6 @@ pub mod cuda;
 pub mod driver;
 pub mod generic;
 #[cfg(feature = "metal")]
-pub mod metal;
-#[cfg(feature = "metal")]
 pub mod metal_kernels;
 #[cfg(feature = "mlx")]
 pub mod mlx;
@@ -178,15 +176,15 @@ pub fn load_backend(
         ))),
         #[cfg(feature = "metal")]
         BackendKind::Metal => {
-            // Route models through the driver/arch system by architecture.
+            // All models route through the driver/arch system.
             if is_modernbert_model(model_repo) {
                 return load_modernbert_metal(model_repo);
             }
             if is_classic_bert_model(model_repo) {
                 return load_classic_metal(model_repo);
             }
-            let backend = metal::MetalBackend::load(model_repo, &device_hint)?;
-            Ok(Box::new(backend))
+            // Default: NomicBert (CodeRankEmbed, nomic-embed-text, etc.)
+            load_nomic_metal(model_repo)
         }
         #[cfg(not(feature = "metal"))]
         BackendKind::Metal => Err(crate::Error::Other(anyhow::anyhow!(
@@ -235,8 +233,8 @@ pub fn detect_backends(
             if let Ok(b) = load_classic_metal(model_repo) {
                 backends.push(b);
             }
-        } else if let Ok(b) = metal::MetalBackend::load(model_repo, &DeviceHint::Auto) {
-            backends.push(Box::new(b));
+        } else if let Ok(b) = load_nomic_metal(model_repo) {
+            backends.push(b);
         }
     }
 
