@@ -1,0 +1,5 @@
+# Enable best available SIMD instructions for the build machine.
+# This benefits ndarray BLAS, memchr, and LLVM auto-vectorization.
+# NOTE: Binaries built with this flag are not portable to older CPUs.
+[build]
+rustflags = ["-C", "target-cpu=native"]

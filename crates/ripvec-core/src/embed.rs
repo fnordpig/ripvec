@@ -21,17 +21,12 @@
 use std::path::Path;
 use std::time::Instant;
 
-use memmap2::Mmap;
 use rayon::prelude::*;
 use tracing::{debug, info_span, instrument, warn};
 
 use crate::backend::{EmbedBackend, Encoding};
 use crate::chunk::{ChunkConfig, CodeChunk};
 use crate::similarity;
-
-/// Files larger than this are memory-mapped instead of read into a String.
-/// Mmap avoids heap allocation and lets the OS page cache handle I/O.
-const MMAP_THRESHOLD: u64 = 32 * 1024; // 32 KB
 
 /// Default batch size for embedding inference.
 pub const DEFAULT_BATCH_SIZE: usize = 32;
@@ -63,6 +58,8 @@ pub struct SearchConfig {
     /// and L2-re-normalized copy of the embedding matrix at this dimension for
     /// fast two-phase cascade search. `None` (default) disables cascade search.
     pub cascade_dim: Option<usize>,
+    /// File type filters (e.g. `["rust", "py"]`). Empty means all files.
+    pub file_types: Vec<String>,
 }
 
 impl Default for SearchConfig {
@@ -73,6 +70,7 @@ impl Default for SearchConfig {
             chunk: ChunkConfig::default(),
             text_mode: false,
             cascade_dim: None,
+            file_types: Vec::new(),
         }
     }
 }
@@ -116,13 +114,12 @@ pub fn embed_all(
     let files = {
         let _span = info_span!("walk").entered();
         let guard = profiler.phase("walk");
-        let files = crate::walk::collect_files(root);
+        let files = crate::walk::collect_files(root, &cfg.file_types);
         guard.set_detail(format!("{} files", files.len()));
         files
     };
 
     // Phase 2: Chunk all files in parallel.
-    // Large files are mmap'd to avoid heap allocation; small files use read_to_string.
     let chunks: Vec<CodeChunk> = {
         let _span = info_span!("chunk", file_count = files.len()).entered();
         let chunk_start = Instant::now();
@@ -505,72 +502,29 @@ pub(crate) fn embed_distributed(
     Ok(embeddings)
 }
 
-/// Source text either owned (from `read_to_string`) or mmap'd.
-pub(crate) enum SourceText {
-    Owned(String),
-    Mapped(Mmap),
-}
-
-impl std::ops::Deref for SourceText {
-    type Target = str;
-    fn deref(&self) -> &str {
-        match self {
-            Self::Owned(s) => s,
-            Self::Mapped(m) => {
-                // SAFETY: we only construct Mapped from files that passed UTF-8 validation
-                #[expect(
-                    unsafe_code,
-                    reason = "validated UTF-8 before constructing Mapped variant"
-                )]
-                unsafe {
-                    std::str::from_utf8_unchecked(m)
-                }
-            }
-        }
-    }
-}
-
-/// Read a source file, using mmap for large files and `read_to_string` for small ones.
+/// Read a source file into a `String`, skipping binary files.
 ///
-/// Returns `None` (with a debug log) when the file cannot be read or is not valid UTF-8.
-#[expect(unsafe_code, reason = "mmap of read-only source file")]
-pub(crate) fn read_source(path: &Path) -> Option<SourceText> {
-    let metadata = match std::fs::metadata(path) {
-        Ok(m) => m,
+/// Binary files are detected by scanning the first 8 KB for NUL bytes using
+/// SIMD-accelerated `memchr`. Returns `None` (with a debug log) when the file
+/// cannot be read, contains NUL bytes, or is not valid UTF-8.
+pub(crate) fn read_source(path: &Path) -> Option<String> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
         Err(e) => {
-            debug!(path = %path.display(), err = %e, "skipping file: metadata read failed");
+            debug!(path = %path.display(), err = %e, "skipping file");
             return None;
         }
     };
-    if metadata.len() >= MMAP_THRESHOLD {
-        let file = match std::fs::File::open(path) {
-            Ok(f) => f,
-            Err(e) => {
-                debug!(path = %path.display(), err = %e, "skipping file: open failed");
-                return None;
-            }
-        };
-        // SAFETY: file is read-only, not modified while mapped
-        let mmap = match unsafe { Mmap::map(&file) } {
-            Ok(m) => m,
-            Err(e) => {
-                debug!(path = %path.display(), err = %e, "skipping file: mmap failed");
-                return None;
-            }
-        };
-        // Validate UTF-8 before wrapping
-        if std::str::from_utf8(&mmap).is_err() {
-            debug!(path = %path.display(), "skipping file: not valid UTF-8");
-            return None;
-        }
-        Some(SourceText::Mapped(mmap))
-    } else {
-        match std::fs::read_to_string(path) {
-            Ok(s) => Some(SourceText::Owned(s)),
-            Err(e) => {
-                debug!(path = %path.display(), err = %e, "skipping file: read failed");
-                None
-            }
+    let probe = &bytes[..bytes.len().min(8192)];
+    if memchr::memchr(0, probe).is_some() {
+        debug!(path = %path.display(), "skipping binary file");
+        return None;
+    }
+    match String::from_utf8(bytes) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            debug!(path = %path.display(), err = %e, "skipping file: not valid UTF-8");
+            None
         }
     }
 }

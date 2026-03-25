@@ -17,6 +17,12 @@ fn main() -> Result<()> {
         args.path = std::mem::take(&mut args.query);
     }
 
+    // Handle --type-list early (before loading anything)
+    if args.type_list {
+        ripvec_core::walk::print_type_list();
+        return Ok(());
+    }
+
     // Handle --clear-cache early (before loading anything)
     if args.clear_cache {
         let root = std::path::Path::new(&args.path);
@@ -184,6 +190,7 @@ fn load_pipeline(
         },
         text_mode: args.text_mode,
         cascade_dim: None,
+        file_types: args.file_types.clone(),
     };
 
     Ok((backends, tokenizer, search_cfg))

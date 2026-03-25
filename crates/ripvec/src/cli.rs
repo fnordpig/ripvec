@@ -84,6 +84,16 @@ pub struct Args {
     #[arg(long, default_value_t = 512)]
     pub window_overlap: usize,
 
+    /// Filter files by type (e.g. `rust`, `py`, `js`). Uses ripgrep's type database.
+    ///
+    /// Repeat for multiple types: `-T rust -T py`. Use `--type-list` to see all types.
+    #[arg(short = 'T', long = "type", value_name = "TYPE")]
+    pub file_types: Vec<String>,
+
+    /// List all supported file types and exit.
+    #[arg(long)]
+    pub type_list: bool,
+
     /// Treat all files as plain text (sliding-window chunking only).
     /// By default, recognized source files use tree-sitter semantic chunking
     /// and unrecognized files fall back to plain-text windows.

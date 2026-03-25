@@ -28,6 +28,7 @@ tree-sitter-cpp = "0.23"
 # Parallelism and file traversal
 rayon = "1.10"
 ignore = "0.4"
+memchr = "2.7"
 
 # Tracing / profiling
 tracing = "0.1"

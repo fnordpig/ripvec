@@ -133,6 +133,50 @@ pub fn extract_signature(node: tree_sitter::Node<'_>, source: &str) -> Option<St
     }
 }
 
+/// Minify whitespace in code to maximize semantic content per token window.
+///
+/// Collapses runs of spaces/tabs to single-space indentation levels, strips
+/// trailing whitespace on each line, and collapses 3+ consecutive blank lines
+/// to 2. Preserves content inside string literals.
+#[must_use]
+fn minify_whitespace(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut consecutive_blank = 0u32;
+
+    for line in input.split('\n') {
+        let trimmed_end = line.trim_end();
+        if trimmed_end.is_empty() {
+            consecutive_blank += 1;
+            if consecutive_blank <= 2 {
+                out.push('\n');
+            }
+            continue;
+        }
+        consecutive_blank = 0;
+
+        // Count leading whitespace and collapse to single spaces per indent level.
+        // Treat a tab or 4 spaces as one indent level.
+        let leading = trimmed_end.len() - trimmed_end.trim_start().len();
+        if leading > 0 {
+            let prefix = &trimmed_end[..leading];
+            let indent_level = prefix
+                .chars()
+                .fold(0u32, |acc, c| acc + if c == '\t' { 4 } else { 1 })
+                / 4;
+            for _ in 0..indent_level {
+                out.push(' ');
+            }
+        }
+        out.push_str(trimmed_end.trim_start());
+        out.push('\n');
+    }
+    // Remove trailing newline if input didn't end with one
+    if !input.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
 /// Build the enriched content header for a code chunk.
 ///
 /// Prepends scope chain and signature metadata as a comment line.
@@ -144,6 +188,7 @@ fn build_enriched_content(
     content: &str,
     max_bytes: usize,
 ) -> String {
+    let minified = minify_whitespace(content);
     let scope = build_scope_chain(node, source);
     let sig = extract_signature(node, source).unwrap_or_default();
     let rel_path = path.display().to_string();
@@ -158,10 +203,10 @@ fn build_enriched_content(
         format!("// {rel_path} | {scope} | defines: {sig}\n")
     };
 
-    if header.len() + content.len() > max_bytes {
-        content.to_string()
+    if header.len() + minified.len() > max_bytes {
+        minified
     } else {
-        format!("{header}{content}")
+        format!("{header}{minified}")
     }
 }
 

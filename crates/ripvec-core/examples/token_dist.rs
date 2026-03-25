@@ -11,7 +11,7 @@ use std::path::Path;
 fn main() {
     let dir = std::env::args().nth(1).unwrap_or_else(|| ".".into());
     let tokenizer = ripvec_core::tokenize::load_tokenizer("BAAI/bge-small-en-v1.5").unwrap();
-    let files = ripvec_core::walk::collect_files(Path::new(&dir));
+    let files = ripvec_core::walk::collect_files(Path::new(&dir), &[]);
     let mut token_counts: Vec<usize> = Vec::new();
 
     for path in &files {

@@ -37,7 +37,7 @@ pub fn compute_diff(root: &Path, manifest: &Manifest) -> crate::Result<DiffResul
     let mut seen_files: HashSet<String> = HashSet::new();
 
     // Walk the filesystem using the same walker as embed
-    let files = crate::walk::collect_files(root);
+    let files = crate::walk::collect_files(root, &[]);
 
     for file_path in &files {
         let relative = file_path
