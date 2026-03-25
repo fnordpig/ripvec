@@ -33,10 +33,12 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Resolve model repo: --code → CodeRankEmbed, --text/default → BGE-small
+    // Resolve model repo: --modern → ModernBERT, --code → CodeRankEmbed, default → BGE-small
     let use_code_model = args.code;
     let model_repo = args.model_repo.clone().unwrap_or_else(|| {
-        if use_code_model {
+        if args.modern {
+            "nomic-ai/modernbert-embed-base".to_string()
+        } else if use_code_model {
             "nomic-ai/CodeRankEmbed".to_string()
         } else {
             "BAAI/bge-small-en-v1.5".to_string()
@@ -151,6 +153,7 @@ fn load_pipeline(
                     cli::BackendArg::Cpu => ripvec_core::backend::BackendKind::Cpu,
                     cli::BackendArg::Cuda => ripvec_core::backend::BackendKind::Cuda,
                     cli::BackendArg::Mlx => ripvec_core::backend::BackendKind::Mlx,
+                    cli::BackendArg::Metal => ripvec_core::backend::BackendKind::Metal,
                     cli::BackendArg::Auto => unreachable!(),
                 };
                 let device_hint = match args.device {
@@ -182,6 +185,8 @@ fn load_pipeline(
             window_overlap: args.window_overlap,
         },
         text_mode: args.text_mode,
+        cascade_dim: None,
+        file_type: args.file_type.clone(),
     };
 
     Ok((backends, tokenizer, search_cfg))
@@ -235,7 +240,9 @@ fn run_interactive(
         backends.iter().map(|b| &**b).collect();
 
     let model_repo = args.model_repo.clone().unwrap_or_else(|| {
-        if use_code_model {
+        if args.modern {
+            "nomic-ai/modernbert-embed-base".to_string()
+        } else if use_code_model {
             "nomic-ai/CodeRankEmbed".to_string()
         } else {
             "BAAI/bge-small-en-v1.5".to_string()
@@ -310,7 +317,7 @@ fn run_interactive(
         format!("{} chunks \u{2502} {}", chunks.len(), breakdown.join(", "))
     };
 
-    let index = ripvec_core::index::SearchIndex::new(chunks, &embeddings);
+    let index = ripvec_core::index::SearchIndex::new(chunks, &embeddings, None);
 
     let mut app = tui::App {
         query: String::new(),

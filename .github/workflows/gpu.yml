@@ -30,7 +30,7 @@ jobs:
       contains(github.event.pull_request.labels.*.name, 'gpu-test')
     runs-on: [self-hosted, linux, cuda]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -38,7 +38,7 @@ jobs:
         run: nvidia-smi
 
       - name: Cache HuggingFace models
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ env.HF_HOME }}
           key: hf-models-cuda-bge-small-coderank-v1
@@ -64,12 +64,12 @@ jobs:
       contains(github.event.pull_request.labels.*.name, 'gpu-test')
     runs-on: [self-hosted, macOS, apple-silicon]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
       - name: Cache HuggingFace models
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ env.HF_HOME }}
           key: hf-models-mlx-bge-small-coderank-v1
@@ -94,12 +94,12 @@ jobs:
     needs: [cuda]
     runs-on: [self-hosted, linux, cuda]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
       - name: Cache HuggingFace models
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ env.HF_HOME }}
           key: hf-models-cuda-bge-small-coderank-v1

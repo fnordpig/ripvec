@@ -37,6 +37,11 @@ pub struct Args {
     #[arg(long)]
     pub text: bool,
 
+    /// Use ModernBERT model (nomic-ai/modernbert-embed-base).
+    /// 768-dim, 22 layers, alternating local/global attention, MRL-trained.
+    #[arg(long, conflicts_with_all = ["code", "text"])]
+    pub modern: bool,
+
     /// Override `HuggingFace` model repository (advanced).
     #[arg(long)]
     pub model_repo: Option<String>,
@@ -45,8 +50,12 @@ pub struct Args {
     #[arg(short, long, default_value = "color")]
     pub format: OutputFormat,
 
+    /// Filter files by type (e.g., rust, python, js). Uses ripgrep's type definitions.
+    #[arg(short = 't', long = "type")]
+    pub file_type: Option<String>,
+
     /// Minimum similarity threshold (0.0 to 1.0).
-    #[arg(short = 't', long, default_value_t = 0.5)]
+    #[arg(short = 'T', long, default_value_t = 0.5)]
     pub threshold: f32,
 
     /// Number of threads for parallel processing (0 = cores).
@@ -156,4 +165,6 @@ pub enum BackendArg {
     Cuda,
     /// MLX (Apple Silicon, macOS only).
     Mlx,
+    /// Metal (Apple Silicon, direct Metal GPU).
+    Metal,
 }

@@ -52,8 +52,172 @@ pub struct CodeChunk {
     pub start_line: usize,
     /// 1-based end line number.
     pub end_line: usize,
-    /// Source text of the chunk.
+    /// Source text of the chunk (raw code for display).
     pub content: String,
+    /// Enriched content with scope chain and signature metadata for embedding.
+    /// Falls back to `content` if metadata would exceed chunk size limits.
+    pub enriched_content: String,
+}
+
+/// Walk up the AST parent chain collecting structural container names.
+///
+/// Produces a scope chain like `"impl_item Foo > fn forward"` by
+/// identifying structural containers (impl blocks, classes, modules, namespaces)
+/// and extracting their names. Tries the `name` field first, then `type`
+/// (for Rust `impl_item` which uses `type` instead of `name`).
+#[must_use]
+pub fn build_scope_chain(node: tree_sitter::Node<'_>, source: &str) -> String {
+    /// Node kinds that represent structural containers, by language.
+    const CONTAINER_KINDS: &[&str] = &[
+        // Rust
+        "impl_item",
+        "trait_item",
+        "mod_item",
+        // Python
+        "class_definition",
+        "module",
+        // JS/TS
+        "class_declaration",
+        // Java
+        // "class_declaration" already covered above
+        // Go
+        "type_declaration",
+        // C++
+        "namespace_definition",
+        "class_specifier",
+    ];
+
+    /// Field names to try when extracting the container name.
+    /// `impl_item` uses `type` instead of `name`; Go `type_declaration`
+    /// has no fields, so we fall back to the node kind.
+    const NAME_FIELDS: &[&str] = &["name", "type"];
+
+    let mut parts = Vec::new();
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        let kind = parent.kind();
+        if CONTAINER_KINDS.contains(&kind) {
+            let name = NAME_FIELDS
+                .iter()
+                .find_map(|field| parent.child_by_field_name(field))
+                .map_or(kind, |n| &source[n.start_byte()..n.end_byte()]);
+            parts.push(format!("{kind} {name}"));
+        }
+        current = parent.parent();
+    }
+    parts.reverse();
+    parts.join(" > ")
+}
+
+/// Extract the function/method signature from a definition node.
+///
+/// Returns the text from the function name to the start of the body,
+/// which captures the parameter list and return type (if any).
+/// Returns `None` if the node has no `name` or `body`/`block` field.
+#[must_use]
+pub fn extract_signature(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+    let name_node = node.child_by_field_name("name")?;
+    let body_node = node
+        .child_by_field_name("body")
+        .or_else(|| node.child_by_field_name("block"))?;
+    let start = name_node.start_byte();
+    let end = body_node.start_byte();
+    if start >= end {
+        return None;
+    }
+    let sig = source[start..end].trim();
+    if sig.is_empty() {
+        None
+    } else {
+        Some(sig.to_string())
+    }
+}
+
+/// Reduce indentation waste for embedding by normalizing whitespace.
+///
+/// For each line:
+/// - Counts leading spaces/tabs, normalises to 2 spaces per indent level
+///   (4 spaces → 2, 8 spaces → 4, 1 tab → 2 spaces).
+/// - Strips trailing whitespace.
+///
+/// Additionally, 3 or more consecutive blank lines are collapsed to a single
+/// blank line. This reduces the number of whitespace tokens consumed in the
+/// 512-token embedding window without altering visible structure.
+#[must_use]
+pub fn minify_whitespace(source: &str) -> String {
+    let mut result = String::with_capacity(source.len());
+    let mut consecutive_blank = 0usize;
+
+    for line in source.lines() {
+        // Count leading whitespace and determine indent level
+        let leading = line
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .fold(0usize, |acc, c| acc + if c == '\t' { 2 } else { 1 });
+        let rest = line.trim_start();
+
+        if rest.is_empty() {
+            // Blank line handling: collapse 3+ consecutive blanks to 1.
+            // Only emit the first blank line of a run; suppress the rest.
+            consecutive_blank += 1;
+            if consecutive_blank == 1 {
+                result.push('\n');
+            }
+        } else {
+            consecutive_blank = 0;
+            // Normalise: every 2 spaces of original indent → 1 space of output
+            // (round up so indent level 1 → 1 space, level 2 → 2, etc.)
+            let indent_level = leading.div_ceil(2);
+            for _ in 0..indent_level {
+                result.push(' ');
+            }
+            result.push_str(rest.trim_end());
+            result.push('\n');
+        }
+    }
+
+    // Remove trailing newline added for the last line if source didn't end with one
+    if !source.ends_with('\n') && result.ends_with('\n') {
+        result.pop();
+    }
+
+    result
+}
+
+/// Build the enriched content header for a code chunk.
+///
+/// Prepends scope chain and signature metadata as a comment line.
+/// If the header + content would exceed `max_bytes`, returns `content` unchanged.
+fn build_enriched_content(
+    path: &Path,
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    content: &str,
+    max_bytes: usize,
+) -> String {
+    let scope = build_scope_chain(node, source);
+    let sig = extract_signature(node, source).unwrap_or_default();
+    let rel_path = path.display().to_string();
+
+    let header = if scope.is_empty() && sig.is_empty() {
+        format!("// {rel_path}\n")
+    } else if scope.is_empty() {
+        format!("// {rel_path} | defines: {sig}\n")
+    } else if sig.is_empty() {
+        format!("// {rel_path} | {scope}\n")
+    } else {
+        format!("// {rel_path} | {scope} | defines: {sig}\n")
+    };
+
+    // Minify whitespace for the embedding content to reduce token waste.
+    // The raw `content` field is kept as-is for display.
+    let minified = minify_whitespace(content);
+
+    if header.len() + minified.len() > max_bytes {
+        minified
+    } else {
+        format!("{header}{minified}")
+    }
 }
 
 /// Extract semantic chunks from a source file.
@@ -109,12 +273,20 @@ pub fn chunk_file(
                     chunk_config,
                 ));
             } else {
+                let enriched = build_enriched_content(
+                    path,
+                    node,
+                    source,
+                    content,
+                    chunk_config.max_chunk_bytes,
+                );
                 chunks.push(CodeChunk {
                     file_path: path.display().to_string(),
                     name,
                     kind: node.kind().to_string(),
                     start_line,
                     end_line: node.end_position().row + 1,
+                    enriched_content: enriched,
                     content: content.to_string(),
                 });
             }
@@ -151,6 +323,7 @@ fn sliding_windows(path: &Path, source: &str, chunk_config: &ChunkConfig) -> Vec
 
     // Small enough for a single chunk
     if source.len() <= chunk_config.max_chunk_bytes {
+        let content = source.to_string();
         return vec![CodeChunk {
             file_path: path.display().to_string(),
             name: path
@@ -161,7 +334,8 @@ fn sliding_windows(path: &Path, source: &str, chunk_config: &ChunkConfig) -> Vec
             kind: "file".to_string(),
             start_line: 1,
             end_line: source.lines().count(),
-            content: source.to_string(),
+            enriched_content: content.clone(),
+            content,
         }];
     }
 
@@ -229,13 +403,15 @@ fn sliding_window_chunks(
             let start_line = base_line + source[..offset].matches('\n').count();
             let content_lines = window.lines().count().max(1);
             let end_line = start_line + content_lines - 1;
+            let content = window.to_string();
             chunks.push(CodeChunk {
                 file_path: file_path.display().to_string(),
                 name: format!("{name_prefix}[{window_idx}]"),
                 kind: "window".to_string(),
                 start_line,
                 end_line,
-                content: window.to_string(),
+                enriched_content: content.clone(),
+                content,
             });
             window_idx += 1;
         }
@@ -345,5 +521,232 @@ mod tests {
         let config = crate::languages::config_for_extension("rs").unwrap();
         let chunks = chunk_file(Path::new("empty.rs"), "", &config, &ChunkConfig::default());
         assert!(chunks.is_empty());
+    }
+
+    // --- T1 enrichment tests ---
+
+    /// Helper: parse source with tree-sitter and return the first `@def` node.
+    fn first_def_node(
+        source: &str,
+        ext: &str,
+    ) -> (
+        tree_sitter::Tree,
+        std::sync::Arc<crate::languages::LangConfig>,
+    ) {
+        let config = crate::languages::config_for_extension(ext).unwrap();
+        let mut parser = Parser::new();
+        parser.set_language(&config.language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        (tree, config)
+    }
+
+    #[test]
+    fn scope_chain_rust_impl_method() {
+        let source = "impl Foo {\n    fn bar(&self) {}\n}";
+        let (tree, config) = first_def_node(source, "rs");
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&config.query, tree.root_node(), source.as_bytes());
+
+        let mut def_node = None;
+        while let Some(m) = StreamingIterator::next(&mut matches) {
+            for cap in m.captures {
+                let cap_name = &config.query.capture_names()[cap.index as usize];
+                if *cap_name == "def" {
+                    def_node = Some(cap.node);
+                }
+            }
+        }
+        let node = def_node.expect("should find a @def node");
+        let scope = build_scope_chain(node, source);
+        assert!(
+            scope.contains("impl_item"),
+            "scope should contain impl_item, got: {scope}"
+        );
+        assert!(
+            scope.contains("Foo"),
+            "scope should contain 'Foo', got: {scope}"
+        );
+    }
+
+    #[test]
+    fn scope_chain_python_class_method() {
+        let source = "class Greeter:\n    def say_hello(self):\n        pass\n";
+        let (tree, config) = first_def_node(source, "py");
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&config.query, tree.root_node(), source.as_bytes());
+
+        // Find the function_definition @def (say_hello), not the class @def
+        let mut fn_node = None;
+        while let Some(m) = StreamingIterator::next(&mut matches) {
+            for cap in m.captures {
+                let cap_name = &config.query.capture_names()[cap.index as usize];
+                if *cap_name == "def" && cap.node.kind() == "function_definition" {
+                    fn_node = Some(cap.node);
+                }
+            }
+        }
+        let node = fn_node.expect("should find say_hello @def node");
+        let scope = build_scope_chain(node, source);
+        assert!(
+            scope.contains("class_definition"),
+            "scope should contain class_definition, got: {scope}"
+        );
+        assert!(
+            scope.contains("Greeter"),
+            "scope should contain 'Greeter', got: {scope}"
+        );
+    }
+
+    #[test]
+    fn extract_signature_rust_function() {
+        let source = "fn greet(name: &str) -> String { name.to_string() }";
+        let (tree, config) = first_def_node(source, "rs");
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&config.query, tree.root_node(), source.as_bytes());
+
+        let mut def_node = None;
+        while let Some(m) = StreamingIterator::next(&mut matches) {
+            for cap in m.captures {
+                let cap_name = &config.query.capture_names()[cap.index as usize];
+                if *cap_name == "def" {
+                    def_node = Some(cap.node);
+                }
+            }
+        }
+        let node = def_node.expect("should find @def node");
+        let sig = extract_signature(node, source).expect("should extract signature");
+        assert!(
+            sig.contains("greet"),
+            "signature should contain 'greet', got: {sig}"
+        );
+        assert!(
+            sig.contains("name: &str"),
+            "signature should contain parameter, got: {sig}"
+        );
+        assert!(
+            sig.contains("-> String"),
+            "signature should contain return type, got: {sig}"
+        );
+    }
+
+    #[test]
+    fn enriched_content_has_header() {
+        let source = "fn hello() { println!(\"hi\"); }";
+        let config = crate::languages::config_for_extension("rs").unwrap();
+        let chunks = chunk_file(
+            Path::new("src/main.rs"),
+            source,
+            &config,
+            &ChunkConfig::default(),
+        );
+        assert!(!chunks.is_empty());
+        let chunk = &chunks[0];
+        assert!(
+            chunk.enriched_content.starts_with("//"),
+            "enriched_content should start with '//' header, got: {}",
+            &chunk.enriched_content[..chunk.enriched_content.len().min(80)]
+        );
+        assert!(
+            chunk.enriched_content.contains("src/main.rs"),
+            "enriched_content should contain file path"
+        );
+        // Raw content should NOT have the header
+        assert!(
+            !chunk.content.starts_with("//"),
+            "raw content should not start with header"
+        );
+    }
+
+    #[test]
+    fn sliding_window_enriched_equals_content() {
+        let source = "let x = 42;\nconsole.log(x);\n";
+        let chunks = chunk_text(Path::new("test.txt"), source, &ChunkConfig::default());
+        assert!(!chunks.is_empty());
+        for chunk in &chunks {
+            assert_eq!(
+                chunk.enriched_content, chunk.content,
+                "sliding window chunks should have enriched_content == content"
+            );
+        }
+    }
+
+    #[test]
+    fn header_dropped_when_exceeding_max_bytes() {
+        // Create a chunk that barely fits in max_chunk_bytes, so adding
+        // a header would push it over the limit.
+        let tiny_config = ChunkConfig {
+            max_chunk_bytes: 60,
+            window_size: 30,
+            window_overlap: 10,
+        };
+        // Source is exactly at max_chunk_bytes — any header would exceed it
+        let source = "fn f() { let x = 42; return x; }";
+        assert!(source.len() <= tiny_config.max_chunk_bytes);
+
+        let config = crate::languages::config_for_extension("rs").unwrap();
+        let chunks = chunk_file(
+            Path::new("long/path/to/file.rs"),
+            source,
+            &config,
+            &tiny_config,
+        );
+        assert!(!chunks.is_empty());
+        let chunk = &chunks[0];
+        // Header ("// long/path/to/file.rs | defines: ...") + minified content > 60 bytes.
+        // So enriched_content should fall back to minified content (no header),
+        // and raw content is preserved as-is.
+        assert!(
+            !chunk.enriched_content.starts_with("//"),
+            "header should be dropped when it would exceed max_chunk_bytes"
+        );
+        assert_eq!(chunk.content, source, "raw content should be unchanged");
+    }
+
+    #[test]
+    fn minify_whitespace_normalizes_indent_and_strips_trailing() {
+        // 8-space indent → 4-space (halved)
+        let source = "fn foo() {\n        let x = 1;\n        let y = 2;\n}\n";
+        let result = minify_whitespace(source);
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(
+            lines[1], "    let x = 1;",
+            "8-space indent should become 4-space"
+        );
+        assert_eq!(
+            lines[2], "    let y = 2;",
+            "8-space indent should become 4-space"
+        );
+
+        // Trailing whitespace removed
+        let with_trailing = "fn bar()   \n    return 1;   \n";
+        let result2 = minify_whitespace(with_trailing);
+        assert!(
+            result2.lines().all(|l| !l.ends_with(' ')),
+            "trailing whitespace should be stripped"
+        );
+
+        // 3+ consecutive blank lines collapsed to 1
+        let with_blanks = "a\n\n\n\nb\n";
+        let result3 = minify_whitespace(with_blanks);
+        // Should have at most 1 blank line between a and b
+        let blank_runs: Vec<usize> = {
+            let mut runs = Vec::new();
+            let mut count = 0usize;
+            for line in result3.lines() {
+                if line.is_empty() {
+                    count += 1;
+                } else {
+                    if count > 0 {
+                        runs.push(count);
+                    }
+                    count = 0;
+                }
+            }
+            runs
+        };
+        assert!(
+            blank_runs.iter().all(|&n| n <= 1),
+            "3+ blank lines should collapse to 1, got runs: {blank_runs:?}"
+        );
     }
 }

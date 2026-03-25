@@ -58,9 +58,7 @@ impl std::fmt::Display for CpuVendor {
 #[must_use]
 pub fn detect_cpu_vendor() -> CpuVendor {
     #[cfg(target_os = "macos")]
-    {
-        return CpuVendor::Apple;
-    }
+    return CpuVendor::Apple;
 
     #[cfg(target_os = "linux")]
     {
@@ -72,8 +70,10 @@ pub fn detect_cpu_vendor() -> CpuVendor {
                 return CpuVendor::Intel;
             }
         }
+        CpuVendor::Unknown
     }
 
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     CpuVendor::Unknown
 }
 
@@ -90,7 +90,7 @@ pub fn detect_blas() -> BlasKind {
     #[cfg(target_os = "macos")]
     {
         // On macOS, ndarray links Accelerate by default
-        return BlasKind::Accelerate;
+        BlasKind::Accelerate
     }
 
     #[cfg(target_os = "linux")]
