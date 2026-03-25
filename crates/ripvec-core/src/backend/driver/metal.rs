@@ -695,18 +695,14 @@ impl MetalDriver {
         // Allocate new buffer
         let buffer = alloc_f32_buffer(&self.device, n)?;
 
-        // Add to pool for future reuse — but cap pool size to avoid OOM.
-        // ModernBERT 22 layers × ~15 allocs/layer = ~330 tensors per forward.
-        // Without a cap, the pool holds ALL of them (including 400MB score buffers).
-        // Cap at ~30 (one layer's worth) — subsequent layers reuse the same slots
-        // after begin_batch resets the cursor.
-        const MAX_POOL: usize = 30;
-        if cursor < MAX_POOL {
-            if cursor < pool.len() {
-                pool[cursor] = buffer.clone();
-            } else {
-                pool.push(buffer.clone());
-            }
+        // Add to pool for future reuse across batches.
+        // The pool grows to hold one full forward pass worth of buffers
+        // (~330 for ModernBERT, ~2-3GB peak). On subsequent batches
+        // (after begin_batch resets cursor), ALL are reused — zero allocation.
+        if cursor < pool.len() {
+            pool[cursor] = buffer.clone();
+        } else {
+            pool.push(buffer.clone());
         }
         self.pool_cursor.set(cursor + 1);
 
