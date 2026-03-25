@@ -1571,11 +1571,15 @@ impl Driver for MetalDriver {
     }
 
     fn reset_layer_workspace(&self) {
-        // Reset pool cursor so the next layer reuses the same buffer slots.
-        // Without this, 22-layer ModernBERT accumulates 22 × ~1GB of workspace
-        // buffers (including 400MB attention score matrices). With this, peak
-        // memory is ~1GB (one layer's worth).
-        self.pool_cursor.set(0);
+        // NO-OP within a batched command buffer. Resetting the pool cursor
+        // would cause layer N to overwrite layer N-1's buffers while the GPU
+        // is still reading them (same command buffer, no synchronization).
+        // This race condition deadlocks the Metal command processor, triggering
+        // a kernel watchdog timeout and system crash.
+        //
+        // Buffer reuse happens ACROSS batches only (begin_batch resets cursor).
+        // Within a batch, each layer gets fresh buffers from the pool.
+        // For ModernBERT 22 layers: ~2-3GB peak workspace (acceptable on M2 Max).
     }
 
     fn alloc_zeros(&self, n: usize) -> crate::Result<MetalTensor> {
