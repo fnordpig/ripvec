@@ -14,6 +14,9 @@
 //!   batching wrapper.
 //! - **Reuses MSL sources**: compiles kernels from [`super::super::metal_kernels`].
 
+use std::collections::HashMap;
+use std::path::Path;
+
 use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -26,9 +29,13 @@ use objc2_metal::{
 use objc2_metal_performance_shaders::{
     MPSDataType, MPSMatrix, MPSMatrixDescriptor, MPSMatrixMultiplication,
 };
+use safetensors::SafeTensors;
 
 use super::{BatchInputs, Driver};
 use crate::backend::Encoding;
+use crate::backend::arch::modern_bert::{
+    ModernBertArch, ModernBertLayerWeights, ModernBertWeights, RopeCache,
+};
 
 // ---------------------------------------------------------------------------
 // CoreGraphics linkage (required for MTLCreateSystemDefaultDevice)
@@ -53,6 +60,15 @@ pub struct MetalTensor {
     /// Byte offset into `buffer` where this tensor's data starts.
     pub offset: usize,
 }
+
+// SAFETY: Metal buffers use `StorageModeShared` on Apple Silicon (unified memory).
+// The Metal framework guarantees thread-safe access to buffer contents once the
+// command buffer that wrote the data has completed. Weight tensors are read-only
+// after loading, so sharing across threads is safe.
+#[expect(unsafe_code, reason = "Metal shared-mode buffers are thread-safe")]
+unsafe impl Send for MetalTensor {}
+#[expect(unsafe_code, reason = "Metal shared-mode buffers are thread-safe")]
+unsafe impl Sync for MetalTensor {}
 
 // ---------------------------------------------------------------------------
 // KernelPipelines
@@ -535,6 +551,14 @@ impl MetalDriver {
         })
     }
 
+    /// Borrow the underlying Metal device handle.
+    ///
+    /// Needed by weight-loading code that creates zero-copy buffers from
+    /// memory-mapped safetensors files.
+    pub fn device(&self) -> &ProtocolObject<dyn MTLDevice> {
+        &self.device
+    }
+
     /// Allocate a new [`MetalTensor`] of `n` floats.
     ///
     /// # Errors
@@ -570,6 +594,277 @@ impl MetalDriver {
         cmd_buf.commit();
         cmd_buf.waitUntilCompleted();
         Ok(())
+    }
+
+    /// Load `ModernBERT` weights from a safetensors file into [`MetalTensor`]s.
+    ///
+    /// Memory-maps the file and wraps it as a single zero-copy Metal buffer via
+    /// `newBufferWithBytesNoCopy`. Individual weight tensors are sub-views into
+    /// this buffer at the byte offsets recorded in the safetensors header.
+    ///
+    /// Also pre-computes the two `RoPE` cos/sin caches (global theta=160000,
+    /// local theta=10000) and allocates a zero-bias buffer.
+    ///
+    /// Returns `(arch, mmap)` — the caller **must** keep `mmap` alive as long as
+    /// the arch's tensors are in use (the Metal buffer references the mmap'd pages).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be opened/mapped, safetensors parsing
+    /// fails, or any expected weight tensor is missing.
+    #[expect(
+        unsafe_code,
+        clippy::cast_possible_truncation,
+        reason = "mmap + newBufferWithBytesNoCopy require unsafe FFI; config ints are small"
+    )]
+    pub fn load_modern_bert_weights(
+        &self,
+        weights_path: &Path,
+        config: &ModernBertConfig,
+    ) -> crate::Result<(ModernBertArch<MetalTensor>, memmap2::Mmap)> {
+        // 1. mmap the safetensors file
+        let file = std::fs::File::open(weights_path).map_err(|e| crate::Error::Io {
+            path: weights_path.display().to_string(),
+            source: e,
+        })?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| crate::Error::Io {
+            path: weights_path.display().to_string(),
+            source: e,
+        })?;
+
+        // 2. Create zero-copy Metal buffer
+        let page_size: usize = 16384; // Apple Silicon 16KB pages
+        let aligned_len = mmap.len().next_multiple_of(page_size);
+        let weight_buffer = unsafe {
+            self.device
+                .newBufferWithBytesNoCopy_length_options_deallocator(
+                    std::ptr::NonNull::new(mmap.as_ptr() as *mut _)
+                        .ok_or_else(|| crate::Error::Metal("mmap returned null pointer".into()))?,
+                    aligned_len as NSUInteger,
+                    MTLResourceOptions::StorageModeShared,
+                    None,
+                )
+        }
+        .ok_or_else(|| {
+            crate::Error::Metal(
+                "zero-copy buffer creation failed (pointer not page-aligned?)".into(),
+            )
+        })?;
+
+        // 3. Parse safetensors header to get tensor offsets
+        let tensors = SafeTensors::deserialize(&mmap)
+            .map_err(|e| crate::Error::Metal(format!("safetensors parse: {e}")))?;
+
+        let mmap_base = mmap.as_ptr() as usize;
+        let mut refs: HashMap<String, (usize, Vec<usize>)> = HashMap::new();
+        for (name, view) in tensors.tensors() {
+            let offset = view.data().as_ptr() as usize - mmap_base;
+            let shape: Vec<usize> = view.shape().to_vec();
+            refs.insert(name.clone(), (offset, shape));
+        }
+        drop(tensors);
+
+        // Helper: look up a required weight by name.
+        let get_ref = |name: &str| -> crate::Result<(usize, &[usize])> {
+            let (offset, shape) = refs
+                .get(name)
+                .ok_or_else(|| crate::Error::Metal(format!("missing weight: {name}")))?;
+            Ok((*offset, shape.as_slice()))
+        };
+
+        // Helper: create a MetalTensor pointing into the weight buffer at a byte offset.
+        let tensor_at = |offset: usize| -> MetalTensor {
+            MetalTensor {
+                buffer: weight_buffer.clone(),
+                offset,
+            }
+        };
+
+        let hidden = config.hidden_size;
+        let num_layers = config.num_hidden_layers;
+        let num_heads = config.num_attention_heads;
+        let head_dim = hidden / num_heads;
+        let intermediate = config.intermediate_size;
+        let global_attn_every_n = config.global_attn_every_n_layers;
+
+        // 4. Build per-layer weights
+        let mut layers = Vec::with_capacity(num_layers);
+        for i in 0..num_layers {
+            let qkv_offset = get_ref(&format!("layers.{i}.attn.Wqkv.weight"))?.0;
+            let wo_offset = get_ref(&format!("layers.{i}.attn.Wo.weight"))?.0;
+            let attn_norm_offset = if i == 0 {
+                None // Layer 0 has no attn_norm (identity)
+            } else {
+                Some(get_ref(&format!("layers.{i}.attn_norm.weight"))?.0)
+            };
+            let wi_offset = get_ref(&format!("layers.{i}.mlp.Wi.weight"))?.0;
+            let mlp_wo_offset = get_ref(&format!("layers.{i}.mlp.Wo.weight"))?.0;
+            let mlp_norm_offset = get_ref(&format!("layers.{i}.mlp_norm.weight"))?.0;
+
+            let is_global = i % global_attn_every_n == 0;
+
+            layers.push(ModernBertLayerWeights {
+                qkv_weight: tensor_at(qkv_offset),
+                output_weight: tensor_at(wo_offset),
+                attn_norm_weight: attn_norm_offset.map(&tensor_at),
+                mlp_wi_weight: tensor_at(wi_offset),
+                mlp_wo_weight: tensor_at(mlp_wo_offset),
+                mlp_norm_weight: tensor_at(mlp_norm_offset),
+                is_global,
+            });
+        }
+
+        // 5. Embedding + final norm weights
+        let tok_emb_offset = get_ref("embeddings.tok_embeddings.weight")?.0;
+        let emb_norm_offset = get_ref("embeddings.norm.weight")?.0;
+        let final_norm_offset = get_ref("final_norm.weight")?.0;
+
+        // Allocate a zero-filled buffer for the dummy LN bias.
+        let zero_bias = self.alloc_tensor(hidden)?;
+
+        let weights = ModernBertWeights {
+            tok_embeddings: tensor_at(tok_emb_offset),
+            emb_norm_weight: tensor_at(emb_norm_offset),
+            final_norm_weight: tensor_at(final_norm_offset),
+            zero_bias,
+            layers,
+            num_heads,
+            head_dim,
+            hidden_dim: hidden,
+            intermediate_dim: intermediate,
+            layer_norm_eps: config.norm_eps,
+            local_window: config.local_attention,
+        };
+
+        // 6. Build RoPE caches
+        let max_seq = config.max_position_embeddings;
+        let global_rope = build_rope_cache(self, head_dim, max_seq, config.global_rope_theta)?;
+        let local_rope = build_rope_cache(self, head_dim, max_seq, config.local_rope_theta)?;
+
+        let arch = ModernBertArch {
+            weights,
+            global_rope,
+            local_rope,
+        };
+
+        Ok((arch, mmap))
+    }
+}
+
+/// Build a `RoPE` cos/sin cache for the given theta and sequence length.
+///
+/// Computes `cos(pos * freq)` and `sin(pos * freq)` for each position in
+/// `[0, max_seq)` and each frequency dimension in `[0, head_dim/2)`.
+/// The result is uploaded to Metal buffers as `[max_seq, head_dim/2]` tables.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "head_dim and position indices are small enough for exact f32"
+)]
+fn build_rope_cache(
+    driver: &MetalDriver,
+    head_dim: usize,
+    max_seq: usize,
+    theta: f32,
+) -> crate::Result<RopeCache<MetalTensor>> {
+    let half_dim = head_dim / 2;
+    let n = max_seq * half_dim;
+    let mut cos_data = Vec::with_capacity(n);
+    let mut sin_data = Vec::with_capacity(n);
+
+    for pos in 0..max_seq {
+        for d in 0..half_dim {
+            let freq = (pos as f32) / theta.powf(2.0 * d as f32 / head_dim as f32);
+            cos_data.push(freq.cos());
+            sin_data.push(freq.sin());
+        }
+    }
+
+    let cos = upload_f32_to_metal(driver, &cos_data)?;
+    let sin = upload_f32_to_metal(driver, &sin_data)?;
+    Ok(RopeCache { cos, sin })
+}
+
+/// Upload a host `f32` slice to a new Metal buffer as a [`MetalTensor`].
+#[expect(unsafe_code, reason = "newBufferWithBytes requires unsafe FFI")]
+fn upload_f32_to_metal(driver: &MetalDriver, data: &[f32]) -> crate::Result<MetalTensor> {
+    let size = (data.len() * core::mem::size_of::<f32>()) as NSUInteger;
+    let buffer = unsafe {
+        driver.device().newBufferWithBytes_length_options(
+            std::ptr::NonNull::new(data.as_ptr() as *mut _)
+                .ok_or_else(|| crate::Error::Metal("null data pointer".into()))?,
+            size,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+    .ok_or_else(|| crate::Error::Metal("RoPE buffer alloc failed".into()))?;
+    Ok(MetalTensor { buffer, offset: 0 })
+}
+
+/// Parsed `ModernBERT` model configuration from `config.json`.
+///
+/// Contains all geometry and hyperparameters needed to build the model
+/// architecture and load weights.
+pub struct ModernBertConfig {
+    /// Hidden dimension (768 for `modernbert-embed-base`).
+    pub hidden_size: usize,
+    /// MLP intermediate dimension (1152).
+    pub intermediate_size: usize,
+    /// Number of encoder layers (22).
+    pub num_hidden_layers: usize,
+    /// Number of attention heads (12).
+    pub num_attention_heads: usize,
+    /// Global attention applied every N layers (3).
+    pub global_attn_every_n_layers: usize,
+    /// Sliding window size for local attention (128).
+    pub local_attention: usize,
+    /// `RoPE` theta for global attention layers (160000.0).
+    pub global_rope_theta: f32,
+    /// `RoPE` theta for local attention layers (10000.0).
+    pub local_rope_theta: f32,
+    /// Layer normalization epsilon (1e-5).
+    pub norm_eps: f32,
+    /// Maximum position embeddings / sequence length (8192).
+    pub max_position_embeddings: usize,
+    /// Vocabulary size (50368).
+    pub vocab_size: usize,
+}
+
+impl ModernBertConfig {
+    /// Parse a `ModernBERT` config from a `config.json` value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any required field is missing or has an unexpected type.
+    pub fn from_json(json: &serde_json::Value) -> crate::Result<Self> {
+        let get_usize = |key: &str| -> crate::Result<usize> {
+            json.get(key)
+                .and_then(serde_json::Value::as_u64)
+                .map(|v| v as usize)
+                .ok_or_else(|| {
+                    crate::Error::Metal(format!("config.json missing or invalid: {key}"))
+                })
+        };
+        let get_f64 = |key: &str| -> crate::Result<f64> {
+            json.get(key)
+                .and_then(serde_json::Value::as_f64)
+                .ok_or_else(|| {
+                    crate::Error::Metal(format!("config.json missing or invalid: {key}"))
+                })
+        };
+
+        Ok(Self {
+            hidden_size: get_usize("hidden_size")?,
+            intermediate_size: get_usize("intermediate_size")?,
+            num_hidden_layers: get_usize("num_hidden_layers")?,
+            num_attention_heads: get_usize("num_attention_heads")?,
+            global_attn_every_n_layers: get_usize("global_attn_every_n_layers")?,
+            local_attention: get_usize("local_attention")?,
+            global_rope_theta: get_f64("global_rope_theta")? as f32,
+            local_rope_theta: get_f64("local_rope_theta")? as f32,
+            norm_eps: get_f64("norm_eps").unwrap_or(1e-5) as f32,
+            max_position_embeddings: get_usize("max_position_embeddings")?,
+            vocab_size: get_usize("vocab_size")?,
+        })
     }
 }
 
