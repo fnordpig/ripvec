@@ -21,17 +21,12 @@
 use std::path::Path;
 use std::time::Instant;
 
-use memmap2::Mmap;
 use rayon::prelude::*;
 use tracing::{debug, info_span, instrument, warn};
 
 use crate::backend::{EmbedBackend, Encoding};
 use crate::chunk::{ChunkConfig, CodeChunk};
 use crate::similarity;
-
-/// Files larger than this are memory-mapped instead of read into a String.
-/// Mmap avoids heap allocation and lets the OS page cache handle I/O.
-const MMAP_THRESHOLD: u64 = 32 * 1024; // 32 KB
 
 /// Default batch size for embedding inference.
 pub const DEFAULT_BATCH_SIZE: usize = 32;
@@ -63,6 +58,11 @@ pub struct SearchConfig {
     /// and L2-re-normalized copy of the embedding matrix at this dimension for
     /// fast two-phase cascade search. `None` (default) disables cascade search.
     pub cascade_dim: Option<usize>,
+    /// Optional file type filter (e.g. "rust", "python", "js").
+    ///
+    /// When set, only files matching this type (using ripgrep's built-in type
+    /// database) are collected during the walk phase.
+    pub file_type: Option<String>,
 }
 
 impl Default for SearchConfig {
@@ -73,6 +73,7 @@ impl Default for SearchConfig {
             chunk: ChunkConfig::default(),
             text_mode: false,
             cascade_dim: None,
+            file_type: None,
         }
     }
 }
@@ -116,7 +117,7 @@ pub fn embed_all(
     let files = {
         let _span = info_span!("walk").entered();
         let guard = profiler.phase("walk");
-        let files = crate::walk::collect_files(root);
+        let files = crate::walk::collect_files(root, cfg.file_type.as_deref());
         guard.set_detail(format!("{} files", files.len()));
         files
     };
@@ -505,72 +506,15 @@ pub(crate) fn embed_distributed(
     Ok(embeddings)
 }
 
-/// Source text either owned (from `read_to_string`) or mmap'd.
-pub(crate) enum SourceText {
-    Owned(String),
-    Mapped(Mmap),
-}
-
-impl std::ops::Deref for SourceText {
-    type Target = str;
-    fn deref(&self) -> &str {
-        match self {
-            Self::Owned(s) => s,
-            Self::Mapped(m) => {
-                // SAFETY: we only construct Mapped from files that passed UTF-8 validation
-                #[expect(
-                    unsafe_code,
-                    reason = "validated UTF-8 before constructing Mapped variant"
-                )]
-                unsafe {
-                    std::str::from_utf8_unchecked(m)
-                }
-            }
-        }
-    }
-}
-
-/// Read a source file, using mmap for large files and `read_to_string` for small ones.
+/// Read a source file into a `String`.
 ///
 /// Returns `None` (with a debug log) when the file cannot be read or is not valid UTF-8.
-#[expect(unsafe_code, reason = "mmap of read-only source file")]
-pub(crate) fn read_source(path: &Path) -> Option<SourceText> {
-    let metadata = match std::fs::metadata(path) {
-        Ok(m) => m,
+pub(crate) fn read_source(path: &Path) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Some(s),
         Err(e) => {
-            debug!(path = %path.display(), err = %e, "skipping file: metadata read failed");
-            return None;
-        }
-    };
-    if metadata.len() >= MMAP_THRESHOLD {
-        let file = match std::fs::File::open(path) {
-            Ok(f) => f,
-            Err(e) => {
-                debug!(path = %path.display(), err = %e, "skipping file: open failed");
-                return None;
-            }
-        };
-        // SAFETY: file is read-only, not modified while mapped
-        let mmap = match unsafe { Mmap::map(&file) } {
-            Ok(m) => m,
-            Err(e) => {
-                debug!(path = %path.display(), err = %e, "skipping file: mmap failed");
-                return None;
-            }
-        };
-        // Validate UTF-8 before wrapping
-        if std::str::from_utf8(&mmap).is_err() {
-            debug!(path = %path.display(), "skipping file: not valid UTF-8");
-            return None;
-        }
-        Some(SourceText::Mapped(mmap))
-    } else {
-        match std::fs::read_to_string(path) {
-            Ok(s) => Some(SourceText::Owned(s)),
-            Err(e) => {
-                debug!(path = %path.display(), err = %e, "skipping file: read failed");
-                None
-            }
+            debug!(path = %path.display(), err = %e, "skipping file: read failed");
+            None
         }
     }
 }
