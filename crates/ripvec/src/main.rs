@@ -33,10 +33,12 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Resolve model repo: --code → CodeRankEmbed, --text/default → BGE-small
+    // Resolve model repo: --modern → ModernBERT, --code → CodeRankEmbed, default → BGE-small
     let use_code_model = args.code;
     let model_repo = args.model_repo.clone().unwrap_or_else(|| {
-        if use_code_model {
+        if args.modern {
+            "nomic-ai/modernbert-embed-base".to_string()
+        } else if use_code_model {
             "nomic-ai/CodeRankEmbed".to_string()
         } else {
             "BAAI/bge-small-en-v1.5".to_string()
@@ -238,7 +240,9 @@ fn run_interactive(
         backends.iter().map(|b| &**b).collect();
 
     let model_repo = args.model_repo.clone().unwrap_or_else(|| {
-        if use_code_model {
+        if args.modern {
+            "nomic-ai/modernbert-embed-base".to_string()
+        } else if use_code_model {
             "nomic-ai/CodeRankEmbed".to_string()
         } else {
             "BAAI/bge-small-en-v1.5".to_string()

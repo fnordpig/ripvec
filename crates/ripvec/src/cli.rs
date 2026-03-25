@@ -37,6 +37,11 @@ pub struct Args {
     #[arg(long)]
     pub text: bool,
 
+    /// Use ModernBERT model (nomic-ai/modernbert-embed-base).
+    /// 768-dim, 22 layers, alternating local/global attention, MRL-trained.
+    #[arg(long, conflicts_with_all = ["code", "text"])]
+    pub modern: bool,
+
     /// Override `HuggingFace` model repository (advanced).
     #[arg(long)]
     pub model_repo: Option<String>,
