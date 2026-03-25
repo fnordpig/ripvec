@@ -637,5 +637,40 @@ mod tests {
                 eprintln!("  layers={layers:>2} dims={dims:>3}: cosine={cos:.6}");
             }
         }
+
+        // Throughput benchmark
+        eprintln!("\n=== ModernBERT Throughput ===");
+        arch.max_layers = None;
+        // Build 32 encodings of varying length
+        let mut encs = Vec::new();
+        for i in 0..32 {
+            let len = 16 + (i * 4); // 16 to 140 tokens
+            let mut ids = vec![1_i64]; // CLS
+            for j in 1..len - 1 {
+                ids.push(100 + j as i64);
+            }
+            ids.push(2); // SEP
+            encs.push(Encoding {
+                input_ids: ids.clone(),
+                attention_mask: vec![1; ids.len()],
+                token_type_ids: vec![0; ids.len()],
+            });
+        }
+
+        // Warmup
+        let _ = arch.forward(&driver, &encs[..4]);
+
+        // Timed run
+        let t0 = std::time::Instant::now();
+        let result = arch.forward(&driver, &encs).unwrap();
+        let elapsed = t0.elapsed();
+        let throughput = encs.len() as f64 / elapsed.as_secs_f64();
+        eprintln!(
+            "  batch={}, time={:.1}ms, throughput={:.1}/s",
+            encs.len(),
+            elapsed.as_secs_f64() * 1000.0,
+            throughput
+        );
+        assert_eq!(result.len(), 32);
     }
 }
