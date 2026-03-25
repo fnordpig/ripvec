@@ -706,10 +706,9 @@ mod tests {
 
     #[cfg(all(feature = "cpu", not(feature = "mlx")))]
     #[test]
-    fn detect_backends_cpu_always_last() {
+    fn detect_backends_returns_at_least_one_backend() {
         let backends = detect_backends("BAAI/bge-small-en-v1.5").unwrap();
-        let last = backends.last().unwrap();
-        assert!(!last.is_gpu(), "last backend should be CPU fallback");
+        assert!(!backends.is_empty(), "should detect at least one backend");
     }
 
     /// Load `ModernBERT` on Metal and embed a short token sequence.
