@@ -12,6 +12,9 @@
 //!   can monomorphize and inline driver calls.
 //! - **Send + Sync**: drivers are shared across the pipeline.
 
+#[cfg(feature = "metal")]
+pub mod metal;
+
 use super::Encoding;
 
 /// Hardware-agnostic compute primitives for BERT inference.
