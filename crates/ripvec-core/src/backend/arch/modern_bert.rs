@@ -98,6 +98,9 @@ pub struct ModernBertArch<T> {
     pub global_rope: RopeCache<T>,
     /// `RoPE` cos/sin cache for local attention layers (theta=10000).
     pub local_rope: RopeCache<T>,
+    /// Optional early exit: run only this many encoder layers.
+    /// `None` runs all 22 layers.
+    pub max_layers: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -441,8 +444,12 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
             eps: w.layer_norm_eps,
         };
 
-        // Encoder layers (22).
-        for (layer_idx, layer) in w.layers.iter().enumerate() {
+        // Encoder layers (up to max_layers or all 22).
+        let num_layers = self
+            .max_layers
+            .unwrap_or(w.layers.len())
+            .min(w.layers.len());
+        for (layer_idx, layer) in w.layers[..num_layers].iter().enumerate() {
             let rope = if layer.is_global {
                 &self.global_rope
             } else {

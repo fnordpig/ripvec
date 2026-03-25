@@ -473,7 +473,7 @@ mod tests {
         let config_json: serde_json::Value = serde_json::from_str(&config_str).unwrap();
         let config =
             crate::backend::driver::metal::ModernBertConfig::from_json(&config_json).unwrap();
-        let (arch, _mmap) = driver
+        let (mut arch, _mmap) = driver
             .load_modern_bert_weights(&weights_path, &config)
             .unwrap();
 
@@ -562,7 +562,7 @@ mod tests {
         let nz = s_h[0].iter().filter(|&&v| v.abs() > 1e-10).count();
         eprintln!("STAGE 4 - scores: {nz}/{} nonzero", nh * 8 * 8);
 
-        // Try just 1 layer via the architecture directly
+        // Early exit quality sweep — the whole point of ModernBERT
         use crate::backend::arch::ModelArch;
         let enc2 = Encoding {
             input_ids: vec![1, 100, 200, 300, 2],
@@ -570,14 +570,72 @@ mod tests {
             token_type_ids: vec![0; 5],
         };
 
-        // Modify max_layers if the arch supports it — but it doesn't yet.
-        // Instead, call the forward pass and check the result.
-        let result = arch.forward(&driver, &[enc2]).expect("forward failed");
-        let l2: f32 = result[0].iter().map(|x| x * x).sum::<f32>().sqrt();
-        let nz = result[0].iter().filter(|&&v| v.abs() > 1e-10).count();
+        // Get full 22-layer reference embedding
+        arch.max_layers = None;
+        let full = arch.forward(&driver, &[enc2.clone()]).unwrap();
+        let full_emb = &full[0];
+        eprintln!("\n=== ModernBERT Early Exit Quality ===");
         eprintln!(
-            "ARCH FORWARD: L2={l2}, nz={nz}/768, first 5: {:?}",
-            &result[0][..5]
+            "Full 22-layer embedding: {} dims, L2={:.4}",
+            full_emb.len(),
+            full_emb.iter().map(|x| x * x).sum::<f32>().sqrt()
         );
+
+        // Sweep layers
+        for layers in [1, 2, 4, 6, 8, 11, 14, 17, 20, 22] {
+            arch.max_layers = Some(layers);
+            let result = arch.forward(&driver, &[enc2.clone()]).unwrap();
+            let emb = &result[0];
+            let cos: f32 = emb.iter().zip(full_emb).map(|(a, b)| a * b).sum();
+            eprintln!("  layers={layers:>2}: cosine={cos:.6}");
+        }
+
+        // MRL truncation at full layers
+        eprintln!("\n=== ModernBERT MRL Truncation ===");
+        arch.max_layers = None;
+        let full2 = arch.forward(&driver, &[enc2.clone()]).unwrap();
+        let full_emb2 = &full2[0];
+        for dims in [64, 128, 256, 384, 512, 768] {
+            let t: Vec<f32> = full_emb2[..dims].to_vec();
+            let t_norm: f32 = t.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+            let f_norm: f32 = full_emb2[..dims]
+                .iter()
+                .map(|x| x * x)
+                .sum::<f32>()
+                .sqrt()
+                .max(1e-12);
+            let cos: f32 = t
+                .iter()
+                .zip(&full_emb2[..dims])
+                .map(|(a, b)| a * b)
+                .sum::<f32>()
+                / (t_norm * f_norm);
+            eprintln!("  dims={dims:>3}: cosine={cos:.6}");
+        }
+
+        // Combined: early exit + MRL
+        eprintln!("\n=== Combined: Early Exit + MRL ===");
+        for layers in [6, 11, 16, 22] {
+            arch.max_layers = Some(layers);
+            let result = arch.forward(&driver, &[enc2.clone()]).unwrap();
+            let emb = &result[0];
+            for dims in [64, 128, 256, 768] {
+                let t: Vec<f32> = emb[..dims].to_vec();
+                let t_norm: f32 = t.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+                let f_norm: f32 = full_emb[..dims]
+                    .iter()
+                    .map(|x| x * x)
+                    .sum::<f32>()
+                    .sqrt()
+                    .max(1e-12);
+                let cos: f32 = t
+                    .iter()
+                    .zip(&full_emb[..dims])
+                    .map(|(a, b)| a * b)
+                    .sum::<f32>()
+                    / (t_norm * f_norm);
+                eprintln!("  layers={layers:>2} dims={dims:>3}: cosine={cos:.6}");
+            }
+        }
     }
 }

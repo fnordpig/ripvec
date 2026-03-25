@@ -17,9 +17,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::AnyThread;
 use objc2_foundation::{NSString, NSUInteger};
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
@@ -32,10 +32,10 @@ use objc2_metal_performance_shaders::{
 use safetensors::SafeTensors;
 
 use super::{BatchInputs, Driver};
+use crate::backend::Encoding;
 use crate::backend::arch::modern_bert::{
     ModernBertArch, ModernBertLayerWeights, ModernBertWeights, RopeCache,
 };
-use crate::backend::Encoding;
 
 // ---------------------------------------------------------------------------
 // CoreGraphics linkage (required for MTLCreateSystemDefaultDevice)
@@ -763,6 +763,7 @@ impl MetalDriver {
             weights,
             global_rope,
             local_rope,
+            max_layers: None,
         };
 
         Ok((arch, mmap))
