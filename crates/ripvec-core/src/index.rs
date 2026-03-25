@@ -68,15 +68,36 @@ impl SearchIndex {
         let embeddings =
             Array2::from_shape_vec((n, hidden_dim), flat).expect("embedding matrix shape mismatch");
 
-        // Build truncated + re-normalized matrix for MRL cascade pre-filter
+        // Build truncated + re-normalized matrix for MRL cascade pre-filter.
+        // Nomic MRL models require layer-norm before truncation:
+        //   1. Layer-norm over the FULL embedding (mean-center, scale by inv_std)
+        //   2. Truncate to first d dimensions
+        //   3. L2 renormalize the truncated slice
         let truncated_dim = cascade_dim.map(|d| d.min(hidden_dim));
         let truncated = truncated_dim.map(|d| {
             let mut trunc = Array2::zeros((n, d));
             for (i, row) in embeddings.rows().into_iter().enumerate() {
-                let slice = &row.as_slice().expect("embedding row not contiguous")[..d];
-                let norm: f32 = slice.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
-                for (j, &v) in slice.iter().enumerate() {
-                    trunc[[i, j]] = v / norm;
+                let full = row.as_slice().expect("embedding row not contiguous");
+
+                // Step 1: Layer-norm over FULL embedding
+                let len = full.len() as f32;
+                let mean: f32 = full.iter().sum::<f32>() / len;
+                let var: f32 = full.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / len;
+                let inv_std = 1.0 / (var + 1e-5).sqrt();
+
+                // Step 2: Truncate first d dims of layer-normed embedding
+                // Step 3: L2 renormalize the truncated slice
+                let norm: f32 = full[..d]
+                    .iter()
+                    .map(|x| {
+                        let ln = (x - mean) * inv_std;
+                        ln * ln
+                    })
+                    .sum::<f32>()
+                    .sqrt()
+                    .max(1e-12);
+                for (j, &v) in full[..d].iter().enumerate() {
+                    trunc[[i, j]] = (v - mean) * inv_std / norm;
                 }
             }
             trunc
@@ -114,9 +135,9 @@ impl SearchIndex {
 
     /// Two-phase MRL cascade ranking: fast pre-filter then full re-rank.
     ///
-    /// 1. Truncates the query to `truncated_dim`, L2-normalizes it, and
-    ///    computes dot products against the truncated matrix to find the
-    ///    top `pre_filter_k` candidates.
+    /// 1. Layer-norms the query over its full dimension, truncates to
+    ///    `truncated_dim`, L2-normalizes, and computes dot products against
+    ///    the truncated matrix to find the top `pre_filter_k` candidates.
     /// 2. Re-ranks those candidates using full-dimension dot products.
     ///
     /// Falls back to [`rank`] when no truncated matrix is available.
@@ -138,7 +159,19 @@ impl SearchIndex {
         let pre_filter_k = 100_usize.max(top_k * 3); // over-retrieve for re-ranking
 
         // Phase 1: fast pre-filter at truncated dimension
-        let trunc_query: Vec<f32> = query_embedding[..trunc_dim].to_vec();
+        // Apply layer-norm over full query before truncation (matches corpus processing)
+        let len = query_embedding.len() as f32;
+        let mean: f32 = query_embedding.iter().sum::<f32>() / len;
+        let var: f32 = query_embedding
+            .iter()
+            .map(|x| (x - mean).powi(2))
+            .sum::<f32>()
+            / len;
+        let inv_std = 1.0 / (var + 1e-5).sqrt();
+        let trunc_query: Vec<f32> = query_embedding[..trunc_dim]
+            .iter()
+            .map(|x| (x - mean) * inv_std)
+            .collect();
         let norm: f32 = trunc_query
             .iter()
             .map(|x| x * x)
