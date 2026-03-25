@@ -2921,6 +2921,7 @@ dependencies = [
  "hf-hub",
  "ignore",
  "libc",
+ "memchr",
  "memmap2",
  "mlx-rs",
  "ndarray",
