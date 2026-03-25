@@ -22,9 +22,9 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSString, NSUInteger};
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary,
-    MTLResourceOptions, MTLSize,
+    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLLibrary, MTLResourceOptions, MTLSize,
 };
 use objc2_metal_performance_shaders::{
     MPSDataType, MPSMatrix, MPSMatrixDescriptor, MPSMatrixMultiplication,
@@ -536,12 +536,16 @@ fn make_f32_buffer(
 
 /// Metal GPU compute driver using MPS for weight GEMMs and custom MSL kernels.
 ///
-/// Implements [`Driver`] for Apple Silicon GPUs. Each trait method creates its
-/// own command buffer, encodes the operation, commits, and waits for completion.
+/// Supports two modes:
+/// - **Per-call** (default): each trait method creates its own command buffer.
+/// - **Batched**: call [`begin_batch`] before a forward pass. All operations
+///   encode into ONE command buffer. [`end_batch`] commits and waits once.
+///   This eliminates per-call overhead (~220 commits → 1) and enables MPS GEMM.
 ///
 /// # Thread safety
 ///
-/// Metal device and command queue are thread-safe. `MetalDriver` is `Send + Sync`.
+/// Metal device and command queue are thread-safe. The batch command buffer
+/// uses `RefCell` — batched mode is single-threaded (architectures are `&self`).
 pub struct MetalDriver {
     /// Metal GPU device handle.
     device: Retained<ProtocolObject<dyn MTLDevice>>,
@@ -549,6 +553,8 @@ pub struct MetalDriver {
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     /// Pre-compiled MSL pipeline states.
     kernels: KernelPipelines,
+    /// Shared command buffer for batched mode. `None` = per-call mode.
+    batch_cmd: std::cell::RefCell<Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>>,
 }
 
 impl MetalDriver {
@@ -566,7 +572,41 @@ impl MetalDriver {
             device,
             queue,
             kernels,
+            batch_cmd: std::cell::RefCell::new(None),
         })
+    }
+
+    /// Begin batched mode: all subsequent Driver operations encode into ONE
+    /// command buffer instead of creating individual ones.
+    ///
+    /// Call [`end_batch`] to commit and wait. This eliminates ~220 per-call
+    /// commits per forward pass → 1 commit.
+    pub fn begin_batch(&self) -> crate::Result<()> {
+        let cmd = new_command_buffer(&self.queue)?;
+        *self.batch_cmd.borrow_mut() = Some(cmd);
+        Ok(())
+    }
+
+    /// End batched mode: commit the shared command buffer and wait.
+    ///
+    /// Returns an error if no batch is active.
+    pub fn end_batch(&self) -> crate::Result<()> {
+        let cmd =
+            self.batch_cmd.borrow_mut().take().ok_or_else(|| {
+                crate::Error::Metal("end_batch called without begin_batch".into())
+            })?;
+        cmd.commit();
+        cmd.waitUntilCompleted();
+
+        // Check for GPU errors
+        let status = cmd.status();
+        if status == objc2_metal::MTLCommandBufferStatus::Error {
+            if let Some(err) = cmd.error() {
+                return Err(crate::Error::Metal(format!("GPU batch error: {err}")));
+            }
+            return Err(crate::Error::Metal("GPU batch error (unknown)".into()));
+        }
+        Ok(())
     }
 
     /// Borrow the underlying Metal device handle.
@@ -587,31 +627,54 @@ impl MetalDriver {
         Ok(MetalTensor { buffer, offset: 0 })
     }
 
-    /// Execute a compute operation: create command buffer + encoder, run `f`,
-    /// end encoding, commit, and wait.
+    /// Execute a compute operation.
+    ///
+    /// In batched mode: encodes into the shared command buffer (no commit).
+    /// In per-call mode: creates a new command buffer, commits, and waits.
     fn run_compute<F>(&self, f: F) -> crate::Result<()>
     where
         F: FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>) -> crate::Result<()>,
     {
-        let cmd_buf = new_command_buffer(&self.queue)?;
-        let enc = new_encoder(&cmd_buf)?;
-        f(&enc)?;
-        enc.endEncoding();
-        cmd_buf.commit();
-        cmd_buf.waitUntilCompleted();
-        Ok(())
+        let is_batched = self.batch_cmd.borrow().is_some();
+        if is_batched {
+            let batch = self.batch_cmd.borrow();
+            let cmd_buf = batch.as_ref().unwrap();
+            let enc = new_encoder(cmd_buf)?;
+            f(&enc)?;
+            enc.endEncoding();
+            drop(batch);
+            Ok(())
+        } else {
+            let cmd_buf = new_command_buffer(&self.queue)?;
+            let enc = new_encoder(&cmd_buf)?;
+            f(&enc)?;
+            enc.endEncoding();
+            cmd_buf.commit();
+            cmd_buf.waitUntilCompleted();
+            Ok(())
+        }
     }
 
-    /// Execute an operation that uses MPS (encodes directly to command buffer).
+    /// Execute an MPS operation (encodes directly to command buffer).
+    ///
+    /// In batched mode: encodes into the shared command buffer (no commit).
+    /// In per-call mode: creates a new command buffer, commits, and waits.
     fn run_mps<F>(&self, f: F) -> crate::Result<()>
     where
         F: FnOnce(&ProtocolObject<dyn MTLCommandBuffer>) -> crate::Result<()>,
     {
-        let cmd_buf = new_command_buffer(&self.queue)?;
-        f(&cmd_buf)?;
-        cmd_buf.commit();
-        cmd_buf.waitUntilCompleted();
-        Ok(())
+        let batch = self.batch_cmd.borrow();
+        if let Some(ref cmd_buf) = *batch {
+            f(cmd_buf)?;
+            Ok(())
+        } else {
+            drop(batch);
+            let cmd_buf = new_command_buffer(&self.queue)?;
+            f(&cmd_buf)?;
+            cmd_buf.commit();
+            cmd_buf.waitUntilCompleted();
+            Ok(())
+        }
     }
 
     /// Load `ModernBERT` weights from a safetensors file into [`MetalTensor`]s.
@@ -905,6 +968,14 @@ unsafe impl Sync for MetalDriver {}
 impl Driver for MetalDriver {
     type Tensor = MetalTensor;
 
+    fn begin_batch(&self) -> crate::Result<()> {
+        self.begin_batch()
+    }
+
+    fn end_batch(&self) -> crate::Result<()> {
+        self.end_batch()
+    }
+
     fn alloc_zeros(&self, n: usize) -> crate::Result<MetalTensor> {
         self.alloc_tensor(n)
     }
@@ -915,16 +986,39 @@ impl Driver for MetalDriver {
     )]
     fn clone_tensor(&self, tensor: &MetalTensor, n: usize) -> crate::Result<MetalTensor> {
         let new_tensor = self.alloc_tensor(n)?;
-        let byte_count = n * core::mem::size_of::<f32>();
-        unsafe {
-            let src = tensor
-                .buffer
-                .contents()
-                .as_ptr()
-                .cast::<u8>()
-                .add(tensor.offset);
-            let dst = new_tensor.buffer.contents().as_ptr().cast::<u8>();
-            std::ptr::copy_nonoverlapping(src, dst, byte_count);
+        let byte_count = (n * core::mem::size_of::<f32>()) as NSUInteger;
+
+        // Use GPU blit copy so it works in batched mode (CPU memcpy would
+        // read stale data from uncommitted command buffers).
+        let is_batched = self.batch_cmd.borrow().is_some();
+        if is_batched {
+            let batch = self.batch_cmd.borrow();
+            let cmd_buf = batch.as_ref().unwrap();
+            let blit = cmd_buf
+                .blitCommandEncoder()
+                .ok_or_else(|| crate::Error::Metal("blit encoder failed".into()))?;
+            unsafe {
+                blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                    &tensor.buffer,
+                    tensor.offset as NSUInteger,
+                    &new_tensor.buffer,
+                    0,
+                    byte_count,
+                );
+            }
+            blit.endEncoding();
+        } else {
+            // Per-call mode: CPU copy is fine (data already committed)
+            unsafe {
+                let src = tensor
+                    .buffer
+                    .contents()
+                    .as_ptr()
+                    .cast::<u8>()
+                    .add(tensor.offset);
+                let dst = new_tensor.buffer.contents().as_ptr().cast::<u8>();
+                std::ptr::copy_nonoverlapping(src, dst, byte_count as usize);
+            }
         }
         Ok(new_tensor)
     }

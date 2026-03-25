@@ -28,6 +28,21 @@ pub trait Driver: Send + Sync {
     /// Metal: `MTLBuffer` + byte offset. CUDA: `CUdeviceptr`. CPU: `Array2<f32>`.
     type Tensor;
 
+    // --- Batching ---
+
+    /// Begin batched mode: all subsequent operations encode into one dispatch.
+    ///
+    /// GPU drivers accumulate into a single command buffer; CPU is a no-op.
+    /// Call [`end_batch`] to commit. This eliminates per-call overhead.
+    fn begin_batch(&self) -> crate::Result<()> {
+        Ok(())
+    }
+
+    /// End batched mode: commit all accumulated operations and wait.
+    fn end_batch(&self) -> crate::Result<()> {
+        Ok(())
+    }
+
     // --- Allocation ---
 
     /// Allocate a zero-initialized tensor with `n` float elements on device.

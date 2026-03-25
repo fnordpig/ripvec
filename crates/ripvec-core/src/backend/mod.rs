@@ -570,6 +570,15 @@ mod tests {
             token_type_ids: vec![0; 5],
         };
 
+        arch.max_layers = None;
+        let quick = arch.forward(&driver, &[enc2.clone()]).unwrap();
+        let l2: f32 = quick[0].iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nz = quick[0].iter().filter(|&&v| v.abs() > 1e-10).count();
+        eprintln!(
+            "BATCHED forward: L2={l2:.4}, nz={nz}/768, first 3: {:?}",
+            &quick[0][..3]
+        );
+
         // Get full 22-layer reference embedding
         arch.max_layers = None;
         let full = arch.forward(&driver, &[enc2.clone()]).unwrap();
