@@ -199,7 +199,7 @@ fn incremental_path(
     // Rebuild SearchIndex from all cached objects
     let (all_chunks, all_embeddings) = load_all_from_store(store, &manifest)?;
     let chunks_total = all_chunks.len();
-    let index = SearchIndex::new(all_chunks, &all_embeddings);
+    let index = SearchIndex::new(all_chunks, &all_embeddings, None);
 
     Ok((
         index,
@@ -287,7 +287,7 @@ fn full_index_path(
 
     let chunks_total = chunks.len();
     let files_changed = file_groups.len();
-    let index = SearchIndex::new(chunks, &embeddings);
+    let index = SearchIndex::new(chunks, &embeddings, None);
 
     Ok((
         index,

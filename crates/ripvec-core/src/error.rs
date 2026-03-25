@@ -17,6 +17,10 @@ pub enum Error {
     #[error("Metal: {0}")]
     Metal(String),
 
+    /// CPU backend error.
+    #[error("CPU: {0}")]
+    Cpu(String),
+
     /// Tokenization of input text failed.
     #[error("tokenization failed: {0}")]
     Tokenization(String),

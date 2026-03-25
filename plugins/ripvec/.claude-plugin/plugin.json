@@ -1,0 +1,12 @@
+{
+  "name": "ripvec",
+  "version": "0.1.0",
+  "description": "Semantic code search and structural analysis — find code by meaning, understand architecture through dependency graphs",
+  "author": {
+    "name": "fnordpig",
+    "url": "https://github.com/fnordpig/ripvec"
+  },
+  "repository": "https://github.com/fnordpig/ripvec",
+  "license": "MIT",
+  "keywords": ["search", "semantic", "embeddings", "code-search", "pagerank", "architecture", "tree-sitter"]
+}

@@ -21,17 +21,12 @@
 use std::path::Path;
 use std::time::Instant;
 
-use memmap2::Mmap;
 use rayon::prelude::*;
 use tracing::{debug, info_span, instrument, warn};
 
 use crate::backend::{EmbedBackend, Encoding};
 use crate::chunk::{ChunkConfig, CodeChunk};
 use crate::similarity;
-
-/// Files larger than this are memory-mapped instead of read into a String.
-/// Mmap avoids heap allocation and lets the OS page cache handle I/O.
-const MMAP_THRESHOLD: u64 = 32 * 1024; // 32 KB
 
 /// Default batch size for embedding inference.
 pub const DEFAULT_BATCH_SIZE: usize = 32;
@@ -57,6 +52,17 @@ pub struct SearchConfig {
     /// When `false` (default), files with recognized extensions use tree-sitter
     /// semantic chunking, and unrecognized extensions fall back to sliding windows.
     pub text_mode: bool,
+    /// MRL cascade pre-filter dimension.
+    ///
+    /// When set, [`SearchIndex`](crate::index::SearchIndex) stores a truncated
+    /// and L2-re-normalized copy of the embedding matrix at this dimension for
+    /// fast two-phase cascade search. `None` (default) disables cascade search.
+    pub cascade_dim: Option<usize>,
+    /// Optional file type filter (e.g. "rust", "python", "js").
+    ///
+    /// When set, only files matching this type (using ripgrep's built-in type
+    /// database) are collected during the walk phase.
+    pub file_type: Option<String>,
 }
 
 impl Default for SearchConfig {
@@ -66,6 +72,8 @@ impl Default for SearchConfig {
             max_tokens: 0,
             chunk: ChunkConfig::default(),
             text_mode: false,
+            cascade_dim: None,
+            file_type: None,
         }
     }
 }
@@ -109,7 +117,7 @@ pub fn embed_all(
     let files = {
         let _span = info_span!("walk").entered();
         let guard = profiler.phase("walk");
-        let files = crate::walk::collect_files(root);
+        let files = crate::walk::collect_files(root, cfg.file_type.as_deref());
         guard.set_detail(format!("{} files", files.len()));
         files
     };
@@ -235,12 +243,22 @@ pub fn search(
     // Phases 1, 2, 3, 4: walk, chunk, pre-tokenize, embed all files
     let (chunks, embeddings) = embed_all(root, backends, tokenizer, cfg, profiler)?;
 
+    let t_query_start = std::time::Instant::now();
+
     // Phase 5: Embed query (using the primary backend)
     let query_embedding = {
         let _span = info_span!("embed_query").entered();
         let _guard = profiler.phase("embed_query");
+        let t_tok = std::time::Instant::now();
         let enc = tokenize(query, tokenizer, cfg.max_tokens, backends[0].max_tokens())?;
+        let tok_ms = t_tok.elapsed().as_secs_f64() * 1000.0;
+        let t_emb = std::time::Instant::now();
         let mut results = backends[0].embed_batch(&[enc])?;
+        let emb_ms = t_emb.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "[search] query: tokenize={tok_ms:.1}ms embed={emb_ms:.1}ms total_since_embed_all={:.1}ms",
+            t_query_start.elapsed().as_secs_f64() * 1000.0
+        );
         results.pop().ok_or_else(|| {
             crate::Error::Other(anyhow::anyhow!("backend returned no embedding for query"))
         })?
@@ -268,11 +286,7 @@ pub fn search(
         scored
     };
 
-    results.sort_unstable_by(|a, b| {
-        b.similarity
-            .partial_cmp(&a.similarity)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    results.sort_unstable_by(|a, b| b.similarity.total_cmp(&a.similarity));
     if top_k > 0 {
         results.truncate(top_k);
     }
@@ -297,6 +311,9 @@ impl DistributedState<'_> {
         use std::sync::atomic::Ordering;
 
         let n = self.tokenized.len();
+        // GPU backends grab larger batches to amortize per-call overhead.
+        // MLX's lazy eval graph optimizer benefits from large matrices.
+        // Metal sub-batches internally via MAX_BATCH to limit padding waste.
         let grab_size = if backend.is_gpu() {
             self.batch_size * 4
         } else {
@@ -495,72 +512,31 @@ pub(crate) fn embed_distributed(
     Ok(embeddings)
 }
 
-/// Source text either owned (from `read_to_string`) or mmap'd.
-pub(crate) enum SourceText {
-    Owned(String),
-    Mapped(Mmap),
-}
-
-impl std::ops::Deref for SourceText {
-    type Target = str;
-    fn deref(&self) -> &str {
-        match self {
-            Self::Owned(s) => s,
-            Self::Mapped(m) => {
-                // SAFETY: we only construct Mapped from files that passed UTF-8 validation
-                #[expect(
-                    unsafe_code,
-                    reason = "validated UTF-8 before constructing Mapped variant"
-                )]
-                unsafe {
-                    std::str::from_utf8_unchecked(m)
-                }
-            }
-        }
-    }
-}
-
-/// Read a source file, using mmap for large files and `read_to_string` for small ones.
+/// Read a source file into a `String`, skipping binary files.
 ///
-/// Returns `None` (with a debug log) when the file cannot be read or is not valid UTF-8.
-#[expect(unsafe_code, reason = "mmap of read-only source file")]
-pub(crate) fn read_source(path: &Path) -> Option<SourceText> {
-    let metadata = match std::fs::metadata(path) {
-        Ok(m) => m,
+/// Reads the file as raw bytes first, checks for NUL bytes in the first 8 KB
+/// to detect binary files, then converts to UTF-8. Returns `None` (with a
+/// debug log) when the file cannot be read, is binary, or is not valid UTF-8.
+pub(crate) fn read_source(path: &Path) -> Option<String> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
         Err(e) => {
-            debug!(path = %path.display(), err = %e, "skipping file: metadata read failed");
+            debug!(path = %path.display(), err = %e, "skipping file: read failed");
             return None;
         }
     };
-    if metadata.len() >= MMAP_THRESHOLD {
-        let file = match std::fs::File::open(path) {
-            Ok(f) => f,
-            Err(e) => {
-                debug!(path = %path.display(), err = %e, "skipping file: open failed");
-                return None;
-            }
-        };
-        // SAFETY: file is read-only, not modified while mapped
-        let mmap = match unsafe { Mmap::map(&file) } {
-            Ok(m) => m,
-            Err(e) => {
-                debug!(path = %path.display(), err = %e, "skipping file: mmap failed");
-                return None;
-            }
-        };
-        // Validate UTF-8 before wrapping
-        if std::str::from_utf8(&mmap).is_err() {
-            debug!(path = %path.display(), "skipping file: not valid UTF-8");
-            return None;
-        }
-        Some(SourceText::Mapped(mmap))
-    } else {
-        match std::fs::read_to_string(path) {
-            Ok(s) => Some(SourceText::Owned(s)),
-            Err(e) => {
-                debug!(path = %path.display(), err = %e, "skipping file: read failed");
-                None
-            }
+
+    // Skip binary files: NUL byte anywhere in the first 8 KB is a reliable signal.
+    if memchr::memchr(0, &bytes[..bytes.len().min(8192)]).is_some() {
+        debug!(path = %path.display(), "skipping binary file");
+        return None;
+    }
+
+    match std::str::from_utf8(&bytes) {
+        Ok(s) => Some(s.to_string()),
+        Err(e) => {
+            debug!(path = %path.display(), err = %e, "skipping file: not valid UTF-8");
+            None
         }
     }
 }
@@ -587,11 +563,46 @@ fn tokenize(
     Ok(enc)
 }
 
+/// Normalize similarity scores to `[0,1]` and apply a `PageRank` structural boost.
+///
+/// Each result's similarity is min-max normalized, then a weighted `PageRank`
+/// score is added: `final = normalized + alpha * pagerank`. This promotes
+/// architecturally important files (many dependents) in search results.
+///
+/// Called from the MCP search handler which has access to the `RepoGraph`,
+/// rather than from [`search`] directly.
+pub fn apply_structural_boost<S: ::std::hash::BuildHasher>(
+    results: &mut [SearchResult],
+    file_ranks: &std::collections::HashMap<String, f32, S>,
+    alpha: f32,
+) {
+    if results.is_empty() || alpha == 0.0 {
+        return;
+    }
+
+    let min = results
+        .iter()
+        .map(|r| r.similarity)
+        .fold(f32::INFINITY, f32::min);
+    let max = results
+        .iter()
+        .map(|r| r.similarity)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let range = (max - min).max(1e-12);
+
+    for r in results.iter_mut() {
+        let normalized = (r.similarity - min) / range;
+        let pr = file_ranks.get(&r.chunk.file_path).copied().unwrap_or(0.0);
+        r.similarity = normalized + alpha * pr;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "cpu")]
     #[ignore = "loads model + embeds full source tree; run with `cargo test -- --ignored`"]
     fn search_with_backend_trait() {
         let backend = crate::backend::load_backend(
@@ -644,5 +655,276 @@ mod tests {
         for (i, emb) in results.iter().enumerate() {
             assert_eq!(emb.len(), 384, "embedding {i} should be 384-dim");
         }
+    }
+
+    /// Truncate an embedding to `dims` dimensions and L2-normalize.
+    fn truncate_and_normalize(emb: &[f32], dims: usize) -> Vec<f32> {
+        let trunc = &emb[..dims];
+        let norm: f32 = trunc.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+        trunc.iter().map(|x| x / norm).collect()
+    }
+
+    /// Rank corpus embeddings against a query, return top-K chunk indices.
+    fn rank_topk(query: &[f32], corpus: &[Vec<f32>], k: usize) -> Vec<usize> {
+        let mut scored: Vec<(usize, f32)> = corpus
+            .iter()
+            .enumerate()
+            .map(|(i, emb)| {
+                let dot: f32 = query.iter().zip(emb).map(|(a, b)| a * b).sum();
+                (i, dot)
+            })
+            .collect();
+        scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        scored.into_iter().take(k).map(|(i, _)| i).collect()
+    }
+
+    /// MRL retrieval recall test: does truncated search retrieve the same results?
+    ///
+    /// Embeds the ripvec codebase at full dimension, then tests whether
+    /// truncating to fewer dimensions retrieves the same top-10 results.
+    /// This is the real MRL quality test — per-vector cosine is trivially 1.0
+    /// but retrieval recall can degrade if the first N dims don't preserve
+    /// relative ordering between different vectors.
+    #[test]
+    #[ignore = "loads model + embeds; run with --nocapture"]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "top_k and overlap are small counts"
+    )]
+    fn mrl_retrieval_recall() {
+        let model = "BAAI/bge-small-en-v1.5";
+        let backends = crate::backend::detect_backends(model).unwrap();
+        let tokenizer = crate::tokenize::load_tokenizer(model).unwrap();
+        let cfg = SearchConfig::default();
+        let profiler = crate::profile::Profiler::noop();
+
+        // Embed the ripvec source tree
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        eprintln!("Embedding {}", root.display());
+        let backend_refs: Vec<&dyn crate::backend::EmbedBackend> =
+            backends.iter().map(std::convert::AsRef::as_ref).collect();
+        let (chunks, embeddings) =
+            embed_all(root, &backend_refs, &tokenizer, &cfg, &profiler).unwrap();
+        let full_dim = embeddings[0].len();
+        eprintln!(
+            "Corpus: {} chunks, {full_dim}-dim embeddings\n",
+            chunks.len()
+        );
+
+        // Test queries spanning different semantic intents
+        let queries = [
+            "error handling in the embedding pipeline",
+            "tree-sitter chunking and AST parsing",
+            "Metal GPU kernel dispatch",
+            "file watcher for incremental reindex",
+            "cosine similarity ranking",
+        ];
+
+        let top_k = 10;
+        let mrl_dims: Vec<usize> = [32, 64, 128, 192, 256, full_dim]
+            .into_iter()
+            .filter(|&d| d <= full_dim)
+            .collect();
+
+        eprintln!("=== MRL Retrieval Recall@{top_k} (vs full {full_dim}-dim) ===\n");
+
+        for query in &queries {
+            // Embed query at full dim
+            let enc = tokenize(query, &tokenizer, 0, backends[0].max_tokens()).unwrap();
+            let query_emb = backends[0].embed_batch(&[enc]).unwrap().pop().unwrap();
+
+            // Full-dim reference ranking
+            let ref_topk = rank_topk(&query_emb, &embeddings, top_k);
+
+            eprintln!("Query: \"{query}\"");
+            eprintln!(
+                "  Full-dim top-1: {} ({})",
+                chunks[ref_topk[0]].name, chunks[ref_topk[0]].file_path
+            );
+
+            for &dims in &mrl_dims {
+                // Truncate corpus and query
+                let trunc_corpus: Vec<Vec<f32>> = embeddings
+                    .iter()
+                    .map(|e| truncate_and_normalize(e, dims))
+                    .collect();
+                let trunc_query = truncate_and_normalize(&query_emb, dims);
+
+                let trunc_topk = rank_topk(&trunc_query, &trunc_corpus, top_k);
+
+                // Recall@K: how many of the full-dim top-K appear in truncated top-K
+                let overlap = ref_topk.iter().filter(|i| trunc_topk.contains(i)).count();
+                let recall = overlap as f32 / top_k as f32;
+                let marker = if dims == full_dim {
+                    " (ref)"
+                } else if recall >= 0.8 {
+                    " ***"
+                } else {
+                    ""
+                };
+                eprintln!(
+                    "  dims={dims:>3}: Recall@{top_k}={recall:.1} ({overlap}/{top_k}){marker}"
+                );
+            }
+            eprintln!();
+        }
+    }
+
+    /// MRL retrieval recall test for `CodeRankEmbed` (768-dim, MRL-trained).
+    ///
+    /// `CodeRankEmbed` was trained with Matryoshka Representation Learning,
+    /// so truncated embeddings should preserve retrieval quality much better
+    /// than non-MRL models like BGE-small. Uses code-focused queries with
+    /// the required query prefix.
+    #[test]
+    #[ignore = "loads model + embeds; run with --nocapture"]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "top_k and overlap are small counts"
+    )]
+    fn mrl_retrieval_recall_coderank() {
+        let model = "nomic-ai/CodeRankEmbed";
+        let backends = crate::backend::detect_backends(model).unwrap();
+        let tokenizer = crate::tokenize::load_tokenizer(model).unwrap();
+        let cfg = SearchConfig::default();
+        let profiler = crate::profile::Profiler::noop();
+
+        // Embed the ripvec source tree
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        eprintln!("Embedding {}", root.display());
+        let backend_refs: Vec<&dyn crate::backend::EmbedBackend> =
+            backends.iter().map(std::convert::AsRef::as_ref).collect();
+        let (chunks, embeddings) =
+            embed_all(root, &backend_refs, &tokenizer, &cfg, &profiler).unwrap();
+        let full_dim = embeddings[0].len();
+        eprintln!(
+            "Corpus: {} chunks, {full_dim}-dim embeddings\n",
+            chunks.len()
+        );
+
+        // Code-focused queries (CodeRankEmbed is optimized for code search)
+        let query_prefix = "Represent this query for searching relevant code: ";
+        let queries = [
+            "error handling with thiserror and anyhow",
+            "tree-sitter grammar registration and AST chunking",
+            "Metal GPU kernel dispatch and command buffer encoding",
+            "cosine similarity search and top-K ranking",
+            "ONNX model loading and session initialization",
+        ];
+
+        let top_k = 10;
+        let mrl_dims: Vec<usize> = [64, 128, 256, 384, 512, full_dim]
+            .into_iter()
+            .filter(|&d| d <= full_dim)
+            .collect();
+
+        eprintln!(
+            "=== MRL Retrieval Recall@{top_k} — CodeRankEmbed (vs full {full_dim}-dim) ===\n"
+        );
+
+        for query in &queries {
+            // Embed query with CodeRankEmbed prefix
+            let prefixed = format!("{query_prefix}{query}");
+            let enc = tokenize(&prefixed, &tokenizer, 0, backends[0].max_tokens()).unwrap();
+            let query_emb = backends[0].embed_batch(&[enc]).unwrap().pop().unwrap();
+
+            // Full-dim reference ranking
+            let ref_topk = rank_topk(&query_emb, &embeddings, top_k);
+
+            eprintln!("Query: \"{query}\"");
+            eprintln!(
+                "  Full-dim top-1: {} ({})",
+                chunks[ref_topk[0]].name, chunks[ref_topk[0]].file_path
+            );
+
+            for &dims in &mrl_dims {
+                // Truncate corpus and query
+                let trunc_corpus: Vec<Vec<f32>> = embeddings
+                    .iter()
+                    .map(|e| truncate_and_normalize(e, dims))
+                    .collect();
+                let trunc_query = truncate_and_normalize(&query_emb, dims);
+
+                let trunc_topk = rank_topk(&trunc_query, &trunc_corpus, top_k);
+
+                // Recall@K: how many of the full-dim top-K appear in truncated top-K
+                let overlap = ref_topk.iter().filter(|i| trunc_topk.contains(i)).count();
+                let recall = overlap as f32 / top_k as f32;
+                let marker = if dims == full_dim {
+                    " (ref)"
+                } else if recall >= 0.8 {
+                    " ***"
+                } else {
+                    ""
+                };
+                eprintln!(
+                    "  dims={dims:>3}: Recall@{top_k}={recall:.1} ({overlap}/{top_k}){marker}"
+                );
+            }
+            eprintln!();
+        }
+    }
+
+    fn make_result(file_path: &str, similarity: f32) -> SearchResult {
+        SearchResult {
+            chunk: CodeChunk {
+                file_path: file_path.to_string(),
+                name: "test".to_string(),
+                kind: "function".to_string(),
+                start_line: 1,
+                end_line: 10,
+                enriched_content: String::new(),
+                content: String::new(),
+            },
+            similarity,
+        }
+    }
+
+    #[test]
+    fn structural_boost_normalizes_and_applies() {
+        let mut results = vec![
+            make_result("src/a.rs", 0.8),
+            make_result("src/b.rs", 0.4),
+            make_result("src/c.rs", 0.6),
+        ];
+        let mut ranks = std::collections::HashMap::new();
+        ranks.insert("src/a.rs".to_string(), 0.5);
+        ranks.insert("src/b.rs".to_string(), 1.0);
+        ranks.insert("src/c.rs".to_string(), 0.0);
+
+        apply_structural_boost(&mut results, &ranks, 0.2);
+
+        // a: normalized=(0.8-0.4)/0.4=1.0, boost=0.2*0.5=0.1 => 1.1
+        assert!((results[0].similarity - 1.1).abs() < 1e-6);
+        // b: normalized=(0.4-0.4)/0.4=0.0, boost=0.2*1.0=0.2 => 0.2
+        assert!((results[1].similarity - 0.2).abs() < 1e-6);
+        // c: normalized=(0.6-0.4)/0.4=0.5, boost=0.2*0.0=0.0 => 0.5
+        assert!((results[2].similarity - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn structural_boost_noop_on_empty() {
+        let mut results: Vec<SearchResult> = vec![];
+        let ranks = std::collections::HashMap::new();
+        apply_structural_boost(&mut results, &ranks, 0.2);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn structural_boost_noop_on_zero_alpha() {
+        let mut results = vec![make_result("src/a.rs", 0.8)];
+        let mut ranks = std::collections::HashMap::new();
+        ranks.insert("src/a.rs".to_string(), 1.0);
+        apply_structural_boost(&mut results, &ranks, 0.0);
+        // Should be unchanged
+        assert!((results[0].similarity - 0.8).abs() < 1e-6);
     }
 }

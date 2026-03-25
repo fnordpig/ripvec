@@ -133,6 +133,57 @@ pub fn extract_signature(node: tree_sitter::Node<'_>, source: &str) -> Option<St
     }
 }
 
+/// Reduce indentation waste for embedding by normalizing whitespace.
+///
+/// For each line:
+/// - Counts leading spaces/tabs, normalises to 2 spaces per indent level
+///   (4 spaces → 2, 8 spaces → 4, 1 tab → 2 spaces).
+/// - Strips trailing whitespace.
+///
+/// Additionally, 3 or more consecutive blank lines are collapsed to a single
+/// blank line. This reduces the number of whitespace tokens consumed in the
+/// 512-token embedding window without altering visible structure.
+#[must_use]
+pub fn minify_whitespace(source: &str) -> String {
+    let mut result = String::with_capacity(source.len());
+    let mut consecutive_blank = 0usize;
+
+    for line in source.lines() {
+        // Count leading whitespace and determine indent level
+        let leading = line
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .fold(0usize, |acc, c| acc + if c == '\t' { 2 } else { 1 });
+        let rest = line.trim_start();
+
+        if rest.is_empty() {
+            // Blank line handling: collapse 3+ consecutive blanks to 1.
+            // Only emit the first blank line of a run; suppress the rest.
+            consecutive_blank += 1;
+            if consecutive_blank == 1 {
+                result.push('\n');
+            }
+        } else {
+            consecutive_blank = 0;
+            // Normalise: every 2 spaces of original indent → 1 space of output
+            // (round up so indent level 1 → 1 space, level 2 → 2, etc.)
+            let indent_level = leading.div_ceil(2);
+            for _ in 0..indent_level {
+                result.push(' ');
+            }
+            result.push_str(rest.trim_end());
+            result.push('\n');
+        }
+    }
+
+    // Remove trailing newline added for the last line if source didn't end with one
+    if !source.ends_with('\n') && result.ends_with('\n') {
+        result.pop();
+    }
+
+    result
+}
+
 /// Build the enriched content header for a code chunk.
 ///
 /// Prepends scope chain and signature metadata as a comment line.
@@ -158,10 +209,14 @@ fn build_enriched_content(
         format!("// {rel_path} | {scope} | defines: {sig}\n")
     };
 
-    if header.len() + content.len() > max_bytes {
-        content.to_string()
+    // Minify whitespace for the embedding content to reduce token waste.
+    // The raw `content` field is kept as-is for display.
+    let minified = minify_whitespace(content);
+
+    if header.len() + minified.len() > max_bytes {
+        minified
     } else {
-        format!("{header}{content}")
+        format!("{header}{minified}")
     }
 }
 
@@ -637,11 +692,61 @@ mod tests {
         );
         assert!(!chunks.is_empty());
         let chunk = &chunks[0];
-        // Header ("// long/path/to/file.rs | defines: ...") + content > 60 bytes
-        // So enriched_content should fall back to raw content
-        assert_eq!(
-            chunk.enriched_content, chunk.content,
+        // Header ("// long/path/to/file.rs | defines: ...") + minified content > 60 bytes.
+        // So enriched_content should fall back to minified content (no header),
+        // and raw content is preserved as-is.
+        assert!(
+            !chunk.enriched_content.starts_with("//"),
             "header should be dropped when it would exceed max_chunk_bytes"
+        );
+        assert_eq!(chunk.content, source, "raw content should be unchanged");
+    }
+
+    #[test]
+    fn minify_whitespace_normalizes_indent_and_strips_trailing() {
+        // 8-space indent → 4-space (halved)
+        let source = "fn foo() {\n        let x = 1;\n        let y = 2;\n}\n";
+        let result = minify_whitespace(source);
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(
+            lines[1], "    let x = 1;",
+            "8-space indent should become 4-space"
+        );
+        assert_eq!(
+            lines[2], "    let y = 2;",
+            "8-space indent should become 4-space"
+        );
+
+        // Trailing whitespace removed
+        let with_trailing = "fn bar()   \n    return 1;   \n";
+        let result2 = minify_whitespace(with_trailing);
+        assert!(
+            result2.lines().all(|l| !l.ends_with(' ')),
+            "trailing whitespace should be stripped"
+        );
+
+        // 3+ consecutive blank lines collapsed to 1
+        let with_blanks = "a\n\n\n\nb\n";
+        let result3 = minify_whitespace(with_blanks);
+        // Should have at most 1 blank line between a and b
+        let blank_runs: Vec<usize> = {
+            let mut runs = Vec::new();
+            let mut count = 0usize;
+            for line in result3.lines() {
+                if line.is_empty() {
+                    count += 1;
+                } else {
+                    if count > 0 {
+                        runs.push(count);
+                    }
+                    count = 0;
+                }
+            }
+            runs
+        };
+        assert!(
+            blank_runs.iter().all(|&n| n <= 1),
+            "3+ blank lines should collapse to 1, got runs: {blank_runs:?}"
         );
     }
 }

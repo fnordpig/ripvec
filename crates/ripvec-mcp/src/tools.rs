@@ -99,6 +99,24 @@ fn default_offset() -> usize {
     0
 }
 
+/// Parameters for the `get_repo_map` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RepoMapParams {
+    /// Maximum tokens in output (default: 2000).
+    #[serde(
+        default = "default_repo_map_tokens",
+        deserialize_with = "deserialize_number_or_string"
+    )]
+    pub max_tokens: usize,
+    /// Focus file for topic-sensitive `PageRank` (relative path).
+    pub focus_file: Option<String>,
+}
+
+/// Default token budget for repo map rendering.
+fn default_repo_map_tokens() -> usize {
+    2000
+}
+
 #[tool_router]
 impl RipvecServer {
     /// Create a new server for the given project root.
@@ -112,6 +130,7 @@ impl RipvecServer {
             project_root,
             indexing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tool_router: Self::tool_router(),
+            repo_graph: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -425,6 +444,54 @@ impl RipvecServer {
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
+
+    /// Get a PageRank-weighted structural overview of the codebase.
+    ///
+    /// Renders the most architecturally important files first with their key
+    /// definitions, dependency relationships, and function signatures. Supports
+    /// topic-sensitive `PageRank` when a focus file is provided.
+    #[tool(
+        name = "get_repo_map",
+        description = "Get a PageRank-weighted structural overview of the codebase. \
+            Use FIRST when exploring unfamiliar code or asked about architecture. \
+            Shows the most architecturally important files first with their key \
+            definitions, dependency relationships, and function signatures."
+    )]
+    async fn get_repo_map(
+        &self,
+        Parameters(params): Parameters<RepoMapParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let graph_guard = self
+            .repo_graph
+            .read()
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+
+        let graph = graph_guard.as_ref().ok_or_else(|| {
+            if self.indexing.load(std::sync::atomic::Ordering::SeqCst) {
+                rmcp::ErrorData::internal_error(
+                    "Repository graph is still building. Try again shortly.".to_string(),
+                    None,
+                )
+            } else {
+                rmcp::ErrorData::internal_error(
+                    "No repository graph available. Call reindex first.".to_string(),
+                    None,
+                )
+            }
+        })?;
+
+        // Resolve focus file to an index in the graph
+        let focus_idx = params.focus_file.as_deref().and_then(|focus| {
+            graph
+                .files
+                .iter()
+                .position(|f| f.path == focus || f.path.ends_with(focus))
+        });
+
+        let rendered = ripvec_core::repo_map::render(graph, params.max_tokens, focus_idx);
+
+        Ok(CallToolResult::success(vec![Content::text(rendered)]))
+    }
 }
 
 #[cfg(test)]
@@ -497,5 +564,28 @@ mod tests {
         let json = r#"{"query": "test", "top_k": "not_a_number"}"#;
         let result: Result<SearchParams, _> = serde_json::from_str(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_repo_map_params_defaults() {
+        let json = r"{}";
+        let params: RepoMapParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.max_tokens, 2000);
+        assert!(params.focus_file.is_none());
+    }
+
+    #[test]
+    fn test_repo_map_params_with_values() {
+        let json = r#"{"max_tokens": 500, "focus_file": "src/main.rs"}"#;
+        let params: RepoMapParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.max_tokens, 500);
+        assert_eq!(params.focus_file.as_deref(), Some("src/main.rs"));
+    }
+
+    #[test]
+    fn test_repo_map_params_string_tokens() {
+        let json = r#"{"max_tokens": "1000"}"#;
+        let params: RepoMapParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.max_tokens, 1000);
     }
 }
