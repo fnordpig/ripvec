@@ -58,13 +58,20 @@ impl<D: Driver, A: ModelArch<D>> GenericBackend<D, A> {
             is_gpu,
             _mmap: mmap,
         };
-        // Warm up buffer pool for small models (BGE-small: 384-dim, 12 layers).
-        // Cost: ~80ms. Benefit: primes pool for all sub-batches (295/s vs 150/s).
+        // Warm up buffer pool: run a dummy forward to pre-allocate Metal buffers.
+        // Without this, the first real batch pays 160-330 fresh newBufferWithLength
+        // calls. The warm-up fills the pool; subsequent batches with similar
+        // dimensions get exact-match hits (within 8× tolerance).
         //
-        // Skip for large models (ModernBERT: 768-dim, 22 layers, max_tokens=8192).
-        // Cost: 7.5s. Benefit: negative (batch=32 doesn't match real batch=26).
+        // Small models (BGE-small, 12L): batch=32 × seq=512, ~80ms.
+        // Large models (ModernBERT, 22L): batch=32 × seq=64, ~300ms.
+        //   (Smaller seq keeps cost down; 8× pool tolerance covers seq up to 512.)
         if is_gpu && max_tokens <= 1024 {
-            let seq = 512.min(max_tokens);
+            let seq = if max_tokens <= 1024 {
+                512.min(max_tokens)
+            } else {
+                64
+            };
             let mut dummy = Vec::with_capacity(32);
             for _ in 0..32 {
                 let ids: Vec<i64> = (0..seq as i64).collect();
