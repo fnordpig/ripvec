@@ -9,9 +9,9 @@
 //! scan via sequential memory access + centroid table lookup.
 
 use ndarray::{Array1, Array2};
-use turbo_quant::TurboQuantizer;
 
 use crate::chunk::CodeChunk;
+use crate::turbo_quant::{CompressedCode, PolarCodec};
 
 /// Pre-computed embedding matrix for fast re-ranking.
 ///
@@ -40,12 +40,12 @@ pub struct SearchIndex {
     truncated_dim: Option<usize>,
 }
 
-/// `TurboQuant`-compressed embedding index for fast approximate scanning.
+/// `PolarQuant`-compressed embedding index for fast approximate scanning.
 struct CompressedIndex {
-    /// The quantizer (holds rotation matrix + codebook, regenerated from seed).
-    quantizer: TurboQuantizer,
+    /// The codec (holds rotation matrix + centroid tables).
+    codec: PolarCodec,
     /// Compressed codes for all vectors.
-    codes: Vec<turbo_quant::TurboCode>,
+    codes: Vec<CompressedCode>,
 }
 
 impl SearchIndex {
@@ -121,22 +121,12 @@ impl SearchIndex {
             trunc
         });
 
-        // Compress embeddings with TurboQuant (4-bit, PolarQuant + QJL).
-        // At 768-dim: 386 bytes/vector vs 3072 FP32. Scan ~5× faster.
-        let compressed = if hidden_dim >= 64 {
-            let quantizer = TurboQuantizer::new(hidden_dim, 4, hidden_dim, 42).ok();
-            quantizer.map(|q| {
-                let codes: Vec<_> = (0..embeddings.nrows())
-                    .filter_map(|i| {
-                        let row = embeddings.row(i);
-                        q.encode(row.as_slice().unwrap()).ok()
-                    })
-                    .collect();
-                CompressedIndex {
-                    quantizer: q,
-                    codes,
-                }
-            })
+        // Compress embeddings with PolarQuant (4-bit).
+        // At 768-dim: ~1920 bytes/vector vs 3072 FP32. 8× compression with bit-packing.
+        let compressed = if hidden_dim >= 64 && hidden_dim % 2 == 0 {
+            let codec = PolarCodec::new(hidden_dim, 4, 42);
+            let codes = codec.encode_batch(&embeddings);
+            Some(CompressedIndex { codec, codes })
         } else {
             None
         };
@@ -194,19 +184,12 @@ impl SearchIndex {
             return self.rank(query_embedding, threshold);
         }
 
-        // Phase 1: approximate scan via TurboQuant
+        // Phase 1: approximate scan via PolarQuant batch scan.
+        // Pre-compute query centroid table ONCE, then scan all codes.
         let pre_filter_k = (top_k * 10).min(comp.codes.len());
-        let mut approx_scores: Vec<(usize, f32)> = comp
-            .codes
-            .iter()
-            .enumerate()
-            .filter_map(|(i, code)| {
-                comp.quantizer
-                    .inner_product_estimate(code, query_embedding)
-                    .ok()
-                    .map(|score| (i, score))
-            })
-            .collect();
+        let query_state = comp.codec.prepare_query(query_embedding);
+        let scores = comp.codec.batch_scan(&comp.codes, &query_state);
+        let mut approx_scores: Vec<(usize, f32)> = scores.into_iter().enumerate().collect();
         approx_scores.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
         approx_scores.truncate(pre_filter_k);
 
