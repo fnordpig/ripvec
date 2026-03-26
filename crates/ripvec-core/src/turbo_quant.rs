@@ -480,26 +480,41 @@ mod tests {
         let cpu_scores = codec.scan_corpus(&corpus, &qs);
         let cpu_us = t0.elapsed().as_secs_f64() * 1e6;
 
-        // GPU scan
+        // GPU scan — upload once, scan twice to measure warm vs cold
         let driver = crate::backend::driver::metal::MetalDriver::new().unwrap();
-        let t1 = std::time::Instant::now();
-        let gpu_scores = driver
-            .turboquant_scan(
-                &corpus.radii,
-                &corpus.indices,
-                &qs.centroid_q,
-                n,
-                corpus.pairs,
-                qs.levels,
-            )
-            .unwrap();
-        let gpu_us = t1.elapsed().as_secs_f64() * 1e6;
 
+        // Cold: upload + scan (includes buffer creation)
+        let t_cold = std::time::Instant::now();
+        let gpu_corpus = driver
+            .turboquant_upload_corpus(&corpus.radii, &corpus.indices)
+            .unwrap();
+        let upload_us = t_cold.elapsed().as_secs_f64() * 1e6;
+
+        let t_warm = std::time::Instant::now();
+        let gpu_scores = driver
+            .turboquant_scan_gpu(&gpu_corpus, &qs.centroid_q, n, corpus.pairs, qs.levels)
+            .unwrap();
+        let warm_us = t_warm.elapsed().as_secs_f64() * 1e6;
+
+        // Second scan — fully warm (centroid upload only)
+        let t_hot = std::time::Instant::now();
+        let _ = driver
+            .turboquant_scan_gpu(&gpu_corpus, &qs.centroid_q, n, corpus.pairs, qs.levels)
+            .unwrap();
+        let hot_us = t_hot.elapsed().as_secs_f64() * 1e6;
+
+        eprintln!("10K vectors:");
+        eprintln!("  CPU:        {cpu_us:.0}µs ({:.1}M/s)", n as f64 / cpu_us);
+        eprintln!("  GPU upload: {upload_us:.0}µs (one-time)");
         eprintln!(
-            "10K vectors: CPU={cpu_us:.0}µs ({:.1}M/s), GPU={gpu_us:.0}µs ({:.1}M/s), speedup={:.1}×",
-            n as f64 / cpu_us,
-            n as f64 / gpu_us,
-            cpu_us / gpu_us
+            "  GPU warm:   {warm_us:.0}µs ({:.1}M/s, {:.1}× vs CPU)",
+            n as f64 / warm_us,
+            cpu_us / warm_us
+        );
+        eprintln!(
+            "  GPU hot:    {hot_us:.0}µs ({:.1}M/s, {:.1}× vs CPU)",
+            n as f64 / hot_us,
+            cpu_us / hot_us
         );
 
         // Verify GPU matches CPU (approximate — f32 accumulation order differs)

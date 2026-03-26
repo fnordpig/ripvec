@@ -81,6 +81,18 @@ impl MetalTensor {
     }
 }
 
+/// GPU-resident TurboQuant corpus buffers. Uploaded once, reused for all queries.
+pub struct TurboQuantGpuCorpus {
+    radii: Retained<ProtocolObject<dyn MTLBuffer>>,
+    indices: Retained<ProtocolObject<dyn MTLBuffer>>,
+}
+
+// SAFETY: Metal shared-mode buffers are safe to hold across threads.
+#[expect(unsafe_code, reason = "Metal StorageModeShared is thread-safe")]
+unsafe impl Send for TurboQuantGpuCorpus {}
+#[expect(unsafe_code, reason = "Metal StorageModeShared is thread-safe")]
+unsafe impl Sync for TurboQuantGpuCorpus {}
+
 // SAFETY: Metal buffers use `StorageModeShared` on Apple Silicon (unified memory).
 // The Metal framework guarantees thread-safe access to buffer contents once the
 // command buffer that wrote the data has completed. Weight tensors are read-only
@@ -870,24 +882,36 @@ impl MetalDriver {
     /// memory, accessible at full bandwidth.
     ///
     /// At 100K vectors on M2 Max: ~50µs (vs ~33ms CPU scalar).
-    pub fn turboquant_scan(
+    /// Upload corpus data to GPU once. Returns opaque handles for `turboquant_scan_gpu`.
+    pub fn turboquant_upload_corpus(
         &self,
         radii: &[f32],
         indices: &[u8],
+    ) -> crate::Result<TurboQuantGpuCorpus> {
+        Ok(TurboQuantGpuCorpus {
+            radii: make_f32_buffer(&self.device, radii)?,
+            indices: make_u8_buffer(&self.device, indices)?,
+        })
+    }
+
+    /// Fast GPU scan using pre-uploaded corpus buffers. Only the centroid table
+    /// (24 KB) is uploaded per query. The corpus data stays on GPU.
+    #[expect(unsafe_code, reason = "Metal buffer readback")]
+    pub fn turboquant_scan_gpu(
+        &self,
+        gpu_corpus: &TurboQuantGpuCorpus,
         centroid_q: &[f32],
         n_vectors: usize,
         n_pairs: usize,
         n_levels: usize,
     ) -> crate::Result<Vec<f32>> {
-        let radii_buf = make_f32_buffer(&self.device, radii)?;
-        let idx_buf = make_u8_buffer(&self.device, indices)?;
         let centroid_buf = make_f32_buffer(&self.device, centroid_q)?;
         let scores_buf = alloc_f32_buffer(&self.device, n_vectors)?;
 
         self.run_compute(|enc| {
             enc.setComputePipelineState(&self.kernels.turboquant_scan);
-            set_buffer(enc, &radii_buf, 0, 0);
-            set_buffer(enc, &idx_buf, 0, 1);
+            set_buffer(enc, &gpu_corpus.radii, 0, 0);
+            set_buffer(enc, &gpu_corpus.indices, 0, 1);
             set_buffer(enc, &centroid_buf, 0, 2);
             set_buffer(enc, &scores_buf, 0, 3);
             set_i32_param(enc, n_vectors as i32, 4);
@@ -897,12 +921,26 @@ impl MetalDriver {
             Ok(())
         })?;
 
-        // Read back scores
         let scores = unsafe {
             let ptr = scores_buf.contents().as_ptr() as *const f32;
             std::slice::from_raw_parts(ptr, n_vectors).to_vec()
         };
         Ok(scores)
+    }
+
+    /// Upload + scan in one call (convenience, re-uploads corpus each time).
+    #[expect(unsafe_code, reason = "Metal buffer readback")]
+    pub fn turboquant_scan(
+        &self,
+        radii: &[f32],
+        indices: &[u8],
+        centroid_q: &[f32],
+        n_vectors: usize,
+        n_pairs: usize,
+        n_levels: usize,
+    ) -> crate::Result<Vec<f32>> {
+        let gpu = self.turboquant_upload_corpus(radii, indices)?;
+        self.turboquant_scan_gpu(&gpu, centroid_q, n_vectors, n_pairs, n_levels)
     }
 
     /// Pre-convert a weight tensor to FP16 on the GPU.
