@@ -15,6 +15,7 @@ pub mod profile;
 pub mod repo_map;
 pub mod similarity;
 pub mod tokenize;
+pub mod turbo_quant;
 pub mod walk;
 
 pub use error::Error;
