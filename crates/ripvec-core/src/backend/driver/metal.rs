@@ -2688,8 +2688,8 @@ impl Driver for MetalDriver {
         let b_fp16 = b.fp16.borrow();
         let (b_buf, b_off) = if let Some(ref fp16_buf) = *b_fp16 {
             // Weight tensor: use pre-converted FP16 buffer.
-            // Offset is half the original byte offset (f32=4B -> f16=2B).
-            (fp16_buf.as_ref(), b.offset / 2)
+            // ensure_fp16 writes to offset 0 of the fp16 buffer.
+            (fp16_buf.as_ref(), 0)
         } else {
             // Activation: already FP16 in main buffer.
             (&*b.buffer, b.offset)
