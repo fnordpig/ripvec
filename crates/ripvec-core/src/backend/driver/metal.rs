@@ -155,6 +155,38 @@ struct KernelPipelines {
     pad_to_batch: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Gather real tokens from padded `[batch, max_seq, dim]` back to flat.
     unpad_from_batch: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+
+    // --- FP16 attention-path pipeline states ---
+    /// FP16 layer normalization.
+    layer_norm_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// FP16 fused residual add + layer norm.
+    fused_residual_layernorm_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Convert FP16 back to FP32.
+    f16_to_f32: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// FP16 `GeGLU` gated activation.
+    geglu_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// FP16 split `[rows, 2*cols]` into two halves.
+    split_gate_value_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// FP16 residual add (no bias).
+    residual_add_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// FP16 fused scale + mask + softmax.
+    fused_scale_mask_softmax_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// FP16 fused scale + mask + windowed softmax.
+    fused_scale_mask_softmax_windowed_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// FP16 QKV split.
+    qkv_split_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// FP16 attention reshape.
+    attn_reshape_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// FP16 pad to batch.
+    pad_to_batch_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// FP16 unpad from batch.
+    unpad_from_batch_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// FP16 `RoPE`.
+    rope_encode_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Full FP16 GEMM (half A, half B, half C).
+    gemm_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Full FP16 batched GEMM (half A, half B, half C).
+    gemm_batched_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 impl KernelPipelines {
@@ -194,6 +226,24 @@ impl KernelPipelines {
             f32_to_f16: p("f32_to_f16_kernel")?,
             pad_to_batch: p("pad_to_batch_kernel")?,
             unpad_from_batch: p("unpad_from_batch_kernel")?,
+            // FP16 attention-path pipelines
+            layer_norm_f16: p("layer_norm_f16_kernel")?,
+            fused_residual_layernorm_f16: p("fused_residual_layernorm_f16_kernel")?,
+            f16_to_f32: p("f16_to_f32_kernel")?,
+            geglu_f16: p("geglu_f16_kernel")?,
+            split_gate_value_f16: p("split_gate_value_f16_kernel")?,
+            residual_add_f16: p("residual_add_f16_kernel")?,
+            fused_scale_mask_softmax_f16: p("fused_scale_mask_softmax_f16_kernel")?,
+            fused_scale_mask_softmax_windowed_f16: p(
+                "fused_scale_mask_softmax_windowed_f16_kernel",
+            )?,
+            qkv_split_f16: p("qkv_split_f16_kernel")?,
+            attn_reshape_f16: p("attn_reshape_f16_kernel")?,
+            pad_to_batch_f16: p("pad_to_batch_f16_kernel")?,
+            unpad_from_batch_f16: p("unpad_from_batch_f16_kernel")?,
+            rope_encode_f16: p("rope_encode_f16_kernel")?,
+            gemm_f16: create_pipeline(device, &gemm_library, "gemm_f16_kernel")?,
+            gemm_batched_f16: create_pipeline(device, &gemm_library, "gemm_batched_f16_kernel")?,
         })
     }
 }
@@ -556,6 +606,17 @@ fn alloc_f32_buffer(
         .ok_or_else(|| crate::Error::Metal(format!("buffer alloc failed ({n} floats)")))
 }
 
+/// Allocate a Metal buffer of `n` half-precision (FP16) elements with shared storage.
+fn alloc_f16_buffer(
+    device: &ProtocolObject<dyn MTLDevice>,
+    n: usize,
+) -> crate::Result<Retained<ProtocolObject<dyn MTLBuffer>>> {
+    let size = (n * 2) as NSUInteger; // 2 bytes per f16
+    device
+        .newBufferWithLength_options(size, MTLResourceOptions::StorageModeShared)
+        .ok_or_else(|| crate::Error::Metal(format!("f16 buffer alloc failed ({n} halves)")))
+}
+
 /// Create a Metal buffer from i32 data.
 #[expect(unsafe_code, reason = "newBufferWithBytes requires unsafe FFI")]
 fn make_i32_buffer(
@@ -742,6 +803,37 @@ impl MetalDriver {
 
         // Pool exhausted — allocate fresh and add to pool.
         let buffer = alloc_f32_buffer(&self.device, n)?;
+        pool.push(buffer.clone());
+        self.pool_cursor.set(cursor + 1);
+        Ok(MetalTensor::new(buffer, 0))
+    }
+
+    /// Allocate a [`MetalTensor`] of `n` half-precision (FP16) elements.
+    ///
+    /// Uses the same pool as `alloc_tensor` for buffer reuse. The returned
+    /// tensor holds a buffer with `n * 2` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Metal buffer allocation fails.
+    pub fn alloc_f16_tensor(&self, n: usize) -> crate::Result<MetalTensor> {
+        let needed = n * 2; // 2 bytes per f16
+        let cursor = self.pool_cursor.get();
+        let mut pool = self.pool.borrow_mut();
+
+        if cursor < pool.len() {
+            let pool_size = pool[cursor].length() as usize;
+            if pool_size >= needed && pool_size <= needed * 8 {
+                let buffer = pool[cursor].clone();
+                self.pool_cursor.set(cursor + 1);
+                return Ok(MetalTensor::new(buffer, 0));
+            }
+            self.pool_cursor.set(cursor + 1);
+            let buffer = alloc_f16_buffer(&self.device, n)?;
+            return Ok(MetalTensor::new(buffer, 0));
+        }
+
+        let buffer = alloc_f16_buffer(&self.device, n)?;
         pool.push(buffer.clone());
         self.pool_cursor.set(cursor + 1);
         Ok(MetalTensor::new(buffer, 0))
@@ -987,6 +1079,24 @@ impl MetalDriver {
         let global_rope = build_rope_cache(self, head_dim, max_seq, config.global_rope_theta)?;
         let local_rope = build_rope_cache(self, head_dim, max_seq, config.local_rope_theta)?;
 
+        // Pre-convert all projection weights to FP16 for the full FP16 pipeline.
+        // The gemm_f16 kernel reads from MetalTensor.fp16 for weight matrices.
+        // Norm weights (small [hidden] vectors) stay FP32 — the FP16 LN kernel
+        // accepts FP32 weight/bias directly.
+        for layer in &weights.layers {
+            let qkv_elems = 3 * hidden * hidden;
+            self.ensure_fp16(&layer.qkv_weight, qkv_elems)?;
+
+            let out_elems = hidden * hidden;
+            self.ensure_fp16(&layer.output_weight, out_elems)?;
+
+            let wi_elems = 2 * intermediate * hidden;
+            self.ensure_fp16(&layer.mlp_wi_weight, wi_elems)?;
+
+            let wo_elems = hidden * intermediate;
+            self.ensure_fp16(&layer.mlp_wo_weight, wo_elems)?;
+        }
+
         let arch = ModernBertArch {
             weights,
             global_rope,
@@ -994,7 +1104,6 @@ impl MetalDriver {
             max_layers: None,
         };
 
-        // ModernBERT (768-dim): skip FP16 — RefCell overhead per GEMM exceeds savings.
         Ok((arch, mmap))
     }
 
@@ -2517,6 +2626,463 @@ impl Driver for MetalDriver {
             results.push(flat[b * dim..(b + 1) * dim].to_vec());
         }
         Ok(results)
+    }
+
+    // =======================================================================
+    // FP16 operations for full half-precision pipeline
+    // =======================================================================
+
+    fn alloc_zeros_f16(&self, n: usize) -> crate::Result<MetalTensor> {
+        self.alloc_f16_tensor(n)
+    }
+
+    fn f32_to_f16(
+        &self,
+        output: &mut MetalTensor,
+        input: &MetalTensor,
+        n: usize,
+    ) -> crate::Result<()> {
+        self.run_compute(|enc| {
+            enc.setComputePipelineState(&self.kernels.f32_to_f16);
+            set_buffer(enc, &output.buffer, output.offset, 0);
+            set_buffer(enc, &input.buffer, input.offset, 1);
+            set_i32_param(enc, n as i32, 2);
+            dispatch_1d(enc, &self.kernels.f32_to_f16, n);
+            Ok(())
+        })
+    }
+
+    fn f16_to_f32(
+        &self,
+        output: &mut MetalTensor,
+        input: &MetalTensor,
+        n: usize,
+    ) -> crate::Result<()> {
+        self.run_compute(|enc| {
+            enc.setComputePipelineState(&self.kernels.f16_to_f32);
+            set_buffer(enc, &output.buffer, output.offset, 0);
+            set_buffer(enc, &input.buffer, input.offset, 1);
+            set_i32_param(enc, n as i32, 2);
+            dispatch_1d(enc, &self.kernels.f16_to_f32, n);
+            Ok(())
+        })
+    }
+
+    #[expect(
+        clippy::many_single_char_names,
+        reason = "a, b, m, n, k are standard GEMM parameter names from BLAS"
+    )]
+    fn gemm_f16(
+        &self,
+        a: &MetalTensor,
+        b: &MetalTensor,
+        output: &mut MetalTensor,
+        m: usize,
+        n: usize,
+        k: usize,
+        transpose_b: bool,
+    ) -> crate::Result<()> {
+        // Use custom simdgroup kernel — NOT MPS (buffer-capacity bug).
+        // B may be a weight tensor (FP32 main buffer + FP16 in .fp16 field)
+        // or an FP16 activation (already half in main buffer, no .fp16 field).
+        let b_fp16 = b.fp16.borrow();
+        let (b_buf, b_off) = if let Some(ref fp16_buf) = *b_fp16 {
+            // Weight tensor: use pre-converted FP16 buffer.
+            // Offset is half the original byte offset (f32=4B -> f16=2B).
+            (fp16_buf.as_ref(), b.offset / 2)
+        } else {
+            // Activation: already FP16 in main buffer.
+            (&*b.buffer, b.offset)
+        };
+        self.run_compute(|enc| {
+            dispatch_gemm(
+                enc,
+                &self.kernels.gemm_f16,
+                &a.buffer,
+                a.offset,
+                b_buf,
+                b_off,
+                &output.buffer,
+                output.offset,
+                m as u32,
+                n as u32,
+                k as u32,
+                transpose_b,
+            );
+            Ok(())
+        })
+    }
+
+    #[expect(
+        clippy::many_single_char_names,
+        reason = "a, b, m, n, k are standard GEMM parameter names from BLAS"
+    )]
+    fn gemm_batched_f16(
+        &self,
+        a: &MetalTensor,
+        b: &MetalTensor,
+        output: &mut MetalTensor,
+        m: usize,
+        n: usize,
+        k: usize,
+        transpose_b: bool,
+        stride_a: usize,
+        stride_b: usize,
+        stride_c: usize,
+        batch_count: usize,
+    ) -> crate::Result<()> {
+        self.run_compute(|enc| {
+            dispatch_gemm_batched(
+                enc,
+                &self.kernels.gemm_batched_f16,
+                &a.buffer,
+                a.offset,
+                &b.buffer,
+                b.offset,
+                &output.buffer,
+                output.offset,
+                m as u32,
+                n as u32,
+                k as u32,
+                transpose_b,
+                stride_a as u32,
+                stride_b as u32,
+                stride_c as u32,
+                batch_count as u32,
+            );
+            Ok(())
+        })
+    }
+
+    fn layer_norm_f16(
+        &self,
+        output: &mut MetalTensor,
+        input: &MetalTensor,
+        weight: &MetalTensor,
+        bias: &MetalTensor,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+    ) -> crate::Result<()> {
+        let threads = 256.min(cols);
+        self.run_compute(|enc| {
+            enc.setComputePipelineState(&self.kernels.layer_norm_f16);
+            set_buffer(enc, &output.buffer, output.offset, 0);
+            set_buffer(enc, &input.buffer, input.offset, 1);
+            set_buffer(enc, &weight.buffer, weight.offset, 2);
+            set_buffer(enc, &bias.buffer, bias.offset, 3);
+            set_i32_param(enc, rows as i32, 4);
+            set_i32_param(enc, cols as i32, 5);
+            set_f32_param(enc, eps, 6);
+            dispatch_rows(enc, &self.kernels.layer_norm_f16, rows, threads);
+            Ok(())
+        })
+    }
+
+    fn fused_scale_mask_softmax_f16(
+        &self,
+        scores: &mut MetalTensor,
+        mask: &MetalTensor,
+        batch: usize,
+        num_heads: usize,
+        seq_len: usize,
+        scale: f32,
+    ) -> crate::Result<()> {
+        let total_rows = batch * num_heads * seq_len;
+        let threads = 256.min(seq_len);
+        self.run_compute(|enc| {
+            enc.setComputePipelineState(&self.kernels.fused_scale_mask_softmax_f16);
+            set_buffer(enc, &scores.buffer, scores.offset, 0);
+            set_buffer(enc, &mask.buffer, mask.offset, 1);
+            set_i32_param(enc, batch as i32, 2);
+            set_i32_param(enc, num_heads as i32, 3);
+            set_i32_param(enc, seq_len as i32, 4);
+            set_f32_param(enc, scale, 5);
+            dispatch_rows(
+                enc,
+                &self.kernels.fused_scale_mask_softmax_f16,
+                total_rows,
+                threads,
+            );
+            Ok(())
+        })
+    }
+
+    fn fused_scale_mask_softmax_windowed_f16(
+        &self,
+        scores: &mut MetalTensor,
+        mask: &MetalTensor,
+        batch: usize,
+        num_heads: usize,
+        seq_len: usize,
+        scale: f32,
+        window_size: usize,
+    ) -> crate::Result<()> {
+        let total_rows = batch * num_heads * seq_len;
+        let threads = 256.min(seq_len);
+        let half_window = window_size / 2;
+        self.run_compute(|enc| {
+            enc.setComputePipelineState(&self.kernels.fused_scale_mask_softmax_windowed_f16);
+            set_buffer(enc, &scores.buffer, scores.offset, 0);
+            set_buffer(enc, &mask.buffer, mask.offset, 1);
+            set_i32_param(enc, batch as i32, 2);
+            set_i32_param(enc, num_heads as i32, 3);
+            set_i32_param(enc, seq_len as i32, 4);
+            set_f32_param(enc, scale, 5);
+            set_i32_param(enc, half_window as i32, 6);
+            dispatch_rows(
+                enc,
+                &self.kernels.fused_scale_mask_softmax_windowed_f16,
+                total_rows,
+                threads,
+            );
+            Ok(())
+        })
+    }
+
+    fn qkv_split_f16(
+        &self,
+        q: &mut MetalTensor,
+        k: &mut MetalTensor,
+        v: &mut MetalTensor,
+        qkv: &MetalTensor,
+        batch: usize,
+        seq: usize,
+        hidden: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> crate::Result<()> {
+        let total_head = batch * num_heads * seq * head_dim;
+        self.run_compute(|enc| {
+            enc.setComputePipelineState(&self.kernels.qkv_split_f16);
+            set_buffer(enc, &q.buffer, q.offset, 0);
+            set_buffer(enc, &k.buffer, k.offset, 1);
+            set_buffer(enc, &v.buffer, v.offset, 2);
+            set_buffer(enc, &qkv.buffer, qkv.offset, 3);
+            set_i32_param(enc, batch as i32, 4);
+            set_i32_param(enc, seq as i32, 5);
+            set_i32_param(enc, hidden as i32, 6);
+            set_i32_param(enc, num_heads as i32, 7);
+            set_i32_param(enc, head_dim as i32, 8);
+            dispatch_1d(enc, &self.kernels.qkv_split_f16, total_head);
+            Ok(())
+        })
+    }
+
+    fn attn_reshape_f16(
+        &self,
+        output: &mut MetalTensor,
+        input: &MetalTensor,
+        batch: usize,
+        seq: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> crate::Result<()> {
+        let total = batch * seq * num_heads * head_dim;
+        self.run_compute(|enc| {
+            enc.setComputePipelineState(&self.kernels.attn_reshape_f16);
+            set_buffer(enc, &output.buffer, output.offset, 0);
+            set_buffer(enc, &input.buffer, input.offset, 1);
+            set_i32_param(enc, batch as i32, 2);
+            set_i32_param(enc, seq as i32, 3);
+            set_i32_param(enc, num_heads as i32, 4);
+            set_i32_param(enc, head_dim as i32, 5);
+            dispatch_1d(enc, &self.kernels.attn_reshape_f16, total);
+            Ok(())
+        })
+    }
+
+    fn pad_to_batch_f16(
+        &self,
+        flat: &MetalTensor,
+        padded: &mut MetalTensor,
+        seq_lengths: &[usize],
+        max_seq: usize,
+        dim: usize,
+    ) -> crate::Result<()> {
+        let batch = seq_lengths.len();
+        let total_out = batch * max_seq * dim;
+
+        let mut cu: Vec<i32> = Vec::with_capacity(batch + 1);
+        cu.push(0);
+        let mut acc: i32 = 0;
+        for &len in seq_lengths {
+            acc += len as i32;
+            cu.push(acc);
+        }
+        let cu_buf = make_i32_buffer(&self.device, &cu)?;
+
+        *padded = self.alloc_f16_tensor(total_out)?;
+        let padded_buf = padded.buffer.clone();
+        let padded_offset = padded.offset;
+        let flat_buf = flat.buffer.clone();
+        let flat_offset = flat.offset;
+
+        self.run_compute(|enc| {
+            enc.setComputePipelineState(&self.kernels.pad_to_batch_f16);
+            set_buffer(enc, &padded_buf, padded_offset, 0);
+            set_buffer(enc, &flat_buf, flat_offset, 1);
+            set_buffer(enc, &cu_buf, 0, 2);
+            set_i32_param(enc, max_seq as i32, 3);
+            set_i32_param(enc, dim as i32, 4);
+            set_i32_param(enc, batch as i32, 5);
+            dispatch_1d(enc, &self.kernels.pad_to_batch_f16, total_out);
+            Ok(())
+        })
+    }
+
+    fn unpad_from_batch_f16(
+        &self,
+        padded: &MetalTensor,
+        flat: &mut MetalTensor,
+        seq_lengths: &[usize],
+        max_seq: usize,
+        dim: usize,
+    ) -> crate::Result<()> {
+        let batch = seq_lengths.len();
+        let total_tokens: usize = seq_lengths.iter().sum();
+
+        let mut cu: Vec<i32> = Vec::with_capacity(batch + 1);
+        cu.push(0);
+        let mut acc: i32 = 0;
+        for &len in seq_lengths {
+            acc += len as i32;
+            cu.push(acc);
+        }
+        let cu_buf = make_i32_buffer(&self.device, &cu)?;
+
+        *flat = self.alloc_f16_tensor(total_tokens * dim)?;
+        let flat_buf = flat.buffer.clone();
+        let flat_offset = flat.offset;
+        let padded_buf = padded.buffer.clone();
+        let padded_offset = padded.offset;
+
+        self.run_compute(|enc| {
+            enc.setComputePipelineState(&self.kernels.unpad_from_batch_f16);
+            set_buffer(enc, &flat_buf, flat_offset, 0);
+            set_buffer(enc, &padded_buf, padded_offset, 1);
+            set_buffer(enc, &cu_buf, 0, 2);
+            set_i32_param(enc, max_seq as i32, 3);
+            set_i32_param(enc, dim as i32, 4);
+            set_i32_param(enc, total_tokens as i32, 5);
+            dispatch_1d(enc, &self.kernels.unpad_from_batch_f16, total_tokens * dim);
+            Ok(())
+        })
+    }
+
+    fn rope_encode_f16(
+        &self,
+        qk: &mut MetalTensor,
+        cos: &MetalTensor,
+        sin: &MetalTensor,
+        num_rows: usize,
+        seq_len: usize,
+        head_dim: usize,
+        num_heads: usize,
+    ) -> crate::Result<()> {
+        let half_d = head_dim / 2;
+        let total = num_rows * half_d;
+        self.run_compute(|enc| {
+            enc.setComputePipelineState(&self.kernels.rope_encode_f16);
+            set_buffer(enc, &qk.buffer, qk.offset, 0);
+            set_buffer(enc, &cos.buffer, cos.offset, 1);
+            set_buffer(enc, &sin.buffer, sin.offset, 2);
+            set_i32_param(enc, num_rows as i32, 3);
+            set_i32_param(enc, seq_len as i32, 4);
+            set_i32_param(enc, head_dim as i32, 5);
+            set_i32_param(enc, num_heads as i32, 6);
+            dispatch_1d(enc, &self.kernels.rope_encode_f16, total);
+            Ok(())
+        })
+    }
+
+    fn geglu_f16(
+        &self,
+        value: &MetalTensor,
+        gate: &MetalTensor,
+        output: &mut MetalTensor,
+        n: usize,
+    ) -> crate::Result<()> {
+        self.run_compute(|enc| {
+            enc.setComputePipelineState(&self.kernels.geglu_f16);
+            set_buffer(enc, &output.buffer, output.offset, 0);
+            set_buffer(enc, &value.buffer, value.offset, 1);
+            set_buffer(enc, &gate.buffer, gate.offset, 2);
+            set_i32_param(enc, n as i32, 3);
+            dispatch_1d(enc, &self.kernels.geglu_f16, n);
+            Ok(())
+        })
+    }
+
+    fn fused_residual_layernorm_f16(
+        &self,
+        output: &mut MetalTensor,
+        hidden: &MetalTensor,
+        residual: &MetalTensor,
+        weight: &MetalTensor,
+        bias: &MetalTensor,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+    ) -> crate::Result<()> {
+        let threads = 256.min(cols);
+        self.run_compute(|enc| {
+            enc.setComputePipelineState(&self.kernels.fused_residual_layernorm_f16);
+            set_buffer(enc, &output.buffer, output.offset, 0);
+            set_buffer(enc, &hidden.buffer, hidden.offset, 1);
+            set_buffer(enc, &residual.buffer, residual.offset, 2);
+            set_buffer(enc, &weight.buffer, weight.offset, 3);
+            set_buffer(enc, &bias.buffer, bias.offset, 4);
+            set_i32_param(enc, rows as i32, 5);
+            set_i32_param(enc, cols as i32, 6);
+            set_f32_param(enc, eps, 7);
+            dispatch_rows(
+                enc,
+                &self.kernels.fused_residual_layernorm_f16,
+                rows,
+                threads,
+            );
+            Ok(())
+        })
+    }
+
+    fn residual_add_f16(
+        &self,
+        output: &mut MetalTensor,
+        hidden: &MetalTensor,
+        residual: &MetalTensor,
+        n: usize,
+    ) -> crate::Result<()> {
+        self.run_compute(|enc| {
+            enc.setComputePipelineState(&self.kernels.residual_add_f16);
+            set_buffer(enc, &output.buffer, output.offset, 0);
+            set_buffer(enc, &hidden.buffer, hidden.offset, 1);
+            set_buffer(enc, &residual.buffer, residual.offset, 2);
+            set_i32_param(enc, n as i32, 3);
+            dispatch_1d(enc, &self.kernels.residual_add_f16, n);
+            Ok(())
+        })
+    }
+
+    fn split_gate_value_f16(
+        &self,
+        first: &mut MetalTensor,
+        second: &mut MetalTensor,
+        input: &MetalTensor,
+        rows: usize,
+        cols: usize,
+    ) -> crate::Result<()> {
+        let total = rows * cols;
+        self.run_compute(|enc| {
+            enc.setComputePipelineState(&self.kernels.split_gate_value_f16);
+            set_buffer(enc, &first.buffer, first.offset, 0);
+            set_buffer(enc, &second.buffer, second.offset, 1);
+            set_buffer(enc, &input.buffer, input.offset, 2);
+            set_i32_param(enc, rows as i32, 3);
+            set_i32_param(enc, cols as i32, 4);
+            dispatch_1d(enc, &self.kernels.split_gate_value_f16, total);
+            Ok(())
+        })
     }
 }
 

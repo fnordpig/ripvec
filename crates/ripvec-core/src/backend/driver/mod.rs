@@ -488,6 +488,272 @@ pub trait Driver: Send + Sync {
         batch: usize,
         dim: usize,
     ) -> crate::Result<Vec<Vec<f32>>>;
+
+    // =======================================================================
+    // FP16 operations for full half-precision pipeline
+    //
+    // These methods mirror the FP32 counterparts but operate on FP16 tensors.
+    // Internal reductions (softmax, layer-norm) use FP32 accumulators but
+    // all tensor I/O is half precision. Default implementations return an
+    // error — only backends with FP16 support override them.
+    // =======================================================================
+
+    /// Allocate a zero-initialized FP16 tensor with `n` half-precision elements.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if device memory allocation fails or FP16 is unsupported.
+    fn alloc_zeros_f16(&self, _n: usize) -> crate::Result<Self::Tensor> {
+        Err(crate::Error::Metal(
+            "FP16 not supported by this driver".into(),
+        ))
+    }
+
+    /// Convert FP32 tensor to FP16 (element-wise narrowing).
+    fn f32_to_f16(
+        &self,
+        _output: &mut Self::Tensor,
+        _input: &Self::Tensor,
+        _n: usize,
+    ) -> crate::Result<()> {
+        Err(crate::Error::Metal(
+            "FP16 not supported by this driver".into(),
+        ))
+    }
+
+    /// Convert FP16 tensor back to FP32 (element-wise widening).
+    fn f16_to_f32(
+        &self,
+        _output: &mut Self::Tensor,
+        _input: &Self::Tensor,
+        _n: usize,
+    ) -> crate::Result<()> {
+        Err(crate::Error::Metal(
+            "FP16 not supported by this driver".into(),
+        ))
+    }
+
+    /// FP16 GEMM: `output = A * B` (or `A * B^T`). All tensors are half.
+    fn gemm_f16(
+        &self,
+        _a: &Self::Tensor,
+        _b: &Self::Tensor,
+        _output: &mut Self::Tensor,
+        _m: usize,
+        _n: usize,
+        _k: usize,
+        _transpose_b: bool,
+    ) -> crate::Result<()> {
+        Err(crate::Error::Metal(
+            "FP16 not supported by this driver".into(),
+        ))
+    }
+
+    /// FP16 batched GEMM for multi-head attention. All tensors are half.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "matches FP32 gemm_batched signature"
+    )]
+    fn gemm_batched_f16(
+        &self,
+        _a: &Self::Tensor,
+        _b: &Self::Tensor,
+        _output: &mut Self::Tensor,
+        _m: usize,
+        _n: usize,
+        _k: usize,
+        _transpose_b: bool,
+        _stride_a: usize,
+        _stride_b: usize,
+        _stride_c: usize,
+        _batch_count: usize,
+    ) -> crate::Result<()> {
+        Err(crate::Error::Metal(
+            "FP16 not supported by this driver".into(),
+        ))
+    }
+
+    /// FP16 layer normalization. Half I/O, FP32 reductions.
+    fn layer_norm_f16(
+        &self,
+        _output: &mut Self::Tensor,
+        _input: &Self::Tensor,
+        _weight: &Self::Tensor,
+        _bias: &Self::Tensor,
+        _rows: usize,
+        _cols: usize,
+        _eps: f32,
+    ) -> crate::Result<()> {
+        Err(crate::Error::Metal(
+            "FP16 not supported by this driver".into(),
+        ))
+    }
+
+    /// FP16 fused scale + mask + softmax. Half scores, FP32 reductions.
+    fn fused_scale_mask_softmax_f16(
+        &self,
+        _scores: &mut Self::Tensor,
+        _mask: &Self::Tensor,
+        _batch: usize,
+        _num_heads: usize,
+        _seq_len: usize,
+        _scale: f32,
+    ) -> crate::Result<()> {
+        Err(crate::Error::Metal(
+            "FP16 not supported by this driver".into(),
+        ))
+    }
+
+    /// FP16 fused scale + mask + sliding window + softmax.
+    fn fused_scale_mask_softmax_windowed_f16(
+        &self,
+        _scores: &mut Self::Tensor,
+        _mask: &Self::Tensor,
+        _batch: usize,
+        _num_heads: usize,
+        _seq_len: usize,
+        _scale: f32,
+        _window_size: usize,
+    ) -> crate::Result<()> {
+        Err(crate::Error::Metal(
+            "FP16 not supported by this driver".into(),
+        ))
+    }
+
+    /// FP16 QKV split: `[batch*seq, 3*hidden]` into Q, K, V per-head layout.
+    fn qkv_split_f16(
+        &self,
+        _q: &mut Self::Tensor,
+        _k: &mut Self::Tensor,
+        _v: &mut Self::Tensor,
+        _qkv: &Self::Tensor,
+        _batch: usize,
+        _seq: usize,
+        _hidden: usize,
+        _num_heads: usize,
+        _head_dim: usize,
+    ) -> crate::Result<()> {
+        Err(crate::Error::Metal(
+            "FP16 not supported by this driver".into(),
+        ))
+    }
+
+    /// FP16 attention output reshape: `[batch*num_heads, seq, head_dim]` to
+    /// `[batch*seq, hidden]`.
+    fn attn_reshape_f16(
+        &self,
+        _output: &mut Self::Tensor,
+        _input: &Self::Tensor,
+        _batch: usize,
+        _seq: usize,
+        _num_heads: usize,
+        _head_dim: usize,
+    ) -> crate::Result<()> {
+        Err(crate::Error::Metal(
+            "FP16 not supported by this driver".into(),
+        ))
+    }
+
+    /// FP16 scatter flat `[total_tokens, dim]` to padded `[batch, max_seq, dim]`.
+    fn pad_to_batch_f16(
+        &self,
+        _flat: &Self::Tensor,
+        _padded: &mut Self::Tensor,
+        _seq_lengths: &[usize],
+        _max_seq: usize,
+        _dim: usize,
+    ) -> crate::Result<()> {
+        Err(crate::Error::Metal(
+            "FP16 not supported by this driver".into(),
+        ))
+    }
+
+    /// FP16 gather padded `[batch, max_seq, dim]` back to flat `[total_tokens, dim]`.
+    fn unpad_from_batch_f16(
+        &self,
+        _padded: &Self::Tensor,
+        _flat: &mut Self::Tensor,
+        _seq_lengths: &[usize],
+        _max_seq: usize,
+        _dim: usize,
+    ) -> crate::Result<()> {
+        Err(crate::Error::Metal(
+            "FP16 not supported by this driver".into(),
+        ))
+    }
+
+    /// FP16 RoPE: apply rotary position embedding. Half Q/K, float cos/sin tables.
+    fn rope_encode_f16(
+        &self,
+        _qk: &mut Self::Tensor,
+        _cos: &Self::Tensor,
+        _sin: &Self::Tensor,
+        _num_rows: usize,
+        _seq_len: usize,
+        _head_dim: usize,
+        _num_heads: usize,
+    ) -> crate::Result<()> {
+        Err(crate::Error::Metal(
+            "FP16 not supported by this driver".into(),
+        ))
+    }
+
+    /// FP16 `GeGLU` gated activation: `output = gelu(value) * gate`. Half I/O.
+    fn geglu_f16(
+        &self,
+        _value: &Self::Tensor,
+        _gate: &Self::Tensor,
+        _output: &mut Self::Tensor,
+        _n: usize,
+    ) -> crate::Result<()> {
+        Err(crate::Error::Metal(
+            "FP16 not supported by this driver".into(),
+        ))
+    }
+
+    /// FP16 fused residual add + layer normalization.
+    fn fused_residual_layernorm_f16(
+        &self,
+        _output: &mut Self::Tensor,
+        _hidden: &Self::Tensor,
+        _residual: &Self::Tensor,
+        _weight: &Self::Tensor,
+        _bias: &Self::Tensor,
+        _rows: usize,
+        _cols: usize,
+        _eps: f32,
+    ) -> crate::Result<()> {
+        Err(crate::Error::Metal(
+            "FP16 not supported by this driver".into(),
+        ))
+    }
+
+    /// FP16 residual add (no bias): `output = hidden + residual`.
+    fn residual_add_f16(
+        &self,
+        _output: &mut Self::Tensor,
+        _hidden: &Self::Tensor,
+        _residual: &Self::Tensor,
+        _n: usize,
+    ) -> crate::Result<()> {
+        Err(crate::Error::Metal(
+            "FP16 not supported by this driver".into(),
+        ))
+    }
+
+    /// FP16 split `[rows, 2*cols]` into two `[rows, cols]` halves.
+    fn split_gate_value_f16(
+        &self,
+        _first: &mut Self::Tensor,
+        _second: &mut Self::Tensor,
+        _input: &Self::Tensor,
+        _rows: usize,
+        _cols: usize,
+    ) -> crate::Result<()> {
+        Err(crate::Error::Metal(
+            "FP16 not supported by this driver".into(),
+        ))
+    }
 }
 
 /// Batch input tensors on device, produced by [`Driver::prepare_batch`].

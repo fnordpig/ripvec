@@ -2,8 +2,14 @@
 //!
 //! Stores all chunk embeddings as a contiguous ndarray matrix so that
 //! re-ranking is a single BLAS matrix-vector multiply via [`crate::similarity::rank_all`].
+//!
+//! Optionally uses [`TurboQuant`](turbo_quant) compression for fast approximate
+//! scanning at monorepo scale (100K+ chunks). `TurboQuant` compresses 768-dim
+//! embeddings from 3072 bytes (FP32) to ~386 bytes (4-bit), giving ~5× faster
+//! scan via sequential memory access + centroid table lookup.
 
 use ndarray::{Array1, Array2};
+use turbo_quant::TurboQuantizer;
 
 use crate::chunk::CodeChunk;
 
@@ -24,10 +30,22 @@ pub struct SearchIndex {
     /// Truncated + re-normalized embedding matrix for MRL cascade pre-filter.
     /// `None` when cascade search is disabled.
     truncated: Option<Array2<f32>>,
+    /// `TurboQuant`-compressed embeddings for fast approximate scanning.
+    /// At 4-bit: 386 bytes/vector vs 3072 bytes FP32 (8× compression).
+    /// Scan is ~5× faster than FP32 BLAS at 100K+ chunks.
+    compressed: Option<CompressedIndex>,
     /// Hidden dimension size.
     pub hidden_dim: usize,
     /// Truncated dimension size, if cascade search is enabled.
     truncated_dim: Option<usize>,
+}
+
+/// `TurboQuant`-compressed embedding index for fast approximate scanning.
+struct CompressedIndex {
+    /// The quantizer (holds rotation matrix + codebook, regenerated from seed).
+    quantizer: TurboQuantizer,
+    /// Compressed codes for all vectors.
+    codes: Vec<turbo_quant::TurboCode>,
 }
 
 impl SearchIndex {
@@ -103,10 +121,31 @@ impl SearchIndex {
             trunc
         });
 
+        // Compress embeddings with TurboQuant (4-bit, PolarQuant + QJL).
+        // At 768-dim: 386 bytes/vector vs 3072 FP32. Scan ~5× faster.
+        let compressed = if hidden_dim >= 64 {
+            let quantizer = TurboQuantizer::new(hidden_dim, 4, hidden_dim, 42).ok();
+            quantizer.map(|q| {
+                let codes: Vec<_> = (0..embeddings.nrows())
+                    .filter_map(|i| {
+                        let row = embeddings.row(i);
+                        q.encode(row.as_slice().unwrap()).ok()
+                    })
+                    .collect();
+                CompressedIndex {
+                    quantizer: q,
+                    codes,
+                }
+            })
+        } else {
+            None
+        };
+
         Self {
             chunks,
             embeddings,
             truncated,
+            compressed,
             hidden_dim,
             truncated_dim,
         }
@@ -130,6 +169,59 @@ impl SearchIndex {
             .filter(|(_, score)| *score >= threshold)
             .collect();
         results.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        results
+    }
+
+    /// `TurboQuant`-accelerated ranking: compressed approximate scan → exact re-rank.
+    ///
+    /// 1. Estimate inner products for ALL vectors via `TurboQuant` (~5× faster than BLAS).
+    /// 2. Take top `pre_filter_k` approximate candidates.
+    /// 3. Re-rank with exact FP32 dot products on the full embedding matrix.
+    ///
+    /// Falls back to [`rank`] when no compressed index is available.
+    #[must_use]
+    pub fn rank_turboquant(
+        &self,
+        query_embedding: &[f32],
+        top_k: usize,
+        threshold: f32,
+    ) -> Vec<(usize, f32)> {
+        let Some(ref comp) = self.compressed else {
+            return self.rank(query_embedding, threshold);
+        };
+
+        if comp.codes.len() != self.chunks.len() {
+            return self.rank(query_embedding, threshold);
+        }
+
+        // Phase 1: approximate scan via TurboQuant
+        let pre_filter_k = (top_k * 10).min(comp.codes.len());
+        let mut approx_scores: Vec<(usize, f32)> = comp
+            .codes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, code)| {
+                comp.quantizer
+                    .inner_product_estimate(code, query_embedding)
+                    .ok()
+                    .map(|score| (i, score))
+            })
+            .collect();
+        approx_scores.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        approx_scores.truncate(pre_filter_k);
+
+        // Phase 2: exact re-rank top candidates
+        let query = Array1::from_vec(query_embedding.to_vec());
+        let mut results: Vec<(usize, f32)> = approx_scores
+            .iter()
+            .map(|&(idx, _)| {
+                let exact = self.embeddings.row(idx).dot(&query);
+                (idx, exact)
+            })
+            .filter(|(_, score)| *score >= threshold)
+            .collect();
+        results.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        results.truncate(top_k);
         results
     }
 
@@ -406,5 +498,41 @@ mod tests {
         // Only chunk 0 should pass the 0.5 threshold
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 0);
+    }
+
+    #[test]
+    fn turboquant_recall_vs_exact() {
+        // Generate 200 random 768-dim L2-normalized embeddings.
+        let dim = 768;
+        let n = 200;
+        let mut embeddings: Vec<Vec<f32>> = (0..n)
+            .map(|i| {
+                let mut v: Vec<f32> = (0..dim).map(|d| ((i * 17 + d * 31) as f32).sin()).collect();
+                l2_normalize(&mut v);
+                v
+            })
+            .collect();
+
+        let chunks: Vec<CodeChunk> = (0..n).map(|i| dummy_chunk(&format!("chunk_{i}"))).collect();
+        let mut query: Vec<f32> = (0..dim).map(|d| ((42 * 7 + d * 13) as f32).sin()).collect();
+        l2_normalize(&mut query);
+
+        let index = SearchIndex::new(chunks, &embeddings, None);
+
+        // Exact ranking
+        let exact = index.rank(&query, 0.0);
+        let exact_top10: Vec<usize> = exact.iter().take(10).map(|(idx, _)| *idx).collect();
+
+        // TurboQuant ranking
+        let tq = index.rank_turboquant(&query, 10, 0.0);
+        let tq_top10: Vec<usize> = tq.iter().take(10).map(|(idx, _)| *idx).collect();
+
+        // Recall@10: how many of exact top-10 appear in TQ top-10
+        let recall = exact_top10.iter().filter(|i| tq_top10.contains(i)).count();
+        eprintln!("TurboQuant Recall@10: {recall}/10");
+        assert!(
+            recall >= 7,
+            "TurboQuant recall should be >= 7/10, got {recall}/10"
+        );
     }
 }

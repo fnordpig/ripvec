@@ -425,6 +425,303 @@ fn ffn_sublayer<D: Driver>(
 }
 
 // ---------------------------------------------------------------------------
+// FP16 attention sublayer — pre-norm + QKV + RoPE (all half precision)
+// ---------------------------------------------------------------------------
+
+/// FP16 pre-norm + QKV projection + split + `RoPE`.
+///
+/// All tensors are half precision. RoPE cos/sin tables stay FP32 (the kernel
+/// reads half Q/K, does FP32 trig, writes half).
+/// Returns `(q, k, v)` each `[batch*num_heads, seq, head_dim]` in FP16.
+fn attn_prenorm_qkv_f16<D: Driver>(
+    driver: &D,
+    hidden_states: &D::Tensor,
+    layer: &ModernBertLayerWeights<D::Tensor>,
+    g: &EncoderGeometry,
+    zero_bias: &D::Tensor,
+    rope: &RopeCache<D::Tensor>,
+) -> crate::Result<(D::Tensor, D::Tensor, D::Tensor)> {
+    // Pre-attention norm (identity for layer 0). FP16 in/out.
+    // Layer 0 uses hidden_states directly (GEMM is read-only, no clone needed).
+    let normed: Option<D::Tensor>;
+    let normed_ref = if let Some(ref norm_w) = layer.attn_norm_weight {
+        let mut n = driver.alloc_zeros_f16(g.total_tokens * g.hidden)?;
+        driver.layer_norm_f16(
+            &mut n,
+            hidden_states,
+            norm_w,
+            zero_bias,
+            g.total_tokens,
+            g.hidden,
+            g.eps,
+        )?;
+        normed = Some(n);
+        normed.as_ref().unwrap()
+    } else {
+        // Layer 0: identity — pass through directly. GEMM reads, does not modify.
+        hidden_states
+    };
+
+    // QKV: [total_tokens, hidden] @ [3*hidden, hidden]^T — all FP16.
+    let mut qkv = driver.alloc_zeros_f16(g.total_tokens * 3 * g.hidden)?;
+    driver.gemm_f16(
+        normed_ref,
+        &layer.qkv_weight,
+        &mut qkv,
+        g.total_tokens,
+        3 * g.hidden,
+        g.hidden,
+        true,
+    )?;
+
+    // Pad QKV for attention layout.
+    let mut qkv_padded = driver.alloc_zeros_f16(g.padded_tokens * 3 * g.hidden)?;
+    driver.pad_to_batch_f16(
+        &qkv,
+        &mut qkv_padded,
+        &g.seq_lengths,
+        g.max_seq,
+        3 * g.hidden,
+    )?;
+
+    // Split into Q, K, V — all FP16.
+    let padded = g.padded_tokens;
+    let mut q = driver.alloc_zeros_f16(padded * g.hidden)?;
+    let mut k = driver.alloc_zeros_f16(padded * g.hidden)?;
+    let mut v = driver.alloc_zeros_f16(padded * g.hidden)?;
+    driver.qkv_split_f16(
+        &mut q,
+        &mut k,
+        &mut v,
+        &qkv_padded,
+        g.batch,
+        g.max_seq,
+        g.hidden,
+        g.num_heads,
+        g.head_dim,
+    )?;
+
+    // RoPE: half Q/K, float cos/sin tables.
+    let num_rows = g.batch * g.num_heads * g.max_seq;
+    driver.rope_encode_f16(
+        &mut q,
+        &rope.cos,
+        &rope.sin,
+        num_rows,
+        g.max_seq,
+        g.head_dim,
+        g.num_heads,
+    )?;
+    driver.rope_encode_f16(
+        &mut k,
+        &rope.cos,
+        &rope.sin,
+        num_rows,
+        g.max_seq,
+        g.head_dim,
+        g.num_heads,
+    )?;
+
+    Ok((q, k, v))
+}
+
+// ---------------------------------------------------------------------------
+// FP16 attention sublayer — scores + output projection + residual
+// ---------------------------------------------------------------------------
+
+/// FP16 attention scores + output projection + residual add.
+///
+/// All tensors FP16. The softmax kernel uses FP32 accumulators internally.
+/// The `float_mask` from `BatchInputs` stays FP32 (softmax kernel reads it).
+#[expect(clippy::too_many_arguments, reason = "Q/K/V must be separate tensors")]
+fn attn_scores_residual_f16<D: Driver>(
+    driver: &D,
+    q: &D::Tensor,
+    k: &D::Tensor,
+    v: &D::Tensor,
+    hidden_states: &D::Tensor,
+    layer: &ModernBertLayerWeights<D::Tensor>,
+    inputs: &BatchInputs<D::Tensor>,
+    g: &EncoderGeometry,
+) -> crate::Result<D::Tensor> {
+    let batch_heads = g.batch * g.num_heads;
+    let stride_qk = g.max_seq * g.head_dim;
+
+    // Q@K^T — FP16 batched GEMM.
+    let mut scores = driver.alloc_zeros_f16(batch_heads * g.max_seq * g.max_seq)?;
+    driver.gemm_batched_f16(
+        q,
+        k,
+        &mut scores,
+        g.max_seq,
+        g.max_seq,
+        g.head_dim,
+        true,
+        stride_qk,
+        stride_qk,
+        g.max_seq * g.max_seq,
+        batch_heads,
+    )?;
+
+    // Softmax — FP16 scores, FP32 mask, FP32 accumulators inside kernel.
+    if layer.is_global {
+        driver.fused_scale_mask_softmax_f16(
+            &mut scores,
+            &inputs.float_mask,
+            g.batch,
+            g.num_heads,
+            g.max_seq,
+            g.scale,
+        )?;
+    } else {
+        driver.fused_scale_mask_softmax_windowed_f16(
+            &mut scores,
+            &inputs.float_mask,
+            g.batch,
+            g.num_heads,
+            g.max_seq,
+            g.scale,
+            g.local_window,
+        )?;
+    }
+
+    // scores @ V — FP16 batched GEMM.
+    let mut attn_out = driver.alloc_zeros_f16(g.padded_tokens * g.hidden)?;
+    driver.gemm_batched_f16(
+        &scores,
+        v,
+        &mut attn_out,
+        g.max_seq,
+        g.head_dim,
+        g.max_seq,
+        false,
+        g.max_seq * g.max_seq,
+        stride_qk,
+        stride_qk,
+        batch_heads,
+    )?;
+
+    // Reshape heads — FP16.
+    let mut context = driver.alloc_zeros_f16(g.padded_tokens * g.hidden)?;
+    driver.attn_reshape_f16(
+        &mut context,
+        &attn_out,
+        g.batch,
+        g.max_seq,
+        g.num_heads,
+        g.head_dim,
+    )?;
+
+    // Output projection — FP16 GEMM on padded, then unpad.
+    let mut projected_padded = driver.alloc_zeros_f16(g.padded_tokens * g.hidden)?;
+    driver.gemm_f16(
+        &context,
+        &layer.output_weight,
+        &mut projected_padded,
+        g.padded_tokens,
+        g.hidden,
+        g.hidden,
+        true,
+    )?;
+
+    let mut projected = driver.alloc_zeros_f16(g.total_tokens * g.hidden)?;
+    driver.unpad_from_batch_f16(
+        &projected_padded,
+        &mut projected,
+        &g.seq_lengths,
+        g.max_seq,
+        g.hidden,
+    )?;
+
+    // Residual add — FP16.
+    let mut output = driver.alloc_zeros_f16(g.total_tokens * g.hidden)?;
+    driver.residual_add_f16(
+        &mut output,
+        &projected,
+        hidden_states,
+        g.total_tokens * g.hidden,
+    )?;
+    Ok(output)
+}
+
+// ---------------------------------------------------------------------------
+// FP16 feed-forward (GeGLU MLP) sublayer
+// ---------------------------------------------------------------------------
+
+/// FP16 gated GELU MLP sublayer.
+///
+/// All tensors FP16. `GeGLU` kernel uses FP32 GELU compute internally.
+fn ffn_sublayer_f16<D: Driver>(
+    driver: &D,
+    attn_output: &D::Tensor,
+    layer: &ModernBertLayerWeights<D::Tensor>,
+    g: &EncoderGeometry,
+    zero_bias: &D::Tensor,
+) -> crate::Result<D::Tensor> {
+    // Pre-MLP LayerNorm — FP16.
+    let mut mlp_normed = driver.alloc_zeros_f16(g.total_tokens * g.hidden)?;
+    driver.layer_norm_f16(
+        &mut mlp_normed,
+        attn_output,
+        &layer.mlp_norm_weight,
+        zero_bias,
+        g.total_tokens,
+        g.hidden,
+        g.eps,
+    )?;
+
+    // Wi projection — FP16 GEMM.
+    let double_inter = 2 * g.intermediate;
+    let mut wi_out = driver.alloc_zeros_f16(g.total_tokens * double_inter)?;
+    driver.gemm_f16(
+        &mlp_normed,
+        &layer.mlp_wi_weight,
+        &mut wi_out,
+        g.total_tokens,
+        double_inter,
+        g.hidden,
+        true,
+    )?;
+
+    // Split + GeGLU — FP16.
+    let n_elements = g.total_tokens * g.intermediate;
+    let mut value = driver.alloc_zeros_f16(n_elements)?;
+    let mut gate = driver.alloc_zeros_f16(n_elements)?;
+    driver.split_gate_value_f16(
+        &mut value,
+        &mut gate,
+        &wi_out,
+        g.total_tokens,
+        g.intermediate,
+    )?;
+
+    let mut activated = driver.alloc_zeros_f16(n_elements)?;
+    driver.geglu_f16(&value, &gate, &mut activated, n_elements)?;
+
+    // Wo projection — FP16 GEMM.
+    let mut mlp_out = driver.alloc_zeros_f16(g.total_tokens * g.hidden)?;
+    driver.gemm_f16(
+        &activated,
+        &layer.mlp_wo_weight,
+        &mut mlp_out,
+        g.total_tokens,
+        g.hidden,
+        g.intermediate,
+        true,
+    )?;
+
+    // Residual add — FP16.
+    let mut output = driver.alloc_zeros_f16(g.total_tokens * g.hidden)?;
+    driver.residual_add_f16(
+        &mut output,
+        &mlp_out,
+        attn_output,
+        g.total_tokens * g.hidden,
+    )?;
+    Ok(output)
+}
+
+// ---------------------------------------------------------------------------
 // ModelArch implementation
 // ---------------------------------------------------------------------------
 
@@ -442,7 +739,6 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
         let batch = encodings.len();
         let hidden = w.hidden_dim;
 
-        // TEMPORARY: padded mode to debug the query hang.
         let max_seq = encodings
             .iter()
             .map(|e| e.input_ids.len())
@@ -455,7 +751,7 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
         // Enter batched mode: all GPU ops encode into ONE command buffer.
         driver.begin_batch()?;
 
-        // Embedding: tok_embeddings + LayerNorm (NO position or token_type embeddings).
+        // Embedding (FP32): tok_embeddings + LayerNorm.
         let mut hidden_states =
             driver.embedding_lookup(&inputs.input_ids, &w.tok_embeddings, total_tokens, hidden)?;
         let emb_input = driver.clone_tensor(&hidden_states, total_tokens * hidden)?;
@@ -484,30 +780,63 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
             eps: w.layer_norm_eps,
         };
 
-        // Encoder layers (up to max_layers or all 22).
         let num_layers = self
             .max_layers
             .unwrap_or(w.layers.len())
             .min(w.layers.len());
-        for layer in &w.layers[..num_layers] {
-            // Reset workspace so this layer reuses buffers from previous layer.
-            // Without this, 22 layers accumulate ~22GB of workspace buffers.
-            driver.reset_layer_workspace();
 
-            let rope = if layer.is_global {
-                &self.global_rope
-            } else {
-                &self.local_rope
-            };
+        // Try FP16 path: f32_to_f16 ONCE → all layers in FP16 → f16_to_f32 ONCE.
+        // Falls back to FP32 if the driver doesn't support FP16 ops.
+        let use_f16 = driver.alloc_zeros_f16(1).map(|_| true).unwrap_or(false);
 
-            let (q, k, v) =
-                attn_prenorm_qkv(driver, &hidden_states, layer, &g, &w.zero_bias, rope)?;
-            let attn_output =
-                attn_scores_residual(driver, &q, &k, &v, &hidden_states, layer, &inputs, &g)?;
-            hidden_states = ffn_sublayer(driver, &attn_output, layer, &g, &w.zero_bias)?;
+        if use_f16 {
+            // === FP16 PATH: zero F32↔F16 conversions in layer loop ===
+
+            // ONLY conversion #1: F32 → F16 after embedding LN.
+            let mut hidden_f16 = driver.alloc_zeros_f16(total_tokens * hidden)?;
+            driver.f32_to_f16(&mut hidden_f16, &hidden_states, total_tokens * hidden)?;
+
+            // 22 layers — ALL in FP16. Zero conversions.
+            for layer in &w.layers[..num_layers] {
+                driver.reset_layer_workspace();
+
+                let rope = if layer.is_global {
+                    &self.global_rope
+                } else {
+                    &self.local_rope
+                };
+
+                let (q, k, v) =
+                    attn_prenorm_qkv_f16(driver, &hidden_f16, layer, &g, &w.zero_bias, rope)?;
+                let attn_output =
+                    attn_scores_residual_f16(driver, &q, &k, &v, &hidden_f16, layer, &inputs, &g)?;
+                hidden_f16 = ffn_sublayer_f16(driver, &attn_output, layer, &g, &w.zero_bias)?;
+            }
+
+            // ONLY conversion #2: F16 → F32 before final LN + pooling.
+            let mut hidden_f32 = driver.alloc_zeros(total_tokens * hidden)?;
+            driver.f16_to_f32(&mut hidden_f32, &hidden_f16, total_tokens * hidden)?;
+            hidden_states = hidden_f32;
+        } else {
+            // === FP32 PATH (fallback) ===
+            for layer in &w.layers[..num_layers] {
+                driver.reset_layer_workspace();
+
+                let rope = if layer.is_global {
+                    &self.global_rope
+                } else {
+                    &self.local_rope
+                };
+
+                let (q, k, v) =
+                    attn_prenorm_qkv(driver, &hidden_states, layer, &g, &w.zero_bias, rope)?;
+                let attn_output =
+                    attn_scores_residual(driver, &q, &k, &v, &hidden_states, layer, &inputs, &g)?;
+                hidden_states = ffn_sublayer(driver, &attn_output, layer, &g, &w.zero_bias)?;
+            }
         }
 
-        // Final LayerNorm before pooling.
+        // Final LayerNorm (FP32) before pooling.
         let final_input = driver.clone_tensor(&hidden_states, total_tokens * hidden)?;
         driver.layer_norm(
             &mut hidden_states,
@@ -529,7 +858,7 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
             hidden,
         )?;
 
-        // Mean pooling + L2 normalize.
+        // Mean pooling + L2 normalize (FP32).
         let mut pooled = driver.alloc_zeros(batch * hidden)?;
         driver.mean_pool(
             &mut pooled,

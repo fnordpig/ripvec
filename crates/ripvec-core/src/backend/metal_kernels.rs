@@ -64,6 +64,23 @@ kernel void add_one(
 /// - `add_bias_f16_kernel` -- FP16 bias add (in-place)
 /// - `add_embeddings_f16_kernel` -- FP16 embedding add
 /// - `embedding_lookup_f16_kernel` -- FP16 embedding lookup
+///
+/// ## FP16 attention-path kernels (full FP16 pipeline)
+///
+/// These kernels keep the entire attention hot-loop in FP16: all I/O is `half`,
+/// only accumulators/reductions use FP32 internally. Zero F32-F16 conversions.
+///
+/// - `f16_to_f32_kernel` -- convert f16 back to f32
+/// - `geglu_f16_kernel` -- FP16 GeGLU with FP32 gelu compute
+/// - `split_gate_value_f16_kernel` -- FP16 split [rows, 2*cols] into halves
+/// - `residual_add_f16_kernel` -- FP16 residual add (no bias)
+/// - `fused_scale_mask_softmax_f16_kernel` -- FP16 softmax with FP32 reductions
+/// - `fused_scale_mask_softmax_windowed_f16_kernel` -- FP16 windowed softmax
+/// - `qkv_split_f16_kernel` -- FP16 QKV split to per-head layout
+/// - `attn_reshape_f16_kernel` -- FP16 attention reshape
+/// - `pad_to_batch_f16_kernel` -- FP16 scatter flat to padded
+/// - `unpad_from_batch_f16_kernel` -- FP16 gather padded to flat
+/// - `rope_encode_f16_kernel` -- FP16 RoPE with FP32 trig
 pub const KERNELS: &str = r"
 #include <metal_stdlib>
 using namespace metal;
@@ -677,13 +694,14 @@ kernel void head_reshape_kernel(
 
 // ---------------------------------------------------------------------------
 // FP16 Layer normalization with FP32 accumulators for reductions.
-// Input/output/weight/bias are half; mean/variance computed in float.
+// Input/output are half; weight/bias stay FP32 (small vectors, no bandwidth
+// concern). Mean/variance computed in float.
 // ---------------------------------------------------------------------------
 kernel void layer_norm_f16_kernel(
     device half* output            [[buffer(0)]],
     const device half* input       [[buffer(1)]],
-    const device half* weight      [[buffer(2)]],
-    const device half* bias        [[buffer(3)]],
+    const device float* weight     [[buffer(2)]],
+    const device float* bias       [[buffer(3)]],
     constant int& rows             [[buffer(4)]],
     constant int& cols             [[buffer(5)]],
     constant float& eps            [[buffer(6)]],
@@ -725,7 +743,7 @@ kernel void layer_norm_f16_kernel(
     for (int i = int(tid); i < cols; i += int(tpg)) {
         uint idx = row * uint(cols) + uint(i);
         float val = (float(input[idx]) - mean) * inv_std;
-        output[idx] = half(val * float(weight[i]) + float(bias[i]));
+        output[idx] = half(val * weight[i] + bias[i]);
     }
 }
 
@@ -783,14 +801,15 @@ kernel void fused_bias_residual_f16_kernel(
 
 // ---------------------------------------------------------------------------
 // FP16 fused residual add + layer norm.
-// Residual add is element-wise half; reductions use FP32 accumulators.
+// Hidden/residual/output are half; weight/bias stay FP32 (small vectors).
+// Reductions use FP32 accumulators.
 // ---------------------------------------------------------------------------
 kernel void fused_residual_layernorm_f16_kernel(
     device half* output            [[buffer(0)]],
     const device half* hidden      [[buffer(1)]],
     const device half* residual    [[buffer(2)]],
-    const device half* weight      [[buffer(3)]],
-    const device half* bias        [[buffer(4)]],
+    const device float* weight     [[buffer(3)]],
+    const device float* bias       [[buffer(4)]],
     constant int& rows             [[buffer(5)]],
     constant int& cols             [[buffer(6)]],
     constant float& eps            [[buffer(7)]],
@@ -834,7 +853,7 @@ kernel void fused_residual_layernorm_f16_kernel(
     for (int i = int(tid); i < cols; i += int(tpg)) {
         uint idx = row * uint(cols) + uint(i);
         float val = (float(output[idx]) - mean) * inv_std;
-        output[idx] = half(val * float(weight[i]) + float(bias[i]));
+        output[idx] = half(val * weight[i] + bias[i]);
     }
 }
 
@@ -1200,6 +1219,342 @@ kernel void banded_sv_kernel(
         }
     }
     output[h * stride_out + i * head_dim + d] = sum;
+}
+
+// ===========================================================================
+// FP16 attention-path kernels (full FP16 pipeline)
+//
+// These kernels keep the entire layer loop in FP16. All I/O is half;
+// only accumulators (dot products, softmax reductions, trig) use FP32.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Convert f16 to f32 (reverse of f32_to_f16_kernel).
+// ---------------------------------------------------------------------------
+kernel void f16_to_f32_kernel(
+    device float* output           [[buffer(0)]],
+    const device half* input       [[buffer(1)]],
+    constant int& n                [[buffer(2)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= uint(n)) return;
+    output[i] = float(input[i]);
+}
+
+// ---------------------------------------------------------------------------
+// FP16 GeGLU: output = gelu(value) * gate. Half I/O, float GELU compute.
+// ---------------------------------------------------------------------------
+kernel void geglu_f16_kernel(
+    device half* output            [[buffer(0)]],
+    const device half* value       [[buffer(1)]],
+    const device half* gate        [[buffer(2)]],
+    constant int& n                [[buffer(3)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= uint(n)) return;
+    float v = float(value[i]);
+    float inner = 0.7978845608 * (v + 0.044715 * v * v * v);
+    inner = clamp(inner, -10.0f, 10.0f);
+    float gelu_v = 0.5 * v * (1.0 + tanh(inner));
+    output[i] = half(gelu_v * float(gate[i]));
+}
+
+// ---------------------------------------------------------------------------
+// FP16 split [rows, 2*cols] into two [rows, cols] halves.
+// ---------------------------------------------------------------------------
+kernel void split_gate_value_f16_kernel(
+    device half* first             [[buffer(0)]],
+    device half* second            [[buffer(1)]],
+    const device half* input       [[buffer(2)]],
+    constant int& rows             [[buffer(3)]],
+    constant int& cols             [[buffer(4)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    int total = rows * cols;
+    if (idx >= uint(total)) return;
+    int row = int(idx) / cols;
+    int col = int(idx) % cols;
+    int double_cols = 2 * cols;
+    first[idx] = input[row * double_cols + col];
+    second[idx] = input[row * double_cols + cols + col];
+}
+
+// ---------------------------------------------------------------------------
+// FP16 residual add (no bias): output = hidden + residual.
+// ---------------------------------------------------------------------------
+kernel void residual_add_f16_kernel(
+    device half* output            [[buffer(0)]],
+    const device half* hidden      [[buffer(1)]],
+    const device half* residual    [[buffer(2)]],
+    constant int& n                [[buffer(3)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= uint(n)) return;
+    output[i] = half(float(hidden[i]) + float(residual[i]));
+}
+
+// ---------------------------------------------------------------------------
+// FP16 fused scale + mask + softmax. Half scores, float max/sum accumulators.
+// Mask stays float (it's the padding mask built in FP32).
+// ---------------------------------------------------------------------------
+kernel void fused_scale_mask_softmax_f16_kernel(
+    device half* scores            [[buffer(0)]],
+    const device float* mask       [[buffer(1)]],
+    constant int& batch            [[buffer(2)]],
+    constant int& num_heads        [[buffer(3)]],
+    constant int& seq              [[buffer(4)]],
+    constant float& scale          [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tpg [[threads_per_threadgroup]]
+) {
+    int total_rows = batch * num_heads * seq;
+    if (row >= uint(total_rows)) return;
+
+    threadgroup float sdata[256];
+    device half* row_data = scores + row * uint(seq);
+    int b = int(row) / (num_heads * seq);
+
+    // Pass 1: scale + mask + find row max
+    float thread_max = -1e30;
+    for (int i = int(tid); i < seq; i += int(tpg)) {
+        float val = float(row_data[i]) * scale + mask[b * seq + i];
+        row_data[i] = half(val);
+        thread_max = max(thread_max, val);
+    }
+    sdata[tid] = thread_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tpg / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] = max(sdata[tid], sdata[tid + s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float row_max = sdata[0];
+
+    // Pass 2: exp(x - max) and sum
+    float thread_sum = 0.0;
+    for (int i = int(tid); i < seq; i += int(tpg)) {
+        float val = exp(float(row_data[i]) - row_max);
+        row_data[i] = half(val);
+        thread_sum += val;
+    }
+    sdata[tid] = thread_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tpg / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_sum = 1.0 / max(sdata[0], 1e-12);
+
+    // Pass 3: normalize
+    for (int i = int(tid); i < seq; i += int(tpg)) {
+        row_data[i] = half(float(row_data[i]) * inv_sum);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FP16 fused scale + mask + sliding window + softmax.
+// Half scores, float mask, float accumulators.
+// ---------------------------------------------------------------------------
+kernel void fused_scale_mask_softmax_windowed_f16_kernel(
+    device half* scores            [[buffer(0)]],
+    const device float* mask       [[buffer(1)]],
+    constant int& batch            [[buffer(2)]],
+    constant int& num_heads        [[buffer(3)]],
+    constant int& seq              [[buffer(4)]],
+    constant float& scale          [[buffer(5)]],
+    constant int& half_window      [[buffer(6)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tpg [[threads_per_threadgroup]]
+) {
+    int total_rows = batch * num_heads * seq;
+    if (row >= uint(total_rows)) return;
+
+    threadgroup float sdata[256];
+    device half* row_data = scores + row * uint(seq);
+    int b = int(row) / (num_heads * seq);
+    int q_pos = int(row) % seq;
+
+    // Pass 1: scale + padding mask + window mask + find max
+    float thread_max = -1e30;
+    for (int i = int(tid); i < seq; i += int(tpg)) {
+        float val = float(row_data[i]) * scale + mask[b * seq + i];
+        int dist = (q_pos > i) ? (q_pos - i) : (i - q_pos);
+        if (dist > half_window) val = -1e9;
+        row_data[i] = half(val);
+        thread_max = max(thread_max, val);
+    }
+    sdata[tid] = thread_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tpg / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] = max(sdata[tid], sdata[tid + s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float row_max = sdata[0];
+
+    // Pass 2: exp(x - max) and sum
+    float thread_sum = 0.0;
+    for (int i = int(tid); i < seq; i += int(tpg)) {
+        float val = exp(float(row_data[i]) - row_max);
+        row_data[i] = half(val);
+        thread_sum += val;
+    }
+    sdata[tid] = thread_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tpg / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_sum = 1.0 / max(sdata[0], 1e-12);
+
+    // Pass 3: normalize
+    for (int i = int(tid); i < seq; i += int(tpg)) {
+        row_data[i] = half(float(row_data[i]) * inv_sum);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FP16 QKV split: [batch*seq, 3*hidden] -> Q,K,V each [batch*heads, seq, head_dim].
+// Half I/O.
+// ---------------------------------------------------------------------------
+kernel void qkv_split_f16_kernel(
+    device half* q                 [[buffer(0)]],
+    device half* k                 [[buffer(1)]],
+    device half* v                 [[buffer(2)]],
+    const device half* qkv         [[buffer(3)]],
+    constant int& batch            [[buffer(4)]],
+    constant int& seq              [[buffer(5)]],
+    constant int& hidden           [[buffer(6)]],
+    constant int& num_heads        [[buffer(7)]],
+    constant int& head_dim         [[buffer(8)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    int total = batch * num_heads * seq * head_dim;
+    if (idx >= uint(total)) return;
+
+    int per_batch = num_heads * seq * head_dim;
+    int b = int(idx) / per_batch;
+    int rem0 = int(idx) % per_batch;
+    int h = rem0 / (seq * head_dim);
+    int rem1 = rem0 % (seq * head_dim);
+    int t = rem1 / head_dim;
+    int d = rem1 % head_dim;
+
+    int qkv_idx = b * seq * (3 * hidden) + t * (3 * hidden) + h * head_dim + d;
+    q[idx] = qkv[qkv_idx];
+    k[idx] = qkv[qkv_idx + hidden];
+    v[idx] = qkv[qkv_idx + 2 * hidden];
+}
+
+// ---------------------------------------------------------------------------
+// FP16 attention reshape: [batch*num_heads, seq, head_dim] -> [batch*seq, hidden].
+// Half I/O.
+// ---------------------------------------------------------------------------
+kernel void attn_reshape_f16_kernel(
+    device half* output            [[buffer(0)]],
+    const device half* heads       [[buffer(1)]],
+    constant int& batch            [[buffer(2)]],
+    constant int& seq              [[buffer(3)]],
+    constant int& num_heads        [[buffer(4)]],
+    constant int& head_dim         [[buffer(5)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    int hidden = num_heads * head_dim;
+    int total = batch * seq * hidden;
+    if (idx >= uint(total)) return;
+
+    int b = int(idx) / (seq * hidden);
+    int rem = int(idx) % (seq * hidden);
+    int t = rem / hidden;
+    int flat_hd = rem % hidden;
+    int h = flat_hd / head_dim;
+    int d = flat_hd % head_dim;
+
+    int heads_idx = (b * num_heads + h) * (seq * head_dim) + t * head_dim + d;
+    output[idx] = heads[heads_idx];
+}
+
+// ---------------------------------------------------------------------------
+// FP16 pad to batch: scatter flat [total_tokens, dim] to padded [batch, max_seq, dim].
+// Half I/O.
+// ---------------------------------------------------------------------------
+kernel void pad_to_batch_f16_kernel(
+    device half* output            [[buffer(0)]],
+    const device half* input       [[buffer(1)]],
+    const device int* cu_seqlens   [[buffer(2)]],
+    constant int& max_seq          [[buffer(3)]],
+    constant int& dim_val          [[buffer(4)]],
+    constant int& batch            [[buffer(5)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    int total_out = batch * max_seq * dim_val;
+    if (idx >= uint(total_out)) return;
+    int b = int(idx) / (max_seq * dim_val);
+    int rem = int(idx) % (max_seq * dim_val);
+    int t = rem / dim_val;
+    int d = rem % dim_val;
+    int seq_start = cu_seqlens[b];
+    int seq_len = cu_seqlens[b + 1] - seq_start;
+    output[idx] = (t < seq_len) ? input[(seq_start + t) * dim_val + d] : half(0.0);
+}
+
+// ---------------------------------------------------------------------------
+// FP16 unpad from batch: gather real tokens from padded [batch, max_seq, dim].
+// Half I/O.
+// ---------------------------------------------------------------------------
+kernel void unpad_from_batch_f16_kernel(
+    device half* output            [[buffer(0)]],
+    const device half* input       [[buffer(1)]],
+    const device int* cu_seqlens   [[buffer(2)]],
+    constant int& max_seq          [[buffer(3)]],
+    constant int& dim_val          [[buffer(4)]],
+    constant int& total_tokens     [[buffer(5)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= uint(total_tokens * dim_val)) return;
+    int token_idx = int(idx) / dim_val;
+    int d = int(idx) % dim_val;
+    int b = 0;
+    for (int i = 0; i < 256; i++) {
+        if (cu_seqlens[i + 1] <= token_idx) b = i + 1;
+        else break;
+    }
+    int local_t = token_idx - cu_seqlens[b];
+    output[idx] = input[(b * max_seq + local_t) * dim_val + d];
+}
+
+// ---------------------------------------------------------------------------
+// FP16 RoPE with pre-computed cos/sin tables.
+// Half Q/K I/O, float cos/sin tables, float trig computation.
+// ---------------------------------------------------------------------------
+kernel void rope_encode_f16_kernel(
+    device half* q_or_k            [[buffer(0)]],
+    const device float* cos_table  [[buffer(1)]],
+    const device float* sin_table  [[buffer(2)]],
+    constant int& num_rows         [[buffer(3)]],
+    constant int& seq              [[buffer(4)]],
+    constant int& head_dim         [[buffer(5)]],
+    constant int& num_heads        [[buffer(6)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    int half_dim = head_dim / 2;
+    int total = num_rows * half_dim;
+    if (idx >= uint(total)) return;
+
+    int row = int(idx) / half_dim;
+    int d = int(idx) % half_dim;
+    int pos = row % seq;
+
+    int first_idx = row * head_dim + d;
+    int second_idx = first_idx + half_dim;
+
+    float cos_val = cos_table[pos * half_dim + d];
+    float sin_val = sin_table[pos * half_dim + d];
+
+    float first = float(q_or_k[first_idx]);
+    float second = float(q_or_k[second_idx]);
+    q_or_k[first_idx] = half(first * cos_val - second * sin_val);
+    q_or_k[second_idx] = half(first * sin_val + second * cos_val);
 }
 ";
 
@@ -2061,6 +2416,167 @@ kernel void flash_attention_kernel(
         uint gr = qr_start + row;
         if (gr < seq_len)
             O_head[gr * head_dim + col] = o_tg[i];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Full FP16 GEMM: C[M,N] = A[M,K] * B[K,N] (or B^T). All buffers are half.
+// Float accumulator for numerical stability, stores as half.
+// Used for weight GEMMs in the FP16 pipeline where activations are already half.
+// ---------------------------------------------------------------------------
+kernel void gemm_f16_kernel(
+    device half* A           [[buffer(0)]],    // activations [M, K] in FP16
+    device half* B           [[buffer(1)]],    // weights [N, K] or [K, N] in FP16
+    device half* C           [[buffer(2)]],    // output [M, N] in FP16
+    constant uint& M         [[buffer(3)]],
+    constant uint& N         [[buffer(4)]],
+    constant uint& K         [[buffer(5)]],
+    constant uint& transB    [[buffer(6)]],
+    uint2 tg_pos             [[threadgroup_position_in_grid]],
+    ushort simd_id           [[simdgroup_index_in_threadgroup]],
+    ushort lane_id           [[thread_index_in_simdgroup]]
+) {
+    ushort2 morton_offset = morton_order(lane_id);
+    ushort2 sid(simd_id % (TILE_N / 8), simd_id / (TILE_N / 8));
+
+    uint M_offset = tg_pos.y * TILE_M;
+    uint N_offset = tg_pos.x * TILE_N;
+
+    if (M_offset + sid.y * 8 >= M || N_offset + sid.x * 8 >= N) return;
+
+    ushort2 offset_in_group(sid.x * 8 + morton_offset.x,
+                            sid.y * 8 + morton_offset.y);
+    uint my_row = M_offset + offset_in_group.y;
+    uint my_col = N_offset + offset_in_group.x;
+
+    simdgroup_matrix_storage<float> C_acc;
+    *(C_acc.thread_elements()) = float2(0.0);
+
+    for (uint k = 0; k < K; k += 8) {
+        simdgroup_matrix_storage<half> A_tile, B_tile;
+
+        if (my_row < M) {
+            uint2 A_off(k + morton_offset.x, my_row);
+            device half* A_src = simdgroup_matrix_storage<half>::apply_offset(
+                A, K, A_off);
+            A_tile.load(A_src, K, ushort2(0, 0));
+        } else {
+            *(A_tile.thread_elements()) = half2(0.0h);
+        }
+
+        if (transB) {
+            if (my_col < N) {
+                uint2 B_off(my_col, k + morton_offset.y);
+                device half* B_src = simdgroup_matrix_storage<half>::apply_offset(
+                    B, K, B_off, true);
+                B_tile.load(B_src, K, ushort2(0, 0), true);
+            } else {
+                *(B_tile.thread_elements()) = half2(0.0h);
+            }
+        } else {
+            if (my_col < N) {
+                uint2 B_off(my_col, k + morton_offset.y);
+                device half* B_src = simdgroup_matrix_storage<half>::apply_offset(
+                    B, N, B_off);
+                B_tile.load(B_src, N, ushort2(0, 0));
+            } else {
+                *(B_tile.thread_elements()) = half2(0.0h);
+            }
+        }
+
+        C_acc.multiply(A_tile, B_tile, true);
+    }
+
+    if (my_row < M && my_col < N) {
+        uint2 C_off(my_col, my_row);
+        device half* C_dst = simdgroup_matrix_storage<half>::apply_offset(
+            C, N, C_off);
+        C_acc.store(C_dst, N, ushort2(0, 0));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Full FP16 batched GEMM: same as gemm_f16_kernel with batch dimension in grid.z.
+// All buffers are half. All strides are in half elements.
+// Float accumulator, stores as half.
+// Used for attention Q@K^T and scores@V in the full FP16 pipeline.
+// ---------------------------------------------------------------------------
+kernel void gemm_batched_f16_kernel(
+    device half* A           [[buffer(0)]],    // activations in FP16
+    device half* B           [[buffer(1)]],    // keys/values in FP16
+    device half* C           [[buffer(2)]],    // output in FP16
+    constant uint& M         [[buffer(3)]],
+    constant uint& N         [[buffer(4)]],
+    constant uint& K         [[buffer(5)]],
+    constant uint& transB    [[buffer(6)]],
+    constant uint& stride_A  [[buffer(7)]],    // half elements between batch slices
+    constant uint& stride_B  [[buffer(8)]],    // half elements between batch slices
+    constant uint& stride_C  [[buffer(9)]],    // half elements between batch slices
+    uint3 tg_pos             [[threadgroup_position_in_grid]],
+    ushort simd_id           [[simdgroup_index_in_threadgroup]],
+    ushort lane_id           [[thread_index_in_simdgroup]]
+) {
+    uint batch_idx = tg_pos.z;
+    device half* A_batch = A + batch_idx * stride_A;
+    device half* B_batch = B + batch_idx * stride_B;
+    device half* C_batch = C + batch_idx * stride_C;
+
+    ushort2 morton_offset = morton_order(lane_id);
+    ushort2 sid(simd_id % (TILE_N / 8), simd_id / (TILE_N / 8));
+
+    uint M_offset = tg_pos.y * TILE_M;
+    uint N_offset = tg_pos.x * TILE_N;
+
+    if (M_offset + sid.y * 8 >= M || N_offset + sid.x * 8 >= N) return;
+
+    ushort2 offset_in_group(sid.x * 8 + morton_offset.x,
+                            sid.y * 8 + morton_offset.y);
+    uint my_row = M_offset + offset_in_group.y;
+    uint my_col = N_offset + offset_in_group.x;
+
+    simdgroup_matrix_storage<float> C_acc;
+    *(C_acc.thread_elements()) = float2(0.0);
+
+    for (uint k = 0; k < K; k += 8) {
+        simdgroup_matrix_storage<half> A_tile, B_tile;
+
+        if (my_row < M) {
+            uint2 A_off(k + morton_offset.x, my_row);
+            device half* A_src = simdgroup_matrix_storage<half>::apply_offset(
+                A_batch, K, A_off);
+            A_tile.load(A_src, K, ushort2(0, 0));
+        } else {
+            *(A_tile.thread_elements()) = half2(0.0h);
+        }
+
+        if (transB) {
+            if (my_col < N) {
+                uint2 B_off(my_col, k + morton_offset.y);
+                device half* B_src = simdgroup_matrix_storage<half>::apply_offset(
+                    B_batch, K, B_off, true);
+                B_tile.load(B_src, K, ushort2(0, 0), true);
+            } else {
+                *(B_tile.thread_elements()) = half2(0.0h);
+            }
+        } else {
+            if (my_col < N) {
+                uint2 B_off(my_col, k + morton_offset.y);
+                device half* B_src = simdgroup_matrix_storage<half>::apply_offset(
+                    B_batch, N, B_off);
+                B_tile.load(B_src, N, ushort2(0, 0));
+            } else {
+                *(B_tile.thread_elements()) = half2(0.0h);
+            }
+        }
+
+        C_acc.multiply(A_tile, B_tile, true);
+    }
+
+    if (my_row < M && my_col < N) {
+        uint2 C_off(my_col, my_row);
+        device half* C_dst = simdgroup_matrix_storage<half>::apply_offset(
+            C_batch, N, C_off);
+        C_acc.store(C_dst, N, ushort2(0, 0));
     }
 }
 ";
