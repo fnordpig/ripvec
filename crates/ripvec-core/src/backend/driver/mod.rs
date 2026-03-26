@@ -267,6 +267,59 @@ pub trait Driver: Send + Sync {
         head_dim: usize,
     ) -> crate::Result<()>;
 
+    // --- Banded (local/sliding-window) attention ---
+
+    /// Banded Q@K^T: compute attention scores only within a sliding window.
+    ///
+    /// Output shape: `[batch * num_heads, seq, window]` (NOT `[seq, seq]`).
+    /// `scores[h, i, w]` = dot(Q[h, i, :], K[h, i - window/2 + w, :])
+    /// where out-of-bounds positions are set to `-inf` (masked in softmax).
+    ///
+    /// Reduces attention compute from O(seq²) to O(seq × window).
+    /// For `seq=512, window=128`: **4× less compute** per local layer.
+    fn banded_qk(
+        &self,
+        q: &Self::Tensor,
+        k: &Self::Tensor,
+        scores: &mut Self::Tensor,
+        batch_heads: usize,
+        seq: usize,
+        head_dim: usize,
+        window: usize,
+        stride_qk: usize,
+        stride_scores: usize,
+    ) -> crate::Result<()>;
+
+    /// Banded scores@V: weighted sum using banded attention scores.
+    ///
+    /// Input scores: `[batch * num_heads, seq, window]` (from `banded_qk`).
+    /// Output: `[batch * num_heads, seq, head_dim]`.
+    /// `output[h, i, d]` = sum_w scores[h, i, w] * V[h, i - window/2 + w, d]
+    fn banded_sv(
+        &self,
+        scores: &Self::Tensor,
+        v: &Self::Tensor,
+        output: &mut Self::Tensor,
+        batch_heads: usize,
+        seq: usize,
+        head_dim: usize,
+        window: usize,
+        stride_scores: usize,
+        stride_v: usize,
+        stride_out: usize,
+    ) -> crate::Result<()>;
+
+    /// Fused scale + softmax over the window dimension (no padding mask needed).
+    ///
+    /// Operates on `[batch * num_heads * seq, window]` rows.
+    fn banded_softmax(
+        &self,
+        scores: &mut Self::Tensor,
+        total_rows: usize,
+        window: usize,
+        scale: f32,
+    ) -> crate::Result<()>;
+
     /// Reshape attention output from `[batch, num_heads, seq, head_dim]` to
     /// `[batch * seq, hidden]`.
     fn attn_reshape(

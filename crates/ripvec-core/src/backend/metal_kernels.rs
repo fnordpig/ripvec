@@ -1067,6 +1067,140 @@ kernel void unpad_from_batch_kernel(
     int local_t = token_idx - cu_seqlens[b];
     output[idx] = input[(b * max_seq + local_t) * dim_val + d];
 }
+
+// ---------------------------------------------------------------------------
+// Banded Q@K^T: sliding-window attention scores.
+// Output: [batch_heads, seq, window] where window << seq.
+// scores[h, i, w] = dot(Q[h,i,:], K[h, i-window/2+w, :])
+// Out-of-bounds positions get -1e9 (masked in softmax).
+// One thread per (batch_head, query_pos, window_pos) element.
+// ---------------------------------------------------------------------------
+kernel void banded_qk_kernel(
+    device float* scores            [[buffer(0)]],
+    const device float* Q           [[buffer(1)]],
+    const device float* K           [[buffer(2)]],
+    constant int& batch_heads       [[buffer(3)]],
+    constant int& seq               [[buffer(4)]],
+    constant int& head_dim          [[buffer(5)]],
+    constant int& window            [[buffer(6)]],
+    constant int& stride_qk        [[buffer(7)]],
+    constant int& stride_sc         [[buffer(8)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    int total = batch_heads * seq * window;
+    if (int(idx) >= total) return;
+
+    int h = int(idx) / (seq * window);
+    int rem = int(idx) % (seq * window);
+    int i = rem / window;
+    int w = rem % window;
+
+    int half_w = window / 2;
+    int k_pos = i - half_w + w;
+
+    if (k_pos < 0 || k_pos >= seq) {
+        scores[h * stride_sc + i * window + w] = -1e9;
+        return;
+    }
+
+    // Dot product Q[h, i, :] . K[h, k_pos, :]
+    float dot = 0.0;
+    for (int d = 0; d < head_dim; d++) {
+        dot += Q[h * stride_qk + i * head_dim + d]
+             * K[h * stride_qk + k_pos * head_dim + d];
+    }
+    scores[h * stride_sc + i * window + w] = dot;
+}
+
+// ---------------------------------------------------------------------------
+// Banded softmax: scale + softmax over window dimension.
+// Input/output: [total_rows, window]. One threadgroup per row.
+// ---------------------------------------------------------------------------
+kernel void banded_softmax_kernel(
+    device float* data              [[buffer(0)]],
+    constant int& window            [[buffer(1)]],
+    constant float& scale           [[buffer(2)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tpg [[threads_per_threadgroup]]
+) {
+    device float* row_data = data + row * window;
+    threadgroup float sdata[256];
+
+    // Scale + find max
+    float thread_max = -1e30;
+    for (int i = int(tid); i < window; i += int(tpg)) {
+        row_data[i] *= scale;
+        thread_max = max(thread_max, row_data[i]);
+    }
+    sdata[tid] = thread_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tpg / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] = max(sdata[tid], sdata[tid + s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float row_max = sdata[0];
+
+    // Exp + sum
+    float thread_sum = 0.0;
+    for (int i = int(tid); i < window; i += int(tpg)) {
+        float v = exp(row_data[i] - row_max);
+        row_data[i] = v;
+        thread_sum += v;
+    }
+    sdata[tid] = thread_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tpg / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_sum = 1.0 / max(sdata[0], 1e-12);
+
+    // Normalize
+    for (int i = int(tid); i < window; i += int(tpg)) {
+        row_data[i] *= inv_sum;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Banded scores@V: weighted sum from banded attention scores.
+// scores: [batch_heads, seq, window], V: [batch_heads, seq, head_dim]
+// output: [batch_heads, seq, head_dim]
+// output[h, i, d] = sum_w scores[h, i, w] * V[h, i-window/2+w, d]
+// One thread per (batch_head, query_pos, dim) element.
+// ---------------------------------------------------------------------------
+kernel void banded_sv_kernel(
+    device float* output            [[buffer(0)]],
+    const device float* scores      [[buffer(1)]],
+    const device float* V           [[buffer(2)]],
+    constant int& batch_heads       [[buffer(3)]],
+    constant int& seq               [[buffer(4)]],
+    constant int& head_dim          [[buffer(5)]],
+    constant int& window            [[buffer(6)]],
+    constant int& stride_sc         [[buffer(7)]],
+    constant int& stride_v          [[buffer(8)]],
+    constant int& stride_out        [[buffer(9)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    int total = batch_heads * seq * head_dim;
+    if (int(idx) >= total) return;
+
+    int h = int(idx) / (seq * head_dim);
+    int rem = int(idx) % (seq * head_dim);
+    int i = rem / head_dim;
+    int d = rem % head_dim;
+
+    int half_w = window / 2;
+    float sum = 0.0;
+    for (int w = 0; w < window; w++) {
+        int v_pos = i - half_w + w;
+        if (v_pos >= 0 && v_pos < seq) {
+            sum += scores[h * stride_sc + i * window + w]
+                 * V[h * stride_v + v_pos * head_dim + d];
+        }
+    }
+    output[h * stride_out + i * head_dim + d] = sum;
+}
 ";
 
 /// MSL GEMM kernel using `simdgroup_matrix_multiply_accumulate`.

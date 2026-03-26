@@ -135,6 +135,12 @@ struct KernelPipelines {
     split_gate_value: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Two-input `GeGLU`: `output = gelu(value) * gate` with separate buffers.
     geglu: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Banded Q@K^T: sliding-window attention scores `[batch_heads, seq, window]`.
+    banded_qk: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Banded softmax over window dimension.
+    banded_softmax: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Banded scores@V: weighted sum from banded attention.
+    banded_sv: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Residual add without bias: `output = hidden + residual`.
     residual_add: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Fused scale + padding mask + sliding window mask + softmax.
@@ -178,6 +184,9 @@ impl KernelPipelines {
             swiglu_two_input: p("swiglu_two_input_kernel")?,
             split_gate_value: p("split_gate_value_kernel")?,
             geglu: p("geglu_kernel")?,
+            banded_qk: p("banded_qk_kernel")?,
+            banded_softmax: p("banded_softmax_kernel")?,
+            banded_sv: p("banded_sv_kernel")?,
             residual_add: p("residual_add_kernel")?,
             fused_scale_mask_softmax_windowed: p("fused_scale_mask_softmax_windowed_kernel")?,
             rope_cached: p("rope_cached_kernel")?,
@@ -2408,6 +2417,84 @@ impl Driver for MetalDriver {
             set_i32_param(enc, rows as i32, 1);
             set_i32_param(enc, cols as i32, 2);
             dispatch_rows(enc, &self.kernels.l2_normalize, rows, threads);
+            Ok(())
+        })
+    }
+
+    fn banded_qk(
+        &self,
+        q: &MetalTensor,
+        k: &MetalTensor,
+        scores: &mut MetalTensor,
+        batch_heads: usize,
+        seq: usize,
+        head_dim: usize,
+        window: usize,
+        stride_qk: usize,
+        stride_scores: usize,
+    ) -> crate::Result<()> {
+        let total = batch_heads * seq * window;
+        self.run_compute(|enc| {
+            enc.setComputePipelineState(&self.kernels.banded_qk);
+            set_buffer(enc, &scores.buffer, scores.offset, 0);
+            set_buffer(enc, &q.buffer, q.offset, 1);
+            set_buffer(enc, &k.buffer, k.offset, 2);
+            set_i32_param(enc, batch_heads as i32, 3);
+            set_i32_param(enc, seq as i32, 4);
+            set_i32_param(enc, head_dim as i32, 5);
+            set_i32_param(enc, window as i32, 6);
+            set_i32_param(enc, stride_qk as i32, 7);
+            set_i32_param(enc, stride_scores as i32, 8);
+            dispatch_1d(enc, &self.kernels.banded_qk, total);
+            Ok(())
+        })
+    }
+
+    fn banded_sv(
+        &self,
+        scores: &MetalTensor,
+        v: &MetalTensor,
+        output: &mut MetalTensor,
+        batch_heads: usize,
+        seq: usize,
+        head_dim: usize,
+        window: usize,
+        stride_scores: usize,
+        stride_v: usize,
+        stride_out: usize,
+    ) -> crate::Result<()> {
+        let total = batch_heads * seq * head_dim;
+        self.run_compute(|enc| {
+            enc.setComputePipelineState(&self.kernels.banded_sv);
+            set_buffer(enc, &output.buffer, output.offset, 0);
+            set_buffer(enc, &scores.buffer, scores.offset, 1);
+            set_buffer(enc, &v.buffer, v.offset, 2);
+            set_i32_param(enc, batch_heads as i32, 3);
+            set_i32_param(enc, seq as i32, 4);
+            set_i32_param(enc, head_dim as i32, 5);
+            set_i32_param(enc, window as i32, 6);
+            set_i32_param(enc, stride_scores as i32, 7);
+            set_i32_param(enc, stride_v as i32, 8);
+            set_i32_param(enc, stride_out as i32, 9);
+            dispatch_1d(enc, &self.kernels.banded_sv, total);
+            Ok(())
+        })
+    }
+
+    fn banded_softmax(
+        &self,
+        scores: &mut MetalTensor,
+        total_rows: usize,
+        window: usize,
+        scale: f32,
+    ) -> crate::Result<()> {
+        let threads = 256.min(window).max(1);
+        self.run_compute(|enc| {
+            enc.setComputePipelineState(&self.kernels.banded_softmax);
+            set_buffer(enc, &scores.buffer, scores.offset, 0);
+            set_i32_param(enc, window as i32, 1);
+            set_f32_param(enc, scale, 2);
+            dispatch_rows(enc, &self.kernels.banded_softmax, total_rows, threads);
             Ok(())
         })
     }

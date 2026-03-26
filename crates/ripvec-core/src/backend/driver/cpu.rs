@@ -1161,6 +1161,97 @@ impl Driver for CpuDriver {
         Ok(())
     }
 
+    fn banded_qk(
+        &self,
+        q: &Vec<f32>,
+        k: &Vec<f32>,
+        scores: &mut Vec<f32>,
+        batch_heads: usize,
+        seq: usize,
+        head_dim: usize,
+        window: usize,
+        stride_qk: usize,
+        stride_scores: usize,
+    ) -> crate::Result<()> {
+        let half_w = window / 2;
+        for h in 0..batch_heads {
+            for i in 0..seq {
+                for w in 0..window {
+                    let k_pos = i as isize - half_w as isize + w as isize;
+                    if k_pos < 0 || k_pos >= seq as isize {
+                        scores[h * stride_scores + i * window + w] = -1e9;
+                    } else {
+                        let mut dot = 0.0_f32;
+                        for d in 0..head_dim {
+                            dot += q[h * stride_qk + i * head_dim + d]
+                                * k[h * stride_qk + k_pos as usize * head_dim + d];
+                        }
+                        scores[h * stride_scores + i * window + w] = dot;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn banded_sv(
+        &self,
+        scores: &Vec<f32>,
+        v: &Vec<f32>,
+        output: &mut Vec<f32>,
+        batch_heads: usize,
+        seq: usize,
+        head_dim: usize,
+        window: usize,
+        stride_scores: usize,
+        stride_v: usize,
+        stride_out: usize,
+    ) -> crate::Result<()> {
+        let half_w = window / 2;
+        for h in 0..batch_heads {
+            for i in 0..seq {
+                for d in 0..head_dim {
+                    let mut sum = 0.0_f32;
+                    for w in 0..window {
+                        let v_pos = i as isize - half_w as isize + w as isize;
+                        if v_pos >= 0 && v_pos < seq as isize {
+                            sum += scores[h * stride_scores + i * window + w]
+                                * v[h * stride_v + v_pos as usize * head_dim + d];
+                        }
+                    }
+                    output[h * stride_out + i * head_dim + d] = sum;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn banded_softmax(
+        &self,
+        scores: &mut Vec<f32>,
+        total_rows: usize,
+        window: usize,
+        scale: f32,
+    ) -> crate::Result<()> {
+        for r in 0..total_rows {
+            let row = &mut scores[r * window..(r + 1) * window];
+            for v in row.iter_mut() {
+                *v *= scale;
+            }
+            let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0_f32;
+            for v in row.iter_mut() {
+                *v = (*v - max).exp();
+                sum += *v;
+            }
+            let inv = 1.0 / sum.max(1e-12);
+            for v in row.iter_mut() {
+                *v *= inv;
+            }
+        }
+        Ok(())
+    }
+
     fn to_host(&self, tensor: &Vec<f32>, batch: usize, dim: usize) -> crate::Result<Vec<Vec<f32>>> {
         let mut results = Vec::with_capacity(batch);
         for b in 0..batch {

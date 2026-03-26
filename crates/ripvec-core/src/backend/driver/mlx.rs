@@ -703,6 +703,53 @@ impl Driver for MlxDriver {
         Ok(())
     }
 
+    fn banded_qk(
+        &self,
+        _q: &MlxTensor,
+        _k: &MlxTensor,
+        _scores: &mut MlxTensor,
+        _bh: usize,
+        _seq: usize,
+        _hd: usize,
+        _w: usize,
+        _sqk: usize,
+        _ss: usize,
+    ) -> crate::Result<()> {
+        Err(crate::Error::Other(anyhow::anyhow!(
+            "banded_qk not implemented for MLX"
+        )))
+    }
+
+    fn banded_sv(
+        &self,
+        _s: &MlxTensor,
+        _v: &MlxTensor,
+        _o: &mut MlxTensor,
+        _bh: usize,
+        _seq: usize,
+        _hd: usize,
+        _w: usize,
+        _ss: usize,
+        _sv: usize,
+        _so: usize,
+    ) -> crate::Result<()> {
+        Err(crate::Error::Other(anyhow::anyhow!(
+            "banded_sv not implemented for MLX"
+        )))
+    }
+
+    fn banded_softmax(
+        &self,
+        _s: &mut MlxTensor,
+        _rows: usize,
+        _w: usize,
+        _scale: f32,
+    ) -> crate::Result<()> {
+        Err(crate::Error::Other(anyhow::anyhow!(
+            "banded_softmax not implemented for MLX"
+        )))
+    }
+
     fn to_host(
         &self,
         tensor: &MlxTensor,

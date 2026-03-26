@@ -240,8 +240,17 @@ fn attn_scores_residual<D: Driver>(
     inputs: &BatchInputs<D::Tensor>,
     g: &EncoderGeometry,
 ) -> crate::Result<D::Tensor> {
-    // Attention scores: Q @ K^T => [batch * num_heads, seq, seq]
-    let mut scores = driver.alloc_zeros(g.batch * g.num_heads * g.max_seq * g.max_seq)?;
+    let batch_heads = g.batch * g.num_heads;
+    let stride_qk = g.max_seq * g.head_dim;
+
+    // Full Q@K^T for all layers. Local layers mask via windowed softmax.
+    //
+    // Banded attention kernels (banded_qk/sv) compute 4× fewer elements for
+    // local layers but are scalar — 35% slower than hardware simdgroup GEMM.
+    // The GEMM + windowed mask approach wastes compute on masked positions but
+    // Apple's hardware matmul throughput more than compensates at seq≤512.
+    // TODO: banded attention wins at seq>2048 where O(seq²) dominates.
+    let mut scores = driver.alloc_zeros(batch_heads * g.max_seq * g.max_seq)?;
     driver.gemm_batched(
         q,
         k,
@@ -250,13 +259,12 @@ fn attn_scores_residual<D: Driver>(
         g.max_seq,
         g.head_dim,
         true,
-        g.max_seq * g.head_dim,
-        g.max_seq * g.head_dim,
+        stride_qk,
+        stride_qk,
         g.max_seq * g.max_seq,
-        g.batch * g.num_heads,
+        batch_heads,
     )?;
 
-    // Scale + mask + softmax (global or windowed).
     if layer.is_global {
         driver.fused_scale_mask_softmax(
             &mut scores,
@@ -278,8 +286,7 @@ fn attn_scores_residual<D: Driver>(
         )?;
     }
 
-    // Weighted sum: scores @ V => [batch * num_heads, seq, head_dim]
-    let mut attn_out = driver.alloc_zeros(g.total_tokens * g.hidden)?;
+    let mut attn_out = driver.alloc_zeros(g.padded_tokens * g.hidden)?;
     driver.gemm_batched(
         &scores,
         v,
@@ -289,9 +296,9 @@ fn attn_scores_residual<D: Driver>(
         g.max_seq,
         false,
         g.max_seq * g.max_seq,
-        g.max_seq * g.head_dim,
-        g.max_seq * g.head_dim,
-        g.batch * g.num_heads,
+        stride_qk,
+        stride_qk,
+        batch_heads,
     )?;
 
     // Reshape heads back to [padded_tokens, hidden] (still padded).
