@@ -834,13 +834,18 @@ impl MetalDriver {
             return Ok(MetalTensor::new(buffer, 0));
         }
 
-        // Pool exhausted or buffer too small — allocate fresh and add to pool.
-        let buffer = alloc_f32_buffer(&self.device, n)?;
         if cursor < pool.len() {
-            pool[cursor] = buffer.clone();
-        } else {
-            pool.push(buffer.clone());
+            // Buffer too small — skip slot, allocate fresh WITHOUT replacing.
+            // Replacing would destroy a large buffer that a different layer needs
+            // (reset_layer_workspace resets cursor, so layers share pool slots).
+            self.pool_cursor.set(cursor + 1);
+            let buffer = alloc_f32_buffer(&self.device, n)?;
+            return Ok(MetalTensor::new(buffer, 0));
         }
+
+        // Pool exhausted — allocate fresh and extend pool.
+        let buffer = alloc_f32_buffer(&self.device, n)?;
+        pool.push(buffer.clone());
         self.pool_cursor.set(cursor + 1);
         Ok(MetalTensor::new(buffer, 0))
     }
@@ -1820,16 +1825,16 @@ impl Driver for MetalDriver {
     fn reset_layer_workspace(&self) {
         // Reset pool cursor so next layer reuses this layer's buffer slots.
         // Metal guarantees sequential execution within a command buffer:
-        // all dispatches from layer N-1 complete before layer N's start.
-        // Buffer aliasing is safe because the GPU serializes encoders.
+        // DO NOT reset pool cursor within a batch. Multiple tensors within
+        // a single layer coexist (hidden_states + qkv + scores + ...).
+        // Resetting cursor makes alloc_tensor return the SAME buffer for
+        // different live tensors → write conflicts → corrupted embeddings.
         //
-        // Without this, ModernBERT (22 layers) accumulates 22 × ~600MB = 13GB
-        // of workspace buffers → OOM. With this, peak is ~600MB (one layer).
+        // Reuse happens across batches only (begin_batch resets cursor after
+        // waitUntilCompleted ensures all tensors from the previous batch are dead).
         //
-        // NOTE: the previous kernel watchdog crash was likely from computation
-        // time (94s for 22-layer batch=32×seq=512), not buffer aliasing.
-        self.pool_cursor.set(0);
-        self.pool_f16_cursor.set(0);
+        // Trade-off: ModernBERT (22 layers) uses ~22 × per-layer buffers in
+        // memory. Mitigated by MAX_BATCH=32 sub-batching which bounds max_seq.
     }
 
     fn alloc_zeros(&self, n: usize) -> crate::Result<MetalTensor> {
