@@ -45,14 +45,38 @@ impl<D: Driver, A: ModelArch<D>> GenericBackend<D, A> {
     ///
     /// The `mmap` must be the memory-mapped safetensors file whose pages back
     /// the weight tensors stored in `arch`.
+    /// Create a new generic backend.
+    ///
+    /// For GPU backends, runs a warm-up forward pass to prime the buffer pool.
+    /// This is skipped for large models (max_tokens > 1024) where the warm-up
+    /// cost exceeds the benefit.
     pub fn new(driver: D, arch: A, max_tokens: usize, is_gpu: bool, mmap: memmap2::Mmap) -> Self {
-        Self {
+        let backend = Self {
             driver,
             arch,
             max_tokens,
             is_gpu,
             _mmap: mmap,
+        };
+        // Warm up buffer pool for small models (BGE-small: 384-dim, 12 layers).
+        // Cost: ~80ms. Benefit: primes pool for all sub-batches (295/s vs 150/s).
+        //
+        // Skip for large models (ModernBERT: 768-dim, 22 layers, max_tokens=8192).
+        // Cost: 7.5s. Benefit: negative (batch=32 doesn't match real batch=26).
+        if is_gpu && max_tokens <= 1024 {
+            let seq = 512.min(max_tokens);
+            let mut dummy = Vec::with_capacity(32);
+            for _ in 0..32 {
+                let ids: Vec<i64> = (0..seq as i64).collect();
+                dummy.push(Encoding {
+                    input_ids: ids,
+                    attention_mask: vec![1; seq],
+                    token_type_ids: vec![0; seq],
+                });
+            }
+            let _ = backend.arch.forward(&backend.driver, &dummy);
         }
+        backend
     }
 }
 
