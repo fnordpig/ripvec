@@ -1,0 +1,20 @@
+# Customize auto-generated release notes categories.
+# See: https://docs.github.com/en/repositories/releasing-projects-on-github/automatically-generated-release-notes
+changelog:
+  categories:
+    - title: "Performance"
+      labels: [performance]
+    - title: "New Features"
+      labels: [enhancement, feature]
+    - title: "Bug Fixes"
+      labels: [bug, fix]
+    - title: "Backend Changes"
+      labels: [backend, metal, mlx, cuda, cpu]
+    - title: "MCP Server"
+      labels: [mcp]
+    - title: "Dependencies"
+      labels: [dependencies]
+    - title: "CI / Infrastructure"
+      labels: [ci]
+    - title: "Other Changes"
+      labels: ["*"]
