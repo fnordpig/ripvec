@@ -17,9 +17,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
+use objc2::AnyThread;
 use objc2_foundation::{NSString, NSUInteger};
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
@@ -32,7 +32,6 @@ use objc2_metal_performance_shaders::{
 use safetensors::SafeTensors;
 
 use super::{BatchInputs, Driver};
-use crate::backend::Encoding;
 use crate::backend::arch::classic_bert::{
     ClassicBertArch, ClassicBertLayerWeights, ClassicBertWeights,
 };
@@ -40,6 +39,7 @@ use crate::backend::arch::modern_bert::{
     ModernBertArch, ModernBertLayerWeights, ModernBertWeights, RopeCache,
 };
 use crate::backend::arch::nomic_bert::{NomicBertArch, NomicBertLayerWeights, NomicBertWeights};
+use crate::backend::Encoding;
 
 // ---------------------------------------------------------------------------
 // CoreGraphics linkage (required for MTLCreateSystemDefaultDevice)
@@ -514,6 +514,9 @@ fn dispatch_mps_gemm(
     a_data_type: MPSDataType,
     b_data_type: MPSDataType,
 ) {
+    // Output type matches A type (FP16 pipeline stays FP16, FP32 stays FP32).
+    let c_data_type = a_data_type;
+
     let a_elem_size = if a_data_type == MPSDataType::Float16 {
         2
     } else {
@@ -524,9 +527,14 @@ fn dispatch_mps_gemm(
     } else {
         4
     };
+    let c_elem_size = if c_data_type == MPSDataType::Float16 {
+        2
+    } else {
+        4
+    };
 
     let a_row_bytes = k * a_elem_size;
-    let c_row_bytes = n * 4; // output is always FP32
+    let c_row_bytes = n * c_elem_size;
 
     let (b_rows, b_cols, b_row_bytes) = if trans_b {
         (n, k, k * b_elem_size)
@@ -551,7 +559,7 @@ fn dispatch_mps_gemm(
             m as NSUInteger,
             n as NSUInteger,
             c_row_bytes as NSUInteger,
-            MPSDataType::Float32,
+            c_data_type,
         );
 
         let mat_a = MPSMatrix::initWithBuffer_offset_descriptor(
@@ -685,12 +693,12 @@ pub struct MetalDriver {
     /// Whether the persistent encoder has been used since last creation.
     /// Avoids unnecessary flush when consecutive MPS calls have no compute between them.
     enc_dirty: std::cell::Cell<bool>,
-    /// Buffer pool: reuse Metal buffers across forward passes.
-    /// Each entry: (capacity_bytes, buffer). `alloc_zeros` takes from pool
-    /// if a buffer with sufficient capacity exists; otherwise allocates new.
-    /// `begin_batch` resets the cursor so buffers are reused next pass.
+    /// FP32 buffer pool: reuse Metal buffers across forward passes.
     pool: std::cell::RefCell<Vec<Retained<ProtocolObject<dyn MTLBuffer>>>>,
     pool_cursor: std::cell::Cell<usize>,
+    /// FP16 buffer pool: separate from FP32 to prevent mixed-type reuse.
+    pool_f16: std::cell::RefCell<Vec<Retained<ProtocolObject<dyn MTLBuffer>>>>,
+    pool_f16_cursor: std::cell::Cell<usize>,
 }
 
 impl MetalDriver {
@@ -713,6 +721,8 @@ impl MetalDriver {
             enc_dirty: std::cell::Cell::new(false),
             pool: std::cell::RefCell::new(Vec::with_capacity(150)),
             pool_cursor: std::cell::Cell::new(0),
+            pool_f16: std::cell::RefCell::new(Vec::with_capacity(350)),
+            pool_f16_cursor: std::cell::Cell::new(0),
         })
     }
 
@@ -724,7 +734,8 @@ impl MetalDriver {
     pub fn begin_batch(&self) -> crate::Result<()> {
         let cmd = new_command_buffer(&self.queue)?;
         *self.batch_cmd.borrow_mut() = Some(cmd);
-        self.pool_cursor.set(0); // Reset pool — reuse buffers from previous pass
+        self.pool_cursor.set(0);
+        self.pool_f16_cursor.set(0);
         Ok(())
     }
 
@@ -779,31 +790,22 @@ impl MetalDriver {
         let cursor = self.pool_cursor.get();
         let mut pool = self.pool.borrow_mut();
 
-        if cursor < pool.len() {
-            let pool_size = pool[cursor].length() as usize;
-
-            if pool_size >= needed && pool_size <= needed * 8 {
-                // Similar size — reuse. MPS processes at most 8× extra rows
-                // (padding zeros, cheap, doesn't affect valid output).
-                // Covers corpus sub-batches where max_seq varies by <2×.
-                let buffer = pool[cursor].clone();
-                self.pool_cursor.set(cursor + 1);
-                return Ok(MetalTensor::new(buffer, 0));
-            }
-
-            // Way oversized (>4×) or undersized: skip this pool slot.
-            // DON'T truncate — keep corpus buffers alive for the next
-            // corpus batch. Allocate fresh without modifying the pool.
-            // This handles the corpus→query transition: query gets tiny
-            // fresh buffers, corpus buffers survive for reuse.
+        // Reuse any buffer that's large enough. MPS uses descriptor dimensions
+        // (M, N, K) for dispatch — NOT buffer.length/rowBytes. Oversized buffers
+        // are safe per Apple's documented API contract.
+        if cursor < pool.len() && pool[cursor].length() as usize >= needed {
+            let buffer = pool[cursor].clone();
             self.pool_cursor.set(cursor + 1);
-            let buffer = alloc_f32_buffer(&self.device, n)?;
             return Ok(MetalTensor::new(buffer, 0));
         }
 
-        // Pool exhausted — allocate fresh and add to pool.
+        // Pool exhausted or buffer too small — allocate fresh and add to pool.
         let buffer = alloc_f32_buffer(&self.device, n)?;
-        pool.push(buffer.clone());
+        if cursor < pool.len() {
+            pool[cursor] = buffer.clone();
+        } else {
+            pool.push(buffer.clone());
+        }
         self.pool_cursor.set(cursor + 1);
         Ok(MetalTensor::new(buffer, 0))
     }
@@ -817,25 +819,24 @@ impl MetalDriver {
     ///
     /// Returns an error if Metal buffer allocation fails.
     pub fn alloc_f16_tensor(&self, n: usize) -> crate::Result<MetalTensor> {
-        let needed = n * 2; // 2 bytes per f16
-        let cursor = self.pool_cursor.get();
-        let mut pool = self.pool.borrow_mut();
+        // Separate FP16 pool — prevents mixed-type reuse with FP32 buffers.
+        let needed = n * 2; // 2 bytes per half
+        let cursor = self.pool_f16_cursor.get();
+        let mut pool = self.pool_f16.borrow_mut();
 
-        if cursor < pool.len() {
-            let pool_size = pool[cursor].length() as usize;
-            if pool_size >= needed && pool_size <= needed * 8 {
-                let buffer = pool[cursor].clone();
-                self.pool_cursor.set(cursor + 1);
-                return Ok(MetalTensor::new(buffer, 0));
-            }
-            self.pool_cursor.set(cursor + 1);
-            let buffer = alloc_f16_buffer(&self.device, n)?;
+        if cursor < pool.len() && pool[cursor].length() as usize >= needed {
+            let buffer = pool[cursor].clone();
+            self.pool_f16_cursor.set(cursor + 1);
             return Ok(MetalTensor::new(buffer, 0));
         }
 
         let buffer = alloc_f16_buffer(&self.device, n)?;
-        pool.push(buffer.clone());
-        self.pool_cursor.set(cursor + 1);
+        if cursor < pool.len() {
+            pool[cursor] = buffer.clone();
+        } else {
+            pool.push(buffer.clone());
+        }
+        self.pool_f16_cursor.set(cursor + 1);
         Ok(MetalTensor::new(buffer, 0))
     }
 
@@ -1725,6 +1726,7 @@ impl Driver for MetalDriver {
         // NOTE: the previous kernel watchdog crash was likely from computation
         // time (94s for 22-layer batch=32×seq=512), not buffer aliasing.
         self.pool_cursor.set(0);
+        self.pool_f16_cursor.set(0);
     }
 
     fn alloc_zeros(&self, n: usize) -> crate::Result<MetalTensor> {
@@ -2682,32 +2684,34 @@ impl Driver for MetalDriver {
         k: usize,
         transpose_b: bool,
     ) -> crate::Result<()> {
-        // Use custom simdgroup kernel — NOT MPS (buffer-capacity bug).
-        // B may be a weight tensor (FP32 main buffer + FP16 in .fp16 field)
-        // or an FP16 activation (already half in main buffer, no .fp16 field).
+        // MPS with Float16 descriptors — 2× faster than custom simdgroup.
+        // MPS uses descriptor dimensions for dispatch, NOT buffer.length.
+        // Oversized buffers are safe per Apple's documented API contract.
+        //
+        // B may be a weight tensor (FP32 main + FP16 in .fp16 field)
+        // or an FP16 activation (half in main buffer, no .fp16 field).
         let b_fp16 = b.fp16.borrow();
         let (b_buf, b_off) = if let Some(ref fp16_buf) = *b_fp16 {
-            // Weight tensor: use pre-converted FP16 buffer.
-            // ensure_fp16 writes to offset 0 of the fp16 buffer.
-            (fp16_buf.as_ref(), 0)
+            (fp16_buf as &ProtocolObject<dyn MTLBuffer>, 0)
         } else {
-            // Activation: already FP16 in main buffer.
-            (&*b.buffer, b.offset)
+            (&*b.buffer as &ProtocolObject<dyn MTLBuffer>, b.offset)
         };
-        self.run_compute(|enc| {
-            dispatch_gemm(
-                enc,
-                &self.kernels.gemm_f16,
+        self.run_mps(|cmd_buf| {
+            dispatch_mps_gemm(
+                cmd_buf,
+                &self.device,
                 &a.buffer,
                 a.offset,
                 b_buf,
                 b_off,
                 &output.buffer,
                 output.offset,
-                m as u32,
-                n as u32,
-                k as u32,
+                m,
+                n,
+                k,
                 transpose_b,
+                MPSDataType::Float16,
+                MPSDataType::Float16,
             );
             Ok(())
         })
