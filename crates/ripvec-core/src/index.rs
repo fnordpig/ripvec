@@ -11,7 +11,7 @@
 use ndarray::{Array1, Array2};
 
 use crate::chunk::CodeChunk;
-use crate::turbo_quant::{CompressedCode, PolarCodec};
+use crate::turbo_quant::{CompressedCorpus, PolarCodec};
 
 /// Pre-computed embedding matrix for fast re-ranking.
 ///
@@ -41,11 +41,13 @@ pub struct SearchIndex {
 }
 
 /// `PolarQuant`-compressed embedding index for fast approximate scanning.
+///
+/// Uses SoA flat layout ([`CompressedCorpus`]) for cache-friendly streaming scans.
 struct CompressedIndex {
     /// The codec (holds rotation matrix + centroid tables).
     codec: PolarCodec,
-    /// Compressed codes for all vectors.
-    codes: Vec<CompressedCode>,
+    /// Flat SoA corpus: radii + indices packed contiguously.
+    corpus: CompressedCorpus,
 }
 
 impl SearchIndex {
@@ -125,8 +127,8 @@ impl SearchIndex {
         // At 768-dim: ~1920 bytes/vector vs 3072 FP32. 8× compression with bit-packing.
         let compressed = if hidden_dim >= 64 && hidden_dim % 2 == 0 {
             let codec = PolarCodec::new(hidden_dim, 4, 42);
-            let codes = codec.encode_batch(&embeddings);
-            Some(CompressedIndex { codec, codes })
+            let corpus = codec.encode_batch(&embeddings);
+            Some(CompressedIndex { codec, corpus })
         } else {
             None
         };
@@ -180,15 +182,14 @@ impl SearchIndex {
             return self.rank(query_embedding, threshold);
         };
 
-        if comp.codes.len() != self.chunks.len() {
+        if comp.corpus.n != self.chunks.len() {
             return self.rank(query_embedding, threshold);
         }
 
-        // Phase 1: approximate scan via PolarQuant batch scan.
-        // Pre-compute query centroid table ONCE, then scan all codes.
-        let pre_filter_k = (top_k * 10).min(comp.codes.len());
+        // Phase 1: SoA corpus scan — sequential streaming, centroid table in L1.
+        let pre_filter_k = (top_k * 10).min(comp.corpus.n);
         let query_state = comp.codec.prepare_query(query_embedding);
-        let scores = comp.codec.batch_scan(&comp.codes, &query_state);
+        let scores = comp.codec.scan_corpus(&comp.corpus, &query_state);
         let mut approx_scores: Vec<(usize, f32)> = scores.into_iter().enumerate().collect();
         approx_scores.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
         approx_scores.truncate(pre_filter_k);
