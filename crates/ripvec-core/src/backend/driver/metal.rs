@@ -711,32 +711,30 @@ impl MetalDriver {
 
         if cursor < pool.len() {
             let pool_size = pool[cursor].length() as usize;
-            if pool_size == needed {
-                // Exact match — safe for MPS (which dispatches based on
-                // buffer.length()/rowBytes, not the descriptor's row count).
+
+            if pool_size >= needed && pool_size <= needed * 8 {
+                // Similar size — reuse. MPS processes at most 8× extra rows
+                // (padding zeros, cheap, doesn't affect valid output).
+                // Covers corpus sub-batches where max_seq varies by <2×.
                 let buffer = pool[cursor].clone();
                 self.pool_cursor.set(cursor + 1);
                 return Ok(MetalTensor::new(buffer, 0));
             }
-            // Size changed (e.g., corpus→query transition).
-            // Truncate stale entries — they'd cause MPS ghost-row hangs.
-            pool.truncate(cursor);
+
+            // Way oversized (>4×) or undersized: skip this pool slot.
+            // DON'T truncate — keep corpus buffers alive for the next
+            // corpus batch. Allocate fresh without modifying the pool.
+            // This handles the corpus→query transition: query gets tiny
+            // fresh buffers, corpus buffers survive for reuse.
+            self.pool_cursor.set(cursor + 1);
+            let buffer = alloc_f32_buffer(&self.device, n)?;
+            return Ok(MetalTensor::new(buffer, 0));
         }
 
-        // Allocate exact-sized buffer.
+        // Pool exhausted — allocate fresh and add to pool.
         let buffer = alloc_f32_buffer(&self.device, n)?;
-
-        // Add to pool for future reuse across batches.
-        // The pool grows to hold one full forward pass worth of buffers
-        // (~330 for ModernBERT, ~2-3GB peak). On subsequent batches
-        // (after begin_batch resets cursor), ALL are reused — zero allocation.
-        if cursor < pool.len() {
-            pool[cursor] = buffer.clone();
-        } else {
-            pool.push(buffer.clone());
-        }
+        pool.push(buffer.clone());
         self.pool_cursor.set(cursor + 1);
-
         Ok(MetalTensor::new(buffer, 0))
     }
 
