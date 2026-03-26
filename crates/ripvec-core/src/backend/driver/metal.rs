@@ -1822,19 +1822,21 @@ impl Driver for MetalDriver {
         self.end_batch()
     }
 
-    fn reset_layer_workspace(&self) {
-        // Reset pool cursor so next layer reuses this layer's buffer slots.
-        // Metal guarantees sequential execution within a command buffer:
-        // DO NOT reset pool cursor within a batch. Multiple tensors within
-        // a single layer coexist (hidden_states + qkv + scores + ...).
-        // Resetting cursor makes alloc_tensor return the SAME buffer for
-        // different live tensors → write conflicts → corrupted embeddings.
+    fn save_pool_cursor(&self) -> usize {
+        self.pool_cursor.get()
+    }
+
+    fn restore_pool_cursor(&self, saved: usize) {
+        // Restore cursor to a saved position so the NEXT layer reuses the
+        // pool slots that the CURRENT layer's dropped tensors occupied.
         //
-        // Reuse happens across batches only (begin_batch resets cursor after
-        // waitUntilCompleted ensures all tensors from the previous batch are dead).
-        //
-        // Trade-off: ModernBERT (22 layers) uses ~22 × per-layer buffers in
-        // memory. Mitigated by MAX_BATCH=32 sub-batching which bounds max_seq.
+        // Safe because the architecture drops all transient tensors (qkv,
+        // scores, context, etc.) before calling this. Only hidden_states
+        // survives — and it was allocated BEFORE the saved position (at the
+        // embedding phase or previous layer's output slot).
+        self.pool_cursor.set(saved);
+        self.pool_f16_cursor
+            .set(saved.min(self.pool_f16_cursor.get()));
     }
 
     fn alloc_zeros(&self, n: usize) -> crate::Result<MetalTensor> {

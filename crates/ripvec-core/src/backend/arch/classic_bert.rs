@@ -377,11 +377,14 @@ impl<D: Driver> ModelArch<D> for ClassicBertArch<D::Tensor> {
 
         // Encoder layers.
         for layer in &w.layers {
-            driver.reset_layer_workspace();
+            let saved = driver.save_pool_cursor();
             let (q, k, v) = attn_qkv(driver, &hidden_states, layer, &g)?;
             let attn_output =
                 attn_scores_residual(driver, &q, &k, &v, &hidden_states, layer, &inputs, &g)?;
             hidden_states = ffn_sublayer(driver, &attn_output, layer, &g)?;
+            // All transient tensors (q, k, v, attn_output) dropped here.
+            // Only hidden_states survives. Restore cursor so next layer reuses slots.
+            driver.restore_pool_cursor(saved);
         }
 
         // Pad back to [batch, max_seq, hidden] for cls_pool kernel.

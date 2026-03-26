@@ -47,11 +47,18 @@ pub trait Driver: Send + Sync {
         Ok(())
     }
 
-    /// Reset workspace allocation cursor so the next layer reuses buffers
-    /// from the previous layer. Without this, each of N layers allocates
-    /// fresh buffers, accumulating N × (buffers-per-layer) in memory.
-    /// With this, peak memory is 1 × (buffers-per-layer).
-    fn reset_layer_workspace(&self) {}
+    /// Save the current pool cursor position. Call BEFORE a layer's work.
+    fn save_pool_cursor(&self) -> usize {
+        0
+    }
+
+    /// Restore the pool cursor to a previously saved position. Call AFTER
+    /// a layer's transient tensors have been dropped (out of scope).
+    ///
+    /// The architecture must ensure only the output tensor (`hidden_states`)
+    /// survives — all layer-internal tensors (qkv, scores, context, etc.)
+    /// must be dropped before this call so their pool slots can be recycled.
+    fn restore_pool_cursor(&self, _saved: usize) {}
 
     // --- Allocation ---
 

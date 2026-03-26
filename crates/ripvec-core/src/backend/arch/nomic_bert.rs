@@ -439,11 +439,12 @@ impl<D: Driver> ModelArch<D> for NomicBertArch<D::Tensor> {
 
         // Encoder layers (all 12, post-norm architecture).
         for layer in &w.layers {
-            driver.reset_layer_workspace();
+            let saved = driver.save_pool_cursor();
             let (q, k, v) = attn_qkv_rope(driver, &hidden_states, layer, &g, w)?;
             let attn_output =
                 attn_scores_residual(driver, &q, &k, &v, &hidden_states, layer, &inputs, &g)?;
             hidden_states = ffn_sublayer(driver, &attn_output, layer, &g)?;
+            driver.restore_pool_cursor(saved);
         }
 
         // No final norm before pooling (unlike ModernBERT).

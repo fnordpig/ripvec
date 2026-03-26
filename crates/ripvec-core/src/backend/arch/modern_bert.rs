@@ -798,7 +798,7 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
 
             // 22 layers — ALL in FP16. Zero conversions.
             for layer in &w.layers[..num_layers] {
-                driver.reset_layer_workspace();
+                let saved = driver.save_pool_cursor();
 
                 let rope = if layer.is_global {
                     &self.global_rope
@@ -811,6 +811,7 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
                 let attn_output =
                     attn_scores_residual_f16(driver, &q, &k, &v, &hidden_f16, layer, &inputs, &g)?;
                 hidden_f16 = ffn_sublayer_f16(driver, &attn_output, layer, &g, &w.zero_bias)?;
+                driver.restore_pool_cursor(saved);
             }
 
             // ONLY conversion #2: F16 → F32 before final LN + pooling.
@@ -820,7 +821,7 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
         } else {
             // === FP32 PATH (fallback) ===
             for layer in &w.layers[..num_layers] {
-                driver.reset_layer_workspace();
+                let saved = driver.save_pool_cursor();
 
                 let rope = if layer.is_global {
                     &self.global_rope
@@ -833,6 +834,7 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
                 let attn_output =
                     attn_scores_residual(driver, &q, &k, &v, &hidden_states, layer, &inputs, &g)?;
                 hidden_states = ffn_sublayer(driver, &attn_output, layer, &g, &w.zero_bias)?;
+                driver.restore_pool_cursor(saved);
             }
         }
 
