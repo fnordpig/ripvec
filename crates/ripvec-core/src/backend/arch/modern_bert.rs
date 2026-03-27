@@ -795,7 +795,7 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
             driver.f32_to_f16(&mut hidden_f16, &hidden_states, total_tokens * hidden)?;
 
             // 22 layers — ALL in FP16. Zero conversions.
-            for layer in &w.layers[..num_layers] {
+            for (li, layer) in w.layers[..num_layers].iter().enumerate() {
                 let saved = driver.save_pool_cursor();
 
                 let rope = if layer.is_global {
@@ -810,6 +810,11 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
                     attn_scores_residual_f16(driver, &q, &k, &v, &hidden_f16, layer, &inputs, &g)?;
                 hidden_f16 = ffn_sublayer_f16(driver, &attn_output, layer, &g, &w.zero_bias)?;
                 driver.restore_pool_cursor(saved);
+
+                // Flush command buffer every 10 layers to prevent GPU timeout.
+                if (li + 1) % 8 == 0 {
+                    driver.flush_batch()?;
+                }
             }
 
             // ONLY conversion #2: F16 → F32 before final LN + pooling.
@@ -818,7 +823,7 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
             hidden_states = hidden_f32;
         } else {
             // === FP32 PATH (fallback) ===
-            for layer in &w.layers[..num_layers] {
+            for (li, layer) in w.layers[..num_layers].iter().enumerate() {
                 let saved = driver.save_pool_cursor();
 
                 let rope = if layer.is_global {
@@ -832,7 +837,13 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
                 let attn_output =
                     attn_scores_residual(driver, &q, &k, &v, &hidden_states, layer, &inputs, &g)?;
                 hidden_states = ffn_sublayer(driver, &attn_output, layer, &g, &w.zero_bias)?;
+
                 driver.restore_pool_cursor(saved);
+
+                // Flush command buffer every 10 layers to prevent GPU timeout.
+                if (li + 1) % 8 == 0 {
+                    driver.flush_batch()?;
+                }
             }
         }
 

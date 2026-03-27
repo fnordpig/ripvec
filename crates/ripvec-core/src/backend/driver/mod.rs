@@ -47,6 +47,12 @@ pub trait Driver: Send + Sync {
         Ok(())
     }
 
+    /// Flush the current command buffer and start a new one, preserving pool
+    /// state. Use mid-forward-pass to prevent GPU timeouts on deep models.
+    fn flush_batch(&self) -> crate::Result<()> {
+        Ok(())
+    }
+
     /// Save the current pool cursor position. Call BEFORE a layer's work.
     fn save_pool_cursor(&self) -> usize {
         0

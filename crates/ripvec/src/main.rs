@@ -151,10 +151,8 @@ fn load_pipeline(
             None
         };
         let result = match args.backend {
-            cli::BackendArg::Auto => {
-                ripvec_core::backend::detect_backends(model_repo, max_layers)
-                    .context("failed to detect available backends")?
-            }
+            cli::BackendArg::Auto => ripvec_core::backend::detect_backends(model_repo, max_layers)
+                .context("failed to detect available backends")?,
             ref specific => {
                 let kind = match specific {
                     cli::BackendArg::Cpu => ripvec_core::backend::BackendKind::Cpu,

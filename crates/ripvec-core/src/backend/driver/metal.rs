@@ -17,10 +17,10 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::AnyThread;
-use objc2_foundation::{ns_string, NSString, NSUInteger};
+use objc2_foundation::{NSString, NSUInteger, ns_string};
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
     MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
@@ -32,6 +32,7 @@ use objc2_metal_performance_shaders::{
 use safetensors::SafeTensors;
 
 use super::{BatchInputs, Driver};
+use crate::backend::Encoding;
 use crate::backend::arch::classic_bert::{
     ClassicBertArch, ClassicBertLayerWeights, ClassicBertWeights,
 };
@@ -39,7 +40,6 @@ use crate::backend::arch::modern_bert::{
     ModernBertArch, ModernBertLayerWeights, ModernBertWeights, RopeCache,
 };
 use crate::backend::arch::nomic_bert::{NomicBertArch, NomicBertLayerWeights, NomicBertWeights};
-use crate::backend::Encoding;
 
 // ---------------------------------------------------------------------------
 // CoreGraphics linkage (required for MTLCreateSystemDefaultDevice)
@@ -774,6 +774,34 @@ impl MetalDriver {
         *self.batch_cmd.borrow_mut() = Some(cmd);
         self.pool_cursor.set(0);
         self.pool_f16_cursor.set(0);
+        Ok(())
+    }
+
+    /// Flush the current command buffer and start a new one WITHOUT
+    /// resetting pool cursors. Use mid-forward-pass to prevent GPU timeouts
+    /// on models with many layers (e.g., ModernBERT 22 layers).
+    ///
+    /// All pool tensors remain valid — only the command buffer is replaced.
+    pub fn flush_batch(&self) -> crate::Result<()> {
+        if let Some(enc) = self.batch_enc.borrow_mut().take() {
+            enc.endEncoding();
+        }
+        self.enc_dirty.set(false);
+        if let Some(cmd) = self.batch_cmd.borrow_mut().take() {
+            cmd.commit();
+            cmd.waitUntilCompleted();
+            let status = cmd.status();
+            if status == objc2_metal::MTLCommandBufferStatus::Error {
+                if let Some(err) = cmd.error() {
+                    return Err(crate::Error::Metal(format!("GPU flush error: {err}")));
+                }
+                return Err(crate::Error::Metal("GPU flush error (unknown)".into()));
+            }
+        }
+        // Start a new command buffer — pool cursors NOT reset
+        let cmd = new_command_buffer(&self.queue)?;
+        cmd.setLabel(Some(ns_string!("forward-pass")));
+        *self.batch_cmd.borrow_mut() = Some(cmd);
         Ok(())
     }
 
@@ -1839,6 +1867,10 @@ impl Driver for MetalDriver {
         self.end_batch()
     }
 
+    fn flush_batch(&self) -> crate::Result<()> {
+        self.flush_batch()
+    }
+
     fn save_pool_cursor(&self) -> usize {
         self.pool_cursor.get()
     }
@@ -2086,7 +2118,7 @@ impl Driver for MetalDriver {
         }
         let cu_buf = make_i32_buffer(&self.device, &cu)?;
 
-        *padded = self.alloc_tensor(total_out)?;
+        // Use caller's pre-allocated buffer — do NOT re-allocate.
         let padded_buf = padded.buffer.clone();
         let padded_offset = padded.offset;
         let flat_buf = flat.buffer.clone();
@@ -2126,7 +2158,10 @@ impl Driver for MetalDriver {
         }
         let cu_buf = make_i32_buffer(&self.device, &cu)?;
 
-        *flat = self.alloc_tensor(total_tokens * dim)?;
+        // Use caller's pre-allocated buffer — do NOT re-allocate.
+        // The caller sizes flat to g.total_tokens * dim which may differ from
+        // sum(seq_lengths) in the padded path. Re-allocating would cause a
+        // buffer overflow in residual_add.
         let flat_buf = flat.buffer.clone();
         let flat_offset = flat.offset;
         let padded_buf = padded.buffer.clone();
@@ -3065,7 +3100,7 @@ impl Driver for MetalDriver {
         }
         let cu_buf = make_i32_buffer(&self.device, &cu)?;
 
-        *padded = self.alloc_f16_tensor(total_out)?;
+        // Use caller's pre-allocated buffer — do NOT re-allocate.
         let padded_buf = padded.buffer.clone();
         let padded_offset = padded.offset;
         let flat_buf = flat.buffer.clone();
@@ -3104,7 +3139,7 @@ impl Driver for MetalDriver {
         }
         let cu_buf = make_i32_buffer(&self.device, &cu)?;
 
-        *flat = self.alloc_f16_tensor(total_tokens * dim)?;
+        // Use caller's pre-allocated buffer — do NOT re-allocate (see unpad_from_batch).
         let flat_buf = flat.buffer.clone();
         let flat_offset = flat.offset;
         let padded_buf = padded.buffer.clone();
