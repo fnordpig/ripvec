@@ -81,6 +81,14 @@ pub struct Args {
     #[arg(long, default_value_t = 0)]
     pub max_tokens: usize,
 
+    /// Number of encoder layers to run (ModernBERT only, 1-22).
+    ///
+    /// Fewer layers = faster inference at the cost of embedding quality.
+    /// ModernBERT has 22 layers; values 14-18 offer good quality/speed tradeoffs.
+    /// 0 means all layers (default).
+    #[arg(long, default_value_t = 0)]
+    pub layers: usize,
+
     /// Maximum chunk size in bytes before splitting into windows.
     #[arg(long, default_value_t = 4096)]
     pub max_chunk_bytes: usize,

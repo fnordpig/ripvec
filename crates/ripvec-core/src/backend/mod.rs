@@ -145,6 +145,11 @@ pub fn load_backend(
         expect(unused_variables, reason = "used when backend features are enabled")
     )]
     device_hint: DeviceHint,
+    #[cfg_attr(
+        not(any(feature = "cuda", feature = "mlx", feature = "cpu", feature = "metal")),
+        expect(unused_variables, reason = "used when backend features are enabled")
+    )]
+    max_layers: Option<usize>,
 ) -> crate::Result<Box<dyn EmbedBackend>> {
     match kind {
         #[cfg(feature = "cuda")]
@@ -178,7 +183,7 @@ pub fn load_backend(
         BackendKind::Metal => {
             // All models route through the driver/arch system.
             if is_modernbert_model(model_repo) {
-                return load_modernbert_metal(model_repo);
+                return load_modernbert_metal(model_repo, max_layers);
             }
             if is_classic_bert_model(model_repo) {
                 return load_classic_metal(model_repo);
@@ -208,6 +213,11 @@ pub fn detect_backends(
         expect(unused_variables, reason = "used when backend features are enabled")
     )]
     model_repo: &str,
+    #[cfg_attr(
+        not(any(feature = "cuda", feature = "mlx", feature = "cpu", feature = "metal")),
+        expect(unused_variables, reason = "used when backend features are enabled")
+    )]
+    max_layers: Option<usize>,
 ) -> crate::Result<Vec<Box<dyn EmbedBackend>>> {
     #[cfg_attr(
         not(any(feature = "cuda", feature = "mlx", feature = "cpu", feature = "metal")),
@@ -226,7 +236,7 @@ pub fn detect_backends(
     {
         // Route models through the driver/arch system by architecture.
         if is_modernbert_model(model_repo) {
-            if let Ok(b) = load_modernbert_metal(model_repo) {
+            if let Ok(b) = load_modernbert_metal(model_repo, max_layers) {
                 backends.push(b);
             }
         } else if is_classic_bert_model(model_repo) {
@@ -285,7 +295,10 @@ pub fn detect_backends(
 /// Returns an error if no Metal device is available, the model cannot be
 /// downloaded, or weight loading fails.
 #[cfg(feature = "metal")]
-pub fn load_modernbert_metal(model_repo: &str) -> crate::Result<Box<dyn EmbedBackend>> {
+pub fn load_modernbert_metal(
+    model_repo: &str,
+    max_layers: Option<usize>,
+) -> crate::Result<Box<dyn EmbedBackend>> {
     use driver::metal::{MetalDriver, ModernBertConfig};
     use generic::GenericBackend;
     use hf_hub::api::sync::Api;
@@ -311,7 +324,8 @@ pub fn load_modernbert_metal(model_repo: &str) -> crate::Result<Box<dyn EmbedBac
     let max_tokens = config.max_position_embeddings;
 
     let driver = MetalDriver::new()?;
-    let (arch, mmap) = driver.load_modern_bert_weights(&weights_path, &config)?;
+    let (mut arch, mmap) = driver.load_modern_bert_weights(&weights_path, &config)?;
+    arch.max_layers = max_layers;
 
     tracing::info!(
         model_repo,

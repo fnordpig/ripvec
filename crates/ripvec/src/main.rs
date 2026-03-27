@@ -145,9 +145,16 @@ fn load_pipeline(
     let backends = {
         let _guard = profiler.phase("model_load");
         let pb = use_progress.then(|| progress::spinner("Loading model\u{2026}"));
+        let max_layers = if args.layers > 0 {
+            Some(args.layers)
+        } else {
+            None
+        };
         let result = match args.backend {
-            cli::BackendArg::Auto => ripvec_core::backend::detect_backends(model_repo)
-                .context("failed to detect available backends")?,
+            cli::BackendArg::Auto => {
+                ripvec_core::backend::detect_backends(model_repo, max_layers)
+                    .context("failed to detect available backends")?
+            }
             ref specific => {
                 let kind = match specific {
                     cli::BackendArg::Cpu => ripvec_core::backend::BackendKind::Cpu,
@@ -163,7 +170,7 @@ fn load_pipeline(
                     }
                 };
                 vec![
-                    ripvec_core::backend::load_backend(kind, model_repo, device_hint)
+                    ripvec_core::backend::load_backend(kind, model_repo, device_hint, max_layers)
                         .context("failed to load embedding backend")?,
                 ]
             }
