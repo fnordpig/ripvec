@@ -10,8 +10,8 @@
 //! [`Driver`](super::super::driver::Driver) primitives into the full forward
 //! pass.
 
-use super::super::Encoding;
 use super::super::driver::{BatchInputs, Driver};
+use super::super::Encoding;
 use super::ModelArch;
 
 // ---------------------------------------------------------------------------
@@ -312,26 +312,28 @@ fn attn_scores_residual<D: Driver>(
         g.head_dim,
     )?;
 
-    // Output projection on padded layout, then unpad.
-    let mut projected_padded = driver.alloc_zeros(g.padded_tokens * g.hidden)?;
-    driver.gemm(
-        &context,
-        &layer.output_weight,
-        &mut projected_padded,
-        g.padded_tokens,
-        g.hidden,
-        g.hidden,
-        true,
-    )?;
-
-    // Unpad: [padded_tokens, H] → [total_tokens, H]
-    let mut projected = driver.alloc_zeros(g.total_tokens * g.hidden)?;
+    // Unpad FIRST: [padded_tokens, H] → [total_tokens, H].
+    // Output projection is per-token — unpadding before GEMM is valid and
+    // avoids processing batch*max_seq rows when only total_tokens are real.
+    let mut context_unpacked = driver.alloc_zeros(g.total_tokens * g.hidden)?;
     driver.unpad_from_batch(
-        &projected_padded,
-        &mut projected,
+        &context,
+        &mut context_unpacked,
         &g.seq_lengths,
         g.max_seq,
         g.hidden,
+    )?;
+
+    // Output projection on unpadded layout: [total_tokens, H] × [H, H].
+    let mut projected = driver.alloc_zeros(g.total_tokens * g.hidden)?;
+    driver.gemm(
+        &context_unpacked,
+        &layer.output_weight,
+        &mut projected,
+        g.total_tokens,
+        g.hidden,
+        g.hidden,
+        true,
     )?;
 
     // Residual add (no bias in ModernBERT). Both are [total_tokens, H].
@@ -612,25 +614,26 @@ fn attn_scores_residual_f16<D: Driver>(
         g.head_dim,
     )?;
 
-    // Output projection — FP16 GEMM on padded, then unpad.
-    let mut projected_padded = driver.alloc_zeros_f16(g.padded_tokens * g.hidden)?;
-    driver.gemm_f16(
-        &context,
-        &layer.output_weight,
-        &mut projected_padded,
-        g.padded_tokens,
-        g.hidden,
-        g.hidden,
-        true,
-    )?;
-
-    let mut projected = driver.alloc_zeros_f16(g.total_tokens * g.hidden)?;
+    // Unpad FIRST — FP16: [padded_tokens, H] → [total_tokens, H].
+    let mut context_unpacked = driver.alloc_zeros_f16(g.total_tokens * g.hidden)?;
     driver.unpad_from_batch_f16(
-        &projected_padded,
-        &mut projected,
+        &context,
+        &mut context_unpacked,
         &g.seq_lengths,
         g.max_seq,
         g.hidden,
+    )?;
+
+    // Output projection on unpadded — FP16: [total_tokens, H] × [H, H].
+    let mut projected = driver.alloc_zeros_f16(g.total_tokens * g.hidden)?;
+    driver.gemm_f16(
+        &context_unpacked,
+        &layer.output_weight,
+        &mut projected,
+        g.total_tokens,
+        g.hidden,
+        g.hidden,
+        true,
     )?;
 
     // Residual add — FP16.
