@@ -17,10 +17,10 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::{NSString, NSUInteger};
+use objc2::AnyThread;
+use objc2_foundation::{ns_string, NSString, NSUInteger};
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
     MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
@@ -32,7 +32,6 @@ use objc2_metal_performance_shaders::{
 use safetensors::SafeTensors;
 
 use super::{BatchInputs, Driver};
-use crate::backend::Encoding;
 use crate::backend::arch::classic_bert::{
     ClassicBertArch, ClassicBertLayerWeights, ClassicBertWeights,
 };
@@ -40,6 +39,7 @@ use crate::backend::arch::modern_bert::{
     ModernBertArch, ModernBertLayerWeights, ModernBertWeights, RopeCache,
 };
 use crate::backend::arch::nomic_bert::{NomicBertArch, NomicBertLayerWeights, NomicBertWeights};
+use crate::backend::Encoding;
 
 // ---------------------------------------------------------------------------
 // CoreGraphics linkage (required for MTLCreateSystemDefaultDevice)
@@ -277,9 +277,11 @@ fn create_device() -> crate::Result<Retained<ProtocolObject<dyn MTLDevice>>> {
 fn create_queue(
     device: &ProtocolObject<dyn MTLDevice>,
 ) -> crate::Result<Retained<ProtocolObject<dyn MTLCommandQueue>>> {
-    device
+    let queue = device
         .newCommandQueue()
-        .ok_or_else(|| crate::Error::Metal("failed to create command queue".into()))
+        .ok_or_else(|| crate::Error::Metal("failed to create command queue".into()))?;
+    queue.setLabel(Some(ns_string!("ripvec-compute")));
+    Ok(queue)
 }
 
 /// Compile MSL source code into a Metal library.
@@ -768,6 +770,7 @@ impl MetalDriver {
     /// commits per forward pass → 1 commit.
     pub fn begin_batch(&self) -> crate::Result<()> {
         let cmd = new_command_buffer(&self.queue)?;
+        cmd.setLabel(Some(ns_string!("forward-pass")));
         *self.batch_cmd.borrow_mut() = Some(cmd);
         self.pool_cursor.set(0);
         self.pool_f16_cursor.set(0);
@@ -913,7 +916,7 @@ impl MetalDriver {
         let centroid_buf = make_f32_buffer(&self.device, centroid_q)?;
         let scores_buf = alloc_f32_buffer(&self.device, n_vectors)?;
 
-        self.run_compute(|enc| {
+        self.run_compute("turboquant-scan", |enc| {
             enc.setComputePipelineState(&self.kernels.turboquant_scan);
             set_buffer(enc, &gpu_corpus.radii, 0, 0);
             set_buffer(enc, &gpu_corpus.indices, 0, 1);
@@ -964,7 +967,7 @@ impl MetalDriver {
             .ok_or_else(|| crate::Error::Metal("fp16 buffer alloc failed".into()))?;
 
         // Convert on GPU using f32_to_f16 kernel
-        self.run_compute(|enc| {
+        self.run_compute("ensure-fp16", |enc| {
             enc.setComputePipelineState(&self.kernels.f32_to_f16);
             set_buffer(enc, &fp16_buf, 0, 0);
             set_buffer(enc, &tensor.buffer, tensor.offset, 1);
@@ -977,16 +980,20 @@ impl MetalDriver {
         Ok(())
     }
 
-    /// Execute a compute operation.
+    /// Execute a compute operation with a debug label for Metal System Trace.
     ///
     /// In batched mode: reuses a persistent encoder (created on first call,
     /// closed before MPS). This eliminates per-operation encoder overhead
     /// (~221 encoders → ~12 per forward pass, one per MPS boundary).
     /// In per-call mode: creates a new command buffer, commits, and waits.
-    fn run_compute<F>(&self, f: F) -> crate::Result<()>
+    ///
+    /// The `label` appears as a debug group in Metal System Trace / Instruments,
+    /// replacing generic "Compute Command N" with meaningful operation names.
+    fn run_compute<F>(&self, label: &str, f: F) -> crate::Result<()>
     where
         F: FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>) -> crate::Result<()>,
     {
+        let ns_label = NSString::from_str(label);
         if self.batch_cmd.borrow().is_some() {
             // Ensure persistent encoder exists
             if self.batch_enc.borrow().is_none() {
@@ -997,13 +1004,20 @@ impl MetalDriver {
                 *self.batch_enc.borrow_mut() = Some(enc);
             }
             let enc_ref = self.batch_enc.borrow();
-            f(enc_ref.as_ref().unwrap())?;
+            let enc = enc_ref.as_ref().unwrap();
+            enc.pushDebugGroup(&ns_label);
+            let result = f(enc);
+            enc.popDebugGroup();
+            result?;
             self.enc_dirty.set(true);
             Ok(())
         } else {
             let cmd_buf = new_command_buffer(&self.queue)?;
+            cmd_buf.setLabel(Some(&ns_label));
             let enc = new_encoder(&cmd_buf)?;
+            enc.pushDebugGroup(&ns_label);
             f(&enc)?;
+            enc.popDebugGroup();
             enc.endEncoding();
             cmd_buf.commit();
             cmd_buf.waitUntilCompleted();
@@ -1028,7 +1042,9 @@ impl MetalDriver {
     /// In batched mode: closes any open compute encoder first, then encodes
     /// MPS directly to the shared command buffer. A new compute encoder
     /// will be created on the next `run_compute` call.
-    fn run_mps<F>(&self, f: F) -> crate::Result<()>
+    ///
+    /// The `label` is used for the command buffer label in non-batch mode.
+    fn run_mps<F>(&self, label: &str, f: F) -> crate::Result<()>
     where
         F: FnOnce(&ProtocolObject<dyn MTLCommandBuffer>) -> crate::Result<()>,
     {
@@ -1040,6 +1056,7 @@ impl MetalDriver {
             Ok(())
         } else {
             let cmd_buf = new_command_buffer(&self.queue)?;
+            cmd_buf.setLabel(Some(&NSString::from_str(label)));
             f(&cmd_buf)?;
             cmd_buf.commit();
             cmd_buf.waitUntilCompleted();
@@ -1927,7 +1944,7 @@ impl Driver for MetalDriver {
 
         // Build float attention bias mask (0.0 for real, -1e9 for pad)
         let float_mask_buf = alloc_f32_buffer(&self.device, total)?;
-        self.run_compute(|enc| {
+        self.run_compute("build-attn-mask", |enc| {
             enc.setComputePipelineState(&self.kernels.build_attn_mask);
             set_buffer(enc, &float_mask_buf, 0, 0);
             set_buffer(enc, &attn_mask_int_buf, 0, 1);
@@ -1989,14 +2006,12 @@ impl Driver for MetalDriver {
         let mut input_ids = Vec::with_capacity(total_tokens);
         let mut token_type_ids = Vec::with_capacity(total_tokens);
         let mut position_ids = Vec::with_capacity(total_tokens);
-        let mut pooling_mask = Vec::with_capacity(total_tokens);
 
         for enc in encodings {
             for (i, &id) in enc.input_ids.iter().enumerate() {
                 input_ids.push(id as i32);
                 token_type_ids.push(enc.token_type_ids[i] as i32);
                 position_ids.push(i as i32);
-                pooling_mask.push(1.0_f32); // All real tokens
             }
         }
 
@@ -2004,19 +2019,43 @@ impl Driver for MetalDriver {
         let input_ids_buf = make_i32_buffer(&self.device, &input_ids)?;
         let token_type_ids_buf = make_i32_buffer(&self.device, &token_type_ids)?;
         let position_ids_buf = make_i32_buffer(&self.device, &position_ids)?;
-        let pooling_mask_buf = make_f32_buffer(&self.device, &pooling_mask)?;
 
-        // Dummy attention mask and float_mask — unused in unpadded mode
-        // (attention uses cu_seqlens + pad_to_batch instead)
-        let dummy_i32 = make_i32_buffer(&self.device, &vec![0_i32; total_tokens])?;
-        let dummy_f32 = alloc_f32_buffer(&self.device, total_tokens)?;
+        // Build padded attention mask from seq_lengths: [batch * max_seq]
+        // 1 for real tokens, 0 for padding positions.
+        let padded_total = batch * max_seq;
+        let mut attn_mask_int = vec![0_i32; padded_total];
+        for (b, &len) in seq_lengths.iter().enumerate() {
+            let offset = b * max_seq;
+            for i in 0..len {
+                attn_mask_int[offset + i] = 1;
+            }
+        }
+        let attn_mask_int_buf = make_i32_buffer(&self.device, &attn_mask_int)?;
+
+        // Build float attention bias mask on GPU (0.0 for real, -1e9 for pad)
+        let float_mask_buf = alloc_f32_buffer(&self.device, padded_total)?;
+        self.run_compute("build-attn-mask", |enc| {
+            enc.setComputePipelineState(&self.kernels.build_attn_mask);
+            set_buffer(enc, &float_mask_buf, 0, 0);
+            set_buffer(enc, &attn_mask_int_buf, 0, 1);
+            set_i32_param(enc, padded_total as i32, 2);
+            dispatch_1d(enc, &self.kernels.build_attn_mask, padded_total);
+            Ok(())
+        })?;
+
+        // Build padded pooling mask (1.0 for real, 0.0 for pad)
+        let pooling_mask_padded: Vec<f32> = attn_mask_int
+            .iter()
+            .map(|&m| if m == 1 { 1.0 } else { 0.0 })
+            .collect();
+        let pooling_mask_buf = make_f32_buffer(&self.device, &pooling_mask_padded)?;
 
         Ok(BatchInputs {
             input_ids: MetalTensor::new(input_ids_buf, 0),
-            attention_mask: MetalTensor::new(dummy_i32, 0),
+            attention_mask: MetalTensor::new(attn_mask_int_buf, 0),
             token_type_ids: MetalTensor::new(token_type_ids_buf, 0),
             position_ids: MetalTensor::new(position_ids_buf, 0),
-            float_mask: MetalTensor::new(dummy_f32, 0),
+            float_mask: MetalTensor::new(float_mask_buf, 0),
             pooling_mask: MetalTensor::new(pooling_mask_buf, 0),
             batch,
             max_seq,
@@ -2053,7 +2092,7 @@ impl Driver for MetalDriver {
         let flat_buf = flat.buffer.clone();
         let flat_offset = flat.offset;
 
-        self.run_compute(|enc| {
+        self.run_compute("pad-to-batch", |enc| {
             enc.setComputePipelineState(&self.kernels.pad_to_batch);
             set_buffer(enc, &padded_buf, padded_offset, 0);
             set_buffer(enc, &flat_buf, flat_offset, 1);
@@ -2093,7 +2132,7 @@ impl Driver for MetalDriver {
         let padded_buf = padded.buffer.clone();
         let padded_offset = padded.offset;
 
-        self.run_compute(|enc| {
+        self.run_compute("unpad-from-batch", |enc| {
             enc.setComputePipelineState(&self.kernels.unpad_from_batch);
             set_buffer(enc, &flat_buf, flat_offset, 0);
             set_buffer(enc, &padded_buf, padded_offset, 1);
@@ -2116,7 +2155,7 @@ impl Driver for MetalDriver {
         let n = seq_len * hidden;
         let output = self.alloc_tensor(n)?;
 
-        self.run_compute(|enc| {
+        self.run_compute("embedding-lookup", |enc| {
             enc.setComputePipelineState(&self.kernels.embedding_lookup);
             set_buffer(enc, &output.buffer, output.offset, 0);
             set_buffer(enc, &embedding_table.buffer, embedding_table.offset, 1);
@@ -2139,7 +2178,7 @@ impl Driver for MetalDriver {
         hidden_dim: usize,
     ) -> crate::Result<()> {
         let n = seq_len * hidden_dim;
-        self.run_compute(|enc| {
+        self.run_compute("add-embeddings", |enc| {
             enc.setComputePipelineState(&self.kernels.add_embeddings);
             set_buffer(enc, &hidden.buffer, hidden.offset, 0);
             set_buffer(enc, &table.buffer, table.offset, 1);
@@ -2162,7 +2201,7 @@ impl Driver for MetalDriver {
         eps: f32,
     ) -> crate::Result<()> {
         let threads = 256.min(cols);
-        self.run_compute(|enc| {
+        self.run_compute("layer-norm", |enc| {
             enc.setComputePipelineState(&self.kernels.layer_norm);
             set_buffer(enc, &output.buffer, output.offset, 0);
             set_buffer(enc, &input.buffer, input.offset, 1);
@@ -2196,7 +2235,7 @@ impl Driver for MetalDriver {
         // IMPORTANT: MPS dispatches based on buffer.length()/rowBytes, NOT the
         // descriptor's row count. The pool MUST return exact-sized buffers for
         // MPS operands to avoid processing ghost rows (→ GPU hang).
-        self.run_mps(|cmd_buf| {
+        self.run_mps("mps-gemm", |cmd_buf| {
             dispatch_mps_gemm(
                 cmd_buf,
                 &self.device,
@@ -2235,7 +2274,7 @@ impl Driver for MetalDriver {
         stride_c: usize,
         batch_count: usize,
     ) -> crate::Result<()> {
-        self.run_compute(|enc| {
+        self.run_compute("gemm-batched", |enc| {
             dispatch_gemm_batched(
                 enc,
                 &self.kernels.gemm_batched,
@@ -2269,7 +2308,7 @@ impl Driver for MetalDriver {
     ) -> crate::Result<()> {
         let total_rows = batch * num_heads * seq_len;
         let threads = 256.min(seq_len);
-        self.run_compute(|enc| {
+        self.run_compute("softmax", |enc| {
             enc.setComputePipelineState(&self.kernels.fused_scale_mask_softmax);
             set_buffer(enc, &scores.buffer, scores.offset, 0);
             set_buffer(enc, &mask.buffer, mask.offset, 1);
@@ -2300,7 +2339,7 @@ impl Driver for MetalDriver {
         let total_rows = batch * num_heads * seq_len;
         let threads = 256.min(seq_len);
         let half_window = window_size / 2;
-        self.run_compute(|enc| {
+        self.run_compute("softmax-windowed", |enc| {
             enc.setComputePipelineState(&self.kernels.fused_scale_mask_softmax_windowed);
             set_buffer(enc, &scores.buffer, scores.offset, 0);
             set_buffer(enc, &mask.buffer, mask.offset, 1);
@@ -2325,7 +2364,7 @@ impl Driver for MetalDriver {
         int_mask: &MetalTensor,
         n: usize,
     ) -> crate::Result<()> {
-        self.run_compute(|enc| {
+        self.run_compute("build-attn-mask", |enc| {
             enc.setComputePipelineState(&self.kernels.build_attn_mask);
             set_buffer(enc, &output.buffer, output.offset, 0);
             set_buffer(enc, &int_mask.buffer, int_mask.offset, 1);
@@ -2348,7 +2387,7 @@ impl Driver for MetalDriver {
         head_dim: usize,
     ) -> crate::Result<()> {
         let total_head = batch * num_heads * seq * head_dim;
-        self.run_compute(|enc| {
+        self.run_compute("qkv-split", |enc| {
             enc.setComputePipelineState(&self.kernels.qkv_split);
             set_buffer(enc, &q.buffer, q.offset, 0);
             set_buffer(enc, &k.buffer, k.offset, 1);
@@ -2374,7 +2413,7 @@ impl Driver for MetalDriver {
         head_dim: usize,
     ) -> crate::Result<()> {
         let total = batch * seq * num_heads * head_dim;
-        self.run_compute(|enc| {
+        self.run_compute("attn-reshape", |enc| {
             enc.setComputePipelineState(&self.kernels.attn_reshape);
             set_buffer(enc, &output.buffer, output.offset, 0);
             set_buffer(enc, &input.buffer, input.offset, 1);
@@ -2399,7 +2438,7 @@ impl Driver for MetalDriver {
     ) -> crate::Result<()> {
         let half = head_dim / 2;
         let total = num_rows * half;
-        self.run_compute(|enc| {
+        self.run_compute("apply-rope", |enc| {
             enc.setComputePipelineState(&self.kernels.rope_cached);
             set_buffer(enc, &qk.buffer, qk.offset, 0);
             set_buffer(enc, &cos.buffer, cos.offset, 1);
@@ -2414,7 +2453,7 @@ impl Driver for MetalDriver {
     }
 
     fn gelu(&self, x: &mut MetalTensor, n: usize) -> crate::Result<()> {
-        self.run_compute(|enc| {
+        self.run_compute("gelu", |enc| {
             enc.setComputePipelineState(&self.kernels.gelu);
             set_buffer(enc, &x.buffer, x.offset, 0);
             set_i32_param(enc, n as i32, 1);
@@ -2430,7 +2469,7 @@ impl Driver for MetalDriver {
         output: &mut MetalTensor,
         n: usize,
     ) -> crate::Result<()> {
-        self.run_compute(|enc| {
+        self.run_compute("swiglu", |enc| {
             enc.setComputePipelineState(&self.kernels.swiglu_two_input);
             set_buffer(enc, &output.buffer, output.offset, 0);
             set_buffer(enc, &value.buffer, value.offset, 1);
@@ -2450,7 +2489,7 @@ impl Driver for MetalDriver {
         cols: usize,
     ) -> crate::Result<()> {
         let total = rows * cols;
-        self.run_compute(|enc| {
+        self.run_compute("split-gate-value", |enc| {
             enc.setComputePipelineState(&self.kernels.split_gate_value);
             set_buffer(enc, &first.buffer, first.offset, 0);
             set_buffer(enc, &second.buffer, second.offset, 1);
@@ -2469,7 +2508,7 @@ impl Driver for MetalDriver {
         output: &mut MetalTensor,
         n: usize,
     ) -> crate::Result<()> {
-        self.run_compute(|enc| {
+        self.run_compute("geglu", |enc| {
             enc.setComputePipelineState(&self.kernels.geglu);
             set_buffer(enc, &output.buffer, output.offset, 0);
             set_buffer(enc, &value.buffer, value.offset, 1);
@@ -2488,7 +2527,7 @@ impl Driver for MetalDriver {
         cols: usize,
     ) -> crate::Result<()> {
         let total = rows * cols;
-        self.run_compute(|enc| {
+        self.run_compute("fused-bias-gelu", |enc| {
             enc.setComputePipelineState(&self.kernels.fused_bias_gelu);
             set_buffer(enc, &x.buffer, x.offset, 0);
             set_buffer(enc, &bias.buffer, bias.offset, 1);
@@ -2509,7 +2548,7 @@ impl Driver for MetalDriver {
         cols: usize,
     ) -> crate::Result<()> {
         let rows = n / cols;
-        self.run_compute(|enc| {
+        self.run_compute("fused-bias-residual", |enc| {
             enc.setComputePipelineState(&self.kernels.fused_bias_residual);
             set_buffer(enc, &output.buffer, output.offset, 0);
             set_buffer(enc, &input.buffer, input.offset, 1);
@@ -2534,7 +2573,7 @@ impl Driver for MetalDriver {
         eps: f32,
     ) -> crate::Result<()> {
         let threads = 256.min(cols);
-        self.run_compute(|enc| {
+        self.run_compute("fused-residual-layernorm", |enc| {
             enc.setComputePipelineState(&self.kernels.fused_residual_layernorm);
             set_buffer(enc, &output.buffer, output.offset, 0);
             set_buffer(enc, &hidden.buffer, hidden.offset, 1);
@@ -2556,7 +2595,7 @@ impl Driver for MetalDriver {
         residual: &MetalTensor,
         n: usize,
     ) -> crate::Result<()> {
-        self.run_compute(|enc| {
+        self.run_compute("residual-add", |enc| {
             enc.setComputePipelineState(&self.kernels.residual_add);
             set_buffer(enc, &output.buffer, output.offset, 0);
             set_buffer(enc, &hidden.buffer, hidden.offset, 1);
@@ -2575,7 +2614,7 @@ impl Driver for MetalDriver {
         cols: usize,
     ) -> crate::Result<()> {
         let total = rows * cols;
-        self.run_compute(|enc| {
+        self.run_compute("add-bias", |enc| {
             enc.setComputePipelineState(&self.kernels.add_bias);
             set_buffer(enc, &x.buffer, x.offset, 0);
             set_buffer(enc, &bias.buffer, bias.offset, 1);
@@ -2595,7 +2634,7 @@ impl Driver for MetalDriver {
         hidden_dim: usize,
     ) -> crate::Result<()> {
         let total = batch * hidden_dim;
-        self.run_compute(|enc| {
+        self.run_compute("cls-pool", |enc| {
             enc.setComputePipelineState(&self.kernels.cls_pool);
             set_buffer(enc, &output.buffer, output.offset, 0);
             set_buffer(enc, &hidden.buffer, hidden.offset, 1);
@@ -2617,7 +2656,7 @@ impl Driver for MetalDriver {
         hidden_dim: usize,
     ) -> crate::Result<()> {
         let total = batch * hidden_dim;
-        self.run_compute(|enc| {
+        self.run_compute("mean-pool", |enc| {
             enc.setComputePipelineState(&self.kernels.mean_pool);
             set_buffer(enc, &output.buffer, output.offset, 0);
             set_buffer(enc, &hidden.buffer, hidden.offset, 1);
@@ -2632,7 +2671,7 @@ impl Driver for MetalDriver {
 
     fn l2_normalize(&self, data: &mut MetalTensor, rows: usize, cols: usize) -> crate::Result<()> {
         let threads = 256.min(cols);
-        self.run_compute(|enc| {
+        self.run_compute("l2-normalize", |enc| {
             enc.setComputePipelineState(&self.kernels.l2_normalize);
             set_buffer(enc, &data.buffer, data.offset, 0);
             set_i32_param(enc, rows as i32, 1);
@@ -2655,7 +2694,7 @@ impl Driver for MetalDriver {
         stride_scores: usize,
     ) -> crate::Result<()> {
         let total = batch_heads * seq * window;
-        self.run_compute(|enc| {
+        self.run_compute("banded-qk", |enc| {
             enc.setComputePipelineState(&self.kernels.banded_qk);
             set_buffer(enc, &scores.buffer, scores.offset, 0);
             set_buffer(enc, &q.buffer, q.offset, 1);
@@ -2685,7 +2724,7 @@ impl Driver for MetalDriver {
         stride_out: usize,
     ) -> crate::Result<()> {
         let total = batch_heads * seq * head_dim;
-        self.run_compute(|enc| {
+        self.run_compute("banded-sv", |enc| {
             enc.setComputePipelineState(&self.kernels.banded_sv);
             set_buffer(enc, &output.buffer, output.offset, 0);
             set_buffer(enc, &scores.buffer, scores.offset, 1);
@@ -2710,7 +2749,7 @@ impl Driver for MetalDriver {
         scale: f32,
     ) -> crate::Result<()> {
         let threads = 256.min(window).max(1);
-        self.run_compute(|enc| {
+        self.run_compute("banded-softmax", |enc| {
             enc.setComputePipelineState(&self.kernels.banded_softmax);
             set_buffer(enc, &scores.buffer, scores.offset, 0);
             set_i32_param(enc, window as i32, 1);
@@ -2754,7 +2793,7 @@ impl Driver for MetalDriver {
         input: &MetalTensor,
         n: usize,
     ) -> crate::Result<()> {
-        self.run_compute(|enc| {
+        self.run_compute("f32-to-f16", |enc| {
             enc.setComputePipelineState(&self.kernels.f32_to_f16);
             set_buffer(enc, &output.buffer, output.offset, 0);
             set_buffer(enc, &input.buffer, input.offset, 1);
@@ -2770,7 +2809,7 @@ impl Driver for MetalDriver {
         input: &MetalTensor,
         n: usize,
     ) -> crate::Result<()> {
-        self.run_compute(|enc| {
+        self.run_compute("f16-to-f32", |enc| {
             enc.setComputePipelineState(&self.kernels.f16_to_f32);
             set_buffer(enc, &output.buffer, output.offset, 0);
             set_buffer(enc, &input.buffer, input.offset, 1);
@@ -2806,7 +2845,7 @@ impl Driver for MetalDriver {
         } else {
             (&*b.buffer as &ProtocolObject<dyn MTLBuffer>, b.offset)
         };
-        self.run_mps(|cmd_buf| {
+        self.run_mps("mps-gemm-f16", |cmd_buf| {
             dispatch_mps_gemm(
                 cmd_buf,
                 &self.device,
@@ -2845,7 +2884,7 @@ impl Driver for MetalDriver {
         stride_c: usize,
         batch_count: usize,
     ) -> crate::Result<()> {
-        self.run_compute(|enc| {
+        self.run_compute("gemm-batched-f16", |enc| {
             dispatch_gemm_batched(
                 enc,
                 &self.kernels.gemm_batched_f16,
@@ -2879,7 +2918,7 @@ impl Driver for MetalDriver {
         eps: f32,
     ) -> crate::Result<()> {
         let threads = 256.min(cols);
-        self.run_compute(|enc| {
+        self.run_compute("layer-norm-f16", |enc| {
             enc.setComputePipelineState(&self.kernels.layer_norm_f16);
             set_buffer(enc, &output.buffer, output.offset, 0);
             set_buffer(enc, &input.buffer, input.offset, 1);
@@ -2904,7 +2943,7 @@ impl Driver for MetalDriver {
     ) -> crate::Result<()> {
         let total_rows = batch * num_heads * seq_len;
         let threads = 256.min(seq_len);
-        self.run_compute(|enc| {
+        self.run_compute("softmax-f16", |enc| {
             enc.setComputePipelineState(&self.kernels.fused_scale_mask_softmax_f16);
             set_buffer(enc, &scores.buffer, scores.offset, 0);
             set_buffer(enc, &mask.buffer, mask.offset, 1);
@@ -2935,7 +2974,7 @@ impl Driver for MetalDriver {
         let total_rows = batch * num_heads * seq_len;
         let threads = 256.min(seq_len);
         let half_window = window_size / 2;
-        self.run_compute(|enc| {
+        self.run_compute("softmax-windowed-f16", |enc| {
             enc.setComputePipelineState(&self.kernels.fused_scale_mask_softmax_windowed_f16);
             set_buffer(enc, &scores.buffer, scores.offset, 0);
             set_buffer(enc, &mask.buffer, mask.offset, 1);
@@ -2967,7 +3006,7 @@ impl Driver for MetalDriver {
         head_dim: usize,
     ) -> crate::Result<()> {
         let total_head = batch * num_heads * seq * head_dim;
-        self.run_compute(|enc| {
+        self.run_compute("qkv-split-f16", |enc| {
             enc.setComputePipelineState(&self.kernels.qkv_split_f16);
             set_buffer(enc, &q.buffer, q.offset, 0);
             set_buffer(enc, &k.buffer, k.offset, 1);
@@ -2993,7 +3032,7 @@ impl Driver for MetalDriver {
         head_dim: usize,
     ) -> crate::Result<()> {
         let total = batch * seq * num_heads * head_dim;
-        self.run_compute(|enc| {
+        self.run_compute("attn-reshape-f16", |enc| {
             enc.setComputePipelineState(&self.kernels.attn_reshape_f16);
             set_buffer(enc, &output.buffer, output.offset, 0);
             set_buffer(enc, &input.buffer, input.offset, 1);
@@ -3032,7 +3071,7 @@ impl Driver for MetalDriver {
         let flat_buf = flat.buffer.clone();
         let flat_offset = flat.offset;
 
-        self.run_compute(|enc| {
+        self.run_compute("pad-to-batch-f16", |enc| {
             enc.setComputePipelineState(&self.kernels.pad_to_batch_f16);
             set_buffer(enc, &padded_buf, padded_offset, 0);
             set_buffer(enc, &flat_buf, flat_offset, 1);
@@ -3071,7 +3110,7 @@ impl Driver for MetalDriver {
         let padded_buf = padded.buffer.clone();
         let padded_offset = padded.offset;
 
-        self.run_compute(|enc| {
+        self.run_compute("unpad-from-batch-f16", |enc| {
             enc.setComputePipelineState(&self.kernels.unpad_from_batch_f16);
             set_buffer(enc, &flat_buf, flat_offset, 0);
             set_buffer(enc, &padded_buf, padded_offset, 1);
@@ -3096,7 +3135,7 @@ impl Driver for MetalDriver {
     ) -> crate::Result<()> {
         let half_d = head_dim / 2;
         let total = num_rows * half_d;
-        self.run_compute(|enc| {
+        self.run_compute("rope-encode-f16", |enc| {
             enc.setComputePipelineState(&self.kernels.rope_encode_f16);
             set_buffer(enc, &qk.buffer, qk.offset, 0);
             set_buffer(enc, &cos.buffer, cos.offset, 1);
@@ -3117,7 +3156,7 @@ impl Driver for MetalDriver {
         output: &mut MetalTensor,
         n: usize,
     ) -> crate::Result<()> {
-        self.run_compute(|enc| {
+        self.run_compute("geglu-f16", |enc| {
             enc.setComputePipelineState(&self.kernels.geglu_f16);
             set_buffer(enc, &output.buffer, output.offset, 0);
             set_buffer(enc, &value.buffer, value.offset, 1);
@@ -3140,7 +3179,7 @@ impl Driver for MetalDriver {
         eps: f32,
     ) -> crate::Result<()> {
         let threads = 256.min(cols);
-        self.run_compute(|enc| {
+        self.run_compute("fused-residual-layernorm-f16", |enc| {
             enc.setComputePipelineState(&self.kernels.fused_residual_layernorm_f16);
             set_buffer(enc, &output.buffer, output.offset, 0);
             set_buffer(enc, &hidden.buffer, hidden.offset, 1);
@@ -3167,7 +3206,7 @@ impl Driver for MetalDriver {
         residual: &MetalTensor,
         n: usize,
     ) -> crate::Result<()> {
-        self.run_compute(|enc| {
+        self.run_compute("residual-add-f16", |enc| {
             enc.setComputePipelineState(&self.kernels.residual_add_f16);
             set_buffer(enc, &output.buffer, output.offset, 0);
             set_buffer(enc, &hidden.buffer, hidden.offset, 1);
@@ -3187,7 +3226,7 @@ impl Driver for MetalDriver {
         cols: usize,
     ) -> crate::Result<()> {
         let total = rows * cols;
-        self.run_compute(|enc| {
+        self.run_compute("split-gate-value-f16", |enc| {
             enc.setComputePipelineState(&self.kernels.split_gate_value_f16);
             set_buffer(enc, &first.buffer, first.offset, 0);
             set_buffer(enc, &second.buffer, second.offset, 1);
