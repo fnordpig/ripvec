@@ -10,8 +10,8 @@
 //! [`Driver`](super::super::driver::Driver) primitives into the full forward
 //! pass.
 
-use super::super::driver::{BatchInputs, Driver};
 use super::super::Encoding;
+use super::super::driver::{BatchInputs, Driver};
 use super::ModelArch;
 
 // ---------------------------------------------------------------------------
@@ -742,14 +742,9 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
         let batch = encodings.len();
         let hidden = w.hidden_dim;
 
-        let max_seq = encodings
-            .iter()
-            .map(|e| e.input_ids.len())
-            .max()
-            .unwrap_or(0)
-            .next_multiple_of(8);
-        let total_tokens = batch * max_seq;
-        let inputs = driver.prepare_batch(encodings, max_seq)?;
+        let inputs = driver.prepare_batch_unpadded(encodings)?;
+        let max_seq = inputs.max_seq;
+        let total_tokens = inputs.total_tokens;
 
         // Enter batched mode: all GPU ops encode into ONE command buffer.
         driver.begin_batch()?;
