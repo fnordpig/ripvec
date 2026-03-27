@@ -34,7 +34,7 @@ struct Fixtures {
 impl Fixtures {
     fn load() -> Self {
         let backend =
-            ripvec_core::backend::load_backend(BackendKind::Cpu, MODEL_REPO, DeviceHint::Cpu)
+            ripvec_core::backend::load_backend(BackendKind::Cpu, MODEL_REPO, DeviceHint::Cpu, None)
                 .expect("backend load");
         let tokenizer = ripvec_core::tokenize::load_tokenizer(MODEL_REPO).expect("tokenizer");
 
@@ -182,8 +182,9 @@ fn bench_dot_product(c: &mut Criterion) {
 // --- Token length sweep: cost curve for max_tokens ---
 
 fn bench_max_tokens_sweep(c: &mut Criterion) {
-    let backend = ripvec_core::backend::load_backend(BackendKind::Cpu, MODEL_REPO, DeviceHint::Cpu)
-        .expect("backend load");
+    let backend =
+        ripvec_core::backend::load_backend(BackendKind::Cpu, MODEL_REPO, DeviceHint::Cpu, None)
+            .expect("backend load");
     let tokenizer = ripvec_core::tokenize::load_tokenizer(MODEL_REPO).expect("tokenizer");
 
     // Generate a long source text that tokenizes to 512+ tokens

@@ -143,7 +143,7 @@ impl RipvecServer {
         self.text_backend
             .get_or_try_init(|| async {
                 let backends = tokio::task::spawn_blocking(|| {
-                    ripvec_core::backend::detect_backends("BAAI/bge-small-en-v1.5")
+                    ripvec_core::backend::detect_backends("BAAI/bge-small-en-v1.5", None)
                 })
                 .await
                 .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?

@@ -707,21 +707,21 @@ mod tests {
     #[cfg(not(feature = "mlx"))]
     #[test]
     fn load_backend_mlx_not_compiled() {
-        let result = load_backend(BackendKind::Mlx, "test/model", DeviceHint::Cpu);
+        let result = load_backend(BackendKind::Mlx, "test/model", DeviceHint::Cpu, None);
         assert!(result.is_err());
     }
 
     #[cfg(feature = "cpu")]
     #[test]
     fn detect_backends_returns_at_least_one() {
-        let backends = detect_backends("BAAI/bge-small-en-v1.5").unwrap();
+        let backends = detect_backends("BAAI/bge-small-en-v1.5", None).unwrap();
         assert!(!backends.is_empty());
     }
 
     #[cfg(all(feature = "cpu", not(feature = "mlx")))]
     #[test]
     fn detect_backends_returns_at_least_one_backend() {
-        let backends = detect_backends("BAAI/bge-small-en-v1.5").unwrap();
+        let backends = detect_backends("BAAI/bge-small-en-v1.5", None).unwrap();
         assert!(!backends.is_empty(), "should detect at least one backend");
     }
 
@@ -735,7 +735,8 @@ mod tests {
     fn modernbert_loads_and_embeds() {
         use crate::backend::driver::Driver;
 
-        let backend = load_modernbert_metal("nomic-ai/modernbert-embed-base").expect("load failed");
+        let backend =
+            load_modernbert_metal("nomic-ai/modernbert-embed-base", None).expect("load failed");
         assert!(backend.is_gpu(), "Metal backend should be GPU");
 
         let enc = Encoding {
@@ -1020,7 +1021,7 @@ mod tests {
         // Compare against CPU backend (reliable reference)
         #[cfg(feature = "cpu")]
         {
-            let cpu = load_backend(BackendKind::Cpu, model_repo, DeviceHint::Cpu)
+            let cpu = load_backend(BackendKind::Cpu, model_repo, DeviceHint::Cpu, None)
                 .expect("CPU load failed");
             let cpu_result = cpu.embed_batch(std::slice::from_ref(&enc)).unwrap();
             eprintln!("CPU  first 5: {:?}", &cpu_result[0][..5]);
@@ -1128,7 +1129,7 @@ mod tests {
         // Compare against CPU backend (reliable reference)
         #[cfg(feature = "cpu")]
         {
-            let cpu = load_backend(BackendKind::Cpu, model_repo, DeviceHint::Cpu)
+            let cpu = load_backend(BackendKind::Cpu, model_repo, DeviceHint::Cpu, None)
                 .expect("CPU load failed");
             let cpu_result = cpu.embed_batch(std::slice::from_ref(&enc)).unwrap();
             eprintln!("CPU  first 5: {:?}", &cpu_result[0][..5]);

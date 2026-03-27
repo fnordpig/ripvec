@@ -609,6 +609,7 @@ mod tests {
             crate::backend::BackendKind::Cpu,
             "BAAI/bge-small-en-v1.5",
             crate::backend::DeviceHint::Cpu,
+            None,
         )
         .unwrap();
         let tokenizer = crate::tokenize::load_tokenizer("BAAI/bge-small-en-v1.5").unwrap();
@@ -635,6 +636,7 @@ mod tests {
             crate::backend::BackendKind::Cpu,
             "BAAI/bge-small-en-v1.5",
             crate::backend::DeviceHint::Cpu,
+            None,
         )
         .unwrap();
         let tokenizer = crate::tokenize::load_tokenizer("BAAI/bge-small-en-v1.5").unwrap();
@@ -693,7 +695,7 @@ mod tests {
     )]
     fn mrl_retrieval_recall() {
         let model = "BAAI/bge-small-en-v1.5";
-        let backends = crate::backend::detect_backends(model).unwrap();
+        let backends = crate::backend::detect_backends(model, None).unwrap();
         let tokenizer = crate::tokenize::load_tokenizer(model).unwrap();
         let cfg = SearchConfig::default();
         let profiler = crate::profile::Profiler::noop();
@@ -788,7 +790,7 @@ mod tests {
     )]
     fn mrl_retrieval_recall_coderank() {
         let model = "nomic-ai/CodeRankEmbed";
-        let backends = crate::backend::detect_backends(model).unwrap();
+        let backends = crate::backend::detect_backends(model, None).unwrap();
         let tokenizer = crate::tokenize::load_tokenizer(model).unwrap();
         let cfg = SearchConfig::default();
         let profiler = crate::profile::Profiler::noop();
