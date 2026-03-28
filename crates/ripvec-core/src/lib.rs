@@ -10,6 +10,7 @@ pub mod cache;
 pub mod chunk;
 pub mod embed;
 pub mod error;
+pub mod hybrid;
 pub mod index;
 pub mod languages;
 pub mod profile;
