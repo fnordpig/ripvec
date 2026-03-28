@@ -136,17 +136,35 @@ pub enum DeviceHint {
 pub fn load_backend(
     kind: BackendKind,
     #[cfg_attr(
-        not(any(feature = "cuda", feature = "mlx", feature = "cpu", feature = "metal")),
+        not(any(
+            feature = "cuda",
+            feature = "mlx",
+            feature = "cpu",
+            feature = "cpu-accelerate",
+            feature = "metal"
+        )),
         expect(unused_variables, reason = "used when backend features are enabled")
     )]
     model_repo: &str,
     #[cfg_attr(
-        not(any(feature = "cuda", feature = "mlx", feature = "cpu", feature = "metal")),
+        not(any(
+            feature = "cuda",
+            feature = "mlx",
+            feature = "cpu",
+            feature = "cpu-accelerate",
+            feature = "metal"
+        )),
         expect(unused_variables, reason = "used when backend features are enabled")
     )]
     device_hint: DeviceHint,
     #[cfg_attr(
-        not(any(feature = "cuda", feature = "mlx", feature = "cpu", feature = "metal")),
+        not(any(
+            feature = "cuda",
+            feature = "mlx",
+            feature = "cpu",
+            feature = "cpu-accelerate",
+            feature = "metal"
+        )),
         expect(unused_variables, reason = "used when backend features are enabled")
     )]
     max_layers: Option<usize>,
@@ -170,15 +188,22 @@ pub fn load_backend(
         BackendKind::Mlx => Err(crate::Error::Other(anyhow::anyhow!(
             "mlx backend requires building with: cargo build --features mlx"
         ))),
-        #[cfg(feature = "cpu")]
+        #[cfg(any(feature = "cpu", feature = "cpu-accelerate"))]
         BackendKind::Cpu => {
             if is_modernbert_model(model_repo) {
                 return load_modernbert_cpu(model_repo, max_layers);
             }
-            let backend = cpu::CpuBackend::load(model_repo, &device_hint)?;
-            Ok(Box::new(backend))
+            #[cfg(feature = "cpu")]
+            {
+                let backend = cpu::CpuBackend::load(model_repo, &device_hint)?;
+                return Ok(Box::new(backend));
+            }
+            #[cfg(not(feature = "cpu"))]
+            Err(crate::Error::Other(anyhow::anyhow!(
+                "ClassicBert CPU backend requires feature 'cpu'; only ModernBERT is available with 'cpu-accelerate'"
+            )))
         }
-        #[cfg(not(feature = "cpu"))]
+        #[cfg(not(any(feature = "cpu", feature = "cpu-accelerate")))]
         BackendKind::Cpu => Err(crate::Error::Other(anyhow::anyhow!(
             "cpu backend requires building with: cargo build --features cpu"
         ))),
@@ -208,18 +233,36 @@ pub fn load_backend(
 /// Returns an error if no backends can be loaded (not even CPU).
 pub fn detect_backends(
     #[cfg_attr(
-        not(any(feature = "cuda", feature = "mlx", feature = "cpu", feature = "metal")),
+        not(any(
+            feature = "cuda",
+            feature = "mlx",
+            feature = "cpu",
+            feature = "cpu-accelerate",
+            feature = "metal"
+        )),
         expect(unused_variables, reason = "used when backend features are enabled")
     )]
     model_repo: &str,
     #[cfg_attr(
-        not(any(feature = "cuda", feature = "mlx", feature = "cpu", feature = "metal")),
+        not(any(
+            feature = "cuda",
+            feature = "mlx",
+            feature = "cpu",
+            feature = "cpu-accelerate",
+            feature = "metal"
+        )),
         expect(unused_variables, reason = "used when backend features are enabled")
     )]
     max_layers: Option<usize>,
 ) -> crate::Result<Vec<Box<dyn EmbedBackend>>> {
     #[cfg_attr(
-        not(any(feature = "cuda", feature = "mlx", feature = "cpu", feature = "metal")),
+        not(any(
+            feature = "cuda",
+            feature = "mlx",
+            feature = "cpu",
+            feature = "cpu-accelerate",
+            feature = "metal"
+        )),
         expect(unused_mut, reason = "mut needed when backend features are enabled")
     )]
     let mut backends: Vec<Box<dyn EmbedBackend>> = Vec::new();
@@ -256,18 +299,21 @@ pub fn detect_backends(
     // MLX alone because they share the same physical cores and memory.
     // On discrete GPU systems (CUDA), CPU would be a useful helper.
     #[cfg_attr(
-        not(feature = "cpu"),
+        not(any(feature = "cpu", feature = "cpu-accelerate")),
         expect(unused_variables, reason = "used when cpu feature is enabled")
     )]
     let has_gpu = backends.iter().any(|b| b.is_gpu());
-    #[cfg(feature = "cpu")]
+    #[cfg(any(feature = "cpu", feature = "cpu-accelerate"))]
     if !has_gpu {
         if is_modernbert_model(model_repo) {
             if let Ok(b) = load_modernbert_cpu(model_repo, max_layers) {
                 backends.push(b);
             }
-        } else if let Ok(b) = cpu::CpuBackend::load(model_repo, &DeviceHint::Cpu) {
-            backends.push(Box::new(b));
+        } else {
+            #[cfg(feature = "cpu")]
+            if let Ok(b) = cpu::CpuBackend::load(model_repo, &DeviceHint::Cpu) {
+                backends.push(Box::new(b));
+            }
         }
     }
 
@@ -344,7 +390,7 @@ pub fn load_modernbert_metal(
 }
 
 /// Load `ModernBERT` on CPU via the driver/arch system.
-#[cfg(feature = "cpu")]
+#[cfg(any(feature = "cpu", feature = "cpu-accelerate"))]
 pub fn load_modernbert_cpu(
     model_repo: &str,
     max_layers: Option<usize>,
@@ -394,7 +440,7 @@ pub fn load_modernbert_cpu(
 ///
 /// Downloads and inspects `config.json` to check for `"model_type": "modernbert"`.
 /// Returns `false` on any download or parse error (fail-open for detection).
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "metal", feature = "cpu", feature = "cpu-accelerate"))]
 fn is_modernbert_model(model_repo: &str) -> bool {
     let Ok(api) = hf_hub::api::sync::Api::new() else {
         return false;

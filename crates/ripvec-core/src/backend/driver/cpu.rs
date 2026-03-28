@@ -28,13 +28,13 @@ use std::path::Path;
 use safetensors::SafeTensors;
 
 use super::{BatchInputs, Driver};
+use crate::backend::Encoding;
 use crate::backend::arch::classic_bert::{
     ClassicBertArch, ClassicBertLayerWeights, ClassicBertWeights,
 };
 use crate::backend::arch::modern_bert::{
     ModernBertArch, ModernBertLayerWeights, ModernBertWeights, RopeCache,
 };
-use crate::backend::Encoding;
 // ---------------------------------------------------------------------------
 // CpuDriver
 // ---------------------------------------------------------------------------
@@ -49,8 +49,53 @@ impl CpuDriver {
     /// Create a new CPU driver.
     ///
     /// Always succeeds -- there is no device to initialise.
+    ///
+    /// Does NOT set BLAS threading mode here. Callers that spawn multiple
+    /// workers should call [`force_single_threaded_blas`] per worker thread
+    /// to avoid Accelerate mutex contention. Single-worker callers should
+    /// leave BLAS multi-threaded for intra-GEMM parallelism.
     pub fn new() -> crate::Result<Self> {
         Ok(Self)
+    }
+}
+
+/// Force the current thread's BLAS to single-threaded mode.
+///
+/// On macOS 15+, calls `BLASSetThreading(BLAS_THREADING_SINGLE_THREADED)`.
+/// On Linux, calls `openblas_set_num_threads(1)`. On older macOS or when the
+/// API is unavailable, this is a no-op (the env-var fallback in
+/// `embed_distributed` still applies).
+///
+/// This is per-thread (thread-local). Each worker thread must call it.
+#[expect(unsafe_code, reason = "FFI call to system BLAS thread control API")]
+pub fn force_single_threaded_blas() {
+    #[cfg(target_os = "macos")]
+    {
+        // BLASSetThreading (macOS 15.0+, Accelerate vecLib) is a per-thread
+        // thread-local setting that controls whether BLAS spawns internal worker
+        // threads. For BERT inference the matrices are small enough that internal
+        // parallelism causes more mutex contention than speedup.
+        //
+        // We use dlsym to weak-link: on macOS <15.0 the symbol won't exist and
+        // we silently fall back to the VECLIB_MAXIMUM_THREADS env var.
+        const BLAS_THREADING_SINGLE_THREADED: std::ffi::c_uint = 1;
+        type BLASSetThreadingFn = unsafe extern "C" fn(std::ffi::c_uint) -> std::ffi::c_int;
+
+        let sym = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"BLASSetThreading".as_ptr()) };
+        if !sym.is_null() {
+            let func: BLASSetThreadingFn = unsafe { std::mem::transmute(sym) };
+            unsafe { func(BLAS_THREADING_SINGLE_THREADED) };
+        }
+    }
+
+    #[cfg(all(not(target_os = "macos"), feature = "cpu"))]
+    {
+        unsafe extern "C" {
+            fn openblas_set_num_threads(num: std::ffi::c_int);
+        }
+        unsafe {
+            openblas_set_num_threads(1);
+        }
     }
 }
 
@@ -471,6 +516,10 @@ impl Driver for CpuDriver {
     type Tensor = Vec<f32>;
 
     // begin_batch / end_batch: no-ops for CPU.
+
+    fn new_for_clone() -> crate::Result<Self> {
+        Ok(Self)
+    }
 
     fn alloc_zeros(&self, n: usize) -> crate::Result<Vec<f32>> {
         Ok(vec![0.0; n])
@@ -895,23 +944,22 @@ impl Driver for CpuDriver {
     ) -> crate::Result<()> {
         let half = head_dim / 2;
 
-        // qk: [batch*num_heads, seq_len, head_dim]
+        // qk: [batch*num_heads*seq_len, head_dim] flattened
+        // num_rows = batch * num_heads * seq_len (total row count)
         // cos/sin: [max_seq, half_dim]
+        // Each row's sequence position is row_idx % seq_len (matches Metal kernel).
         for row_idx in 0..num_rows {
-            let row_off = row_idx * seq_len;
+            let pos = row_idx % seq_len;
+            let base = row_idx * head_dim;
+            let cache_base = pos * half;
 
-            for s in 0..seq_len {
-                let base = (row_off + s) * head_dim;
-                let cache_base = s * half;
-
-                for d in 0..half {
-                    let first = qk[base + d];
-                    let second = qk[base + d + half];
-                    let c = cos[cache_base + d];
-                    let sn = sin[cache_base + d];
-                    qk[base + d] = first * c - second * sn;
-                    qk[base + d + half] = first * sn + second * c;
-                }
+            for d in 0..half {
+                let first = qk[base + d];
+                let second = qk[base + d + half];
+                let c = cos[cache_base + d];
+                let sn = sin[cache_base + d];
+                qk[base + d] = first * c - second * sn;
+                qk[base + d + half] = first * sn + second * c;
             }
         }
         Ok(())

@@ -32,6 +32,20 @@ pub trait Driver: Send + Sync {
     /// Metal: `MTLBuffer` + byte offset. CUDA: `CUdeviceptr`. CPU: `Array2<f32>`.
     type Tensor;
 
+    /// Create a new driver instance for a cloned worker thread.
+    ///
+    /// CPU drivers are zero-size and always succeed. GPU drivers typically
+    /// cannot be cloned this way (they share device state) and should leave
+    /// the default panic implementation.
+    fn new_for_clone() -> crate::Result<Self>
+    where
+        Self: Sized,
+    {
+        Err(crate::Error::Other(anyhow::anyhow!(
+            "this driver does not support cloning"
+        )))
+    }
+
     // --- Batching ---
 
     /// Begin batched mode: all subsequent operations encode into one dispatch.

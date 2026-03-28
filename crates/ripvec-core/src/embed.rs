@@ -464,6 +464,10 @@ pub(crate) fn embed_distributed(
                 let handles: Vec<_> = (0..num_workers)
                     .map(|_| {
                         s.spawn(|| {
+                            // Per-thread: force single-threaded BLAS (thread-local setting).
+                            // On macOS 15+ this calls BLASSetThreading; on Linux openblas_set_num_threads.
+                            #[cfg(any(feature = "cpu", feature = "cpu-accelerate"))]
+                            crate::backend::driver::cpu::force_single_threaded_blas();
                             let cloned = backends[0].clone_backend();
                             state.run_worker(cloned.as_ref())
                         })
@@ -478,8 +482,9 @@ pub(crate) fn embed_distributed(
                 all
             })
         } else if backends.len() == 1 {
-            // Single non-cloneable backend (GPU): run on the calling thread.
-            // MLX/CUDA handle parallelism internally.
+            // Single non-cloneable backend (GPU or CPU ModernBERT): run on the calling thread.
+            // GPU backends handle parallelism internally; CPU uses BLAS internal
+            // multi-threading (Accelerate/OpenBLAS) for intra-GEMM parallelism.
             state.run_worker(backends[0])
         } else {
             // Multiple backends: one thread per backend via std::thread::scope

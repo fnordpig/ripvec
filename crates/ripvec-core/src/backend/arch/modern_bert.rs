@@ -10,8 +10,8 @@
 //! [`Driver`](super::super::driver::Driver) primitives into the full forward
 //! pass.
 
-use super::super::driver::{BatchInputs, Driver};
 use super::super::Encoding;
+use super::super::driver::{BatchInputs, Driver};
 use super::ModelArch;
 
 // ---------------------------------------------------------------------------
