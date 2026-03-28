@@ -15,7 +15,7 @@ pub struct FileCache {
     pub chunks: Vec<CodeChunk>,
     /// Flat embedding data: `[n_chunks × hidden_dim]` contiguous f32 values.
     pub embeddings: Vec<f32>,
-    /// The embedding dimension (e.g., 384 for BGE-small, 768 for `CodeRankEmbed`).
+    /// The embedding dimension (e.g., 384 for BGE-small, 768 for ModernBERT).
     pub hidden_dim: usize,
 }
 

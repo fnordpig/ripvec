@@ -27,8 +27,8 @@ Cargo workspace with three crates:
 - **CPU** (everywhere) — ndarray + system BLAS (Accelerate/OpenBLAS/AOCL)
 
 ### Models
-- **BGE-small-en-v1.5** (default) — ClassicBert, 384-dim, CLS pooling
-- **CodeRankEmbed** (--code) — NomicBert, 768-dim, mean pooling, MRL-trained
+- **BGE-small-en-v1.5** (--fast) — ClassicBert, 384-dim, CLS pooling
+- **ModernBERT** (default) — 768-dim, mean pooling
 
 ## When to use ripvec vs LSP vs grep
 
@@ -64,7 +64,7 @@ Cargo workspace with three crates:
 ## Key invariants
 - Model weights (~33-100MB) must NOT be committed to git
 - Metal: `_mmap` field must outlive `weight_buffer` (drop order matters)
-- BGE models use CLS pooling; CodeRankEmbed uses mean pooling — don't mix
+- BGE-small uses CLS pooling; ModernBERT uses mean pooling — don't mix
 - All embeddings are L2-normalized; cosine similarity = dot product
 - Metal MAX_BATCH=32 for optimal padding; MLX MAX_BATCH=64
 

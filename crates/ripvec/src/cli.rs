@@ -28,10 +28,6 @@ pub struct Args {
     #[arg(short = 'n', long, default_value_t = 0)]
     pub top_k: usize,
 
-    /// Use code-optimized model (nomic-ai/CodeRankEmbed). Deprecated.
-    #[arg(long, conflicts_with = "fast", hide = true)]
-    pub code: bool,
-
     /// Use fast lightweight model (BAAI/bge-small-en-v1.5, 384-dim, 12 layers).
     /// Trades quality for ~4× faster inference.
     #[arg(long)]

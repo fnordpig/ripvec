@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run --with sentence-transformers --with torch --python 3.12
 """
-Benchmark modernbert-embed-base vs CodeRankEmbed on ripvec's own codebase.
+Benchmark modernbert-embed-base and bge-small-en-v1.5 on ripvec's own codebase.
 
 Usage:
     uv run scripts/benchmark-modernbert.py
@@ -152,7 +152,7 @@ def main():
 
     results.append(
         benchmark_model(
-            "nomic-ai/CodeRankEmbed",
+            "nomic-ai/modernbert-embed-base",
             query_prefix="search_query: ",
             doc_prefix="search_document: ",
             chunks=chunks,
@@ -162,9 +162,9 @@ def main():
 
     results.append(
         benchmark_model(
-            "nomic-ai/modernbert-embed-base",
-            query_prefix="search_query: ",
-            doc_prefix="search_document: ",
+            "BAAI/bge-small-en-v1.5",
+            query_prefix="",
+            doc_prefix="",
             chunks=chunks,
             queries=queries,
         )

@@ -100,7 +100,7 @@ impl rmcp::ServerHandler for RipvecServer {
              Results include full code — review before calling read_file.\n\n\
              ## TIPS\n\
              - Natural language queries work best (not regex or exact code)\n\
-             - search_code with --code flag uses CodeRankEmbed (optimized for code)\n\
+             - search_code uses ModernBERT by default (semantic, high quality)\n\
              - Index auto-updates when files change (2s debounce)\n\
              - focus_file on get_repo_map: great when you're editing a specific file",
         )

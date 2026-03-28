@@ -37,14 +37,11 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Resolve model repo: default → ModernBERT, --fast → BGE-small, --code → CodeRankEmbed
-    let use_code_model = args.code;
+    // Resolve model repo: default → ModernBERT, --fast → BGE-small
     let use_fast = args.fast || args.text;
     let model_repo = args.model_repo.clone().unwrap_or_else(|| {
         if use_fast {
             "BAAI/bge-small-en-v1.5".to_string()
-        } else if use_code_model {
-            "nomic-ai/CodeRankEmbed".to_string()
         } else {
             "nomic-ai/modernbert-embed-base".to_string()
         }
@@ -53,14 +50,6 @@ fn main() -> Result<()> {
     // Default threshold: 0.5 on normalized [0,1] scores (model-agnostic).
     if args.threshold == 0.0 {
         args.threshold = 0.5;
-    }
-
-    // For --code mode, prepend the required query prefix (non-interactive only)
-    if use_code_model && !args.interactive && !args.query.is_empty() {
-        args.query = format!(
-            "Represent this query for searching relevant code: {}",
-            args.query
-        );
     }
 
     // Set up Chrome tracing if `--trace <file>` is specified.
@@ -119,7 +108,6 @@ fn main() -> Result<()> {
             &args,
             use_progress,
             &profiler,
-            use_code_model,
         )?;
     } else {
         run_oneshot(
@@ -222,7 +210,6 @@ fn run_interactive(
     args: &cli::Args,
     use_progress: bool,
     _profiler: &ripvec_core::profile::Profiler,
-    use_code_model: bool,
 ) -> Result<()> {
     // Create a profiler that drives progress display with live stats.
     // Starts as a spinner for walk/chunk phases, then switches to a
@@ -258,12 +245,10 @@ fn run_interactive(
         backends.iter().map(|b| &**b).collect();
 
     let model_repo = args.model_repo.clone().unwrap_or_else(|| {
-        if args.modern {
-            "nomic-ai/modernbert-embed-base".to_string()
-        } else if use_code_model {
-            "nomic-ai/CodeRankEmbed".to_string()
-        } else {
+        if args.fast || args.text {
             "BAAI/bge-small-en-v1.5".to_string()
+        } else {
+            "nomic-ai/modernbert-embed-base".to_string()
         }
     });
 
@@ -352,21 +337,16 @@ fn run_interactive(
         should_quit: false,
         open_editor: None,
         index_summary,
-        query_prefix: if use_code_model {
-            "Represent this query for searching relevant code: ".to_string()
-        } else {
-            String::new()
-        },
         watcher_rx: None,
         watcher_handle: None,
         status_flash: None,
         force_redraw: false,
         cache_config: if args.index {
             let model = args.model_repo.clone().unwrap_or_else(|| {
-                if use_code_model {
-                    "nomic-ai/CodeRankEmbed".to_string()
-                } else {
+                if args.fast || args.text {
                     "BAAI/bge-small-en-v1.5".to_string()
+                } else {
+                    "nomic-ai/modernbert-embed-base".to_string()
                 }
             });
             Some(tui::CacheConfig {
@@ -428,10 +408,10 @@ fn run_oneshot(
 
     // Resolve model repo for cache compatibility check
     let model_repo = args.model_repo.clone().unwrap_or_else(|| {
-        if args.code {
-            "nomic-ai/CodeRankEmbed".to_string()
-        } else {
+        if args.fast || args.text {
             "BAAI/bge-small-en-v1.5".to_string()
+        } else {
+            "nomic-ai/modernbert-embed-base".to_string()
         }
     });
 

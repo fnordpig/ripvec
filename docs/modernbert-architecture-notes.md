@@ -89,7 +89,7 @@ The weight tensor `layers.0.attn_norm.weight` does NOT exist in safetensors.
 ### Final Norm
 
 After all 22 layers, apply `final_norm` (LayerNorm) before pooling.
-This is new — NomicBert/ClassicBert don't have it.
+This is new — ClassicBert doesn't have it.
 
 ### Embedding: Token Only
 
