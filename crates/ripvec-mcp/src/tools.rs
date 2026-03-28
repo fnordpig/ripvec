@@ -151,7 +151,7 @@ impl RipvecServer {
         self.text_backend
             .get_or_try_init(|| async {
                 let backends = tokio::task::spawn_blocking(|| {
-                    ripvec_core::backend::detect_backends("BAAI/bge-small-en-v1.5", None)
+                    ripvec_core::backend::detect_backends("nomic-ai/modernbert-embed-base", None)
                 })
                 .await
                 .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
@@ -171,7 +171,7 @@ impl RipvecServer {
         self.text_tokenizer
             .get_or_try_init(|| async {
                 let t = tokio::task::spawn_blocking(|| {
-                    ripvec_core::tokenize::load_tokenizer("BAAI/bge-small-en-v1.5")
+                    ripvec_core::tokenize::load_tokenizer("nomic-ai/modernbert-embed-base")
                 })
                 .await
                 .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?

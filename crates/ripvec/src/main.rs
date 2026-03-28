@@ -37,18 +37,16 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Resolve model repo: --modern → ModernBERT, --code → CodeRankEmbed, default → BGE-small
-    // NOTE: ModernBERT has a known NaN bug on some corpora (>32 tokens).
-    // Once fixed, ModernBERT becomes the default and --fast selects BGE-small.
+    // Resolve model repo: default → ModernBERT, --fast → BGE-small, --code → CodeRankEmbed
     let use_code_model = args.code;
-    let use_modern = args.modern;
+    let use_fast = args.fast || args.text;
     let model_repo = args.model_repo.clone().unwrap_or_else(|| {
-        if use_modern {
-            "nomic-ai/modernbert-embed-base".to_string()
+        if use_fast {
+            "BAAI/bge-small-en-v1.5".to_string()
         } else if use_code_model {
             "nomic-ai/CodeRankEmbed".to_string()
         } else {
-            "BAAI/bge-small-en-v1.5".to_string()
+            "nomic-ai/modernbert-embed-base".to_string()
         }
     });
 
