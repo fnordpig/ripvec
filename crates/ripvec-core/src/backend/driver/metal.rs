@@ -2342,7 +2342,7 @@ impl Driver for MetalDriver {
         scale: f32,
     ) -> crate::Result<()> {
         let total_rows = batch * num_heads * seq_len;
-        let threads = 256.min(seq_len);
+        let threads = 256.min(seq_len.next_power_of_two());
         self.run_compute("softmax", |enc| {
             enc.setComputePipelineState(&self.kernels.fused_scale_mask_softmax);
             set_buffer(enc, &scores.buffer, scores.offset, 0);
@@ -2372,7 +2372,7 @@ impl Driver for MetalDriver {
         window_size: usize,
     ) -> crate::Result<()> {
         let total_rows = batch * num_heads * seq_len;
-        let threads = 256.min(seq_len);
+        let threads = 256.min(seq_len.next_power_of_two());
         let half_window = window_size / 2;
         self.run_compute("softmax-windowed", |enc| {
             enc.setComputePipelineState(&self.kernels.fused_scale_mask_softmax_windowed);
@@ -2977,7 +2977,7 @@ impl Driver for MetalDriver {
         scale: f32,
     ) -> crate::Result<()> {
         let total_rows = batch * num_heads * seq_len;
-        let threads = 256.min(seq_len);
+        let threads = 256.min(seq_len.next_power_of_two());
         self.run_compute("softmax-f16", |enc| {
             enc.setComputePipelineState(&self.kernels.fused_scale_mask_softmax_f16);
             set_buffer(enc, &scores.buffer, scores.offset, 0);
@@ -3007,7 +3007,7 @@ impl Driver for MetalDriver {
         window_size: usize,
     ) -> crate::Result<()> {
         let total_rows = batch * num_heads * seq_len;
-        let threads = 256.min(seq_len);
+        let threads = 256.min(seq_len.next_power_of_two());
         let half_window = window_size / 2;
         self.run_compute("softmax-windowed-f16", |enc| {
             enc.setComputePipelineState(&self.kernels.fused_scale_mask_softmax_windowed_f16);

@@ -596,7 +596,9 @@ kernel void l2_normalize_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// Build attention mask: 0.0 for real tokens (mask=1), -1e9 for padding (mask=0).
+// Build attention mask: 0.0 for real tokens (mask=1), -65504.0 for padding (mask=0).
+// Uses -65504 (max finite FP16) instead of -1e9 to avoid FP16 overflow to -inf,
+// which would cause NaN in softmax when row_max is also -inf (inf - inf = NaN).
 // ---------------------------------------------------------------------------
 kernel void build_attn_mask_kernel(
     device float* output           [[buffer(0)]],
@@ -605,7 +607,7 @@ kernel void build_attn_mask_kernel(
     uint i [[thread_position_in_grid]]
 ) {
     if (i >= uint(total)) return;
-    output[i] = (mask[i] == 1) ? 0.0 : -1e9;
+    output[i] = (mask[i] == 1) ? 0.0 : -65504.0;
 }
 
 // ---------------------------------------------------------------------------
@@ -947,7 +949,7 @@ kernel void fused_scale_mask_softmax_windowed_kernel(
         // Apply sliding window: mask out positions outside the window
         int dist = (q_pos > i) ? (q_pos - i) : (i - q_pos);
         if (dist > half_window) {
-            val = -1e9;
+            val = -65504.0;
         }
         row_data[i] = val;
         thread_max = max(thread_max, val);
@@ -1091,7 +1093,7 @@ kernel void unpad_from_batch_kernel(
 // Banded Q@K^T: sliding-window attention scores.
 // Output: [batch_heads, seq, window] where window << seq.
 // scores[h, i, w] = dot(Q[h,i,:], K[h, i-window/2+w, :])
-// Out-of-bounds positions get -1e9 (masked in softmax).
+// Out-of-bounds positions get -65504 (masked in softmax).
 // One thread per (batch_head, query_pos, window_pos) element.
 // ---------------------------------------------------------------------------
 kernel void banded_qk_kernel(
@@ -1118,7 +1120,7 @@ kernel void banded_qk_kernel(
     int k_pos = i - half_w + w;
 
     if (k_pos < 0 || k_pos >= seq) {
-        scores[h * stride_sc + i * window + w] = -1e9;
+        scores[h * stride_sc + i * window + w] = -65504.0;
         return;
     }
 
@@ -1380,7 +1382,7 @@ kernel void fused_scale_mask_softmax_windowed_f16_kernel(
     for (int i = int(tid); i < seq; i += int(tpg)) {
         float val = float(row_data[i]) * scale + mask[b * seq + i];
         int dist = (q_pos > i) ? (q_pos - i) : (i - q_pos);
-        if (dist > half_window) val = -1e9;
+        if (dist > half_window) val = -65504.0;
         row_data[i] = half(val);
         thread_max = max(thread_max, val);
     }

@@ -88,7 +88,7 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .enumerate()
         .map(|(i, (chunk_idx, score))| {
-            let chunk = &app.index.chunks[*chunk_idx];
+            let chunk = &app.index.chunks()[*chunk_idx];
             let marker = if i == app.selected { "\u{25b8} " } else { "  " };
             let text = format!(
                 "{marker}{}. [{:.2}] {}",
@@ -134,7 +134,7 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::default().fg(Color::Blue));
 
     let lines: Vec<Line<'_>> = if let Some((chunk_idx, _)) = app.results.get(app.selected) {
-        let chunk = &app.index.chunks[*chunk_idx];
+        let chunk = &app.index.chunks()[*chunk_idx];
         let extension = std::path::Path::new(&chunk.file_path)
             .extension()
             .and_then(|e| e.to_str())
@@ -159,7 +159,7 @@ const STATUS_HINTS: &str =
 /// Draw the status bar with file location left-aligned and keybinding hints right-aligned.
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let location = if let Some((chunk_idx, _)) = app.results.get(app.selected) {
-        let chunk = &app.index.chunks[*chunk_idx];
+        let chunk = &app.index.chunks()[*chunk_idx];
         format!(
             " {}:{}-{}",
             chunk.file_path, chunk.start_line, chunk.end_line

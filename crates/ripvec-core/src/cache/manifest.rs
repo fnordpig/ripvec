@@ -46,8 +46,8 @@ pub struct FileEntry {
     pub chunk_count: usize,
 }
 
-/// Current cache format version.
-const MANIFEST_VERSION: u32 = 1;
+/// Current cache format version. Bump to invalidate all existing caches.
+pub const MANIFEST_VERSION: u32 = 2;
 
 impl Manifest {
     /// Create a new empty manifest for the given model.

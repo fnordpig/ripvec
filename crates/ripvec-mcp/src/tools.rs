@@ -242,7 +242,13 @@ impl RipvecServer {
             )
         })?;
 
-        let ranked = index.rank(&query_embedding, threshold);
+        let ranked = index.search(
+            &query_embedding,
+            query,
+            top_k,
+            threshold,
+            ripvec_core::hybrid::SearchMode::Hybrid,
+        );
 
         let results: Vec<SearchResultItem> = ranked
             .into_iter()
@@ -250,7 +256,7 @@ impl RipvecServer {
             .take(top_k)
             .filter_map(|(idx, score)| {
                 index
-                    .chunks
+                    .chunks()
                     .get(idx)
                     .map(|chunk| SearchResultItem::from_chunk(chunk, score))
             })
@@ -317,7 +323,7 @@ impl RipvecServer {
 
         // Find the chunk containing this location
         let source_idx = index
-            .chunks
+            .chunks()
             .iter()
             .position(|chunk| {
                 chunk.file_path.ends_with(&params.file_path)
@@ -332,7 +338,7 @@ impl RipvecServer {
             })?;
 
         // Get the source chunk's embedding
-        let source_embedding = index.embedding(source_idx).ok_or_else(|| {
+        let source_embedding = index.semantic.embedding(source_idx).ok_or_else(|| {
             rmcp::ErrorData::internal_error(
                 "Embedding not found for source chunk.".to_string(),
                 None,
@@ -340,7 +346,7 @@ impl RipvecServer {
         })?;
 
         // Rank all chunks against the source embedding
-        let ranked = index.rank(&source_embedding, 0.0);
+        let ranked = index.semantic.rank(&source_embedding, 0.0);
 
         let results: Vec<SearchResultItem> = ranked
             .into_iter()
@@ -349,7 +355,7 @@ impl RipvecServer {
             .take(params.top_k)
             .filter_map(|(idx, score)| {
                 index
-                    .chunks
+                    .chunks()
                     .get(idx)
                     .map(|chunk| SearchResultItem::from_chunk(chunk, score))
             })
@@ -385,12 +391,12 @@ impl RipvecServer {
         let (chunk_count, file_count) = match idx_guard.as_ref() {
             Some(index) => {
                 let files = index
-                    .chunks
+                    .chunks()
                     .iter()
                     .map(|c| c.file_path.as_str())
                     .collect::<HashSet<_>>()
                     .len();
-                (index.chunks.len(), files)
+                (index.chunks().len(), files)
             }
             None => (0, 0),
         };
@@ -424,7 +430,7 @@ impl RipvecServer {
             Some(index) => {
                 let mut files_set = HashSet::new();
                 let mut exts: HashMap<String, usize> = HashMap::new();
-                for chunk in &index.chunks {
+                for chunk in index.chunks() {
                     files_set.insert(chunk.file_path.as_str());
                     let ext = std::path::Path::new(&chunk.file_path)
                         .extension()
@@ -433,7 +439,7 @@ impl RipvecServer {
                         .to_string();
                     *exts.entry(ext).or_insert(0) += 1;
                 }
-                (index.chunks.len(), files_set.len(), exts)
+                (index.chunks().len(), files_set.len(), exts)
             }
             None => (0, 0, HashMap::new()),
         };

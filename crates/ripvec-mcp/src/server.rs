@@ -27,7 +27,7 @@ impl Drop for IndexingGuard {
 #[derive(Clone)]
 pub struct RipvecServer {
     /// Pre-built search index (populated after background indexing).
-    pub index: Arc<RwLock<Option<ripvec_core::index::SearchIndex>>>,
+    pub index: Arc<RwLock<Option<ripvec_core::hybrid::HybridIndex>>>,
     /// Text embedding backend (BGE-small), lazy-loaded on first search.
     pub text_backend: Arc<OnceCell<Arc<dyn ripvec_core::backend::EmbedBackend>>>,
     /// Tokenizer for the text model, lazy-loaded.

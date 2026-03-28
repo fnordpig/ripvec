@@ -17,15 +17,19 @@ fn main() -> Result<()> {
         args.path = std::mem::take(&mut args.query);
     }
 
-    // Handle --clear-cache early (before loading anything)
+    // Handle --clear-cache early (before loading anything).
+    // Clears ALL model variants for this project (removes the project hash dir).
     if args.clear_cache {
         let root = std::path::Path::new(&args.path);
-        let cache_dir = ripvec_core::cache::reindex::resolve_cache_dir(
+        // Pass a dummy model — we want the parent (project hash) dir.
+        let version_dir = ripvec_core::cache::reindex::resolve_cache_dir(
             root,
+            "dummy",
             args.cache_dir.as_deref().map(std::path::Path::new),
         );
+        let cache_dir = version_dir.parent().unwrap_or(&version_dir);
         if cache_dir.exists() {
-            std::fs::remove_dir_all(&cache_dir).context("failed to clear cache")?;
+            std::fs::remove_dir_all(cache_dir).context("failed to clear cache")?;
             eprintln!("Cache cleared: {}", cache_dir.display());
         } else {
             eprintln!("No cache found at {}", cache_dir.display());
@@ -278,10 +282,10 @@ fn run_interactive(
         )
         .context("incremental index failed")?;
 
-        // Extract chunks and embeddings from the index for the TUI
-        let n = index.chunks.len();
-        let embs: Vec<Vec<f32>> = (0..n).filter_map(|i| index.embedding(i)).collect();
-        (index.chunks.clone(), embs)
+        // Extract chunks and embeddings from the HybridIndex for the TUI
+        let n = index.chunks().len();
+        let embs: Vec<Vec<f32>> = (0..n).filter_map(|i| index.semantic.embedding(i)).collect();
+        (index.chunks().to_vec(), embs)
     } else {
         // Stateless path: embed everything from scratch
         ripvec_core::embed::embed_all(
@@ -333,7 +337,8 @@ fn run_interactive(
         format!("{} chunks \u{2502} {}", chunks.len(), breakdown.join(", "))
     };
 
-    let index = ripvec_core::index::SearchIndex::new(chunks, &embeddings, None);
+    let index = ripvec_core::hybrid::HybridIndex::new(chunks, embeddings, None)
+        .context("failed to build hybrid index")?;
 
     let mut app = tui::App {
         query: String::new(),
@@ -438,6 +443,7 @@ fn run_oneshot(
         if args.reindex {
             let cache_dir = ripvec_core::cache::reindex::resolve_cache_dir(
                 std::path::Path::new(&args.path),
+                &model_repo,
                 args.cache_dir.as_deref().map(std::path::Path::new),
             );
             let _ = std::fs::remove_dir_all(&cache_dir);
@@ -470,10 +476,8 @@ fn run_oneshot(
             }
         }
 
-        // Build BM25 index for hybrid/keyword search
-        let bm25 = ripvec_core::bm25::Bm25Index::build(&index.chunks)
-            .context("failed to build BM25 index")?;
-        let hybrid = ripvec_core::hybrid::HybridIndex::from_parts(index, bm25);
+        // incremental_index now returns HybridIndex directly (semantic + BM25)
+        let hybrid = index;
 
         // Embed query (skip for keyword-only mode)
         let query_embedding = if search_cfg.mode == ripvec_core::hybrid::SearchMode::Keyword {

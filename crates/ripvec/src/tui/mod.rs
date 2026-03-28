@@ -31,8 +31,8 @@ pub struct App {
     pub selected: usize,
     /// Scroll offset for the preview pane.
     pub preview_scroll: u16,
-    /// Pre-computed search index for BLAS-accelerated re-ranking.
-    pub index: SearchIndex,
+    /// Pre-computed hybrid index (semantic + BM25) for re-ranking.
+    pub index: ripvec_core::hybrid::HybridIndex,
     /// Current ranked results: `(chunk_index, similarity_score)`.
     pub results: Vec<(usize, f32)>,
     /// Embedding backends (primary first, used for query re-embedding).
@@ -114,7 +114,13 @@ impl App {
         };
 
         // BLAS matrix-vector multiply for ranking
-        self.results = self.index.rank(&query_emb, self.threshold);
+        self.results = self.index.search(
+            &query_emb,
+            &self.query,
+            200,
+            self.threshold,
+            ripvec_core::hybrid::SearchMode::Hybrid,
+        );
 
         self.rank_time_ms = start.elapsed().as_secs_f64() * 1000.0;
         self.selected = 0;

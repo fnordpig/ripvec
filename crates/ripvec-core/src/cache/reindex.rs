@@ -8,12 +8,14 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::backend::EmbedBackend;
+use crate::bm25::Bm25Index;
 use crate::cache::diff;
 use crate::cache::file_cache::FileCache;
 use crate::cache::manifest::Manifest;
 use crate::cache::store::ObjectStore;
 use crate::chunk::CodeChunk;
 use crate::embed::SearchConfig;
+use crate::hybrid::HybridIndex;
 use crate::index::SearchIndex;
 use crate::profile::Profiler;
 
@@ -52,7 +54,7 @@ pub fn incremental_index(
     profiler: &Profiler,
     model_repo: &str,
     cache_dir_override: Option<&Path>,
-) -> crate::Result<(SearchIndex, ReindexStats)> {
+) -> crate::Result<(HybridIndex, ReindexStats)> {
     let start = Instant::now();
 
     if backends.is_empty() {
@@ -61,7 +63,7 @@ pub fn incremental_index(
         )));
     }
 
-    let cache_dir = resolve_cache_dir(root, cache_dir_override);
+    let cache_dir = resolve_cache_dir(root, model_repo, cache_dir_override);
     let manifest_path = cache_dir.join("manifest.json");
     let objects_dir = cache_dir.join("objects");
     let store = ObjectStore::new(&objects_dir);
@@ -100,7 +102,7 @@ fn incremental_path(
     store: &ObjectStore,
     mut manifest: Manifest,
     start: Instant,
-) -> crate::Result<(SearchIndex, ReindexStats)> {
+) -> crate::Result<(HybridIndex, ReindexStats)> {
     let diff_result = diff::compute_diff(root, &manifest)?;
 
     let files_changed = diff_result.dirty.len();
@@ -196,13 +198,13 @@ fn incremental_path(
     // Save manifest
     manifest.save(&cache_dir.join("manifest.json"))?;
 
-    // Rebuild SearchIndex from all cached objects
+    // Rebuild HybridIndex (semantic + BM25) from all cached objects
     let (all_chunks, all_embeddings) = load_all_from_store(store, &manifest)?;
     let chunks_total = all_chunks.len();
-    let index = SearchIndex::new(all_chunks, &all_embeddings, None);
+    let hybrid = HybridIndex::new(all_chunks, all_embeddings, None)?;
 
     Ok((
-        index,
+        hybrid,
         ReindexStats {
             chunks_total,
             chunks_reembedded: new_chunks_count,
@@ -230,7 +232,7 @@ fn full_index_path(
     cache_dir: &Path,
     store: &ObjectStore,
     start: Instant,
-) -> crate::Result<(SearchIndex, ReindexStats)> {
+) -> crate::Result<(HybridIndex, ReindexStats)> {
     let (chunks, embeddings) = crate::embed::embed_all(root, backends, tokenizer, cfg, profiler)?;
 
     let hidden_dim = embeddings.first().map_or(384, Vec::len);
@@ -287,10 +289,10 @@ fn full_index_path(
 
     let chunks_total = chunks.len();
     let files_changed = file_groups.len();
-    let index = SearchIndex::new(chunks, &embeddings, None);
+    let hybrid = HybridIndex::new(chunks, embeddings, None)?;
 
     Ok((
-        index,
+        hybrid,
         ReindexStats {
             chunks_total,
             chunks_reembedded: chunks_total,
@@ -328,12 +330,18 @@ fn load_all_from_store(
     Ok((all_chunks, all_embeddings))
 }
 
-/// Resolve the cache directory for a project.
+/// Resolve the cache directory for a project + model combination.
+///
+/// Layout: `<base>/<project_hash>/v<VERSION>-<model_slug>/`
+///
+/// Encoding the version and model into the directory name means switching
+/// models creates a new cache dir (no migration needed) and bumping
+/// [`MANIFEST_VERSION`](super::manifest::MANIFEST_VERSION) auto-invalidates
+/// old caches (they're just orphaned directories).
 ///
 /// Priority: override > `RIPVEC_CACHE` env > XDG cache dir.
-/// The project hash is blake3 of the canonical absolute path.
 #[must_use]
-pub fn resolve_cache_dir(root: &Path, override_dir: Option<&Path>) -> PathBuf {
+pub fn resolve_cache_dir(root: &Path, model_repo: &str, override_dir: Option<&Path>) -> PathBuf {
     let project_hash = {
         let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         blake3::hash(canonical.to_string_lossy().as_bytes())
@@ -341,16 +349,24 @@ pub fn resolve_cache_dir(root: &Path, override_dir: Option<&Path>) -> PathBuf {
             .to_string()
     };
 
-    if let Some(dir) = override_dir {
-        return dir.join(&project_hash);
-    }
+    // e.g. "nomic-ai/modernbert-embed-base" → "modernbert-embed-base"
+    let model_slug = model_repo
+        .rsplit('/')
+        .next()
+        .unwrap_or(model_repo)
+        .to_lowercase();
+    let version_dir = format!("v{}-{model_slug}", crate::cache::manifest::MANIFEST_VERSION);
 
-    if let Ok(env_dir) = std::env::var("RIPVEC_CACHE") {
-        return PathBuf::from(env_dir).join(&project_hash);
-    }
+    let base = if let Some(dir) = override_dir {
+        dir.join(&project_hash)
+    } else if let Ok(env_dir) = std::env::var("RIPVEC_CACHE") {
+        PathBuf::from(env_dir).join(&project_hash)
+    } else {
+        dirs::cache_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("ripvec")
+            .join(&project_hash)
+    };
 
-    dirs::cache_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("ripvec")
-        .join(&project_hash)
+    base.join(version_dir)
 }

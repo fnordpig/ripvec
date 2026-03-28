@@ -102,7 +102,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         // Open selected result in $EDITOR
         KeyCode::Enter => {
             if let Some(&(chunk_idx, _)) = app.results.get(app.selected) {
-                let chunk = &app.index.chunks[chunk_idx];
+                let chunk = &app.index.chunks()[chunk_idx];
                 app.open_editor = Some((chunk.file_path.clone(), chunk.start_line));
             }
             false
