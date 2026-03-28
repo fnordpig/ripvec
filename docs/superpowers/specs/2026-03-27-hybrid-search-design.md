@@ -74,6 +74,8 @@ pub struct HybridIndex {
 
 Registered as `"code"` on the tantivy index. Implements `tantivy::tokenizer::Tokenizer`.
 
+**Why not tree-sitter?** tantivy requires the same tokenizer for both indexing and querying. Queries are natural language (`"error handling in Metal driver"`), not parseable code — tree-sitter can't lex them without a grammar. We already leverage tree-sitter indirectly: the `name` field (boosted 3x) comes from tree-sitter AST extraction during chunking.
+
 Pipeline per input string:
 1. Split on whitespace + punctuation (ASCII word boundaries)
 2. For each token, detect camelCase and snake_case boundaries
