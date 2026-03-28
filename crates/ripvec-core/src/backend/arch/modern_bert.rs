@@ -10,8 +10,8 @@
 //! [`Driver`](super::super::driver::Driver) primitives into the full forward
 //! pass.
 
-use super::super::Encoding;
 use super::super::driver::{BatchInputs, Driver};
+use super::super::Encoding;
 use super::ModelArch;
 
 // ---------------------------------------------------------------------------
@@ -795,7 +795,7 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
             driver.f32_to_f16(&mut hidden_f16, &hidden_states, total_tokens * hidden)?;
 
             // 22 layers — ALL in FP16. Zero conversions.
-            for (li, layer) in w.layers[..num_layers].iter().enumerate() {
+            for layer in &w.layers[..num_layers] {
                 let saved = driver.save_pool_cursor();
 
                 let rope = if layer.is_global {
@@ -810,10 +810,6 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
                     attn_scores_residual_f16(driver, &q, &k, &v, &hidden_f16, layer, &inputs, &g)?;
                 hidden_f16 = ffn_sublayer_f16(driver, &attn_output, layer, &g, &w.zero_bias)?;
                 driver.restore_pool_cursor(saved);
-
-                if (li + 1) % 8 == 0 {
-                    driver.flush_batch()?;
-                }
             }
 
             // ONLY conversion #2: F16 → F32 before final LN + pooling.
@@ -822,7 +818,7 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
             hidden_states = hidden_f32;
         } else {
             // === FP32 PATH (fallback) ===
-            for (li, layer) in w.layers[..num_layers].iter().enumerate() {
+            for layer in &w.layers[..num_layers] {
                 let saved = driver.save_pool_cursor();
 
                 let rope = if layer.is_global {
@@ -838,10 +834,6 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
                 hidden_states = ffn_sublayer(driver, &attn_output, layer, &g, &w.zero_bias)?;
 
                 driver.restore_pool_cursor(saved);
-
-                if (li + 1) % 8 == 0 {
-                    driver.flush_batch()?;
-                }
             }
         }
 
