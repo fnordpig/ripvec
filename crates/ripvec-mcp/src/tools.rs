@@ -60,14 +60,6 @@ pub struct SearchParams {
         deserialize_with = "deserialize_number_or_string"
     )]
     pub offset: usize,
-    /// Search mode: "hybrid" (default), "semantic", or "keyword".
-    #[serde(default = "default_mode")]
-    pub mode: String,
-}
-
-/// Default search mode.
-fn default_mode() -> String {
-    "hybrid".to_string()
 }
 
 /// Parameters for the `find_similar` tool.
@@ -493,13 +485,12 @@ impl RipvecServer {
                 if path.is_dir() {
                     walk_newest(&path, newest, newest_file);
                 } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                    if ext == "rs" || path.file_name().is_some_and(|n| n == "Cargo.toml") {
-                        if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
-                            if mtime > *newest {
-                                *newest = mtime;
-                                *newest_file = path.display().to_string();
-                            }
-                        }
+                    if (ext == "rs" || path.file_name().is_some_and(|n| n == "Cargo.toml"))
+                        && let Ok(mtime) = entry.metadata().and_then(|m| m.modified())
+                        && mtime > *newest
+                    {
+                        *newest = mtime;
+                        *newest_file = path.display().to_string();
                     }
                 }
             }

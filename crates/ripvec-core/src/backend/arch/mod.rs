@@ -4,12 +4,11 @@
 //! [`Driver`](super::driver::Driver) primitives into a complete forward pass
 //! (embeddings -> encoder layers -> pooling -> normalization).
 //!
-//! Each architecture (ClassicBert, NomicBert, ModernBert) is implemented once
+//! Each architecture (ClassicBert, ModernBert) is implemented once
 //! and works with any driver backend via generics.
 
 pub mod classic_bert;
 pub mod modern_bert;
-pub mod nomic_bert;
 
 use super::Encoding;
 use super::driver::Driver;
@@ -44,8 +43,6 @@ pub trait ModelArch<D: Driver> {
 pub enum ArchVariant {
     /// BGE-small: learned position embeddings, GELU, CLS pooling, bias.
     ClassicBert,
-    /// CodeRankEmbed: RoPE, SwiGLU, mean pooling, no bias.
-    NomicBert,
     /// ModernBERT: alternating local/global attention, GeGLU, unpadding.
     ModernBert,
 }

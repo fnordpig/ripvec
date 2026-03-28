@@ -4,9 +4,8 @@
 //! matrix operations. Weights are loaded directly from safetensors files
 //! downloaded via `hf-hub`.
 //!
-//! Supports two model families:
-//! - **`ClassicBert`** (BGE models): learned position embeddings, GELU, QKV with bias.
-//! - **`NomicBert`** (`CodeRankEmbed`, nomic-embed-text): `RoPE`, `SwiGLU`, no bias.
+//! Supports the `ClassicBert` family (BGE models): learned position embeddings,
+//! GELU activation, and QKV projections with bias.
 
 // Ensure the BLAS linker symbols are pulled in.
 #[cfg(target_os = "macos")]
@@ -19,40 +18,29 @@ use std::f32::consts::PI;
 use std::sync::Arc;
 
 use hf_hub::api::sync::Api;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
+use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 use safetensors::SafeTensors;
 
 use super::{DeviceHint, EmbedBackend, Encoding};
 
 // ---------------------------------------------------------------------------
-// Model variant detection
+// Architecture validation
 // ---------------------------------------------------------------------------
 
-/// Which BERT variant the loaded weights correspond to.
+/// Validate that the loaded weights are a recognized `ClassicBert` model.
 ///
-/// `ClassicBert` uses learned position embeddings, GELU activation, and
-/// biased QKV projections. `NomicBert` uses `RoPE`, `SwiGLU`, and unbiased
-/// projections.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ModelVariant {
-    /// Standard BERT / BGE models (e.g. `BAAI/bge-small-en-v1.5`).
-    ClassicBert,
-    /// `NomicBert` models (e.g. `nomic-ai/CodeRankEmbed`, `nomic-embed-text-v1.5`).
-    NomicBert,
-}
-
-/// Detect the model variant by inspecting weight names.
-///
-/// `ClassicBert` has `embeddings.position_embeddings.weight`; `NomicBert`
-/// does not (it uses rotary position encoding instead).
-fn detect_variant(tensors: &SafeTensors<'_>) -> ModelVariant {
+/// `ClassicBert` has `embeddings.position_embeddings.weight`. Returns an
+/// error if the architecture is not recognized.
+fn detect_variant(tensors: &SafeTensors<'_>) -> crate::Result<()> {
     if tensors
         .tensor("embeddings.position_embeddings.weight")
         .is_ok()
     {
-        ModelVariant::ClassicBert
+        Ok(())
     } else {
-        ModelVariant::NomicBert
+        Err(crate::Error::Other(anyhow::anyhow!(
+            "unrecognized model architecture: no position_embeddings found"
+        )))
     }
 }
 
@@ -63,32 +51,27 @@ fn detect_variant(tensors: &SafeTensors<'_>) -> ModelVariant {
 /// Configuration for a BERT-style encoder model.
 ///
 /// Matches the `config.json` schema from `HuggingFace` model repos.
-/// Supports both `ClassicBert` and `NomicBert` config key names.
 #[derive(Debug, Clone)]
 struct BertConfig {
-    /// Which variant this config describes.
-    variant: ModelVariant,
-    /// Hidden dimension (384 for bge-small, 768 for nomic).
+    /// Hidden dimension (e.g. 384 for bge-small).
     hidden_size: i32,
     /// Number of transformer layers.
     num_hidden_layers: i32,
     /// Number of attention heads.
     num_attention_heads: i32,
-    /// Maximum sequence length (512 for classic, 8192 for nomic).
+    /// Maximum sequence length (512 for ClassicBert).
     max_position_embeddings: i32,
-    /// Base for rotary embeddings (only used by `NomicBert`).
-    rotary_emb_base: f32,
     /// Layer norm epsilon.
     layer_norm_eps: f32,
 }
 
 impl BertConfig {
-    /// Parse from a `config.json` value, dispatching on `variant`.
+    /// Parse from a `config.json` value.
     #[expect(
         clippy::cast_possible_truncation,
         reason = "config values are small ints/floats that fit in i32/f32"
     )]
-    fn from_json(v: &serde_json::Value, variant: ModelVariant) -> crate::Result<Self> {
+    fn from_json(v: &serde_json::Value) -> crate::Result<Self> {
         let get_i32 = |key: &str| -> crate::Result<i32> {
             v.get(key)
                 .and_then(serde_json::Value::as_i64)
@@ -104,40 +87,13 @@ impl BertConfig {
         let layer_norm_eps =
             get_f64("layer_norm_epsilon").or_else(|_| get_f64("layer_norm_eps"))? as f32;
 
-        match variant {
-            ModelVariant::ClassicBert => Ok(Self {
-                variant,
-                hidden_size: get_i32("hidden_size")?,
-                num_hidden_layers: get_i32("num_hidden_layers")?,
-                num_attention_heads: get_i32("num_attention_heads")?,
-                max_position_embeddings: get_i32("max_position_embeddings").unwrap_or(512),
-                rotary_emb_base: 10000.0,
-                layer_norm_eps,
-            }),
-            ModelVariant::NomicBert => {
-                let hidden_size = get_i32("n_embd").or_else(|_| get_i32("hidden_size"))?;
-                let num_hidden_layers =
-                    get_i32("n_layer").or_else(|_| get_i32("num_hidden_layers"))?;
-                let num_attention_heads =
-                    get_i32("n_head").or_else(|_| get_i32("num_attention_heads"))?;
-                let max_position_embeddings = get_i32("n_positions")
-                    .or_else(|_| get_i32("max_position_embeddings"))
-                    .unwrap_or(8192);
-                let rotary_emb_base = get_f64("rotary_emb_base")
-                    .map(|v| v as f32)
-                    .unwrap_or(10000.0);
-
-                Ok(Self {
-                    variant,
-                    hidden_size,
-                    num_hidden_layers,
-                    num_attention_heads,
-                    max_position_embeddings,
-                    rotary_emb_base,
-                    layer_norm_eps,
-                })
-            }
-        }
+        Ok(Self {
+            hidden_size: get_i32("hidden_size")?,
+            num_hidden_layers: get_i32("num_hidden_layers")?,
+            num_attention_heads: get_i32("num_attention_heads")?,
+            max_position_embeddings: get_i32("max_position_embeddings").unwrap_or(512),
+            layer_norm_eps,
+        })
     }
 }
 
@@ -239,11 +195,6 @@ fn gelu(x: f32) -> f32 {
     x * 0.5 * (1.0 + ((2.0 / PI).sqrt() * (x + 0.044_715 * x.powi(3))).tanh())
 }
 
-/// `SiLU` (Sigmoid Linear Unit) activation: `x * sigmoid(x)`.
-fn silu(x: f32) -> f32 {
-    x / (1.0 + (-x).exp())
-}
-
 /// Softmax along the last axis of a 1D slice (in-place).
 ///
 /// Uses the numerically stable `exp(x - max) / sum(exp(x - max))` form.
@@ -264,11 +215,9 @@ fn softmax_inplace(vals: &mut [f32]) {
 // BERT embeddings layer
 // ---------------------------------------------------------------------------
 
-/// BERT embeddings layer: word + optional(position + `token_type`) + `LayerNorm`.
+/// BERT embeddings layer: word + position + `token_type` + `LayerNorm`.
 ///
-/// For `ClassicBert`, position and `token_type` embeddings are summed with word
-/// embeddings. For `NomicBert`, only word embeddings + `LayerNorm` are used
-/// (positions are handled by `RoPE` in each attention layer).
+/// Position and `token_type` embeddings are summed with word embeddings.
 #[derive(Debug)]
 struct CpuBertEmbeddings {
     /// Word embedding table `[vocab_size, hidden]`.
@@ -339,20 +288,18 @@ impl CpuBertEmbeddings {
 
 /// Self-attention sub-layer within a BERT encoder layer.
 ///
-/// Uses a fused QKV projection for both variants: a single `[3*hidden, hidden]`
-/// weight matrix produces Q, K, V in one matmul, then splits the result.
-///
-/// For `ClassicBert`, projections include bias terms and no rotary encoding.
-/// For `NomicBert`, projections are unbiased and `RoPE` is applied to Q and K.
+/// Uses a fused QKV projection: a single `[3*hidden, hidden]` weight matrix
+/// produces Q, K, V in one matmul, then splits the result.
+/// Projections include bias terms; no rotary encoding.
 #[derive(Debug)]
 struct CpuBertSelfAttention {
     /// Fused Q/K/V weight matrix `[3*hidden, hidden]`.
     qkv_weight: Array2<f32>,
-    /// Fused Q/K/V bias `[3*hidden]` (`ClassicBert` only).
+    /// Fused Q/K/V bias `[3*hidden]`.
     qkv_bias: Option<Array1<f32>>,
     /// Output projection weight `[hidden, hidden]`.
     output_weight: Array2<f32>,
-    /// Output projection bias `[hidden]` (`ClassicBert` only).
+    /// Output projection bias `[hidden]`.
     output_bias: Option<Array1<f32>>,
     /// Post-attention `LayerNorm` weight `[hidden]`.
     output_ln_weight: Array1<f32>,
@@ -364,50 +311,12 @@ struct CpuBertSelfAttention {
     head_dim: i32,
     /// Layer norm epsilon.
     layer_norm_eps: f32,
-    /// Rotary embedding base (`NomicBert` only).
-    rotary_emb_base: Option<f32>,
-}
-
-/// Apply rotary position embeddings to Q and K for a single (batch, head) pair.
-///
-/// Each row `[head_dim]` is split into two halves. For position `pos`:
-/// `theta_i = base^(-2i/head_dim)`, then:
-///   `first' = first * cos(pos * theta) - second * sin(pos * theta)`
-///   `second' = first * sin(pos * theta) + second * cos(pos * theta)`
-#[expect(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "position/dimension indices are small; f64 trig results fit in f32"
-)]
-fn apply_rope_to_2d(mat: &ArrayView2<'_, f32>, base: f32, head_dim: i32) -> Array2<f32> {
-    let seq = mat.shape()[0];
-    let hd = head_dim as usize;
-    let half = hd / 2;
-    let mut out = mat.to_owned();
-
-    for pos in 0..seq {
-        for i in 0..half {
-            let theta = f64::from(base).powf(-2.0 * i as f64 / hd as f64);
-            let angle = pos as f64 * theta;
-            let cos_a = angle.cos() as f32;
-            let sin_a = angle.sin() as f32;
-
-            let first = mat[[pos, i]];
-            let second = mat[[pos, i + half]];
-            out[[pos, i]] = first * cos_a - second * sin_a;
-            out[[pos, i + half]] = first * sin_a + second * cos_a;
-        }
-    }
-    out
 }
 
 impl CpuBertSelfAttention {
     /// Scaled dot-product multi-head attention with residual + `LayerNorm`.
     ///
     /// Both variants use post-norm: attention -> residual -> `LayerNorm`.
-    /// `NomicBert` applies `RoPE` to Q and K; `ClassicBert` does not.
-    ///
     /// `hidden` is `[seq, hidden]` (single batch item). `mask` is `[seq]`
     /// with 0.0 for real tokens and a large negative value for padding.
     #[expect(
@@ -447,22 +356,9 @@ impl CpuBertSelfAttention {
             let k_h = k.slice(s![.., col_start..col_end]);
             let v_h = v.slice(s![.., col_start..col_end]);
 
-            // Apply RoPE for NomicBert
-            let (q_h_owned, k_h_owned);
-            let (q_h_ref, k_h_ref) = if let Some(base) = self.rotary_emb_base {
-                q_h_owned = apply_rope_to_2d(&q_h, base, self.head_dim);
-                k_h_owned = apply_rope_to_2d(&k_h, base, self.head_dim);
-                (q_h_owned.view(), k_h_owned.view())
-            } else {
-                // Bind to owned copies so lifetimes match
-                q_h_owned = q_h.to_owned();
-                k_h_owned = k_h.to_owned();
-                (q_h_owned.view(), k_h_owned.view())
-            };
-
             // scores = Q @ K^T / sqrt(head_dim)  => [seq, seq]
             let scale = 1.0 / (hd as f32).sqrt();
-            let mut scores = q_h_ref.dot(&k_h_ref.t());
+            let mut scores = q_h.dot(&k_h.t());
             scores.mapv_inplace(|v| v * scale);
 
             // Add attention mask: broadcast [seq] to each row
@@ -513,20 +409,16 @@ impl CpuBertSelfAttention {
 
 /// Feed-forward network sub-layer within a BERT encoder layer.
 ///
-/// `ClassicBert`: Linear -> GELU -> Linear (all with bias).
-/// `NomicBert`: Linear -> `SwiGLU` split -> Linear (no bias).
+/// Linear -> GELU -> Linear, all with bias terms.
 #[derive(Debug)]
 struct CpuBertFfn {
-    /// Intermediate projection weight.
-    ///
-    /// `ClassicBert`: `[intermediate, hidden]`.
-    /// `NomicBert`: `[2*intermediate, hidden]` (gate+value fused).
+    /// Intermediate projection weight `[intermediate, hidden]`.
     intermediate_weight: Array2<f32>,
-    /// Intermediate projection bias (`ClassicBert` only).
+    /// Intermediate projection bias `[intermediate]`.
     intermediate_bias: Option<Array1<f32>>,
     /// Output projection weight `[hidden, intermediate]`.
     output_weight: Array2<f32>,
-    /// Output projection bias (`ClassicBert` only).
+    /// Output projection bias `[hidden]`.
     output_bias: Option<Array1<f32>>,
     /// Post-FFN `LayerNorm` weight `[hidden]`.
     output_ln_weight: Array1<f32>,
@@ -534,16 +426,10 @@ struct CpuBertFfn {
     output_ln_bias: Array1<f32>,
     /// Layer norm epsilon.
     layer_norm_eps: f32,
-    /// Model variant (determines GELU vs `SwiGLU` activation).
-    variant: ModelVariant,
 }
 
 impl CpuBertFfn {
-    /// FFN forward pass, dispatching on variant for activation function.
-    ///
-    /// Both variants use post-norm: FFN -> residual -> `LayerNorm`.
-    /// `ClassicBert`: GELU activation.
-    /// `NomicBert`: `SwiGLU` (`value * silu(gate)`).
+    /// FFN forward pass: intermediate projection -> GELU -> output projection -> residual + `LayerNorm`.
     ///
     /// `hidden` is `[seq, hidden]`.
     fn forward(&self, hidden: &Array2<f32>) -> Array2<f32> {
@@ -558,19 +444,7 @@ impl CpuBertFfn {
             intermediate
         };
 
-        // Activation (dispatch on variant)
-        let activated = match self.variant {
-            ModelVariant::ClassicBert => intermediate.mapv(gelu),
-            ModelVariant::NomicBert => {
-                // SwiGLU: intermediate has shape [seq, 2*inter]
-                // Split into value (first half) and gate (second half)
-                let inter_dim = intermediate.shape()[1] / 2;
-                let value = intermediate.slice(s![.., ..inter_dim]);
-                let gate = intermediate.slice(s![.., inter_dim..]);
-                let gate_activated = gate.mapv(silu);
-                &value * &gate_activated
-            }
-        };
+        let activated = intermediate.mapv(gelu);
 
         // Output projection: [seq, intermediate] @ [intermediate, hidden] => [seq, hidden]
         let output = activated.dot(&self.output_weight.t());
@@ -697,7 +571,6 @@ fn load_classic_layer(
         num_heads: config.num_attention_heads,
         head_dim: config.hidden_size / config.num_attention_heads,
         layer_norm_eps: config.layer_norm_eps,
-        rotary_emb_base: None,
     };
     let ffn = CpuBertFfn {
         intermediate_weight: load_tensor2(tensors, &format!("{prefix}.intermediate.dense.weight"))?,
@@ -707,49 +580,6 @@ fn load_classic_layer(
         output_ln_weight: load_tensor1(tensors, &format!("{prefix}.output.LayerNorm.weight"))?,
         output_ln_bias: load_tensor1(tensors, &format!("{prefix}.output.LayerNorm.bias"))?,
         layer_norm_eps: config.layer_norm_eps,
-        variant: config.variant,
-    };
-    Ok((attention, ffn))
-}
-
-/// Load `NomicBert` encoder layers from safetensors.
-fn load_nomic_layer(
-    tensors: &SafeTensors<'_>,
-    i: i32,
-    config: &BertConfig,
-) -> crate::Result<(CpuBertSelfAttention, CpuBertFfn)> {
-    let prefix = format!("encoder.layers.{i}");
-
-    let qkv_weight = load_tensor2(tensors, &format!("{prefix}.attn.Wqkv.weight"))?;
-
-    let attention = CpuBertSelfAttention {
-        qkv_weight,
-        qkv_bias: None,
-        output_weight: load_tensor2(tensors, &format!("{prefix}.attn.out_proj.weight"))?,
-        output_bias: None,
-        output_ln_weight: load_tensor1(tensors, &format!("{prefix}.norm1.weight"))?,
-        output_ln_bias: load_tensor1(tensors, &format!("{prefix}.norm1.bias"))?,
-        num_heads: config.num_attention_heads,
-        head_dim: config.hidden_size / config.num_attention_heads,
-        layer_norm_eps: config.layer_norm_eps,
-        rotary_emb_base: Some(config.rotary_emb_base),
-    };
-
-    // SwiGLU: fc11 = value/up, fc12 = gate, fc2 = down
-    let fc11 = load_tensor2(tensors, &format!("{prefix}.mlp.fc11.weight"))?;
-    let fc12 = load_tensor2(tensors, &format!("{prefix}.mlp.fc12.weight"))?;
-    let gate_up = ndarray::concatenate(Axis(0), &[fc11.view(), fc12.view()])
-        .map_err(|e| crate::Error::Other(anyhow::anyhow!("SwiGLU concat error layer {i}: {e}")))?;
-
-    let ffn = CpuBertFfn {
-        intermediate_weight: gate_up,
-        intermediate_bias: None,
-        output_weight: load_tensor2(tensors, &format!("{prefix}.mlp.fc2.weight"))?,
-        output_bias: None,
-        output_ln_weight: load_tensor1(tensors, &format!("{prefix}.norm2.weight"))?,
-        output_ln_bias: load_tensor1(tensors, &format!("{prefix}.norm2.bias"))?,
-        layer_norm_eps: config.layer_norm_eps,
-        variant: config.variant,
     };
     Ok((attention, ffn))
 }
@@ -767,32 +597,19 @@ impl CpuBertModel {
         reason = "hidden_size and num_layers are small positive ints from config"
     )]
     fn from_safetensors(tensors: &SafeTensors<'_>, config: &BertConfig) -> crate::Result<Self> {
-        let embeddings = match config.variant {
-            ModelVariant::ClassicBert => CpuBertEmbeddings {
-                word_embeddings: load_tensor2(tensors, "embeddings.word_embeddings.weight")?,
-                position_embeddings: Some(load_tensor2(
-                    tensors,
-                    "embeddings.position_embeddings.weight",
-                )?),
-                token_type_embeddings: Some(load_tensor2(
-                    tensors,
-                    "embeddings.token_type_embeddings.weight",
-                )?),
-                layer_norm_weight: load_tensor1(tensors, "embeddings.LayerNorm.weight")?,
-                layer_norm_bias: load_tensor1(tensors, "embeddings.LayerNorm.bias")?,
-                layer_norm_eps: config.layer_norm_eps,
-            },
-            ModelVariant::NomicBert => CpuBertEmbeddings {
-                word_embeddings: load_tensor2(tensors, "embeddings.word_embeddings.weight")?,
-                position_embeddings: None,
-                token_type_embeddings: try_load_tensor2(
-                    tensors,
-                    "embeddings.token_type_embeddings.weight",
-                )?,
-                layer_norm_weight: load_tensor1(tensors, "emb_ln.weight")?,
-                layer_norm_bias: load_tensor1(tensors, "emb_ln.bias")?,
-                layer_norm_eps: config.layer_norm_eps,
-            },
+        let embeddings = CpuBertEmbeddings {
+            word_embeddings: load_tensor2(tensors, "embeddings.word_embeddings.weight")?,
+            position_embeddings: Some(load_tensor2(
+                tensors,
+                "embeddings.position_embeddings.weight",
+            )?),
+            token_type_embeddings: Some(load_tensor2(
+                tensors,
+                "embeddings.token_type_embeddings.weight",
+            )?),
+            layer_norm_weight: load_tensor1(tensors, "embeddings.LayerNorm.weight")?,
+            layer_norm_bias: load_tensor1(tensors, "embeddings.LayerNorm.bias")?,
+            layer_norm_eps: config.layer_norm_eps,
         };
 
         let emb_dim = embeddings.word_embeddings.shape()[1] as i32;
@@ -806,10 +623,7 @@ impl CpuBertModel {
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers as usize);
         for i in 0..config.num_hidden_layers {
-            let (attention, ffn) = match config.variant {
-                ModelVariant::ClassicBert => load_classic_layer(tensors, i, config)?,
-                ModelVariant::NomicBert => load_nomic_layer(tensors, i, config)?,
-            };
+            let (attention, ffn) = load_classic_layer(tensors, i, config)?;
             layers.push(CpuBertLayer { attention, ffn });
         }
 
@@ -827,8 +641,8 @@ impl CpuBertModel {
 /// runs on the CPU, making this backend portable to any platform with a
 /// system BLAS library (`OpenBLAS`, MKL, Accelerate).
 ///
-/// Supports both `ClassicBert` (BGE) and `NomicBert` (`CodeRankEmbed`) model
-/// families, detected automatically from weight names.
+/// Supports the `ClassicBert` family (BGE models), detected automatically
+/// from weight names.
 ///
 /// The inner model is wrapped in [`Arc`] so the backend can be cheaply
 /// cloned for per-thread use in rayon.
@@ -851,11 +665,11 @@ impl std::fmt::Debug for CpuBackend {
 }
 
 impl CpuBackend {
-    /// Load a BERT/BGE/`NomicBert` embedding model from `HuggingFace`.
+    /// Load a `ClassicBert` (BGE) embedding model from `HuggingFace`.
     ///
     /// Downloads `model.safetensors` and `config.json` on first call;
-    /// subsequent calls use the `hf-hub` cache. The model variant
-    /// (`ClassicBert` or `NomicBert`) is auto-detected from weight names.
+    /// subsequent calls use the `hf-hub` cache. Returns an error if the
+    /// model architecture is not recognized.
     ///
     /// # Errors
     ///
@@ -887,7 +701,7 @@ impl CpuBackend {
 
         let tensors = SafeTensors::deserialize(&model_bytes)
             .map_err(|e| crate::Error::Other(anyhow::anyhow!("safetensors parse error: {e}")))?;
-        let variant = detect_variant(&tensors);
+        detect_variant(&tensors)?;
 
         let config_str = std::fs::read_to_string(&config_path).map_err(|e| crate::Error::Io {
             path: config_path.display().to_string(),
@@ -895,7 +709,7 @@ impl CpuBackend {
         })?;
         let config_json: serde_json::Value = serde_json::from_str(&config_str)
             .map_err(|e| crate::Error::Other(anyhow::anyhow!("config parse error: {e}")))?;
-        let config = BertConfig::from_json(&config_json, variant)?;
+        let config = BertConfig::from_json(&config_json)?;
 
         let hidden_size = config.hidden_size;
         let max_position_embeddings = config.max_position_embeddings;
@@ -961,7 +775,7 @@ impl EmbedBackend for CpuBackend {
         false
     }
 
-    /// Maximum tokens from model config (512 for BERT, 8192 for `NomicBert`).
+    /// Maximum tokens from model config (512 for `ClassicBert`).
     #[expect(
         clippy::cast_sign_loss,
         reason = "max_position_embeddings is always positive from config"
@@ -986,7 +800,7 @@ mod tests {
             "max_position_embeddings": 512,
             "layer_norm_eps": 1e-12
         });
-        let config = BertConfig::from_json(&json, ModelVariant::ClassicBert).unwrap();
+        let config = BertConfig::from_json(&json).unwrap();
         assert_eq!(config.hidden_size, 384);
         assert_eq!(config.num_hidden_layers, 12);
         assert_eq!(config.num_attention_heads, 12);
@@ -994,25 +808,9 @@ mod tests {
     }
 
     #[test]
-    fn config_from_json_nomic() {
-        let json: serde_json::Value = serde_json::json!({
-            "n_embd": 768,
-            "n_layer": 12,
-            "n_head": 12,
-            "n_positions": 8192,
-            "rotary_emb_base": 10000.0,
-            "layer_norm_epsilon": 1e-5
-        });
-        let config = BertConfig::from_json(&json, ModelVariant::NomicBert).unwrap();
-        assert_eq!(config.hidden_size, 768);
-        assert_eq!(config.num_hidden_layers, 12);
-        assert_eq!(config.max_position_embeddings, 8192);
-    }
-
-    #[test]
     fn config_missing_key_errors() {
         let json: serde_json::Value = serde_json::json!({});
-        let result = BertConfig::from_json(&json, ModelVariant::ClassicBert);
+        let result = BertConfig::from_json(&json);
         assert!(result.is_err());
     }
 

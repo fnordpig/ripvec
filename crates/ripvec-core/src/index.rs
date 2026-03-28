@@ -125,7 +125,7 @@ impl SearchIndex {
 
         // Compress embeddings with PolarQuant (4-bit).
         // At 768-dim: ~1920 bytes/vector vs 3072 FP32. 8× compression with bit-packing.
-        let compressed = if hidden_dim >= 64 && hidden_dim % 2 == 0 {
+        let compressed = if hidden_dim >= 64 && hidden_dim.is_multiple_of(2) {
             let codec = PolarCodec::new(hidden_dim, 4, 42);
             let corpus = codec.encode_batch(&embeddings);
             Some(CompressedIndex { codec, corpus })

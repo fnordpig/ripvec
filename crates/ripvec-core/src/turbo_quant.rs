@@ -58,6 +58,7 @@ pub struct CompressedCode {
 
 impl CompressedCode {
     /// Approximate memory in bytes.
+    #[must_use]
     pub fn encoded_bytes(&self) -> usize {
         self.radii.len() * 4 + self.angle_indices.len()
     }
@@ -87,8 +88,12 @@ impl PolarCodec {
     /// # Panics
     ///
     /// Panics if `dim` is 0, odd, or `bits` is 0 or > 8.
+    #[must_use]
     pub fn new(dim: usize, bits: u8, seed: u64) -> Self {
-        assert!(dim > 0 && dim % 2 == 0, "dim must be even and non-zero");
+        assert!(
+            dim > 0 && dim.is_multiple_of(2),
+            "dim must be even and non-zero"
+        );
         assert!(bits > 0 && bits <= 8, "bits must be 1..=8");
 
         let levels = 1usize << bits;
@@ -115,11 +120,13 @@ impl PolarCodec {
     }
 
     /// Number of pairs per vector.
+    #[must_use]
     pub fn pairs(&self) -> usize {
         self.pairs
     }
 
     /// Encode a single vector (convenience, allocates).
+    #[must_use]
     pub fn encode(&self, vector: &[f32]) -> CompressedCode {
         assert_eq!(vector.len(), self.dim);
         let x = Array1::from_vec(vector.to_vec());
@@ -142,6 +149,7 @@ impl PolarCodec {
     ///
     /// Uses BLAS for the rotation: `rotated = vectors × Πᵀ` (one GEMM).
     /// Quantization is scalar but cache-friendly (sequential writes).
+    #[must_use]
     pub fn encode_batch(&self, vectors: &Array2<f32>) -> CompressedCorpus {
         assert_eq!(vectors.ncols(), self.dim);
         let n = vectors.nrows();
@@ -170,6 +178,7 @@ impl PolarCodec {
     }
 
     /// Also produce the old per-vector codes (for backward compat with index.rs).
+    #[must_use]
     pub fn encode_batch_codes(&self, vectors: &Array2<f32>) -> Vec<CompressedCode> {
         let corpus = self.encode_batch(vectors);
         (0..corpus.n)
@@ -187,6 +196,7 @@ impl PolarCodec {
     ///
     /// Cost: one 768×768 matvec + 384×16 multiply-adds = ~0.08ms.
     /// The returned [`QueryState`] is reused for ALL vectors in the scan.
+    #[must_use]
     pub fn prepare_query(&self, query: &[f32]) -> QueryState {
         assert_eq!(query.len(), self.dim);
         let q = Array1::from_vec(query.to_vec());
@@ -218,6 +228,7 @@ impl PolarCodec {
     /// Centroid table: 24 KB, stays in L1 throughout.
     ///
     /// At 100K vectors, d=768: ~3.3ms on CPU, ~0.1ms on GPU (future Metal kernel).
+    #[must_use]
     pub fn scan_corpus(&self, corpus: &CompressedCorpus, qs: &QueryState) -> Vec<f32> {
         let n = corpus.n;
         let pairs = corpus.pairs;
@@ -260,6 +271,7 @@ impl PolarCodec {
     }
 
     /// Scan per-vector codes (old API, for backward compat).
+    #[must_use]
     pub fn batch_scan(&self, codes: &[CompressedCode], qs: &QueryState) -> Vec<f32> {
         codes
             .iter()

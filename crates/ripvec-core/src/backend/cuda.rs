@@ -4,9 +4,8 @@
 //! management, cuBLAS for matrix multiplications, and runtime-compiled CUDA
 //! kernels for activations, layer normalization, softmax, and embedding lookup.
 //!
-//! Supports two model families:
-//! - **`ClassicBert`** (BGE models): learned position embeddings, GELU, QKV with bias.
-//! - **`NomicBert`** (`CodeRankEmbed`, nomic-embed-text): `RoPE`, `SwiGLU`, no bias.
+//! Supports the `ClassicBert` family (BGE models): learned position embeddings,
+//! GELU activation, and QKV projections with bias.
 
 use std::sync::Arc;
 
@@ -37,31 +36,23 @@ fn cuda_err(e: impl std::fmt::Display) -> crate::Error {
 }
 
 // ---------------------------------------------------------------------------
-// Model variant detection (shared logic with CPU backend)
+// Architecture validation
 // ---------------------------------------------------------------------------
 
-/// Which BERT variant the loaded weights correspond to.
+/// Validate that the loaded weights are a recognized `ClassicBert` model.
 ///
-/// `ClassicBert` uses learned position embeddings, GELU activation, and
-/// biased QKV projections. `NomicBert` uses `RoPE`, `SwiGLU`, and unbiased
-/// projections.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ModelVariant {
-    /// Standard BERT / BGE models (e.g. `BAAI/bge-small-en-v1.5`).
-    ClassicBert,
-    /// `NomicBert` models (e.g. `nomic-ai/CodeRankEmbed`, `nomic-embed-text-v1.5`).
-    NomicBert,
-}
-
-/// Detect the model variant by inspecting weight names.
-fn detect_variant(tensors: &SafeTensors<'_>) -> ModelVariant {
+/// `ClassicBert` has `embeddings.position_embeddings.weight`. Returns an
+/// error if the architecture is not recognized.
+fn detect_variant(tensors: &SafeTensors<'_>) -> crate::Result<()> {
     if tensors
         .tensor("embeddings.position_embeddings.weight")
         .is_ok()
     {
-        ModelVariant::ClassicBert
+        Ok(())
     } else {
-        ModelVariant::NomicBert
+        Err(crate::Error::Other(anyhow::anyhow!(
+            "unrecognized model architecture: no position_embeddings found"
+        )))
     }
 }
 
@@ -72,29 +63,25 @@ fn detect_variant(tensors: &SafeTensors<'_>) -> ModelVariant {
 /// Configuration for a BERT-style encoder model.
 #[derive(Debug, Clone)]
 struct BertConfig {
-    /// Which variant this config describes.
-    variant: ModelVariant,
-    /// Hidden dimension (384 for bge-small, 768 for nomic).
+    /// Hidden dimension (e.g. 384 for bge-small).
     hidden_size: i32,
     /// Number of transformer layers.
     num_hidden_layers: i32,
     /// Number of attention heads.
     num_attention_heads: i32,
-    /// Maximum sequence length (512 for classic, 8192 for nomic).
+    /// Maximum sequence length (512 for ClassicBert).
     max_position_embeddings: i32,
-    /// Base for rotary embeddings (only used by `NomicBert`).
-    rotary_emb_base: f32,
     /// Layer norm epsilon.
     layer_norm_eps: f32,
 }
 
 impl BertConfig {
-    /// Parse from a `config.json` value, dispatching on `variant`.
+    /// Parse from a `config.json` value.
     #[expect(
         clippy::cast_possible_truncation,
         reason = "config values are small ints/floats that fit in i32/f32"
     )]
-    fn from_json(v: &serde_json::Value, variant: ModelVariant) -> crate::Result<Self> {
+    fn from_json(v: &serde_json::Value) -> crate::Result<Self> {
         let get_i32 = |key: &str| -> crate::Result<i32> {
             v.get(key)
                 .and_then(serde_json::Value::as_i64)
@@ -110,40 +97,13 @@ impl BertConfig {
         let layer_norm_eps =
             get_f64("layer_norm_epsilon").or_else(|_| get_f64("layer_norm_eps"))? as f32;
 
-        match variant {
-            ModelVariant::ClassicBert => Ok(Self {
-                variant,
-                hidden_size: get_i32("hidden_size")?,
-                num_hidden_layers: get_i32("num_hidden_layers")?,
-                num_attention_heads: get_i32("num_attention_heads")?,
-                max_position_embeddings: get_i32("max_position_embeddings").unwrap_or(512),
-                rotary_emb_base: 10000.0,
-                layer_norm_eps,
-            }),
-            ModelVariant::NomicBert => {
-                let hidden_size = get_i32("n_embd").or_else(|_| get_i32("hidden_size"))?;
-                let num_hidden_layers =
-                    get_i32("n_layer").or_else(|_| get_i32("num_hidden_layers"))?;
-                let num_attention_heads =
-                    get_i32("n_head").or_else(|_| get_i32("num_attention_heads"))?;
-                let max_position_embeddings = get_i32("n_positions")
-                    .or_else(|_| get_i32("max_position_embeddings"))
-                    .unwrap_or(8192);
-                let rotary_emb_base = get_f64("rotary_emb_base")
-                    .map(|v| v as f32)
-                    .unwrap_or(10000.0);
-
-                Ok(Self {
-                    variant,
-                    hidden_size,
-                    num_hidden_layers,
-                    num_attention_heads,
-                    max_position_embeddings,
-                    rotary_emb_base,
-                    layer_norm_eps,
-                })
-            }
-        }
+        Ok(Self {
+            hidden_size: get_i32("hidden_size")?,
+            num_hidden_layers: get_i32("num_hidden_layers")?,
+            num_attention_heads: get_i32("num_attention_heads")?,
+            max_position_embeddings: get_i32("max_position_embeddings").unwrap_or(512),
+            layer_norm_eps,
+        })
     }
 }
 
@@ -599,7 +559,7 @@ extern "C" __global__ void fused_bias_gelu_kernel(
     x[idx] = 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v)));
 }
 
-// Fused bias + SwiGLU (NomicBert FFN).
+// Fused bias + SwiGLU (ModernBERT FFN).
 // input has shape [rows, 2*half_cols] with bias [2*half_cols].
 // output[i] = value[i] * silu(gate[i]) where value/gate include bias.
 extern "C" __global__ void fused_bias_swiglu_kernel(
@@ -618,7 +578,7 @@ extern "C" __global__ void fused_bias_swiglu_kernel(
     }
 }
 
-// RoPE with pre-computed cos/sin tables (NomicBert).
+// RoPE with pre-computed cos/sin tables (ModernBERT).
 // Replaces rope_kernel which recomputed theta/cos/sin on every call.
 extern "C" __global__ void rope_cached_kernel(
     float* q_or_k,           // [num_rows, head_dim]
@@ -804,7 +764,7 @@ struct KernelHandles {
     fused_scale_mask_softmax: CudaFunction,
     /// Fused bias + GELU activation for `ClassicBert` FFN.
     fused_bias_gelu: CudaFunction,
-    /// Fused bias + `SwiGLU` activation for `NomicBert` FFN. Superseded by `fused_swiglu`.
+    /// Fused bias + `SwiGLU` activation for `ModernBERT` FFN. Superseded by `fused_swiglu`.
     #[expect(dead_code, reason = "kept for potential standalone use")]
     fused_bias_swiglu: CudaFunction,
     /// `RoPE` with pre-computed cos/sin tables.
@@ -902,22 +862,17 @@ struct CudaBertSelfAttention {
     output_ln_bias: CudaSlice<f32>,
     /// Layer norm epsilon.
     layer_norm_eps: f32,
-    /// Rotary embedding base (`NomicBert` only).
-    rotary_emb_base: Option<f32>,
 }
 
 /// Feed-forward network sub-layer on GPU.
 struct CudaBertFfn {
-    /// Intermediate projection weight stored as FP16.
-    ///
-    /// `ClassicBert`: `[intermediate, hidden]`.
-    /// `NomicBert`: `[2*intermediate, hidden]` (gate+value fused).
+    /// Intermediate projection weight `[intermediate, hidden]` stored as FP16.
     intermediate_weight: CudaSlice<u16>,
-    /// Intermediate projection bias (`ClassicBert` only).
+    /// Intermediate projection bias `[intermediate]`.
     intermediate_bias: Option<CudaSlice<f32>>,
     /// Output projection weight `[hidden, intermediate]` stored as FP16.
     output_weight: CudaSlice<u16>,
-    /// Output projection bias (`ClassicBert` only).
+    /// Output projection bias `[hidden]`.
     output_bias: Option<CudaSlice<f32>>,
     /// Post-FFN `LayerNorm` weight `[hidden]`.
     output_ln_weight: CudaSlice<f32>,
@@ -925,7 +880,7 @@ struct CudaBertFfn {
     output_ln_bias: CudaSlice<f32>,
     /// Layer norm epsilon.
     layer_norm_eps: f32,
-    /// Intermediate dimension (for `ClassicBert`) or half-dim (for `NomicBert` `SwiGLU`).
+    /// Intermediate dimension.
     intermediate_dim: i32,
 }
 
@@ -982,14 +937,6 @@ struct CudaWorkspace {
     scores_f16: CudaSlice<u16>,
 }
 
-/// Pre-computed `RoPE` cos/sin tables on GPU (`NomicBert` only).
-struct RopeCache {
-    /// Cosine table `[max_seq, head_dim/2]` on GPU.
-    cos: CudaSlice<f32>,
-    /// Sine table `[max_seq, head_dim/2]` on GPU.
-    sin: CudaSlice<f32>,
-}
-
 /// Complete BERT model with all weights on GPU.
 struct CudaBertModel {
     /// CUDA stream for all operations.
@@ -1008,12 +955,8 @@ struct CudaBertModel {
     num_heads: i32,
     /// Dimension per head.
     head_dim: i32,
-    /// Model variant.
-    variant: ModelVariant,
     /// Pre-allocated workspace buffers.
     workspace: CudaWorkspace,
-    /// Pre-computed `RoPE` cos/sin tables (`NomicBert` only).
-    rope_cache: Option<RopeCache>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1473,38 +1416,6 @@ impl CudaBertModel {
                 unsafe { builder.launch(launch_cfg_1d(total_head_elems)) }.map_err(cuda_err)?;
             }
 
-            // RoPE for NomicBert (cached cos/sin tables)
-            if let (Some(_base), Some(rope)) = (
-                self.layers[layer_idx].attention.rotary_emb_base,
-                &self.rope_cache,
-            ) {
-                let half = head_dim / 2;
-                let num_rows = batch_heads * max_seq;
-                let total_rope = num_rows * half;
-                {
-                    let mut builder = self.stream.launch_builder(&self.kernels.rope_cached);
-                    builder.arg(&mut self.workspace.q);
-                    builder.arg(&rope.cos);
-                    builder.arg(&rope.sin);
-                    builder.arg(&num_rows);
-                    builder.arg(&max_seq);
-                    builder.arg(&head_dim);
-                    builder.arg(&nh);
-                    unsafe { builder.launch(launch_cfg_1d(total_rope)) }.map_err(cuda_err)?;
-                }
-                {
-                    let mut builder = self.stream.launch_builder(&self.kernels.rope_cached);
-                    builder.arg(&mut self.workspace.k);
-                    builder.arg(&rope.cos);
-                    builder.arg(&rope.sin);
-                    builder.arg(&num_rows);
-                    builder.arg(&max_seq);
-                    builder.arg(&head_dim);
-                    builder.arg(&nh);
-                    unsafe { builder.launch(launch_cfg_1d(total_rope)) }.map_err(cuda_err)?;
-                }
-            }
-
             // Convert Q, K, V to FP16 for tensor core batched GEMM
             {
                 let head_elems = batch_heads * max_seq * head_dim;
@@ -1663,10 +1574,6 @@ impl CudaBertModel {
             // === FFN: hidden_b → hidden_a ===
 
             let inter_dim = self.layers[layer_idx].ffn.intermediate_dim;
-            let inter_out_dim = match self.variant {
-                ModelVariant::ClassicBert => inter_dim,
-                ModelVariant::NomicBert => 2 * inter_dim,
-            };
 
             // Intermediate projection (FP16 tensor core)
             gpu_linear_f16(
@@ -1678,76 +1585,38 @@ impl CudaBertModel {
                 &mut self.workspace.ffn_inter,
                 &mut self.workspace.input_f16,
                 batch_seq,
-                inter_out_dim,
+                inter_dim,
                 hd,
             )?;
 
-            // Fused bias + activation, then output projection → scratch
-            match self.variant {
-                ModelVariant::ClassicBert => {
-                    // Fuse intermediate bias + GELU into one kernel when bias exists,
-                    // otherwise just run GELU alone.
-                    let total_act = batch_seq * inter_dim;
-                    if let Some(ref bias) = self.layers[layer_idx].ffn.intermediate_bias {
-                        let mut builder = self.stream.launch_builder(&self.kernels.fused_bias_gelu);
-                        builder.arg(&mut self.workspace.ffn_inter);
-                        builder.arg(bias);
-                        builder.arg(&batch_seq);
-                        builder.arg(&inter_dim);
-                        unsafe { builder.launch(launch_cfg_1d(total_act)) }.map_err(cuda_err)?;
-                    } else {
-                        let mut builder = self.stream.launch_builder(&self.kernels.gelu);
-                        builder.arg(&mut self.workspace.ffn_inter);
-                        builder.arg(&total_act);
-                        unsafe { builder.launch(launch_cfg_1d(total_act)) }.map_err(cuda_err)?;
-                    }
-                    gpu_linear_f16(
-                        &self.blas,
-                        &self.stream,
-                        &self.kernels,
-                        &self.workspace.ffn_inter,
-                        &self.layers[layer_idx].ffn.output_weight,
-                        &mut self.workspace.scratch,
-                        &mut self.workspace.input_f16,
-                        batch_seq,
-                        hd,
-                        inter_dim,
-                    )?;
-                }
-                ModelVariant::NomicBert => {
-                    // Unified SwiGLU kernel handles both bias and no-bias paths.
-                    let half_cols = inter_dim;
-                    let total_act = batch_seq * half_cols;
-                    let has_bias_flag =
-                        i32::from(self.layers[layer_idx].ffn.intermediate_bias.is_some());
-                    // For no-bias case, pass ffn_inter as dummy (kernel ignores it
-                    // when has_bias=0). For bias case, pass the real bias.
-                    let bias_ref = self.layers[layer_idx]
-                        .ffn
-                        .intermediate_bias
-                        .as_ref()
-                        .unwrap_or(&self.workspace.ffn_inter);
-                    let mut builder = self.stream.launch_builder(&self.kernels.fused_swiglu);
-                    builder.arg(&mut self.workspace.activated);
-                    builder.arg(&self.workspace.ffn_inter);
-                    builder.arg(bias_ref);
+            // Fused bias + GELU activation, then output projection → scratch
+            {
+                let total_act = batch_seq * inter_dim;
+                if let Some(ref bias) = self.layers[layer_idx].ffn.intermediate_bias {
+                    let mut builder = self.stream.launch_builder(&self.kernels.fused_bias_gelu);
+                    builder.arg(&mut self.workspace.ffn_inter);
+                    builder.arg(bias);
                     builder.arg(&batch_seq);
-                    builder.arg(&half_cols);
-                    builder.arg(&has_bias_flag);
+                    builder.arg(&inter_dim);
                     unsafe { builder.launch(launch_cfg_1d(total_act)) }.map_err(cuda_err)?;
-                    gpu_linear_f16(
-                        &self.blas,
-                        &self.stream,
-                        &self.kernels,
-                        &self.workspace.activated,
-                        &self.layers[layer_idx].ffn.output_weight,
-                        &mut self.workspace.scratch,
-                        &mut self.workspace.input_f16,
-                        batch_seq,
-                        hd,
-                        inter_dim,
-                    )?;
+                } else {
+                    let mut builder = self.stream.launch_builder(&self.kernels.gelu);
+                    builder.arg(&mut self.workspace.ffn_inter);
+                    builder.arg(&total_act);
+                    unsafe { builder.launch(launch_cfg_1d(total_act)) }.map_err(cuda_err)?;
                 }
+                gpu_linear_f16(
+                    &self.blas,
+                    &self.stream,
+                    &self.kernels,
+                    &self.workspace.ffn_inter,
+                    &self.layers[layer_idx].ffn.output_weight,
+                    &mut self.workspace.scratch,
+                    &mut self.workspace.input_f16,
+                    batch_seq,
+                    hd,
+                    inter_dim,
+                )?;
             }
 
             // Fused FFN output: bias+residual or just residual, then fused residual+layernorm
@@ -1947,7 +1816,6 @@ fn load_classic_layer_gpu(
         output_ln_weight,
         output_ln_bias,
         layer_norm_eps: config.layer_norm_eps,
-        rotary_emb_base: None,
     };
 
     // FFN — GEMM weights as FP16, biases and LN as FP32
@@ -1998,91 +1866,6 @@ fn load_classic_layer_gpu(
     Ok(CudaBertLayer { attention, ffn })
 }
 
-/// Load `NomicBert` encoder layer weights to GPU.
-///
-/// GEMM weights are stored as FP16 for tensor core acceleration.
-/// Biases and layernorm weights remain FP32 for precision.
-fn load_nomic_layer_gpu(
-    stream: &Arc<CudaStream>,
-    kernels: &KernelHandles,
-    tensors: &SafeTensors<'_>,
-    i: i32,
-    config: &BertConfig,
-) -> crate::Result<CudaBertLayer> {
-    let prefix = format!("encoder.layers.{i}");
-
-    let (qkv_weight, _) = load_to_gpu_f16(
-        stream,
-        kernels,
-        tensors,
-        &format!("{prefix}.attn.Wqkv.weight"),
-    )?;
-
-    let (output_weight, _) = load_to_gpu_f16(
-        stream,
-        kernels,
-        tensors,
-        &format!("{prefix}.attn.out_proj.weight"),
-    )?;
-    let (output_ln_weight, _) = load_to_gpu(stream, tensors, &format!("{prefix}.norm1.weight"))?;
-    let (output_ln_bias, _) = load_to_gpu(stream, tensors, &format!("{prefix}.norm1.bias"))?;
-
-    let attention = CudaBertSelfAttention {
-        qkv_weight,
-        qkv_bias: None,
-        output_weight,
-        output_bias: None,
-        output_ln_weight,
-        output_ln_bias,
-        layer_norm_eps: config.layer_norm_eps,
-        rotary_emb_base: Some(config.rotary_emb_base),
-    };
-
-    // SwiGLU: fc11 = value/up, fc12 = gate, fc2 = down — fuse then convert to FP16
-    let (fc11, fc11_shape) = load_tensor_host(tensors, &format!("{prefix}.mlp.fc11.weight"))?;
-    let (fc12, _) = load_tensor_host(tensors, &format!("{prefix}.mlp.fc12.weight"))?;
-
-    let mut gate_up = Vec::with_capacity(fc11.len() + fc12.len());
-    gate_up.extend_from_slice(&fc11);
-    gate_up.extend_from_slice(&fc12);
-    let gate_up_f32 = stream.clone_htod(&gate_up).map_err(cuda_err)?;
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap,
-        reason = "gate_up element count fits in i32"
-    )]
-    let intermediate_weight = convert_to_f16(stream, kernels, &gate_up_f32, gate_up.len() as i32)?;
-
-    let (output_weight_ffn, _) = load_to_gpu_f16(
-        stream,
-        kernels,
-        tensors,
-        &format!("{prefix}.mlp.fc2.weight"),
-    )?;
-    let (out_ln_weight, _) = load_to_gpu(stream, tensors, &format!("{prefix}.norm2.weight"))?;
-    let (out_ln_bias, _) = load_to_gpu(stream, tensors, &format!("{prefix}.norm2.bias"))?;
-
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap,
-        reason = "intermediate dim is a small positive int from model config"
-    )]
-    let intermediate_dim = fc11_shape[0] as i32;
-
-    let ffn = CudaBertFfn {
-        intermediate_weight,
-        intermediate_bias: None,
-        output_weight: output_weight_ffn,
-        output_bias: None,
-        output_ln_weight: out_ln_weight,
-        output_ln_bias: out_ln_bias,
-        layer_norm_eps: config.layer_norm_eps,
-        intermediate_dim,
-    };
-
-    Ok(CudaBertLayer { attention, ffn })
-}
-
 // ---------------------------------------------------------------------------
 // Workspace allocation
 // ---------------------------------------------------------------------------
@@ -2100,18 +1883,10 @@ fn allocate_workspace(
     let hd = config.hidden_size;
     let nh = config.num_attention_heads;
     let head_dim = hd / nh;
-    // Cap workspace seq length at 512 — real chunks rarely exceed this.
-    // NomicBert's 8192 max_position_embeddings would require 400+ GB for scores.
-    // If a batch exceeds this, forward_batch will allocate dynamically.
     let max_seq = config.max_position_embeddings.min(512);
     let max_batch = MAX_BATCH;
     let bs = max_batch * max_seq;
     let bh = max_batch * nh;
-
-    let inter_out = match config.variant {
-        ModelVariant::ClassicBert => intermediate_dim,
-        ModelVariant::NomicBert => 2 * intermediate_dim,
-    };
 
     let alloc = |size: usize| -> crate::Result<CudaSlice<f32>> {
         stream.alloc_zeros::<f32>(size).map_err(cuda_err)
@@ -2121,8 +1896,8 @@ fn allocate_workspace(
     };
 
     // FP16 input buffer must be large enough for the biggest GEMM input:
-    // max(batch*seq * hidden, batch*seq * 2*intermediate, batch*seq * intermediate)
-    let max_input_f16 = (bs * (3 * hd).max(inter_out)) as usize;
+    // max(batch*seq * 3*hidden, batch*seq * intermediate)
+    let max_input_f16 = (bs * (3 * hd).max(intermediate_dim)) as usize;
 
     Ok(CudaWorkspace {
         qkv: alloc((bs * 3 * hd) as usize)?,
@@ -2132,7 +1907,7 @@ fn allocate_workspace(
         scores: alloc((bh * max_seq * max_seq) as usize)?,
         attn_out: alloc((bh * max_seq * head_dim) as usize)?,
         context: alloc((bs * hd) as usize)?,
-        ffn_inter: alloc((bs * inter_out) as usize)?,
+        ffn_inter: alloc((bs * intermediate_dim) as usize)?,
         hidden_a: alloc((bs * hd) as usize)?,
         hidden_b: alloc((bs * hd) as usize)?,
         projected: alloc((bs * hd) as usize)?,
@@ -2161,8 +1936,8 @@ fn allocate_workspace(
 /// on the GPU, with only the final L2-normalized embedding vector copied
 /// back to the host.
 ///
-/// Supports both `ClassicBert` (BGE) and `NomicBert` (`CodeRankEmbed`) model
-/// families, detected automatically from weight names.
+/// Supports the `ClassicBert` family (BGE models), detected automatically
+/// from weight names.
 pub struct CudaBackend {
     /// The BERT model with all weights on GPU (interior mutability for workspace).
     model: std::cell::UnsafeCell<CudaBertModel>,
@@ -2198,11 +1973,12 @@ impl std::fmt::Debug for CudaBackend {
 }
 
 impl CudaBackend {
-    /// Load a BERT/BGE/`NomicBert` embedding model onto an NVIDIA GPU.
+    /// Load a `ClassicBert` (BGE) embedding model onto an NVIDIA GPU.
     ///
     /// Downloads `model.safetensors` and `config.json` on first call;
     /// subsequent calls use the `hf-hub` cache. Compiles CUDA kernels via
-    /// NVRTC and uploads all model weights to GPU memory.
+    /// NVRTC and uploads all model weights to GPU memory. Returns an error
+    /// if the model architecture is not recognized.
     ///
     /// # Errors
     ///
@@ -2245,7 +2021,7 @@ impl CudaBackend {
 
         let tensors = SafeTensors::deserialize(&model_bytes)
             .map_err(|e| crate::Error::Other(anyhow::anyhow!("safetensors parse error: {e}")))?;
-        let variant = detect_variant(&tensors);
+        detect_variant(&tensors)?;
 
         let config_str = std::fs::read_to_string(&config_path).map_err(|e| crate::Error::Io {
             path: config_path.display().to_string(),
@@ -2253,7 +2029,7 @@ impl CudaBackend {
         })?;
         let config_json: serde_json::Value = serde_json::from_str(&config_str)
             .map_err(|e| crate::Error::Other(anyhow::anyhow!("config parse error: {e}")))?;
-        let config = BertConfig::from_json(&config_json, variant)?;
+        let config = BertConfig::from_json(&config_json)?;
 
         let hidden_size = config.hidden_size;
         let max_position_embeddings = config.max_position_embeddings;
@@ -2261,99 +2037,32 @@ impl CudaBackend {
         let head_dim = hidden_size / num_heads;
 
         // Load embeddings to GPU
-        let embeddings = match config.variant {
-            ModelVariant::ClassicBert => {
-                let (word_emb, _) =
-                    load_to_gpu(&stream, &tensors, "embeddings.word_embeddings.weight")?;
-                let (pos_emb, _) =
-                    load_to_gpu(&stream, &tensors, "embeddings.position_embeddings.weight")?;
-                let tok_emb =
-                    try_load_to_gpu(&stream, &tensors, "embeddings.token_type_embeddings.weight")?;
-                let (ln_w, _) = load_to_gpu(&stream, &tensors, "embeddings.LayerNorm.weight")?;
-                let (ln_b, _) = load_to_gpu(&stream, &tensors, "embeddings.LayerNorm.bias")?;
-
-                CudaBertEmbeddings {
-                    word_embeddings: word_emb,
-                    position_embeddings: Some(pos_emb),
-                    token_type_embeddings: tok_emb,
-                    layer_norm_weight: ln_w,
-                    layer_norm_bias: ln_b,
-                    layer_norm_eps: config.layer_norm_eps,
-                }
-            }
-            ModelVariant::NomicBert => {
-                let (word_emb, _) =
-                    load_to_gpu(&stream, &tensors, "embeddings.word_embeddings.weight")?;
-                let tok_emb =
-                    try_load_to_gpu(&stream, &tensors, "embeddings.token_type_embeddings.weight")?;
-                let (ln_w, _) = load_to_gpu(&stream, &tensors, "emb_ln.weight")?;
-                let (ln_b, _) = load_to_gpu(&stream, &tensors, "emb_ln.bias")?;
-
-                CudaBertEmbeddings {
-                    word_embeddings: word_emb,
-                    position_embeddings: None,
-                    token_type_embeddings: tok_emb,
-                    layer_norm_weight: ln_w,
-                    layer_norm_bias: ln_b,
-                    layer_norm_eps: config.layer_norm_eps,
-                }
-            }
+        let (word_emb, _) = load_to_gpu(&stream, &tensors, "embeddings.word_embeddings.weight")?;
+        let (pos_emb, _) = load_to_gpu(&stream, &tensors, "embeddings.position_embeddings.weight")?;
+        let tok_emb =
+            try_load_to_gpu(&stream, &tensors, "embeddings.token_type_embeddings.weight")?;
+        let (ln_w, _) = load_to_gpu(&stream, &tensors, "embeddings.LayerNorm.weight")?;
+        let (ln_b, _) = load_to_gpu(&stream, &tensors, "embeddings.LayerNorm.bias")?;
+        let embeddings = CudaBertEmbeddings {
+            word_embeddings: word_emb,
+            position_embeddings: Some(pos_emb),
+            token_type_embeddings: tok_emb,
+            layer_norm_weight: ln_w,
+            layer_norm_bias: ln_b,
+            layer_norm_eps: config.layer_norm_eps,
         };
 
         // Load encoder layers
         let mut layers = Vec::with_capacity(config.num_hidden_layers as usize);
         let mut intermediate_dim = 0_i32;
         for i in 0..config.num_hidden_layers {
-            let layer = match config.variant {
-                ModelVariant::ClassicBert => {
-                    load_classic_layer_gpu(&stream, &kernels, &tensors, i, &config)?
-                }
-                ModelVariant::NomicBert => {
-                    load_nomic_layer_gpu(&stream, &kernels, &tensors, i, &config)?
-                }
-            };
+            let layer = load_classic_layer_gpu(&stream, &kernels, &tensors, i, &config)?;
             intermediate_dim = layer.ffn.intermediate_dim;
             layers.push(layer);
         }
 
         // Allocate workspace buffers
         let workspace = allocate_workspace(&stream, &config, intermediate_dim)?;
-
-        // Pre-compute RoPE cos/sin tables for NomicBert
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_precision_loss,
-            clippy::cast_sign_loss,
-            reason = "head_dim/seq values are small ints; f64→f32 truncation is intentional"
-        )]
-        let rope_cache = if variant == ModelVariant::NomicBert {
-            let rope_base = f64::from(config.rotary_emb_base);
-            let half_dim = (head_dim / 2) as usize;
-            // Cap at 512 to match workspace allocation
-            let rope_max_seq = config.max_position_embeddings.min(512) as usize;
-
-            let mut cos_table = vec![0.0_f32; rope_max_seq * half_dim];
-            let mut sin_table = vec![0.0_f32; rope_max_seq * half_dim];
-
-            for i in 0..half_dim {
-                let theta = rope_base.powf(-2.0 * i as f64 / f64::from(head_dim));
-                for pos in 0..rope_max_seq {
-                    let angle = pos as f64 * theta;
-                    cos_table[pos * half_dim + i] = angle.cos() as f32;
-                    sin_table[pos * half_dim + i] = angle.sin() as f32;
-                }
-            }
-
-            let cos_dev = stream.clone_htod(&cos_table).map_err(cuda_err)?;
-            let sin_dev = stream.clone_htod(&sin_table).map_err(cuda_err)?;
-
-            Some(RopeCache {
-                cos: cos_dev,
-                sin: sin_dev,
-            })
-        } else {
-            None
-        };
 
         let model = CudaBertModel {
             stream,
@@ -2364,9 +2073,7 @@ impl CudaBackend {
             hidden_size,
             num_heads,
             head_dim,
-            variant,
             workspace,
-            rope_cache,
         };
 
         Ok(Self {
@@ -2430,7 +2137,7 @@ impl EmbedBackend for CudaBackend {
         true
     }
 
-    /// Maximum tokens from model config (512 for BERT, 8192 for `NomicBert`).
+    /// Maximum tokens from model config (512 for `ClassicBert`).
     #[expect(
         clippy::cast_sign_loss,
         reason = "max_position_embeddings is always positive from config"

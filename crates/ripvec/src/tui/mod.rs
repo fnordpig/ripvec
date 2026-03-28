@@ -21,7 +21,6 @@ use ratatui::Terminal;
 use ratatui::prelude::CrosstermBackend;
 
 use ripvec_core::backend::EmbedBackend;
-use ripvec_core::index::SearchIndex;
 
 /// TUI application state.
 pub struct App {

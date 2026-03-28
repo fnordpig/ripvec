@@ -199,7 +199,7 @@ impl Driver for MlxDriver {
         dim: usize,
     ) -> crate::Result<()> {
         // Perform on CPU — pad/unpad is a small, infrequent operation.
-        let batch = seq_lengths.len();
+        let _batch = seq_lengths.len();
         let total_tokens: usize = seq_lengths.iter().sum();
         let mut out = vec![0.0_f32; total_tokens * dim];
 
@@ -302,7 +302,6 @@ impl Driver for MlxDriver {
         Ok(())
     }
 
-    #[expect(clippy::too_many_arguments, reason = "matches Driver trait signature")]
     #[expect(
         clippy::many_single_char_names,
         reason = "matches Driver trait signature (m, n, k)"
@@ -337,10 +336,6 @@ impl Driver for MlxDriver {
         Ok(())
     }
 
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "seq_len used for softmax dimensions is always small"
-    )]
     fn fused_scale_mask_softmax(
         &self,
         scores: &mut MlxTensor,
@@ -500,9 +495,9 @@ impl Driver for MlxDriver {
         _head_dim: usize,
         _num_heads: usize,
     ) -> crate::Result<()> {
-        // RoPE is used by NomicBert, not ClassicBert. Implement when adding NomicBert support.
+        // RoPE is used by ModernBERT, not ClassicBert. Implement when adding ModernBERT MLX support.
         Err(crate::Error::Other(anyhow::anyhow!(
-            "MLX driver: apply_rope not yet implemented (NomicBert support pending)"
+            "MLX driver: apply_rope not yet implemented (ModernBERT support pending)"
         )))
     }
 
@@ -797,7 +792,6 @@ impl ClassicBertConfig {
     /// Returns an error if required keys are missing.
     #[expect(
         clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
         reason = "HuggingFace config ints always fit in usize"
     )]
     pub fn from_json(v: &serde_json::Value) -> crate::Result<Self> {

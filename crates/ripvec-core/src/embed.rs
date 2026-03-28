@@ -26,7 +26,6 @@ use tracing::{debug, info_span, instrument, warn};
 
 use crate::backend::{EmbedBackend, Encoding};
 use crate::chunk::{ChunkConfig, CodeChunk};
-use crate::similarity;
 
 /// Default batch size for embedding inference.
 pub const DEFAULT_BATCH_SIZE: usize = 32;

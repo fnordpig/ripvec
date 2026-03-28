@@ -222,7 +222,7 @@ kernel void swiglu_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// RoPE with pre-computed cos/sin tables (NomicBert).
+// RoPE with pre-computed cos/sin tables (ModernBERT).
 // Rotates q_or_k in-place using cached cos/sin values.
 // ---------------------------------------------------------------------------
 kernel void rope_cached_kernel(
@@ -626,7 +626,7 @@ kernel void f32_to_f16_kernel(
 
 // ---------------------------------------------------------------------------
 // Two-input SwiGLU: output[i] = value[i] * silu(gate[i])
-// Takes separate value and gate buffers (for NomicBert with separate fc11/fc12 weights).
+// Takes separate value and gate buffers (for ModernBERT with separate fc11/fc12 weights).
 // Output is written to the output buffer (may alias value or gate).
 // ---------------------------------------------------------------------------
 kernel void swiglu_two_input_kernel(
@@ -2287,7 +2287,7 @@ kernel void gemm_batched_fp16_kernel(
 
 constant uint FA_TQ = 32;   // Q rows per threadgroup
 constant uint FA_TK = 32;   // K/V rows per tile
-constant uint FA_HD = 32;   // head_dim (BGE-small); extend to 64 for CodeRankEmbed
+constant uint FA_HD = 32;   // head_dim (BGE-small / ClassicBert)
 
 kernel void flash_attention_kernel(
     device float* Q              [[buffer(0)]],

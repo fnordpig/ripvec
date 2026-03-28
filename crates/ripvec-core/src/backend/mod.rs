@@ -77,8 +77,8 @@ pub trait EmbedBackend: Send + Sync {
 
     /// Maximum token count this model supports (position embedding limit).
     ///
-    /// `ClassicBert`: 512. `NomicBert`: 8192. Tokens beyond this are truncated
-    /// during tokenization.
+    /// `ClassicBert`: 512. `ModernBERT`: up to model config. Tokens beyond this
+    /// are truncated during tokenization.
     fn max_tokens(&self) -> usize {
         512 // default for classic BERT models
     }
@@ -185,11 +185,7 @@ pub fn load_backend(
             if is_modernbert_model(model_repo) {
                 return load_modernbert_metal(model_repo, max_layers);
             }
-            if is_classic_bert_model(model_repo) {
-                return load_classic_metal(model_repo);
-            }
-            // Default: NomicBert (CodeRankEmbed, nomic-embed-text, etc.)
-            load_nomic_metal(model_repo)
+            load_classic_metal(model_repo)
         }
         #[cfg(not(feature = "metal"))]
         BackendKind::Metal => Err(crate::Error::Other(anyhow::anyhow!(
@@ -239,11 +235,7 @@ pub fn detect_backends(
             if let Ok(b) = load_modernbert_metal(model_repo, max_layers) {
                 backends.push(b);
             }
-        } else if is_classic_bert_model(model_repo) {
-            if let Ok(b) = load_classic_metal(model_repo) {
-                backends.push(b);
-            }
-        } else if let Ok(b) = load_nomic_metal(model_repo) {
+        } else if let Ok(b) = load_classic_metal(model_repo) {
             backends.push(b);
         }
     }
@@ -367,98 +359,8 @@ fn is_modernbert_model(model_repo: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// NomicBert loader (driver/arch system)
-// ---------------------------------------------------------------------------
-
-/// Load a `NomicBert` model (e.g. `CodeRankEmbed`) on the Metal GPU backend.
-///
-/// Downloads the model from Hugging Face Hub (cached after first download),
-/// memory-maps the safetensors weights, and builds a [`GenericBackend`]
-/// pairing a [`MetalDriver`](driver::metal::MetalDriver) with a
-/// [`NomicBertArch`](arch::nomic_bert::NomicBertArch).
-///
-/// # Errors
-///
-/// Returns an error if no Metal device is available, the model cannot be
-/// downloaded, or weight loading fails.
-#[cfg(feature = "metal")]
-pub fn load_nomic_metal(model_repo: &str) -> crate::Result<Box<dyn EmbedBackend>> {
-    use driver::metal::{MetalDriver, NomicBertConfig};
-    use generic::GenericBackend;
-    use hf_hub::api::sync::Api;
-
-    let api = Api::new().map_err(|e| crate::Error::Download(e.to_string()))?;
-    let repo = api.model(model_repo.to_string());
-
-    let config_path = repo
-        .get("config.json")
-        .map_err(|e| crate::Error::Download(e.to_string()))?;
-    let weights_path = repo
-        .get("model.safetensors")
-        .map_err(|e| crate::Error::Download(e.to_string()))?;
-
-    // Parse config.json
-    let config_str = std::fs::read_to_string(&config_path).map_err(|e| crate::Error::Io {
-        path: config_path.display().to_string(),
-        source: e,
-    })?;
-    let config_json: serde_json::Value = serde_json::from_str(&config_str)
-        .map_err(|e| crate::Error::Other(anyhow::anyhow!("config parse error: {e}")))?;
-    let config = NomicBertConfig::from_json(&config_json)?;
-    let max_tokens = config.max_position_embeddings;
-
-    let driver = MetalDriver::new()?;
-    let (arch, mmap) = driver.load_nomic_bert_weights(&weights_path, &config)?;
-
-    tracing::info!(
-        model_repo,
-        hidden = config.hidden_size,
-        layers = config.num_hidden_layers,
-        heads = config.num_attention_heads,
-        intermediate = config.intermediate_size,
-        max_tokens,
-        rope_theta = config.rotary_emb_base,
-        "NomicBert loaded on Metal (driver/arch)"
-    );
-
-    Ok(Box::new(GenericBackend::new(
-        driver, arch, max_tokens, true, mmap,
-    )))
-}
-
-// ---------------------------------------------------------------------------
 // ClassicBert loader (driver/arch system)
 // ---------------------------------------------------------------------------
-
-/// Check whether a model repo uses the `ClassicBert` architecture.
-///
-/// Downloads and inspects `config.json` to check for `"model_type": "bert"` and
-/// the presence of `"hidden_size"` (not `"n_embd"` which is NomicBert).
-/// Returns `false` on any download or parse error (fail-open for detection).
-#[cfg(feature = "metal")]
-fn is_classic_bert_model(model_repo: &str) -> bool {
-    let Ok(api) = hf_hub::api::sync::Api::new() else {
-        return false;
-    };
-    let repo = api.model(model_repo.to_string());
-    let Ok(config_path) = repo.get("config.json") else {
-        return false;
-    };
-    let Ok(config_str) = std::fs::read_to_string(&config_path) else {
-        return false;
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&config_str) else {
-        return false;
-    };
-    // ClassicBert: model_type == "bert" and uses "hidden_size" (not "n_embd")
-    let is_bert = json
-        .get("model_type")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|t| t == "bert");
-    let has_hidden_size = json.get("hidden_size").is_some();
-    let has_n_embd = json.get("n_embd").is_some();
-    is_bert && has_hidden_size && !has_n_embd
-}
 
 /// Load a `ClassicBert` model (e.g. `BAAI/bge-small-en-v1.5`) on the Metal GPU backend.
 ///
@@ -569,67 +471,6 @@ pub fn load_classic_cpu(model_repo: &str) -> crate::Result<Box<dyn EmbedBackend>
         intermediate = config.intermediate_size,
         max_tokens,
         "ClassicBert loaded on CPU (driver/arch)"
-    );
-
-    Ok(Box::new(GenericBackend::new(
-        driver, arch, max_tokens, false, mmap,
-    )))
-}
-
-// ---------------------------------------------------------------------------
-// NomicBert loader (CPU driver/arch system)
-// ---------------------------------------------------------------------------
-
-/// Load a `NomicBert` model (e.g. `nomic-ai/CodeRankEmbed`) on the CPU backend
-/// via the driver/arch system.
-///
-/// Downloads the model from Hugging Face Hub (cached after first download),
-/// reads safetensors weights into `Vec<f32>` tensors, builds a `RoPE` cache,
-/// and builds a [`GenericBackend`] pairing a
-/// [`CpuDriver`](driver::cpu::CpuDriver) with a
-/// [`NomicBertArch`](arch::nomic_bert::NomicBertArch).
-///
-/// # Errors
-///
-/// Returns an error if the model cannot be downloaded or weight loading fails.
-#[cfg(any(feature = "cpu", feature = "cpu-accelerate"))]
-pub fn load_nomic_cpu(model_repo: &str) -> crate::Result<Box<dyn EmbedBackend>> {
-    use driver::cpu::{CpuDriver, NomicBertConfig};
-    use generic::GenericBackend;
-    use hf_hub::api::sync::Api;
-
-    let api = Api::new().map_err(|e| crate::Error::Download(e.to_string()))?;
-    let repo = api.model(model_repo.to_string());
-
-    let config_path = repo
-        .get("config.json")
-        .map_err(|e| crate::Error::Download(e.to_string()))?;
-    let weights_path = repo
-        .get("model.safetensors")
-        .map_err(|e| crate::Error::Download(e.to_string()))?;
-
-    // Parse config.json
-    let config_str = std::fs::read_to_string(&config_path).map_err(|e| crate::Error::Io {
-        path: config_path.display().to_string(),
-        source: e,
-    })?;
-    let config_json: serde_json::Value = serde_json::from_str(&config_str)
-        .map_err(|e| crate::Error::Other(anyhow::anyhow!("config parse error: {e}")))?;
-    let config = NomicBertConfig::from_json(&config_json)?;
-    let max_tokens = config.max_position_embeddings;
-
-    let driver = CpuDriver::new()?;
-    let (arch, mmap) = driver.load_nomic_bert_weights(&weights_path, &config)?;
-
-    tracing::info!(
-        model_repo,
-        hidden = config.hidden_size,
-        layers = config.num_hidden_layers,
-        heads = config.num_attention_heads,
-        intermediate = config.intermediate_size,
-        max_tokens,
-        rope_theta = config.rotary_emb_base,
-        "NomicBert loaded on CPU (driver/arch)"
     );
 
     Ok(Box::new(GenericBackend::new(
@@ -978,114 +819,6 @@ mod tests {
         let _ = arch.forward(&driver, &single).unwrap();
         let single_ms = t1.elapsed().as_secs_f64() * 1000.0;
         eprintln!("  batch=1, time={single_ms:.1}ms");
-    }
-
-    /// Load `NomicBert` (`CodeRankEmbed`) on Metal via the driver/arch system.
-    ///
-    /// Verifies that the full pipeline produces a 768-dim L2-normalized vector,
-    /// then compares against the monolithic backend for numerical equivalence.
-    /// Also measures throughput (target: >=105/s matching monolithic).
-    #[cfg(feature = "metal")]
-    #[test]
-    #[ignore = "requires model download (~100MB)"]
-    fn nomic_bert_driver_arch() {
-        use crate::backend::arch::ModelArch;
-
-        let model_repo = "nomic-ai/CodeRankEmbed";
-
-        // Load via driver/arch system
-        let backend = load_nomic_metal(model_repo).expect("load_nomic_metal failed");
-        assert!(backend.is_gpu(), "Metal backend should be GPU");
-
-        let enc = Encoding {
-            input_ids: vec![1, 100, 200, 300, 2],
-            attention_mask: vec![1; 5],
-            token_type_ids: vec![0; 5],
-        };
-
-        // Basic forward pass
-        let result = backend.embed_batch(std::slice::from_ref(&enc)).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].len(), 768);
-
-        let l2: f32 = result[0].iter().map(|x| x * x).sum::<f32>().sqrt();
-        eprintln!(
-            "NomicBert driver/arch: L2={l2:.4}, first 3: {:?}",
-            &result[0][..3]
-        );
-        assert!(
-            (l2 - 1.0).abs() < 0.01,
-            "embedding should be L2-normalized, got L2={l2}"
-        );
-
-        // Compare against CPU backend (reliable reference)
-        #[cfg(feature = "cpu")]
-        {
-            let cpu = load_backend(BackendKind::Cpu, model_repo, DeviceHint::Cpu, None)
-                .expect("CPU load failed");
-            let cpu_result = cpu.embed_batch(std::slice::from_ref(&enc)).unwrap();
-            eprintln!("CPU  first 5: {:?}", &cpu_result[0][..5]);
-            eprintln!("NEW  first 5: {:?}", &result[0][..5]);
-            let cosine: f32 = result[0]
-                .iter()
-                .zip(&cpu_result[0])
-                .map(|(a, b)| a * b)
-                .sum();
-            eprintln!("cosine(driver/arch, CPU) = {cosine:.6}");
-        }
-
-        // Throughput benchmark
-        eprintln!("\n=== NomicBert Driver/Arch Throughput ===");
-        let driver = crate::backend::driver::metal::MetalDriver::new().unwrap();
-        let config_path = {
-            let api = hf_hub::api::sync::Api::new().unwrap();
-            let repo = api.model(model_repo.to_string());
-            repo.get("config.json").unwrap()
-        };
-        let weights_path = {
-            let api = hf_hub::api::sync::Api::new().unwrap();
-            let repo = api.model(model_repo.to_string());
-            repo.get("model.safetensors").unwrap()
-        };
-        let config_str = std::fs::read_to_string(&config_path).unwrap();
-        let config_json: serde_json::Value = serde_json::from_str(&config_str).unwrap();
-        let config =
-            crate::backend::driver::metal::NomicBertConfig::from_json(&config_json).unwrap();
-        let (arch, _mmap) = driver
-            .load_nomic_bert_weights(&weights_path, &config)
-            .unwrap();
-
-        // Build 32 encodings of varying length
-        let mut encs = Vec::new();
-        for i in 0..32 {
-            let len = 16 + (i * 4); // 16 to 140 tokens
-            let mut ids = vec![1_i64]; // CLS
-            for j in 1..len - 1 {
-                ids.push(100 + j as i64);
-            }
-            ids.push(2); // SEP
-            encs.push(Encoding {
-                input_ids: ids.clone(),
-                attention_mask: vec![1; ids.len()],
-                token_type_ids: vec![0; ids.len()],
-            });
-        }
-
-        // Warmup
-        let _ = arch.forward(&driver, &encs[..4]);
-
-        // Timed run
-        let t0 = std::time::Instant::now();
-        let bench_result = arch.forward(&driver, &encs).unwrap();
-        let elapsed = t0.elapsed();
-        let throughput = encs.len() as f64 / elapsed.as_secs_f64();
-        eprintln!(
-            "  batch={}, time={:.1}ms, throughput={:.1}/s",
-            encs.len(),
-            elapsed.as_secs_f64() * 1000.0,
-            throughput
-        );
-        assert_eq!(bench_result.len(), 32);
     }
 
     /// Load `ClassicBert` (`BAAI/bge-small-en-v1.5`) on Metal via the driver/arch system.

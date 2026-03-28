@@ -16,7 +16,7 @@ use super::ModelArch;
 
 /// Weights for one `ClassicBert` encoder layer.
 ///
-/// All projections include bias (unlike `NomicBert`). The QKV weight is a fused
+/// All projections include bias (unlike `ModernBERT`). The QKV weight is a fused
 /// `[3*hidden, hidden]` matrix that produces Q, K, V in a single GEMM.
 pub struct ClassicBertLayerWeights<T> {
     /// Fused Q+K+V projection weight `[3*hidden, hidden]`.

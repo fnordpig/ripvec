@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::backend::EmbedBackend;
-use crate::bm25::Bm25Index;
 use crate::cache::diff;
 use crate::cache::file_cache::FileCache;
 use crate::cache::manifest::Manifest;
@@ -16,7 +15,6 @@ use crate::cache::store::ObjectStore;
 use crate::chunk::CodeChunk;
 use crate::embed::SearchConfig;
 use crate::hybrid::HybridIndex;
-use crate::index::SearchIndex;
 use crate::profile::Profiler;
 
 /// Statistics from an incremental reindex operation.

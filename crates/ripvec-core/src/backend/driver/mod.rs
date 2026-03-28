@@ -347,8 +347,7 @@ pub trait Driver: Send + Sync {
 
     /// Apply Rotary Position Embedding (RoPE) to Q/K tensors.
     ///
-    /// Used by NomicBert and ModernBERT (not ClassicBert which uses learned
-    /// position embeddings).
+    /// Used by ModernBERT (not ClassicBert which uses learned position embeddings).
     fn apply_rope(
         &self,
         qk: &mut Self::Tensor,
@@ -366,7 +365,7 @@ pub trait Driver: Send + Sync {
     ///
     /// Each row of `input` is `[first_half | second_half]`. The first `cols`
     /// elements go to `first`, the remaining `cols` to `second`.
-    /// Used by `ModernBERT` and `NomicBert` for gated MLP splits.
+    /// Used by `ModernBERT` for gated MLP splits.
     fn split_gate_value(
         &self,
         first: &mut Self::Tensor,
@@ -383,8 +382,7 @@ pub trait Driver: Send + Sync {
 
     /// SwiGLU gated activation: `output = value * silu(gate)`.
     ///
-    /// Used by NomicBert. The gate and value come from splitting the
-    /// intermediate projection.
+    /// The gate and value come from splitting the intermediate projection.
     fn swiglu(
         &self,
         value: &Self::Tensor,

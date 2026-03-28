@@ -32,8 +32,6 @@ use crate::backend::Encoding;
 use crate::backend::arch::classic_bert::{
     ClassicBertArch, ClassicBertLayerWeights, ClassicBertWeights,
 };
-use crate::backend::arch::nomic_bert::{NomicBertArch, NomicBertLayerWeights, NomicBertWeights};
-
 // ---------------------------------------------------------------------------
 // CpuDriver
 // ---------------------------------------------------------------------------
@@ -117,68 +115,6 @@ impl ClassicBertConfig {
     }
 }
 
-/// Parsed `NomicBert` model configuration from `config.json`.
-///
-/// Contains geometry and hyperparameters needed to build the `NomicBert`
-/// architecture and load weights (e.g. `CodeRankEmbed`, `nomic-embed-text-v1.5`).
-pub struct NomicBertConfig {
-    /// Hidden dimension (768 for `CodeRankEmbed`).
-    pub hidden_size: usize,
-    /// FFN intermediate dimension (3072 for `CodeRankEmbed`).
-    pub intermediate_size: usize,
-    /// Number of encoder layers (12).
-    pub num_hidden_layers: usize,
-    /// Number of attention heads (12).
-    pub num_attention_heads: usize,
-    /// `RoPE` theta base (typically 10000.0).
-    pub rotary_emb_base: f32,
-    /// Layer normalization epsilon (typically 1e-12).
-    pub layer_norm_eps: f32,
-    /// Maximum position embeddings / sequence length (8192).
-    pub max_position_embeddings: usize,
-    /// Vocabulary size (30528).
-    pub vocab_size: usize,
-}
-
-impl NomicBertConfig {
-    /// Parse a `NomicBert` config from a `config.json` value.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any required field is missing or has an unexpected type.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "config ints are small positive values"
-    )]
-    pub fn from_json(json: &serde_json::Value) -> crate::Result<Self> {
-        let get_usize = |key: &str| -> crate::Result<usize> {
-            json.get(key)
-                .and_then(serde_json::Value::as_u64)
-                .map(|v| v as usize)
-                .ok_or_else(|| crate::Error::Cpu(format!("config.json missing or invalid: {key}")))
-        };
-        let get_f64 = |key: &str| -> crate::Result<f64> {
-            json.get(key)
-                .and_then(serde_json::Value::as_f64)
-                .ok_or_else(|| crate::Error::Cpu(format!("config.json missing or invalid: {key}")))
-        };
-
-        Ok(Self {
-            hidden_size: get_usize("n_embd")?,
-            intermediate_size: get_usize("n_inner").or_else(|_| get_usize("intermediate_size"))?,
-            num_hidden_layers: get_usize("n_layer").or_else(|_| get_usize("num_hidden_layers"))?,
-            num_attention_heads: get_usize("n_head")
-                .or_else(|_| get_usize("num_attention_heads"))?,
-            rotary_emb_base: get_f64("rotary_emb_base").unwrap_or(10000.0) as f32,
-            layer_norm_eps: get_f64("layer_norm_epsilon")
-                .or_else(|_| get_f64("layer_norm_eps"))
-                .unwrap_or(1e-12) as f32,
-            max_position_embeddings: get_usize("max_position_embeddings").unwrap_or(2048),
-            vocab_size: get_usize("vocab_size")?,
-        })
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Safetensors -> Vec<f32> helpers
 // ---------------------------------------------------------------------------
@@ -196,15 +132,6 @@ fn load_tensor_flat(tensors: &SafeTensors<'_>, name: &str) -> crate::Result<Vec<
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
     Ok(data)
-}
-
-/// Optionally load a tensor -- returns `None` if missing.
-fn try_load_tensor_flat(tensors: &SafeTensors<'_>, name: &str) -> crate::Result<Option<Vec<f32>>> {
-    if tensors.tensor(name).is_ok() {
-        Ok(Some(load_tensor_flat(tensors, name)?))
-    } else {
-        Ok(None)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -336,125 +263,6 @@ impl CpuDriver {
         };
 
         Ok((ClassicBertArch { weights }, mmap))
-    }
-
-    /// Load `NomicBert` weights from a safetensors file into `Vec<f32>` tensors.
-    ///
-    /// Returns `(arch, mmap)` -- the mmap is kept alive for API consistency.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the file cannot be opened, safetensors parsing fails,
-    /// or any expected weight tensor is missing.
-    #[expect(unsafe_code, reason = "memmap2::Mmap::map requires unsafe")]
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "head_dim and position indices are small enough for exact f32"
-    )]
-    pub fn load_nomic_bert_weights(
-        &self,
-        weights_path: &Path,
-        config: &NomicBertConfig,
-    ) -> crate::Result<(NomicBertArch<Vec<f32>>, memmap2::Mmap)> {
-        let file = std::fs::File::open(weights_path).map_err(|e| crate::Error::Io {
-            path: weights_path.display().to_string(),
-            source: e,
-        })?;
-        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| crate::Error::Io {
-            path: weights_path.display().to_string(),
-            source: e,
-        })?;
-
-        let tensors = SafeTensors::deserialize(&mmap)
-            .map_err(|e| crate::Error::Cpu(format!("safetensors parse: {e}")))?;
-
-        let hidden = config.hidden_size;
-        let num_layers = config.num_hidden_layers;
-        let num_heads = config.num_attention_heads;
-        let head_dim = hidden / num_heads;
-        let intermediate = config.intermediate_size;
-
-        // Build per-layer weights
-        let mut layers = Vec::with_capacity(num_layers);
-        for i in 0..num_layers {
-            layers.push(NomicBertLayerWeights {
-                qkv_weight: load_tensor_flat(
-                    &tensors,
-                    &format!("encoder.layers.{i}.attn.Wqkv.weight"),
-                )?,
-                output_weight: load_tensor_flat(
-                    &tensors,
-                    &format!("encoder.layers.{i}.attn.out_proj.weight"),
-                )?,
-                output_ln_weight: load_tensor_flat(
-                    &tensors,
-                    &format!("encoder.layers.{i}.norm1.weight"),
-                )?,
-                output_ln_bias: load_tensor_flat(
-                    &tensors,
-                    &format!("encoder.layers.{i}.norm1.bias"),
-                )?,
-                ffn_up_weight: load_tensor_flat(
-                    &tensors,
-                    &format!("encoder.layers.{i}.mlp.fc11.weight"),
-                )?,
-                ffn_gate_weight: load_tensor_flat(
-                    &tensors,
-                    &format!("encoder.layers.{i}.mlp.fc12.weight"),
-                )?,
-                ffn_down_weight: load_tensor_flat(
-                    &tensors,
-                    &format!("encoder.layers.{i}.mlp.fc2.weight"),
-                )?,
-                ffn_ln_weight: load_tensor_flat(
-                    &tensors,
-                    &format!("encoder.layers.{i}.norm2.weight"),
-                )?,
-                ffn_ln_bias: load_tensor_flat(&tensors, &format!("encoder.layers.{i}.norm2.bias"))?,
-            });
-        }
-
-        // Embedding weights
-        let tok_embeddings = load_tensor_flat(&tensors, "embeddings.word_embeddings.weight")?;
-        let token_type_embeddings =
-            try_load_tensor_flat(&tensors, "embeddings.token_type_embeddings.weight")?;
-        let emb_ln_weight = load_tensor_flat(&tensors, "emb_ln.weight")?;
-        let emb_ln_bias = load_tensor_flat(&tensors, "emb_ln.bias")?;
-
-        // Build RoPE cache
-        let max_seq = config.max_position_embeddings;
-        let half_dim = head_dim / 2;
-        let n = max_seq * half_dim;
-        let mut cos_data = Vec::with_capacity(n);
-        let mut sin_data = Vec::with_capacity(n);
-
-        for pos in 0..max_seq {
-            for d in 0..half_dim {
-                let freq = (pos as f32)
-                    / config
-                        .rotary_emb_base
-                        .powf(2.0 * d as f32 / head_dim as f32);
-                cos_data.push(freq.cos());
-                sin_data.push(freq.sin());
-            }
-        }
-
-        let weights = NomicBertWeights {
-            tok_embeddings,
-            token_type_embeddings,
-            emb_ln_weight,
-            emb_ln_bias,
-            layers,
-            rope_cos: cos_data,
-            rope_sin: sin_data,
-            num_heads,
-            head_dim,
-            hidden_dim: hidden,
-            intermediate_dim: intermediate,
-            layer_norm_eps: config.layer_norm_eps,
-        };
-
-        Ok((NomicBertArch { weights }, mmap))
     }
 }
 
