@@ -172,6 +172,9 @@ pub fn load_backend(
         ))),
         #[cfg(feature = "cpu")]
         BackendKind::Cpu => {
+            if is_modernbert_model(model_repo) {
+                return load_modernbert_cpu(model_repo, max_layers);
+            }
             let backend = cpu::CpuBackend::load(model_repo, &device_hint)?;
             Ok(Box::new(backend))
         }
@@ -258,8 +261,14 @@ pub fn detect_backends(
     )]
     let has_gpu = backends.iter().any(|b| b.is_gpu());
     #[cfg(feature = "cpu")]
-    if !has_gpu && let Ok(b) = cpu::CpuBackend::load(model_repo, &DeviceHint::Cpu) {
-        backends.push(Box::new(b));
+    if !has_gpu {
+        if is_modernbert_model(model_repo) {
+            if let Ok(b) = load_modernbert_cpu(model_repo, max_layers) {
+                backends.push(b);
+            }
+        } else if let Ok(b) = cpu::CpuBackend::load(model_repo, &DeviceHint::Cpu) {
+            backends.push(Box::new(b));
+        }
     }
 
     if backends.is_empty() {
@@ -331,6 +340,53 @@ pub fn load_modernbert_metal(
 
     Ok(Box::new(GenericBackend::new(
         driver, arch, max_tokens, true, mmap,
+    )))
+}
+
+/// Load `ModernBERT` on CPU via the driver/arch system.
+#[cfg(feature = "cpu")]
+pub fn load_modernbert_cpu(
+    model_repo: &str,
+    max_layers: Option<usize>,
+) -> crate::Result<Box<dyn EmbedBackend>> {
+    use driver::cpu::{CpuDriver, ModernBertConfig};
+    use generic::GenericBackend;
+    use hf_hub::api::sync::Api;
+
+    let api = Api::new().map_err(|e| crate::Error::Download(e.to_string()))?;
+    let repo = api.model(model_repo.to_string());
+
+    let config_path = repo
+        .get("config.json")
+        .map_err(|e| crate::Error::Download(e.to_string()))?;
+    let weights_path = repo
+        .get("model.safetensors")
+        .map_err(|e| crate::Error::Download(e.to_string()))?;
+
+    let config_str = std::fs::read_to_string(&config_path).map_err(|e| crate::Error::Io {
+        path: config_path.display().to_string(),
+        source: e,
+    })?;
+    let config_json: serde_json::Value = serde_json::from_str(&config_str)
+        .map_err(|e| crate::Error::Other(anyhow::anyhow!("config parse error: {e}")))?;
+    let config = ModernBertConfig::from_json(&config_json)?;
+    let max_tokens = config.max_position_embeddings;
+
+    let driver = CpuDriver::new()?;
+    let (mut arch, mmap) = driver.load_modern_bert_weights(&weights_path, &config)?;
+    arch.max_layers = max_layers;
+
+    tracing::info!(
+        model_repo,
+        hidden = config.hidden_size,
+        layers = config.num_hidden_layers,
+        heads = config.num_attention_heads,
+        max_tokens,
+        "ModernBERT loaded on CPU (driver/arch)"
+    );
+
+    Ok(Box::new(GenericBackend::new(
+        driver, arch, max_tokens, false, mmap,
     )))
 }
 

@@ -28,10 +28,13 @@ use std::path::Path;
 use safetensors::SafeTensors;
 
 use super::{BatchInputs, Driver};
-use crate::backend::Encoding;
 use crate::backend::arch::classic_bert::{
     ClassicBertArch, ClassicBertLayerWeights, ClassicBertWeights,
 };
+use crate::backend::arch::modern_bert::{
+    ModernBertArch, ModernBertLayerWeights, ModernBertWeights, RopeCache,
+};
+use crate::backend::Encoding;
 // ---------------------------------------------------------------------------
 // CpuDriver
 // ---------------------------------------------------------------------------
@@ -263,6 +266,168 @@ impl CpuDriver {
         };
 
         Ok((ClassicBertArch { weights }, mmap))
+    }
+
+    /// Load `ModernBERT` weights from a safetensors file into `Vec<f32>` tensors.
+    ///
+    /// Weight names follow the `nomic-ai/modernbert-embed-base` convention:
+    /// `layers.{i}.attn.Wqkv.weight`, `layers.{i}.mlp.Wi.weight`, etc.
+    ///
+    /// Returns `(arch, mmap)` where mmap is kept alive for API consistency.
+    pub fn load_modern_bert_weights(
+        &self,
+        weights_path: &Path,
+        config: &ModernBertConfig,
+    ) -> crate::Result<(ModernBertArch<Vec<f32>>, memmap2::Mmap)> {
+        let file = std::fs::File::open(weights_path).map_err(|e| crate::Error::Io {
+            path: weights_path.display().to_string(),
+            source: e,
+        })?;
+        #[expect(unsafe_code, reason = "memmap2 requires unsafe for mmap")]
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| crate::Error::Io {
+            path: weights_path.display().to_string(),
+            source: e,
+        })?;
+
+        let tensors = SafeTensors::deserialize(&mmap)
+            .map_err(|e| crate::Error::Cpu(format!("safetensors parse: {e}")))?;
+
+        let hidden = config.hidden_size;
+        let num_layers = config.num_hidden_layers;
+        let num_heads = config.num_attention_heads;
+        let head_dim = hidden / num_heads;
+        let intermediate = config.intermediate_size;
+        let global_attn_every_n = config.global_attn_every_n_layers;
+
+        let mut layers = Vec::with_capacity(num_layers);
+        for i in 0..num_layers {
+            let qkv_weight = load_tensor_flat(&tensors, &format!("layers.{i}.attn.Wqkv.weight"))?;
+            let output_weight = load_tensor_flat(&tensors, &format!("layers.{i}.attn.Wo.weight"))?;
+            let attn_norm_weight = if i == 0 {
+                None
+            } else {
+                Some(load_tensor_flat(
+                    &tensors,
+                    &format!("layers.{i}.attn_norm.weight"),
+                )?)
+            };
+            let mlp_wi_weight = load_tensor_flat(&tensors, &format!("layers.{i}.mlp.Wi.weight"))?;
+            let mlp_wo_weight = load_tensor_flat(&tensors, &format!("layers.{i}.mlp.Wo.weight"))?;
+            let mlp_norm_weight =
+                load_tensor_flat(&tensors, &format!("layers.{i}.mlp_norm.weight"))?;
+
+            let is_global = i % global_attn_every_n == 0;
+
+            layers.push(ModernBertLayerWeights {
+                qkv_weight,
+                output_weight,
+                attn_norm_weight,
+                mlp_wi_weight,
+                mlp_wo_weight,
+                mlp_norm_weight,
+                is_global,
+            });
+        }
+
+        let tok_embeddings = load_tensor_flat(&tensors, "embeddings.tok_embeddings.weight")?;
+        let emb_norm_weight = load_tensor_flat(&tensors, "embeddings.norm.weight")?;
+        let final_norm_weight = load_tensor_flat(&tensors, "final_norm.weight")?;
+        let zero_bias = vec![0.0f32; hidden];
+
+        let weights = ModernBertWeights {
+            tok_embeddings,
+            emb_norm_weight,
+            final_norm_weight,
+            zero_bias,
+            layers,
+            num_heads,
+            head_dim,
+            hidden_dim: hidden,
+            intermediate_dim: intermediate,
+            layer_norm_eps: config.norm_eps,
+            local_window: config.local_attention,
+        };
+
+        // Build RoPE caches
+        let max_seq = config.max_position_embeddings;
+        let global_rope = build_rope_cache_cpu(head_dim, max_seq, config.global_rope_theta);
+        let local_rope = build_rope_cache_cpu(head_dim, max_seq, config.local_rope_theta);
+
+        let arch = ModernBertArch {
+            weights,
+            global_rope,
+            local_rope,
+            max_layers: None,
+        };
+
+        Ok((arch, mmap))
+    }
+}
+
+/// Parsed `ModernBERT` config from `config.json`.
+pub struct ModernBertConfig {
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub global_attn_every_n_layers: usize,
+    pub local_attention: usize,
+    pub global_rope_theta: f32,
+    pub local_rope_theta: f32,
+    pub norm_eps: f32,
+    pub max_position_embeddings: usize,
+    pub vocab_size: usize,
+}
+
+impl ModernBertConfig {
+    /// Parse from a `config.json` value.
+    pub fn from_json(json: &serde_json::Value) -> crate::Result<Self> {
+        let get_usize = |key: &str| -> crate::Result<usize> {
+            json.get(key)
+                .and_then(serde_json::Value::as_u64)
+                .map(|v| v as usize)
+                .ok_or_else(|| crate::Error::Cpu(format!("config.json missing or invalid: {key}")))
+        };
+        let get_f64 = |key: &str| -> crate::Result<f64> {
+            json.get(key)
+                .and_then(serde_json::Value::as_f64)
+                .ok_or_else(|| crate::Error::Cpu(format!("config.json missing or invalid: {key}")))
+        };
+
+        Ok(Self {
+            hidden_size: get_usize("hidden_size")?,
+            intermediate_size: get_usize("intermediate_size")?,
+            num_hidden_layers: get_usize("num_hidden_layers")?,
+            num_attention_heads: get_usize("num_attention_heads")?,
+            global_attn_every_n_layers: get_usize("global_attn_every_n_layers")?,
+            local_attention: get_usize("local_attention")?,
+            global_rope_theta: get_f64("global_rope_theta")? as f32,
+            local_rope_theta: get_f64("local_rope_theta")? as f32,
+            norm_eps: get_f64("norm_eps").unwrap_or(1e-5) as f32,
+            max_position_embeddings: get_usize("max_position_embeddings")?,
+            vocab_size: get_usize("vocab_size")?,
+        })
+    }
+}
+
+/// Build RoPE cos/sin tables as `Vec<f32>` for CPU.
+fn build_rope_cache_cpu(head_dim: usize, max_seq: usize, theta: f32) -> RopeCache<Vec<f32>> {
+    let half_dim = head_dim / 2;
+    let n = max_seq * half_dim;
+    let mut cos_data = Vec::with_capacity(n);
+    let mut sin_data = Vec::with_capacity(n);
+
+    for pos in 0..max_seq {
+        for d in 0..half_dim {
+            let freq = (pos as f32) / theta.powf(2.0 * d as f32 / head_dim as f32);
+            cos_data.push(freq.cos());
+            sin_data.push(freq.sin());
+        }
+    }
+
+    RopeCache {
+        cos: cos_data,
+        sin: sin_data,
     }
 }
 
