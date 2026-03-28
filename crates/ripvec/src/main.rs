@@ -181,6 +181,8 @@ fn load_pipeline(
     let tokenizer =
         ripvec_core::tokenize::load_tokenizer(model_repo).context("failed to load tokenizer")?;
 
+    let mode: ripvec_core::hybrid::SearchMode = args.mode.parse().unwrap_or_default();
+
     let search_cfg = ripvec_core::embed::SearchConfig {
         batch_size: args.batch_size,
         max_tokens: args.max_tokens,
@@ -192,6 +194,7 @@ fn load_pipeline(
         text_mode: args.text_mode,
         cascade_dim: None,
         file_type: args.file_type.clone(),
+        mode,
     };
 
     Ok((backends, tokenizer, search_cfg))
@@ -459,28 +462,43 @@ fn run_oneshot(
             }
         }
 
-        // Query against the cached index
-        let enc = ripvec_core::tokenize::tokenize_query(
-            &args.query,
-            tokenizer,
-            backend_refs[0].max_tokens(),
-        )?;
-        let mut query_emb = backend_refs[0].embed_batch(&[enc])?;
-        let query_embedding = query_emb
-            .pop()
-            .ok_or_else(|| anyhow::anyhow!("backend returned no embedding"))?;
+        // Build BM25 index for hybrid/keyword search
+        let bm25 = ripvec_core::bm25::Bm25Index::build(&index.chunks)
+            .context("failed to build BM25 index")?;
+        let hybrid = ripvec_core::hybrid::HybridIndex::from_parts(index, bm25);
 
-        let ranked = index.rank(&query_embedding, args.threshold);
+        // Embed query (skip for keyword-only mode)
+        let query_embedding = if search_cfg.mode == ripvec_core::hybrid::SearchMode::Keyword {
+            vec![0.0f32; hybrid.semantic.hidden_dim]
+        } else {
+            let enc = ripvec_core::tokenize::tokenize_query(
+                &args.query,
+                tokenizer,
+                backend_refs[0].max_tokens(),
+            )?;
+            let mut query_emb = backend_refs[0].embed_batch(&[enc])?;
+            query_emb
+                .pop()
+                .ok_or_else(|| anyhow::anyhow!("backend returned no embedding"))?
+        };
+
+        let effective_top_k = if args.top_k > 0 {
+            args.top_k
+        } else {
+            usize::MAX
+        };
+        let ranked = hybrid.search(
+            &query_embedding,
+            &args.query,
+            effective_top_k,
+            args.threshold,
+            search_cfg.mode,
+        );
         ranked
             .into_iter()
-            .take(if args.top_k > 0 {
-                args.top_k
-            } else {
-                usize::MAX
-            })
             .filter_map(|(idx, score)| {
-                index
-                    .chunks
+                hybrid
+                    .chunks()
                     .get(idx)
                     .map(|chunk| ripvec_core::embed::SearchResult {
                         chunk: chunk.clone(),
@@ -540,10 +558,16 @@ fn run_oneshot(
 
     profiler.finish();
 
-    let filtered: Vec<_> = results
-        .into_iter()
-        .filter(|r| r.similarity >= args.threshold)
-        .collect();
+    // In hybrid/keyword modes, RRF scores are on a different scale (~0.01-0.03)
+    // than cosine similarity (0-1), so skip the cosine threshold filter.
+    let filtered: Vec<_> = if search_cfg.mode == ripvec_core::hybrid::SearchMode::Semantic {
+        results
+            .into_iter()
+            .filter(|r| r.similarity >= args.threshold)
+            .collect()
+    } else {
+        results
+    };
     output::print_results(&filtered, &args.format);
 
     Ok(())

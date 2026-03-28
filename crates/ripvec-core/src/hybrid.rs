@@ -135,8 +135,10 @@ impl HybridIndex {
             }
             SearchMode::Keyword => self.bm25.search(query_text, top_k),
             SearchMode::Hybrid => {
-                let sem = self.semantic.rank(query_embedding, threshold);
-                let kw = self.bm25.search(query_text, top_k);
+                // Use threshold=0 for semantic sub-query: RRF ranks by
+                // position, not score magnitude, so we need all candidates.
+                let sem = self.semantic.rank(query_embedding, 0.0);
+                let kw = self.bm25.search(query_text, top_k.max(100));
                 let mut fused = rrf_fuse(&sem, &kw, 60.0);
                 fused.truncate(top_k);
                 fused
