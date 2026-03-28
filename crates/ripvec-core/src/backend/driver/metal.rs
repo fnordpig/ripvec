@@ -17,10 +17,10 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::{NSString, NSUInteger, ns_string};
+use objc2::AnyThread;
+use objc2_foundation::{ns_string, NSString, NSUInteger};
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
     MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
@@ -32,13 +32,13 @@ use objc2_metal_performance_shaders::{
 use safetensors::SafeTensors;
 
 use super::{BatchInputs, Driver};
-use crate::backend::Encoding;
 use crate::backend::arch::classic_bert::{
     ClassicBertArch, ClassicBertLayerWeights, ClassicBertWeights,
 };
 use crate::backend::arch::modern_bert::{
     ModernBertArch, ModernBertLayerWeights, ModernBertWeights, RopeCache,
 };
+use crate::backend::Encoding;
 
 // ---------------------------------------------------------------------------
 // CoreGraphics linkage (required for MTLCreateSystemDefaultDevice)
@@ -198,6 +198,8 @@ struct KernelPipelines {
     rope_encode_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Full FP16 batched GEMM (half A, half B, half C).
     gemm_batched_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Tiled FP16 GEMM with threadgroup memory (64×64×16, 4 simdgroups).
+    gemm_tiled_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 impl KernelPipelines {
@@ -255,6 +257,7 @@ impl KernelPipelines {
             unpad_from_batch_f16: p("unpad_from_batch_f16_kernel")?,
             rope_encode_f16: p("rope_encode_f16_kernel")?,
             gemm_batched_f16: create_pipeline(device, &gemm_library, "gemm_batched_f16_kernel")?,
+            gemm_tiled_f16: create_pipeline(device, &gemm_library, "gemm_tiled_f16_kernel")?,
         })
     }
 }
@@ -444,6 +447,22 @@ fn set_i32_param(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, value: 
         encoder.setBytes_length_atIndex(
             std::ptr::NonNull::new(&value as *const i32 as *mut _).expect("non-null const ptr"),
             core::mem::size_of::<i32>(),
+            index,
+        );
+    }
+}
+
+/// Set a `constant uint&` parameter at the given buffer index.
+#[expect(
+    unsafe_code,
+    clippy::borrow_as_ptr,
+    reason = "Metal setBytes requires unsafe FFI with raw ptr"
+)]
+fn set_u32_param(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, value: u32, index: usize) {
+    unsafe {
+        encoder.setBytes_length_atIndex(
+            std::ptr::NonNull::new(&value as *const u32 as *mut _).expect("non-null const ptr"),
+            core::mem::size_of::<u32>(),
             index,
         );
     }
@@ -2626,10 +2645,6 @@ impl Driver for MetalDriver {
         k: usize,
         transpose_b: bool,
     ) -> crate::Result<()> {
-        // MPS with Float16 descriptors — 2× faster than custom simdgroup.
-        // MPS uses descriptor dimensions for dispatch, NOT buffer.length.
-        // Oversized buffers are safe per Apple's documented API contract.
-        //
         // B may be a weight tensor (FP32 main + FP16 in .fp16 field)
         // or an FP16 activation (half in main buffer, no .fp16 field).
         let b_fp16 = b.fp16.borrow();
@@ -2638,25 +2653,74 @@ impl Driver for MetalDriver {
         } else {
             (&*b.buffer as &ProtocolObject<dyn MTLBuffer>, b.offset)
         };
-        self.run_mps("mps-gemm-f16", |cmd_buf| {
-            dispatch_mps_gemm(
-                cmd_buf,
-                &self.device,
-                &a.buffer,
-                a.offset,
-                b_buf,
-                b_off,
-                &output.buffer,
-                output.offset,
-                m,
-                n,
-                k,
-                transpose_b,
-                MPSDataType::Float16,
-                MPSDataType::Float16,
-            );
-            Ok(())
-        })
+
+        // RIPVEC_NO_MPS=1 uses the tiled compute GEMM to eliminate encoder
+        // transitions (88 per ModernBERT forward pass → 0).
+        static USE_COMPUTE_GEMM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let use_compute = *USE_COMPUTE_GEMM
+            .get_or_init(|| std::env::var("RIPVEC_NO_MPS").is_ok_and(|v| v == "1"));
+
+        if use_compute {
+            self.run_compute("tiled-gemm-f16", |enc| {
+                enc.setComputePipelineState(&self.kernels.gemm_tiled_f16);
+                set_buffer(enc, &a.buffer, a.offset, 0);
+                set_buffer(enc, b_buf, b_off, 1);
+                set_buffer(enc, &output.buffer, output.offset, 2);
+                // Parameters: M, N, K, transB, stride_A, stride_B, stride_C
+                let trans_val: u32 = if transpose_b { 1 } else { 0 };
+                set_u32_param(enc, m as u32, 3);
+                set_u32_param(enc, n as u32, 4);
+                set_u32_param(enc, k as u32, 5);
+                set_u32_param(enc, trans_val, 6);
+                set_u32_param(enc, (m * k) as u32, 7); // stride_A (unused for non-batched)
+                set_u32_param(
+                    enc,
+                    if transpose_b {
+                        (n * k) as u32
+                    } else {
+                        (k * n) as u32
+                    },
+                    8,
+                );
+                set_u32_param(enc, (m * n) as u32, 9); // stride_C
+
+                // Grid: (ceil(N/64), ceil(M/64), 1)
+                let grid_x = n.div_ceil(64);
+                let grid_y = m.div_ceil(64);
+                let grid = MTLSize {
+                    width: grid_x,
+                    height: grid_y,
+                    depth: 1,
+                };
+                let threads = MTLSize {
+                    width: 128,
+                    height: 1,
+                    depth: 1,
+                };
+                enc.dispatchThreadgroups_threadsPerThreadgroup(grid, threads);
+                Ok(())
+            })
+        } else {
+            self.run_mps("mps-gemm-f16", |cmd_buf| {
+                dispatch_mps_gemm(
+                    cmd_buf,
+                    &self.device,
+                    &a.buffer,
+                    a.offset,
+                    b_buf,
+                    b_off,
+                    &output.buffer,
+                    output.offset,
+                    m,
+                    n,
+                    k,
+                    transpose_b,
+                    MPSDataType::Float16,
+                    MPSDataType::Float16,
+                );
+                Ok(())
+            })
+        }
     }
 
     #[expect(
