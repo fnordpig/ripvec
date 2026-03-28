@@ -48,9 +48,9 @@ fn main() -> Result<()> {
         }
     });
 
-    // Apply model-aware default threshold if user didn't set one
+    // Default threshold: 0.5 on normalized [0,1] scores (model-agnostic).
     if args.threshold == 0.0 {
-        args.threshold = if use_modern { 0.35 } else { 0.5 };
+        args.threshold = 0.5;
     }
 
     // For --code mode, prepend the required query prefix (non-interactive only)
@@ -566,17 +566,8 @@ fn run_oneshot(
 
     profiler.finish();
 
-    // In hybrid/keyword modes, RRF scores are on a different scale (~0.01-0.03)
-    // than cosine similarity (0-1), so skip the cosine threshold filter.
-    let filtered: Vec<_> = if search_cfg.mode == ripvec_core::hybrid::SearchMode::Semantic {
-        results
-            .into_iter()
-            .filter(|r| r.similarity >= args.threshold)
-            .collect()
-    } else {
-        results
-    };
-    output::print_results(&filtered, &args.format);
+    // Scores are already normalized to [0,1] and threshold-filtered by HybridIndex::search().
+    output::print_results(&results, &args.format);
 
     Ok(())
 }

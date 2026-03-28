@@ -115,9 +115,9 @@ impl HybridIndex {
     /// - [`SearchMode::Hybrid`] — retrieves both ranked lists, fuses them
     ///   with [`rrf_fuse`], then truncates to `top_k`.
     ///
-    /// Scores in the returned vec have different scales depending on mode:
-    /// semantic scores are cosine similarities in `[0, 1]`; keyword and
-    /// hybrid scores are RRF scores (`≤ 1 / (k + 1) * 2` for hybrid).
+    /// Scores are min-max normalized to `[0, 1]` regardless of mode, so
+    /// a threshold of 0.5 always means "above midpoint of the score range"
+    /// whether the underlying scores are cosine similarity, BM25, or RRF.
     #[must_use]
     pub fn search(
         &self,
@@ -127,27 +127,42 @@ impl HybridIndex {
         threshold: f32,
         mode: SearchMode,
     ) -> Vec<(usize, f32)> {
-        match mode {
+        let mut raw = match mode {
             SearchMode::Semantic => {
-                let mut results = self
-                    .semantic
-                    .rank_turboquant(query_embedding, top_k, threshold);
-                results.truncate(top_k);
-                results
+                // Fetch more than top_k so normalization has a meaningful range.
+                self.semantic
+                    .rank_turboquant(query_embedding, top_k.max(100), 0.0)
             }
-            SearchMode::Keyword => self.bm25.search(query_text, top_k),
+            SearchMode::Keyword => self.bm25.search(query_text, top_k.max(100)),
             SearchMode::Hybrid => {
-                // TurboQuant 4-bit scan for semantic candidates (5× faster than BLAS).
-                // threshold=0 because RRF ranks by position, not score magnitude.
                 let sem = self
                     .semantic
                     .rank_turboquant(query_embedding, top_k.max(100), 0.0);
                 let kw = self.bm25.search(query_text, top_k.max(100));
-                let mut fused = rrf_fuse(&sem, &kw, 60.0);
-                fused.truncate(top_k);
-                fused
+                rrf_fuse(&sem, &kw, 60.0)
+            }
+        };
+
+        // Min-max normalize scores to [0, 1] so threshold is model-agnostic.
+        if let (Some(max), Some(min)) = (raw.first().map(|(_, s)| *s), raw.last().map(|(_, s)| *s))
+        {
+            let range = max - min;
+            if range > f32::EPSILON {
+                for (_, score) in &mut raw {
+                    *score = (*score - min) / range;
+                }
+            } else {
+                // All scores identical — normalize to 1.0
+                for (_, score) in &mut raw {
+                    *score = 1.0;
+                }
             }
         }
+
+        // Apply threshold on normalized scores, then truncate
+        raw.retain(|(_, score)| *score >= threshold);
+        raw.truncate(top_k);
+        raw
     }
 
     /// All chunks in the index.

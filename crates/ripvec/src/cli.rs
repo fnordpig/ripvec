@@ -57,9 +57,9 @@ pub struct Args {
     #[arg(short = 't', long = "type")]
     pub file_type: Option<String>,
 
-    /// Minimum similarity threshold (0.0 to 1.0).
-    /// Default depends on model: 0.5 for BGE-small (--fast), 0.35 for ModernBERT.
-    /// Set to 0 to disable threshold filtering.
+    /// Minimum similarity threshold on normalized [0, 1] scores.
+    /// 0.5 = above midpoint of the score range (default, model-agnostic).
+    /// 0 = return all results.
     #[arg(short = 'T', long, default_value_t = 0.0)]
     pub threshold: f32,
 
