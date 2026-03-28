@@ -55,7 +55,6 @@ libc = "0.2"
 rand = "0.10.0"
 rand_chacha = "0.10.0"
 rand_distr = "0.6.0"
-tantivy = "0.22"
 
 [features]
 default = []

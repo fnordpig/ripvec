@@ -91,8 +91,8 @@ impl HybridIndex {
         embeddings: Vec<Vec<f32>>,
         cascade_dim: Option<usize>,
     ) -> crate::Result<Self> {
-        let semantic = SearchIndex::new(chunks.clone(), &embeddings, cascade_dim);
-        let bm25 = Bm25Index::new(chunks)?;
+        let bm25 = Bm25Index::build(&chunks)?;
+        let semantic = SearchIndex::new(chunks, &embeddings, cascade_dim);
         Ok(Self { semantic, bm25 })
     }
 
