@@ -34,9 +34,12 @@ fn main() -> Result<()> {
     }
 
     // Resolve model repo: --modern → ModernBERT, --code → CodeRankEmbed, default → BGE-small
+    // NOTE: ModernBERT has a known NaN bug on some corpora (>32 tokens).
+    // Once fixed, ModernBERT becomes the default and --fast selects BGE-small.
     let use_code_model = args.code;
+    let use_modern = args.modern;
     let model_repo = args.model_repo.clone().unwrap_or_else(|| {
-        if args.modern {
+        if use_modern {
             "nomic-ai/modernbert-embed-base".to_string()
         } else if use_code_model {
             "nomic-ai/CodeRankEmbed".to_string()
@@ -44,6 +47,11 @@ fn main() -> Result<()> {
             "BAAI/bge-small-en-v1.5".to_string()
         }
     });
+
+    // Apply model-aware default threshold if user didn't set one
+    if args.threshold == 0.0 {
+        args.threshold = if use_modern { 0.35 } else { 0.5 };
+    }
 
     // For --code mode, prepend the required query prefix (non-interactive only)
     if use_code_model && !args.interactive && !args.query.is_empty() {

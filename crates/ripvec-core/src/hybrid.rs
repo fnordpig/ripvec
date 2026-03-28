@@ -129,15 +129,19 @@ impl HybridIndex {
     ) -> Vec<(usize, f32)> {
         match mode {
             SearchMode::Semantic => {
-                let mut results = self.semantic.rank(query_embedding, threshold);
+                let mut results = self
+                    .semantic
+                    .rank_turboquant(query_embedding, top_k, threshold);
                 results.truncate(top_k);
                 results
             }
             SearchMode::Keyword => self.bm25.search(query_text, top_k),
             SearchMode::Hybrid => {
-                // Use threshold=0 for semantic sub-query: RRF ranks by
-                // position, not score magnitude, so we need all candidates.
-                let sem = self.semantic.rank(query_embedding, 0.0);
+                // TurboQuant 4-bit scan for semantic candidates (5× faster than BLAS).
+                // threshold=0 because RRF ranks by position, not score magnitude.
+                let sem = self
+                    .semantic
+                    .rank_turboquant(query_embedding, top_k.max(100), 0.0);
                 let kw = self.bm25.search(query_text, top_k.max(100));
                 let mut fused = rrf_fuse(&sem, &kw, 60.0);
                 fused.truncate(top_k);

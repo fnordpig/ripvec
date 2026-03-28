@@ -28,18 +28,21 @@ pub struct Args {
     #[arg(short = 'n', long, default_value_t = 0)]
     pub top_k: usize,
 
-    /// Use code-optimized model (nomic-ai/CodeRankEmbed).
-    /// Adds the required query prefix automatically.
-    #[arg(long, conflicts_with = "text")]
+    /// Use code-optimized model (nomic-ai/CodeRankEmbed). Deprecated.
+    #[arg(long, conflicts_with = "fast", hide = true)]
     pub code: bool,
 
-    /// Use general text model (BAAI/bge-small-en-v1.5). This is the default.
+    /// Use fast lightweight model (BAAI/bge-small-en-v1.5, 384-dim, 12 layers).
+    /// Trades quality for ~4× faster inference.
     #[arg(long)]
+    pub fast: bool,
+
+    /// Legacy alias for --fast.
+    #[arg(long, hide = true)]
     pub text: bool,
 
-    /// Use ModernBERT model (nomic-ai/modernbert-embed-base).
-    /// 768-dim, 22 layers, alternating local/global attention, MRL-trained.
-    #[arg(long, conflicts_with_all = ["code", "text"])]
+    /// Legacy flag (ModernBERT is now the default).
+    #[arg(long, hide = true)]
     pub modern: bool,
 
     /// Override `HuggingFace` model repository (advanced).
@@ -55,7 +58,9 @@ pub struct Args {
     pub file_type: Option<String>,
 
     /// Minimum similarity threshold (0.0 to 1.0).
-    #[arg(short = 'T', long, default_value_t = 0.5)]
+    /// Default depends on model: 0.5 for BGE-small (--fast), 0.35 for ModernBERT.
+    /// Set to 0 to disable threshold filtering.
+    #[arg(short = 'T', long, default_value_t = 0.0)]
     pub threshold: f32,
 
     /// Number of threads for parallel processing (0 = cores).
@@ -106,6 +111,12 @@ pub struct Args {
     /// and unrecognized files fall back to plain-text windows.
     #[arg(long)]
     pub text_mode: bool,
+
+    /// Search mode: hybrid (semantic + BM25), semantic-only, or keyword-only.
+    ///
+    /// Hybrid (default) fuses results via Reciprocal Rank Fusion.
+    #[arg(long, default_value = "hybrid")]
+    pub mode: String,
 
     /// Enable pipeline profiling output to stderr.
     #[arg(long)]

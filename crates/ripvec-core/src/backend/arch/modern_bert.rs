@@ -811,7 +811,6 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
                 hidden_f16 = ffn_sublayer_f16(driver, &attn_output, layer, &g, &w.zero_bias)?;
                 driver.restore_pool_cursor(saved);
 
-                // Flush command buffer every 10 layers to prevent GPU timeout.
                 if (li + 1) % 8 == 0 {
                     driver.flush_batch()?;
                 }
@@ -840,7 +839,6 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
 
                 driver.restore_pool_cursor(saved);
 
-                // Flush command buffer every 10 layers to prevent GPU timeout.
                 if (li + 1) % 8 == 0 {
                     driver.flush_batch()?;
                 }

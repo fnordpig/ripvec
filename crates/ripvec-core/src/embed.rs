@@ -63,6 +63,8 @@ pub struct SearchConfig {
     /// When set, only files matching this type (using ripgrep's built-in type
     /// database) are collected during the walk phase.
     pub file_type: Option<String>,
+    /// Search mode: hybrid (default), semantic, or keyword.
+    pub mode: crate::hybrid::SearchMode,
 }
 
 impl Default for SearchConfig {
@@ -74,6 +76,7 @@ impl Default for SearchConfig {
             text_mode: false,
             cascade_dim: None,
             file_type: None,
+            mode: crate::hybrid::SearchMode::Hybrid,
         }
     }
 }
@@ -245,8 +248,22 @@ pub fn search(
 
     let t_query_start = std::time::Instant::now();
 
-    // Phase 5: Embed query (using the primary backend)
-    let query_embedding = {
+    // Phase 5: Build hybrid index (semantic + BM25)
+    let hybrid = {
+        let _span = info_span!("build_hybrid_index").entered();
+        let _guard = profiler.phase("build_hybrid_index");
+        crate::hybrid::HybridIndex::new(chunks, embeddings, cfg.cascade_dim)?
+    };
+
+    let mode = cfg.mode;
+    let effective_top_k = if top_k > 0 { top_k } else { usize::MAX };
+
+    // Phase 6: Embed query (skip for keyword-only mode)
+    let query_embedding = if mode == crate::hybrid::SearchMode::Keyword {
+        // Keyword mode: no embedding needed, use zero vector
+        let dim = hybrid.semantic.hidden_dim;
+        vec![0.0f32; dim]
+    } else {
         let _span = info_span!("embed_query").entered();
         let _guard = profiler.phase("embed_query");
         let t_tok = std::time::Instant::now();
@@ -264,32 +281,32 @@ pub fn search(
         })?
     };
 
-    // Phase 5: Parallel similarity ranking (rayon — just dot products)
-    let mut results: Vec<SearchResult> = {
-        let _span = info_span!("rank", chunk_count = chunks.len()).entered();
+    // Phase 7: Hybrid/semantic/keyword ranking
+    let ranked = {
+        let _span = info_span!("rank", chunk_count = hybrid.chunks().len()).entered();
         let guard = profiler.phase("rank");
-
-        let scored: Vec<SearchResult> = chunks
-            .into_par_iter()
-            .zip(embeddings.into_par_iter())
-            .map(|(chunk, emb)| SearchResult {
-                chunk,
-                similarity: similarity::dot_product(&query_embedding, &emb),
-            })
-            .collect();
-
+        // Threshold only applies to semantic modes; keyword/hybrid use RRF scores
+        let threshold = if mode == crate::hybrid::SearchMode::Semantic {
+            0.0 // SearchIndex::rank applies its own threshold
+        } else {
+            0.0
+        };
+        let results = hybrid.search(&query_embedding, query, effective_top_k, threshold, mode);
         guard.set_detail(format!(
-            "top {} from {}",
-            top_k.min(scored.len()),
-            scored.len()
+            "{mode} top {} from {}",
+            effective_top_k.min(results.len()),
+            hybrid.chunks().len()
         ));
-        scored
+        results
     };
 
-    results.sort_unstable_by(|a, b| b.similarity.total_cmp(&a.similarity));
-    if top_k > 0 {
-        results.truncate(top_k);
-    }
+    let results: Vec<SearchResult> = ranked
+        .into_iter()
+        .map(|(idx, score)| SearchResult {
+            chunk: hybrid.chunks()[idx].clone(),
+            similarity: score,
+        })
+        .collect();
 
     Ok(results)
 }
