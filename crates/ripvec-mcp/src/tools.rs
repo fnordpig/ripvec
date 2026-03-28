@@ -60,6 +60,14 @@ pub struct SearchParams {
         deserialize_with = "deserialize_number_or_string"
     )]
     pub offset: usize,
+    /// Search mode: "hybrid" (default), "semantic", or "keyword".
+    #[serde(default = "default_mode")]
+    pub mode: String,
+}
+
+/// Default search mode.
+fn default_mode() -> String {
+    "hybrid".to_string()
 }
 
 /// Parameters for the `find_similar` tool.
@@ -437,6 +445,73 @@ impl RipvecServer {
             "files": files_count,
             "extensions": ext_counts,
             "project_root": self.project_root.display().to_string(),
+        });
+
+        let json = serde_json::to_string_pretty(&response)
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Check whether the running ripvec-mcp binary is up-to-date with its source.
+    ///
+    /// Compares the binary's modification time against the newest source file
+    /// in the ripvec workspace. Returns stale=true when the binary is older
+    /// than the source, meaning `cargo build --release` should be run.
+    #[tool(
+        name = "up_to_date",
+        description = "Check if the running ripvec-mcp binary is newer than its source code. \
+            Returns version, binary age, and whether a rebuild is needed."
+    )]
+    async fn up_to_date(&self) -> Result<CallToolResult, rmcp::ErrorData> {
+        let binary_path = std::env::current_exe()
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        let binary_mtime = std::fs::metadata(&binary_path)
+            .and_then(|m| m.modified())
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+
+        // Walk crates/ for the newest .rs or Cargo.toml source file.
+        let crates_dir = self.project_root.join("crates");
+        let mut newest_source = std::time::SystemTime::UNIX_EPOCH;
+        let mut newest_file = String::new();
+        fn walk_newest(
+            dir: &std::path::Path,
+            newest: &mut std::time::SystemTime,
+            newest_file: &mut String,
+        ) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk_newest(&path, newest, newest_file);
+                } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    if ext == "rs" || path.file_name().is_some_and(|n| n == "Cargo.toml") {
+                        if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
+                            if mtime > *newest {
+                                *newest = mtime;
+                                *newest_file = path.display().to_string();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        walk_newest(&crates_dir, &mut newest_source, &mut newest_file);
+
+        let stale = newest_source > binary_mtime;
+        let binary_age = binary_mtime.elapsed().unwrap_or_default();
+        let source_age = newest_source.elapsed().unwrap_or_default();
+
+        let response = serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "stale": stale,
+            "binary_age_secs": binary_age.as_secs(),
+            "newest_source_age_secs": source_age.as_secs(),
+            "newest_source_file": newest_file,
+            "binary_path": binary_path.display().to_string(),
+            "rebuild_command": if stale { "cargo build --release" } else { "" },
         });
 
         let json = serde_json::to_string_pretty(&response)

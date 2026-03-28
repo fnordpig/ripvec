@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/ripvec-core", "crates/ripvec", "crates/ripvec-mcp"]
+default-members = ["crates/ripvec", "crates/ripvec-mcp"]
 resolver = "2"
 
 [workspace.package]

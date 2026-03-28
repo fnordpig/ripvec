@@ -15,6 +15,12 @@ use rmcp::ServiceExt;
 /// Start the MCP server: build the background index, then serve over stdio.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Handle --version before anything else (no clap needed for MCP server)
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("ripvec-mcp {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     // Initialize tracing to stderr (MCP uses stdin/stdout for transport)
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
