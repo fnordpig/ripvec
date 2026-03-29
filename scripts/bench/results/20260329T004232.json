@@ -1,0 +1,12 @@
+[
+  {
+    "label": "compute-22L",
+    "cfg": "compute",
+    "layers": 22,
+    "throughput": 53.6,
+    "wall_time": 46.35,
+    "thermal_before": "speed=100% gpu=0% mem=16.8GB",
+    "thermal_after": "speed=100% gpu=80% mem=14.3GB",
+    "returncode": 0
+  }
+]

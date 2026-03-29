@@ -67,6 +67,18 @@ pub trait Driver: Send + Sync {
         Ok(())
     }
 
+    /// Close and reopen the compute encoder within the same command buffer.
+    ///
+    /// This segments a long sequence of compute dispatches into multiple
+    /// encoders without committing or waiting. Metal processes encoders
+    /// back-to-back from the same CB — zero sync overhead.
+    ///
+    /// Use every few layers to prevent encoder state overflow (>~60 dispatches
+    /// per encoder can cause hangs on some Apple Silicon GPUs).
+    fn segment_encoder(&self) {
+        // No-op for non-Metal backends
+    }
+
     /// Save the current pool cursor position. Call BEFORE a layer's work.
     fn save_pool_cursor(&self) -> usize {
         0

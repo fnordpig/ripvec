@@ -1652,6 +1652,10 @@ impl Driver for MetalDriver {
         self.flush_batch()
     }
 
+    fn segment_encoder(&self) {
+        self.flush_compute_encoder();
+    }
+
     fn save_pool_cursor(&self) -> usize {
         self.pool_cursor.get()
     }
@@ -2052,6 +2056,9 @@ impl Driver for MetalDriver {
             .get_or_init(|| std::env::var("RIPVEC_NO_MPS").is_ok_and(|v| v == "1"));
 
         if use_compute {
+            // DEBUG: confirm kernel dispatch
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| eprintln!("[DEBUG] gemm_f16w_f32a dispatch: m={m} n={n} k={k}"));
             // Check if B has FP16 weights available
             let b_fp16 = b.fp16.borrow();
             if let Some(ref fp16_buf) = *b_fp16 {

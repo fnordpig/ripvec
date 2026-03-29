@@ -2890,11 +2890,12 @@ kernel void gemm_f16w_f32a_kernel(
     uint m_start = tg_pos.y * 64;
     uint n_start = tg_pos.x * 64;
 
-    // Threadgroup memory: FP32 activations, FP16 weights.
-    // 8×8-block layout: 32 blocks × 64 elements each.
+    // Threadgroup memory: BOTH FP16 (activations converted from FP32 during load).
+    // 8×8-block layout: 32 blocks × 64 halfs each.
     // sa: M-rows, K-cols → ma[M, K]. sb: K-rows, N-cols → mb[K, N].
-    threadgroup float sa[2048];  // 32 blocks × 64 floats = 8192 bytes
-    threadgroup half  sb[2048];  // 32 blocks × 64 halfs  = 4096 bytes
+    // A loads convert device float → threadgroup half (halves bandwidth at M=35762).
+    threadgroup half sa[2048];  // 32 blocks × 64 halfs = 4096 bytes
+    threadgroup half sb[2048];  // 32 blocks × 64 halfs = 4096 bytes
 
     constexpr short NL0 = 2;  // BK/16: threads per A row
     constexpr short NL1 = 4;  // BK/8: threads per B row
@@ -2915,7 +2916,8 @@ kernel void gemm_f16w_f32a_kernel(
     for (uint loop_k = 0; loop_k < K; loop_k += 32) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Load A (FP32) into sa: M-rows, K-cols
+        // Load A (device float*) into sa (threadgroup half*): float→half conversion.
+        // Halves load bandwidth (critical at M=35762 where A is 110MB).
         {
             short sy = lr0 / 8;
             short ly = lr0 % 8;
@@ -2923,8 +2925,8 @@ kernel void gemm_f16w_f32a_kernel(
                 short sx = short(2 * il0 + i / 8);
                 short lx = short(i % 8);
                 short ib = short(8 * sx + sy);
-                float val = (loop_k + 16 * il0 + i < K && m_start + lr0 < M)
-                    ? *(x + 16 * il0 + i) : 0.0f;
+                half val = (loop_k + 16 * il0 + i < K && m_start + lr0 < M)
+                    ? half(*(x + 16 * il0 + i)) : half(0.0h);
                 *(sa + 64 * ib + 8 * ly + lx) = val;
             }
         }
@@ -2948,13 +2950,13 @@ kernel void gemm_f16w_f32a_kernel(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Compute: native simdgroup ops
-        threadgroup float* base_sa = sa + 4 * 64 * (sgitg % 2);
-        threadgroup half*  base_sb = sb + 4 * 64 * (sgitg / 2);
+        // Compute: native simdgroup ops. Both sa and sb are half.
+        threadgroup half* base_sa = sa + 4 * 64 * (sgitg % 2);
+        threadgroup half* base_sb = sb + 4 * 64 * (sgitg / 2);
 
         for (short ik = 0; ik < 4; ik++) {
-            simdgroup_float8x8 ma[4];
-            simdgroup_half8x8  mb[4];
+            simdgroup_half8x8 ma[4];
+            simdgroup_half8x8 mb[4];
 
             simdgroup_barrier(mem_flags::mem_none);
             #pragma unroll

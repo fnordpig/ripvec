@@ -1,0 +1,62 @@
+[
+  {
+    "label": "mps-22L-b32",
+    "cfg": "mps",
+    "layers": 22,
+    "throughput": 70.6,
+    "wall_time": 34.87,
+    "thermal_before": "speed=100% gpu=0% mem=19.2GB",
+    "thermal_after": "speed=100% gpu=97% mem=18.9GB",
+    "returncode": 0
+  },
+  {
+    "label": "mps-22L-b64",
+    "cfg": "mps",
+    "layers": 22,
+    "throughput": 73.6,
+    "wall_time": 33.49,
+    "thermal_before": "speed=100% gpu=0% mem=19.3GB",
+    "thermal_after": "speed=100% gpu=97% mem=18.7GB",
+    "returncode": 0
+  },
+  {
+    "label": "mps-22L-b128",
+    "cfg": "mps",
+    "layers": 22,
+    "throughput": 73.4,
+    "wall_time": 33.62,
+    "thermal_before": "speed=100% gpu=14% mem=19.3GB",
+    "thermal_after": "speed=100% gpu=96% mem=18.0GB",
+    "returncode": 0
+  },
+  {
+    "label": "compute-22L-b32",
+    "cfg": "compute",
+    "layers": 22,
+    "throughput": 52.7,
+    "wall_time": 46.29,
+    "thermal_before": "speed=100% gpu=0% mem=18.5GB",
+    "thermal_after": "speed=100% gpu=80% mem=18.1GB",
+    "returncode": 0
+  },
+  {
+    "label": "compute-22L-b64",
+    "cfg": "compute",
+    "layers": 22,
+    "throughput": 52.5,
+    "wall_time": 46.45,
+    "thermal_before": "speed=100% gpu=0% mem=18.6GB",
+    "thermal_after": "speed=100% gpu=85% mem=18.0GB",
+    "returncode": 0
+  },
+  {
+    "label": "compute-22L-b128",
+    "cfg": "compute",
+    "layers": 22,
+    "throughput": 52.6,
+    "wall_time": 46.35,
+    "thermal_before": "speed=100% gpu=0% mem=18.6GB",
+    "thermal_after": "speed=100% gpu=87% mem=18.0GB",
+    "returncode": 0
+  }
+]

@@ -790,7 +790,8 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
         // RIPVEC_NO_MPS=1: force FP32 activations + compute GEMM path.
         // The gemm_f16w_f32a_kernel uses native simdgroup ops with FP16 weights
         // and FP32 activations — no MFA wrapper, no type conversion at store.
-        let force_fp32 = std::env::var("RIPVEC_NO_MPS").is_ok_and(|v| v == "1");
+        let force_fp32 = std::env::var("RIPVEC_NO_MPS").is_ok_and(|v| v == "1")
+            || std::env::var("RIPVEC_FP32").is_ok_and(|v| v == "1");
         let use_f16 = if force_fp32 {
             false
         } else {
@@ -827,8 +828,8 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
             driver.f16_to_f32(&mut hidden_f32, &hidden_f16, total_tokens * hidden)?;
             hidden_states = hidden_f32;
         } else {
-            // === FP32 PATH (fallback) ===
-            for layer in &w.layers[..num_layers] {
+            // === FP32 PATH ===
+            for (li, layer) in w.layers[..num_layers].iter().enumerate() {
                 let saved = driver.save_pool_cursor();
 
                 let rope = if layer.is_global {
@@ -844,6 +845,12 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
                 hidden_states = ffn_sublayer(driver, &attn_output, layer, &g, &w.zero_bias)?;
 
                 driver.restore_pool_cursor(saved);
+
+                // Segment the compute encoder every 3 layers to prevent
+                // encoder state overflow. This closes and reopens the encoder
+                // within the same command buffer — zero sync, zero GPU idle.
+                // Segment after EVERY layer (~19 dispatches per encoder)
+                driver.segment_encoder();
             }
         }
 
