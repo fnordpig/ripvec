@@ -2641,25 +2641,28 @@ kernel void gemm_batched_f16_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// Tiled FP16 GEMM with threadgroup memory (llama.cpp / MLX-inspired).
+// Tiled FP16 GEMM — llama.cpp kernel_mul_mm architecture.
 //
-// BM=64, BN=64, BK=32, 4 simdgroups (128 threads).
-// Each simdgroup computes a 32×32 output block using 16 accumulators (4×4 of 8×8).
-// Threadgroup memory: A tile (64×36 half ≈ 4.5KB) + B tile (32×68 half ≈ 4.3KB) ≈ 9KB.
-// FP16 inputs, FP32 accumulators, FP16 output.
+// 8×8-block threadgroup memory layout with stride 8 for optimal
+// simdgroup_load. Computes mc = mb × ma = B × A^T = result[N, M],
+// then stores transposed to row-major C[M, N].
 //
-// Key optimizations over the naive kernel:
-// 1. BK=32 → 4 simdgroup MACs per tgmem load (vs 1 per device load in naive)
-// 2. Coalesced B loads: for transposed B, iterate k-fast so consecutive threads
-//    access consecutive memory addresses (stride 1, not stride K)
-// 3. 4 simdgroups (128 threads) for better occupancy vs 16 (512 threads)
+// Tile: BM=64, BN=64, BK=32. 4 simdgroups (128 threads).
+// Each simdgroup: 2×2 grid in the 64×64 output.
+//   - 4 ma tiles (M dimension) × 4 mb tiles (N dimension) = 16 accumulators
+//   - Each accumulator 8×8 → 32×32 output per simdgroup
+//
+// Threadgroup memory: 8×8 blocks, 64 halfs per block, stride 8 within block.
+//   sa: (BM/8)×(BK/8) = 8×4 = 32 blocks × 64 = 2048 halfs = 4096 bytes
+//   sb: (BN/8)×(BK/8) = 8×4 = 32 blocks × 64 = 2048 halfs = 4096 bytes
+//   Total: 8192 bytes (within 32KB limit)
 //
 // Grid: (ceil(N/64), ceil(M/64), batch)
 // Threads per threadgroup: (128, 1, 1)
 // ---------------------------------------------------------------------------
-constant uint TBM = 64;  // M tile (rows of A / rows of C)
-constant uint TBN = 64;  // N tile (cols of B / cols of C)
-constant uint TBK = 32;  // K tile (inner dimension per load)
+constant uint TBM = 64;
+constant uint TBN = 64;
+constant uint TBK = 32;
 
 kernel void gemm_tiled_f16_kernel(
     device half* A              [[buffer(0)]],
@@ -2673,133 +2676,180 @@ kernel void gemm_tiled_f16_kernel(
     constant uint& stride_B     [[buffer(8)]],
     constant uint& stride_C     [[buffer(9)]],
     uint3 tg_pos                [[threadgroup_position_in_grid]],
-    ushort simd_id              [[simdgroup_index_in_threadgroup]],
+    ushort sgitg                [[simdgroup_index_in_threadgroup]],
     ushort lane_id              [[thread_index_in_simdgroup]],
-    ushort tid                  [[thread_index_in_threadgroup]]
+    ushort tiitg                [[thread_index_in_threadgroup]]
 ) {
-    // Batch offset
     uint batch_idx = tg_pos.z;
     device half* A_batch = A + batch_idx * stride_A;
     device half* B_batch = B + batch_idx * stride_B;
     device half* C_batch = C + batch_idx * stride_C;
 
-    // Threadgroup tile offsets in the output matrix
     uint m_start = tg_pos.y * TBM;
     uint n_start = tg_pos.x * TBN;
 
-    // Threadgroup memory for A and B tiles.
-    // A: [TBM, TBK] row-major, padded stride to avoid bank conflicts.
-    // B: [TBK, TBN] row-major (already transposed during load if needed).
-    constexpr uint A_STRIDE = TBK + 4;  // 32 + 4 = 36 halfs per row
-    constexpr uint B_STRIDE = TBN + 4;  // 64 + 4 = 68 halfs per row
-    threadgroup half sa[TBM * A_STRIDE];  // 64 × 36 = 2304 halfs = 4608 bytes
-    threadgroup half sb[TBK * B_STRIDE];  // 32 × 68 = 2176 halfs = 4352 bytes
+    // --- Threadgroup memory: 8×8-block layout ---
+    // Each block is 64 halfs. Within a block: address = 8*row + col.
+    // sa blocks indexed by ib_a = 8*K_blk + M_blk (K varies fast).
+    //   K_blk: 0..3 (BK/8=4), M_blk: 0..7 (BM/8=8). Total: 32 blocks.
+    // sb blocks indexed by ib_b = 8*K_blk + N_blk.
+    //   K_blk: 0..3, N_blk: 0..7 (BN/8=8). Total: 32 blocks.
+    threadgroup half sa[2048];  // 32 blocks × 64 = 4096 bytes
+    threadgroup half sb[2048];  // 32 blocks × 64 = 4096 bytes
 
-    // 4 simdgroups in a 2×2 layout, each computing 32×32 of the 64×64 output.
-    ushort sg_row = simd_id / 2;   // 0 or 1
-    ushort sg_col = simd_id % 2;   // 0 or 1
+    // NL0 = BK/16 = 2 threads per A row (each loads 16 K elements)
+    // NL1 = BK/8  = 4 threads per B row (each loads 8 K elements)
+    constexpr short NL0 = 2;
+    constexpr short NL1 = 4;
 
-    // 16 accumulators per simdgroup: 4 rows × 4 cols of 8×8 tiles = 32×32 output
-    simdgroup_matrix_storage<float> acc[16];
-    for (int i = 0; i < 16; i++) {
-        *(acc[i].thread_elements()) = float2(0.0);
+    // This thread's row assignment for cooperative loading
+    short lr0 = short(tiitg / NL0);  // A row index 0..63
+    short lr1 = short(tiitg / NL1);  // B row index 0..31
+    short il0 = short(tiitg % NL0);  // position within A row (0 or 1)
+
+    // Clamp to tile bounds
+    lr0 = min(lr0, short(TBM - 1));
+    lr1 = min(lr1, short(TBN - 1));
+
+    // Device memory pointers for this thread's row
+    // A is [M, K] row-major. Each thread loads 16 consecutive K elements.
+    device half* x = A_batch + uint(m_start + lr0) * K;
+
+    // B is [N, K] row-major (transposed weight matrix).
+    // Each thread loads 8 consecutive K elements from its N row.
+    short iy = short(8 * (tiitg % NL1));  // K offset within B row
+    device half* y = B_batch + uint(n_start + lr1) * K;
+
+    // 16 accumulators per simdgroup (4 M-tiles × 4 N-tiles = 32×32 output).
+    // mc = mb × ma computes [N, M]. We store transposed to get row-major C[M, N].
+    simdgroup_matrix_storage<float> mc[16];
+    for (short i = 0; i < 16; i++) {
+        *(mc[i].thread_elements()) = float2(0.0);
     }
 
     ushort2 morton = morton_order(lane_id);
 
-    // K-loop: load TBK=32 columns at a time into threadgroup memory
-    for (uint k = 0; k < K; k += TBK) {
+    // K-loop
+    for (uint loop_k = 0; loop_k < K; loop_k += TBK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // --- Cooperative load A tile [TBM × TBK] into threadgroup memory ---
-        // A is [M, K] row-major. Consecutive threads load consecutive K elements
-        // within the same row → perfectly coalesced (stride 1 in device memory).
-        // 64×32 = 2048 elements / 128 threads = 16 elements per thread.
-        for (uint idx = tid; idx < TBM * TBK; idx += 128) {
-            uint row = idx / TBK;  // M dimension (0..63)
-            uint col = idx % TBK;  // K dimension (0..31) — fast axis, coalesced
-            uint global_row = m_start + row;
-            uint global_col = k + col;
-            half val = (global_row < M && global_col < K)
-                ? A_batch[global_row * K + global_col]
-                : half(0.0h);
-            sa[row * A_STRIDE + col] = val;
-        }
-
-        // --- Cooperative load B tile → [TBK × TBN] in threadgroup memory ---
-        // For transB: B is stored as [N, K] in device memory (B^T = [K, N]).
-        //   We want sb[k][n] = B[n][k]. Iterate with K as fast axis so
-        //   consecutive threads read B[n][k], B[n][k+1], ... → coalesced!
-        // For !transB: B is [K, N]. Iterate with N as fast axis → coalesced.
-        // 32×64 = 2048 elements / 128 threads = 16 elements per thread.
-        if (transB) {
-            for (uint idx = tid; idx < TBK * TBN; idx += 128) {
-                uint n_local = idx / TBK;  // N dimension (0..63) — slow axis
-                uint k_local = idx % TBK;  // K dimension (0..31) — fast, coalesced
-                uint global_n = n_start + n_local;
-                uint global_k = k + k_local;
-                half val = (global_n < N && global_k < K)
-                    ? B_batch[global_n * K + global_k]  // B[n,k] — k stride 1 ✓
-                    : half(0.0h);
-                sb[k_local * B_STRIDE + n_local] = val;  // store as [K, N] in tgmem
-            }
-        } else {
-            for (uint idx = tid; idx < TBK * TBN; idx += 128) {
-                uint k_local = idx / TBN;  // K dimension (0..31) — slow axis
-                uint n_local = idx % TBN;  // N dimension (0..63) — fast, coalesced
-                uint global_k = k + k_local;
-                uint global_n = n_start + n_local;
-                half val = (global_k < K && global_n < N)
-                    ? B_batch[global_k * N + global_n]  // B[k,n] — n stride 1 ✓
-                    : half(0.0h);
-                sb[k_local * B_STRIDE + n_local] = val;
+        // --- Load A into sa (8×8-block layout) ---
+        // Each thread loads 16 elements from A[lr0, 16*il0 .. 16*il0+15].
+        // Block addressing: ib_a = 8*K_blk + M_blk.
+        //   K_blk = sx = 2*il0 + i/8 (which pair of 8 K-columns)
+        //   M_blk = sy = lr0/8 (which group of 8 M-rows)
+        // Within block: K is rows (ly = i%8), M is cols (lx = lr0%8).
+        {
+            short sy = lr0 / 8;
+            short lx = lr0 % 8;
+            for (short i = 0; i < 16; i++) {
+                short sx = short(2 * il0 + i / 8);
+                short ly = short(i % 8);
+                short ib = short(8 * sx + sy);
+                half val = (loop_k + 16 * il0 + i < K && m_start + lr0 < M)
+                    ? *(x + 16 * il0 + i) : half(0.0h);
+                *(sa + 64 * ib + 8 * ly + lx) = val;
             }
         }
+
+        // --- Load B into sb (8×8-block layout) ---
+        // Each thread loads 8 elements from B[lr1, iy .. iy+7].
+        // Block addressing: ib_b = 8*K_blk + N_blk (note: swapped vs A).
+        //   But for B: N is rows (ly = lr1%8), K is cols (lx = i).
+        //   K_blk = sx = tiitg % NL1
+        //   N_blk = sy = lr1 / 8
+        {
+            short sx = short(tiitg % NL1);
+            short sy = lr1 / 8;
+            short ly = lr1 % 8;
+            for (short i = 0; i < 8; i++) {
+                short lx = i;
+                short ib = short(8 * sx + sy);  // 8 = TBN/8 N-blocks
+                half val = (loop_k + iy + i < K && n_start + lr1 < N)
+                    ? *(y + iy + i) : half(0.0h);
+                *(sb + 64 * ib + 8 * ly + lx) = val;
+            }
+        }
+
+        // Advance device pointers
+        x += TBK;
+        y += TBK;
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // --- Compute: 4 steps of 8 within the TBK=32 K-tile ---
-        // Each step: load 4 A sub-tiles + 4 B sub-tiles from tgmem, do 16 MACs.
-        // Total: 4 × 16 = 64 MACs per K-tile (vs 1 MAC per device load in naive).
-        for (ushort kk = 0; kk < TBK; kk += 8) {
-            // Load 4 A sub-tiles (8×8 each) from threadgroup memory
-            simdgroup_matrix_storage<half> a_tiles[4];
-            for (ushort ti = 0; ti < 4; ti++) {
-                // apply_offset computes per-thread address using morton order
+        // --- Compute: simdgroup loads from 8×8-block tgmem ---
+        // sgitg%2 selects M half: 0 → M rows 0-31, 1 → M rows 32-63
+        // sgitg/2 selects N half: 0 → N cols 0-31, 1 → N cols 32-63
+        //
+        // ma tiles: 4 tiles along M (stride 64 between M-blocks in sa)
+        // mb tiles: 4 tiles along N (stride 64 between N-blocks in sb)
+        //
+        // sa layout: ib_a = 8*K_blk + M_blk. For fixed K_blk:
+        //   Consecutive M blocks are ib_a, ib_a+1, ib_a+2, ...
+        //   Address: sa + 64*(8*K_blk + M_blk)
+        //
+        // For sgitg%2=0: ma loads from M_blk 0,1,2,3
+        //   base_a = sa + 64*(8*K_blk + 0) → sa + 64*(8*K_blk)
+        //   ma[i] from base_a + 64*i
+        //
+        // For sgitg%2=1: M_blk 4,5,6,7
+        //   base_a = sa + 64*(8*K_blk + 4) → sa + 64*(8*K_blk) + 256
+
+        threadgroup half* base_sa = sa + 4 * 64 * (sgitg % 2);
+        threadgroup half* base_sb = sb + 4 * 64 * (sgitg / 2);
+
+        for (short ik = 0; ik < short(TBK / 8); ik++) {
+            // Load 4 A tiles: ma[i] covers M block (sgitg%2)*4 + i
+            // Within block: row=K (stride 8), col=M. Loaded non-transposed.
+            // ma[row, col] = A_data[K, M]
+            simdgroup_matrix_storage<half> ma[4];
+            for (short i = 0; i < 4; i++) {
+                threadgroup half* a_ptr = base_sa + 64 * i;
                 threadgroup half* a_src = simdgroup_matrix_storage<half>::apply_offset(
-                    sa, A_STRIDE,
-                    ushort2(kk + morton.x, sg_row * 32 + ti * 8 + morton.y));
-                a_tiles[ti].load(a_src, A_STRIDE, ushort2(0, 0));
+                    a_ptr, (ushort)8, ushort2(morton.x, morton.y));
+                ma[i].load(a_src, (ushort)8, ushort2(0, 0));
             }
 
-            // Load 4 B sub-tiles (8×8 each) from threadgroup memory
-            simdgroup_matrix_storage<half> b_tiles[4];
-            for (ushort tj = 0; tj < 4; tj++) {
+            // Load 4 B tiles: mb[j] covers N block (sgitg/2)*4 + j
+            // Within block: row=N (stride 8), col=K. Loaded non-transposed.
+            // mb[row, col] = B_data[N, K]
+            simdgroup_matrix_storage<half> mb[4];
+            for (short j = 0; j < 4; j++) {
+                threadgroup half* b_ptr = base_sb + 64 * j;
                 threadgroup half* b_src = simdgroup_matrix_storage<half>::apply_offset(
-                    sb, B_STRIDE,
-                    ushort2(sg_col * 32 + tj * 8 + morton.x, kk + morton.y));
-                b_tiles[tj].load(b_src, B_STRIDE, ushort2(0, 0));
+                    b_ptr, (ushort)8, ushort2(morton.x, morton.y));
+                mb[j].load(b_src, (ushort)8, ushort2(0, 0));
             }
 
-            // 4×4 = 16 multiply-accumulate operations
-            for (ushort ti = 0; ti < 4; ti++) {
-                for (ushort tj = 0; tj < 4; tj++) {
-                    acc[ti * 4 + tj].multiply(a_tiles[ti], b_tiles[tj], true);
-                }
+            // 16 MACs: mc[i] += mb[i/4] × ma[i%4]  (llama.cpp ordering)
+            // mb is [N, K], ma is [K, M]
+            // Result: mc += [N, K] × [K, M] = [N, M]
+            for (short i = 0; i < 16; i++) {
+                mc[i].multiply(mb[i / 4], ma[i % 4], true);
             }
+
+            // Advance to next K block: each K block is 8 blocks apart in sa/sb
+            base_sa += 8 * 64;
+            base_sb += 8 * 64;
         }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // --- Store results to device memory ---
-    for (ushort ti = 0; ti < 4; ti++) {
-        for (ushort tj = 0; tj < 4; tj++) {
-            uint out_row = m_start + sg_row * 32 + ti * 8 + morton.y;
-            uint out_col = n_start + sg_col * 32 + tj * 8 + morton.x;
-            if (out_row < M && out_col < N) {
-                device half* dst = &C_batch[out_row * N + out_col];
-                acc[ti * 4 + tj].store(dst, N, ushort2(0, 0));
-            }
+    // --- Store: mc[N, M] → row-major C[M, N] (transposed store) ---
+    // mc[i] where i%4 = M-tile, i/4 = N-tile (matching llama.cpp's multiply).
+    // mc[p, q] = result[N_p, M_q]. Transposed store writes mc^T to get C[M, N].
+    ushort sg_row = sgitg % 2;  // M half (0 or 1)
+    ushort sg_col = sgitg / 2;  // N half (0 or 1)
+
+    for (short i = 0; i < 16; i++) {
+        short m_tile = i % 4;  // M-tile index within this simdgroup's 32-row span
+        short n_tile = i / 4;  // N-tile index within this simdgroup's 32-col span
+
+        uint m_base = m_start + sg_row * 32 + m_tile * 8;
+        uint n_base = n_start + sg_col * 32 + n_tile * 8;
+
+        if (m_base < M && n_base < N) {
+            device half* dst = C_batch + m_base * N + n_base;
+            mc[i].store(dst, (ushort)N, ushort2(morton.x, morton.y), true);
         }
     }
 }

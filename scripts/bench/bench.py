@@ -309,7 +309,9 @@ def cargo_build() -> bool:
 
 
 def expand_configs(
-    configs: list[str], layers: list[int]
+    configs: list[str],
+    layers: list[int],
+    batch_sizes: list[int] | None = None,
 ) -> list[tuple[str, dict[str, object]]]:
     """Return list of (label, spec) pairs.
 
@@ -317,24 +319,41 @@ def expand_configs(
       env     -- extra environment variables dict
       args    -- extra CLI args list
       layers  -- layer count (int or None)
+      batch   -- batch size (int)
     """
+    bs_list = batch_sizes or [0]  # 0 = use default (don't pass -b flag)
     result = []
     for cfg in configs:
         for L in layers:
-            label = f"{cfg}-{L}L"
-            env: dict[str, str] = {}
-            extra_args: list[str] = []
+            for bs in bs_list:
+                if bs > 0:
+                    label = f"{cfg}-{L}L-b{bs}"
+                else:
+                    label = f"{cfg}-{L}L"
+                env: dict[str, str] = {}
+                extra_args: list[str] = []
 
-            if cfg == "compute":
-                env["RIPVEC_NO_MPS"] = "1"
-            elif cfg == "cpu":
-                extra_args += ["--device", "cpu"]
-            # mps: default, no extra env/args
+                if cfg == "compute":
+                    env["RIPVEC_NO_MPS"] = "1"
+                elif cfg == "cpu":
+                    extra_args += ["--device", "cpu"]
+                # mps: default, no extra env/args
 
-            extra_args += ["--layers", str(L)]
-            result.append(
-                (label, {"env": env, "args": extra_args, "layers": L, "cfg": cfg})
-            )
+                extra_args += ["--layers", str(L)]
+                if bs > 0:
+                    extra_args += ["-b", str(bs)]
+                result.append(
+                    (
+                        label,
+                        {
+                            "env": env,
+                            "args": extra_args,
+                            "layers": L,
+                            "batch": bs,
+                            "cfg": cfg,
+                        },
+                    )
+                )
     return result
 
 
@@ -593,6 +612,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Early-exit layer counts (default: 22)",
     )
     p.add_argument(
+        "--batch-sizes",
+        nargs="+",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Batch sizes to test (default: use ripvec default). Cross-product with configs × layers.",
+    )
+    p.add_argument(
         "--corpus",
         type=Path,
         default=DEFAULT_CORPUS,
@@ -670,7 +697,7 @@ def main() -> int:
         print("Run: cargo build --release", file=sys.stderr)
         return 1
 
-    configs = expand_configs(args.configs, args.layers)
+    configs = expand_configs(args.configs, args.layers, args.batch_sizes)
 
     # --validate mode
     if args.validate:
