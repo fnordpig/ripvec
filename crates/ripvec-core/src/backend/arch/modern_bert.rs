@@ -10,8 +10,8 @@
 //! [`Driver`](super::super::driver::Driver) primitives into the full forward
 //! pass.
 
-use super::super::Encoding;
 use super::super::driver::{BatchInputs, Driver};
+use super::super::Encoding;
 use super::ModelArch;
 
 // ---------------------------------------------------------------------------
@@ -846,11 +846,11 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
 
                 driver.restore_pool_cursor(saved);
 
-                // Segment the compute encoder every 3 layers to prevent
-                // encoder state overflow. This closes and reopens the encoder
-                // within the same command buffer — zero sync, zero GPU idle.
-                // Segment after EVERY layer (~19 dispatches per encoder)
-                driver.segment_encoder();
+                // Segment every 10 layers (~190 dispatches per encoder).
+                // endEncoding() costs ~118ms per call (tracemeld measured).
+                if (li + 1) % 10 == 0 {
+                    driver.segment_encoder();
+                }
             }
         }
 
