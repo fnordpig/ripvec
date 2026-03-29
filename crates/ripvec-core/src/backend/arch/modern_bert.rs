@@ -846,11 +846,10 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
 
                 driver.restore_pool_cursor(saved);
 
-                // Segment every 10 layers (~190 dispatches per encoder).
-                // endEncoding() costs ~118ms per call (tracemeld measured).
-                if (li + 1) % 10 == 0 {
-                    driver.segment_encoder();
-                }
+                // No encoder segmentation needed — 400+ dispatches per encoder is fine.
+                // Earlier "hangs" were from per-layer segment_encoder() overhead
+                // (118ms each × 22 = 2.6s), not encoder overflow.
+                let _ = li;
             }
         }
 
