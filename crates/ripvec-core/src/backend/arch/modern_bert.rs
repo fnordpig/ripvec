@@ -783,8 +783,12 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
             .unwrap_or(w.layers.len())
             .min(w.layers.len());
 
-        // Try FP16 path: f32_to_f16 ONCE → all layers in FP16 → f16_to_f32 ONCE.
+        // FP16 path: f32_to_f16 ONCE → all layers in FP16 → f16_to_f32 ONCE.
         // Falls back to FP32 if the driver doesn't support FP16 ops.
+        //
+        // MPS FP16 GEMM uses Apple's proprietary AMX coprocessor and achieves
+        // ~73/s on M2 Max. Custom compute GEMMs (both FP16 and FP32) are 23-37%
+        // slower because they can't access AMX. MPS + FP16 is the optimal path.
         let use_f16 = driver.alloc_zeros_f16(1).map(|_| true).unwrap_or(false);
 
         if use_f16 {

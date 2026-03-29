@@ -1,0 +1,44 @@
+[
+  {
+    "label": "mps-22L",
+    "cfg": "mps",
+    "layers": 22,
+    "throughput": 66.5,
+    "wall_time": 37.0,
+    "thermal_before": {
+      "cpu": 0
+    },
+    "thermal_after": {
+      "cpu": 0
+    },
+    "returncode": 0
+  },
+  {
+    "label": "compute-22L",
+    "cfg": "compute",
+    "layers": 22,
+    "throughput": 48.8,
+    "wall_time": 49.94,
+    "thermal_before": {
+      "cpu": 0
+    },
+    "thermal_after": {
+      "cpu": 0
+    },
+    "returncode": 0
+  },
+  {
+    "label": "cpu-22L",
+    "cfg": "cpu",
+    "layers": 22,
+    "throughput": 69.8,
+    "wall_time": 35.26,
+    "thermal_before": {
+      "cpu": 0
+    },
+    "thermal_after": {
+      "cpu": 0
+    },
+    "returncode": 0
+  }
+]

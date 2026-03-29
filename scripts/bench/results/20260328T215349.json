@@ -1,0 +1,16 @@
+[
+  {
+    "label": "mps-22L",
+    "cfg": "mps",
+    "layers": 22,
+    "throughput": 65.7,
+    "wall_time": 37.42,
+    "thermal_before": {
+      "cpu": 0
+    },
+    "thermal_after": {
+      "cpu": 0
+    },
+    "returncode": 0
+  }
+]
