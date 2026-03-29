@@ -2852,4 +2852,148 @@ kernel void gemm_tiled_f16_kernel(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Mixed-precision GEMM: FP32 activations × FP16 weights → FP32 output.
+// Native simdgroup ops throughout — no MFA wrapper.
+//
+// C[M,N] = A[M,K] × B^T[K,N] where A is device float*, B is device half*.
+// Matches llama.cpp kernel_mul_mm (f16_f32 variant).
+//
+// sa: float[8192 bytes], sb: half[4096 bytes]. Total 12KB.
+// Swapped layout: ma[M,K], mb[K,N] → mc = ma×mb = [M,N] (row-major, direct store).
+// BM=64, BN=64, BK=32, 4 simdgroups (128 threads), 16 accumulators.
+// Grid: (ceil(N/64), ceil(M/64), batch)
+// ---------------------------------------------------------------------------
+
+kernel void gemm_f16w_f32a_kernel(
+    device float* A             [[buffer(0)]],
+    device half*  B             [[buffer(1)]],
+    device float* C             [[buffer(2)]],
+    constant uint& M            [[buffer(3)]],
+    constant uint& N            [[buffer(4)]],
+    constant uint& K            [[buffer(5)]],
+    constant uint& transB       [[buffer(6)]],
+    constant uint& stride_A     [[buffer(7)]],
+    constant uint& stride_B     [[buffer(8)]],
+    constant uint& stride_C     [[buffer(9)]],
+    uint3 tg_pos                [[threadgroup_position_in_grid]],
+    ushort sgitg                [[simdgroup_index_in_threadgroup]],
+    ushort lane_id              [[thread_index_in_simdgroup]],
+    ushort tiitg                [[thread_index_in_threadgroup]]
+) {
+    uint batch_idx = tg_pos.z;
+    device float* A_batch = A + batch_idx * stride_A;
+    device half*  B_batch = B + batch_idx * stride_B;
+    device float* C_batch = C + batch_idx * stride_C;
+
+    uint m_start = tg_pos.y * 64;
+    uint n_start = tg_pos.x * 64;
+
+    // Threadgroup memory: FP32 activations, FP16 weights.
+    // 8×8-block layout: 32 blocks × 64 elements each.
+    // sa: M-rows, K-cols → ma[M, K]. sb: K-rows, N-cols → mb[K, N].
+    threadgroup float sa[2048];  // 32 blocks × 64 floats = 8192 bytes
+    threadgroup half  sb[2048];  // 32 blocks × 64 halfs  = 4096 bytes
+
+    constexpr short NL0 = 2;  // BK/16: threads per A row
+    constexpr short NL1 = 4;  // BK/8: threads per B row
+
+    short lr0 = min(short(tiitg / NL0), short(63));
+    short lr1 = min(short(tiitg / NL1), short(63));
+    short il0 = short(tiitg % NL0);
+    short iy  = short(8 * (tiitg % NL1));
+
+    device float* x = A_batch + uint(m_start + lr0) * K;
+    device half*  y = B_batch + uint(n_start + lr1) * K;
+
+    simdgroup_float8x8 mc[16];
+    for (short i = 0; i < 16; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    for (uint loop_k = 0; loop_k < K; loop_k += 32) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Load A (FP32) into sa: M-rows, K-cols
+        {
+            short sy = lr0 / 8;
+            short ly = lr0 % 8;
+            for (short i = 0; i < 16; i++) {
+                short sx = short(2 * il0 + i / 8);
+                short lx = short(i % 8);
+                short ib = short(8 * sx + sy);
+                float val = (loop_k + 16 * il0 + i < K && m_start + lr0 < M)
+                    ? *(x + 16 * il0 + i) : 0.0f;
+                *(sa + 64 * ib + 8 * ly + lx) = val;
+            }
+        }
+
+        // Load B (FP16) into sb: K-rows, N-cols
+        {
+            short sx = short(tiitg % NL1);
+            short sy = lr1 / 8;
+            short lx_n = lr1 % 8;
+            for (short i = 0; i < 8; i++) {
+                short ly_k = i;
+                short ib = short(8 * sx + sy);
+                half val = (loop_k + iy + i < K && n_start + lr1 < N)
+                    ? *(y + iy + i) : half(0.0h);
+                *(sb + 64 * ib + 8 * ly_k + lx_n) = val;
+            }
+        }
+
+        x += 32;
+        y += 32;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Compute: native simdgroup ops
+        threadgroup float* base_sa = sa + 4 * 64 * (sgitg % 2);
+        threadgroup half*  base_sb = sb + 4 * 64 * (sgitg / 2);
+
+        for (short ik = 0; ik < 4; ik++) {
+            simdgroup_float8x8 ma[4];
+            simdgroup_half8x8  mb[4];
+
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
+            for (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], base_sa + 64 * i, 8, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
+            for (short j = 0; j < 4; j++) {
+                simdgroup_load(mb[j], base_sb + 64 * j, 8, 0, false);
+            }
+
+            // mc[i] += ma[i/4] × mb[i%4] = [M,K]×[K,N] = [M,N]
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
+            for (short i = 0; i < 16; i++) {
+                simdgroup_multiply_accumulate(mc[i], ma[i / 4], mb[i % 4], mc[i]);
+            }
+
+            base_sa += 8 * 64;
+            base_sb += 8 * 64;
+        }
+    }
+
+    // Store: mc[M, N] → device float* directly. No transpose, no conversion.
+    ushort sg_row = sgitg % 2;
+    ushort sg_col = sgitg / 2;
+
+    #pragma unroll
+    for (short i = 0; i < 16; i++) {
+        short m_tile = i / 4;
+        short n_tile = i % 4;
+        uint m_base = m_start + sg_row * 32 + m_tile * 8;
+        uint n_base = n_start + sg_col * 32 + n_tile * 8;
+
+        if (m_base < M && n_base < N) {
+            simdgroup_store(mc[i], C_batch + m_base * N + n_base, N, 0, false);
+        }
+    }
+}
 ";

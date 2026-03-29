@@ -200,6 +200,9 @@ struct KernelPipelines {
     gemm_batched_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Tiled FP16 GEMM with threadgroup memory (64×64×16, 4 simdgroups).
     gemm_tiled_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Mixed-precision GEMM: FP32 activations × FP16 weights → FP32 output.
+    /// Native simdgroup ops, no MFA wrapper.
+    gemm_f16w_f32a: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 impl KernelPipelines {
@@ -258,6 +261,7 @@ impl KernelPipelines {
             rope_encode_f16: p("rope_encode_f16_kernel")?,
             gemm_batched_f16: create_pipeline(device, &gemm_library, "gemm_batched_f16_kernel")?,
             gemm_tiled_f16: create_pipeline(device, &gemm_library, "gemm_tiled_f16_kernel")?,
+            gemm_f16w_f32a: create_pipeline(device, &gemm_library, "gemm_f16w_f32a_kernel")?,
         })
     }
 }
@@ -2041,12 +2045,54 @@ impl Driver for MetalDriver {
         k: usize,
         transpose_b: bool,
     ) -> crate::Result<()> {
-        // MPS GEMM — 2× faster than custom simdgroup on M2 Max. Apple hand-tunes
-        // MPSMatrixMultiplication with undocumented AMX/memory controller access.
-        //
-        // IMPORTANT: MPS dispatches based on buffer.length()/rowBytes, NOT the
-        // descriptor's row count. The pool MUST return exact-sized buffers for
-        // MPS operands to avoid processing ghost rows (→ GPU hang).
+        // RIPVEC_NO_MPS=1: use native simdgroup mixed-precision GEMM
+        // (FP32 activations × FP16 weights → FP32 output, zero MPS transitions).
+        static USE_COMPUTE_GEMM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let use_compute = *USE_COMPUTE_GEMM
+            .get_or_init(|| std::env::var("RIPVEC_NO_MPS").is_ok_and(|v| v == "1"));
+
+        if use_compute {
+            // Check if B has FP16 weights available
+            let b_fp16 = b.fp16.borrow();
+            if let Some(ref fp16_buf) = *b_fp16 {
+                return self.run_compute("gemm-f16w-f32a", |enc| {
+                    enc.setComputePipelineState(&self.kernels.gemm_f16w_f32a);
+                    set_buffer(enc, &a.buffer, a.offset, 0);
+                    set_buffer(enc, fp16_buf, 0, 1);
+                    set_buffer(enc, &output.buffer, output.offset, 2);
+                    set_u32_param(enc, m as u32, 3);
+                    set_u32_param(enc, n as u32, 4);
+                    set_u32_param(enc, k as u32, 5);
+                    set_u32_param(enc, if transpose_b { 1 } else { 0 }, 6);
+                    set_u32_param(enc, (m * k) as u32, 7);
+                    set_u32_param(
+                        enc,
+                        if transpose_b {
+                            (n * k) as u32
+                        } else {
+                            (k * n) as u32
+                        },
+                        8,
+                    );
+                    set_u32_param(enc, (m * n) as u32, 9);
+                    let grid = MTLSize {
+                        width: n.div_ceil(64),
+                        height: m.div_ceil(64),
+                        depth: 1,
+                    };
+                    let threads = MTLSize {
+                        width: 128,
+                        height: 1,
+                        depth: 1,
+                    };
+                    enc.dispatchThreadgroups_threadsPerThreadgroup(grid, threads);
+                    Ok(())
+                });
+            }
+            // No FP16 weights — fall through to MPS or batched compute
+        }
+
+        // MPS GEMM
         self.run_mps("mps-gemm", |cmd_buf| {
             dispatch_mps_gemm(
                 cmd_buf,

@@ -787,9 +787,15 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
         // Falls back to FP32 if the driver doesn't support FP16 ops.
         //
         // MPS FP16 GEMM uses Apple's proprietary AMX coprocessor and achieves
-        // ~73/s on M2 Max. Custom compute GEMMs (both FP16 and FP32) are 23-37%
-        // slower because they can't access AMX. MPS + FP16 is the optimal path.
-        let use_f16 = driver.alloc_zeros_f16(1).map(|_| true).unwrap_or(false);
+        // RIPVEC_NO_MPS=1: force FP32 activations + compute GEMM path.
+        // The gemm_f16w_f32a_kernel uses native simdgroup ops with FP16 weights
+        // and FP32 activations — no MFA wrapper, no type conversion at store.
+        let force_fp32 = std::env::var("RIPVEC_NO_MPS").is_ok_and(|v| v == "1");
+        let use_f16 = if force_fp32 {
+            false
+        } else {
+            driver.alloc_zeros_f16(1).map(|_| true).unwrap_or(false)
+        };
 
         if use_f16 {
             // === FP16 PATH: zero F32↔F16 conversions in layer loop ===
