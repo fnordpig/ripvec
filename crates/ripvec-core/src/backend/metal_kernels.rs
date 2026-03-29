@@ -2799,31 +2799,30 @@ kernel void gemm_tiled_f16_kernel(
         threadgroup half* base_sb = sb + 4 * 64 * (sgitg / 2);
 
         for (short ik = 0; ik < short(TBK / 8); ik++) {
-            // Load 4 A tiles: ma[i] covers M block (sgitg%2)*4 + i
-            // Within block: row=K (stride 8), col=M. Loaded non-transposed.
-            // ma[row, col] = A_data[K, M]
             simdgroup_matrix_storage<half> ma[4];
+            simdgroup_matrix_storage<half> mb[4];
+
+            // Load 4 A tiles (simdgroup_barrier hints scheduler, matches llama.cpp)
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
             for (short i = 0; i < 4; i++) {
-                threadgroup half* a_ptr = base_sa + 64 * i;
                 threadgroup half* a_src = simdgroup_matrix_storage<half>::apply_offset(
-                    a_ptr, (ushort)8, ushort2(morton.x, morton.y));
+                    base_sa + 64 * i, (ushort)8, ushort2(morton.x, morton.y));
                 ma[i].load(a_src, (ushort)8, ushort2(0, 0));
             }
 
-            // Load 4 B tiles: mb[j] covers N block (sgitg/2)*4 + j
-            // Within block: row=N (stride 8), col=K. Loaded non-transposed.
-            // mb[row, col] = B_data[N, K]
-            simdgroup_matrix_storage<half> mb[4];
+            // Load 4 B tiles
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
             for (short j = 0; j < 4; j++) {
-                threadgroup half* b_ptr = base_sb + 64 * j;
                 threadgroup half* b_src = simdgroup_matrix_storage<half>::apply_offset(
-                    b_ptr, (ushort)8, ushort2(morton.x, morton.y));
+                    base_sb + 64 * j, (ushort)8, ushort2(morton.x, morton.y));
                 mb[j].load(b_src, (ushort)8, ushort2(0, 0));
             }
 
             // 16 MACs: mc[i] += mb[i/4] × ma[i%4]  (llama.cpp ordering)
-            // mb is [N, K], ma is [K, M]
-            // Result: mc += [N, K] × [K, M] = [N, M]
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
             for (short i = 0; i < 16; i++) {
                 mc[i].multiply(mb[i / 4], ma[i % 4], true);
             }
