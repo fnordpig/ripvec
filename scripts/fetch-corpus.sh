@@ -23,6 +23,7 @@ REPOS_FULL=(
     "redis/redis"               # C, ~15MB
     "facebook/react"            # JS/TS, ~30MB
     "tokio-rs/tokio"            # Rust, ~20MB
+    "torvalds/linux"		# Linux,  ~89468 source files, 2.0G on disk
 )
 
 REPOS_SMALL=(
