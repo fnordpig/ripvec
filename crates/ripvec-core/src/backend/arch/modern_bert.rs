@@ -686,20 +686,17 @@ fn ffn_sublayer_f16<D: Driver>(
         true,
     )?;
 
-    // Split + GeGLU — FP16.
+    // Fused split + GeGLU — FP16.
+    // Reads [total_tokens, 2*intermediate], writes [total_tokens, intermediate].
+    // Eliminates two intermediate buffers and halves HBM bandwidth.
     let n_elements = g.total_tokens * g.intermediate;
-    let mut value = driver.alloc_zeros_f16(n_elements)?;
-    let mut gate = driver.alloc_zeros_f16(n_elements)?;
-    driver.split_gate_value_f16(
-        &mut value,
-        &mut gate,
+    let mut activated = driver.alloc_zeros_f16(n_elements)?;
+    driver.fused_split_geglu_f16(
+        &mut activated,
         &wi_out,
         g.total_tokens,
         g.intermediate,
     )?;
-
-    let mut activated = driver.alloc_zeros_f16(n_elements)?;
-    driver.geglu_f16(&value, &gate, &mut activated, n_elements)?;
 
     // Wo projection — FP16 GEMM.
     let mut mlp_out = driver.alloc_zeros_f16(g.total_tokens * g.hidden)?;

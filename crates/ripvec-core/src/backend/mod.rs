@@ -172,6 +172,9 @@ pub fn load_backend(
     match kind {
         #[cfg(feature = "cuda")]
         BackendKind::Cuda => {
+            if is_modernbert_model(model_repo) {
+                return load_modernbert_cuda(model_repo, max_layers);
+            }
             let backend = cuda::CudaBackend::load(model_repo, &device_hint)?;
             Ok(Box::new(backend))
         }
@@ -269,8 +272,14 @@ pub fn detect_backends(
 
     // Try CUDA (NVIDIA GPU)
     #[cfg(feature = "cuda")]
-    if let Ok(b) = cuda::CudaBackend::load(model_repo, &DeviceHint::Gpu) {
-        backends.push(Box::new(b));
+    {
+        if is_modernbert_model(model_repo) {
+            if let Ok(b) = load_modernbert_cuda(model_repo, max_layers) {
+                backends.push(b);
+            }
+        } else if let Ok(b) = cuda::CudaBackend::load(model_repo, &DeviceHint::Gpu) {
+            backends.push(Box::new(b));
+        }
     }
 
     // Try Metal (Apple Silicon GPU, preferred over MLX)
@@ -436,11 +445,74 @@ pub fn load_modernbert_cpu(
     )))
 }
 
+/// Load `ModernBERT` on CUDA via the driver/arch system.
+///
+/// Creates a [`CudaDriver`](driver::cuda::CudaDriver), loads safetensors weights
+/// onto the GPU, pre-converts GEMM weights to FP16, builds RoPE caches, and
+/// wraps the result in a [`GenericBackend`](generic::GenericBackend).
+///
+/// # Errors
+///
+/// Returns an error if no CUDA device is available, the model cannot be
+/// downloaded, or weight loading fails.
+#[cfg(feature = "cuda")]
+pub fn load_modernbert_cuda(
+    model_repo: &str,
+    max_layers: Option<usize>,
+) -> crate::Result<Box<dyn EmbedBackend>> {
+    use driver::cuda::{CudaDriver, ModernBertConfig};
+    use generic::GenericBackend;
+    use hf_hub::api::sync::Api;
+
+    let api = Api::new().map_err(|e| crate::Error::Download(e.to_string()))?;
+    let repo = api.model(model_repo.to_string());
+
+    let config_path = repo
+        .get("config.json")
+        .map_err(|e| crate::Error::Download(e.to_string()))?;
+    let weights_path = repo
+        .get("model.safetensors")
+        .map_err(|e| crate::Error::Download(e.to_string()))?;
+
+    // Parse config.json
+    let config_str = std::fs::read_to_string(&config_path).map_err(|e| crate::Error::Io {
+        path: config_path.display().to_string(),
+        source: e,
+    })?;
+    let config_json: serde_json::Value = serde_json::from_str(&config_str)
+        .map_err(|e| crate::Error::Other(anyhow::anyhow!("config parse error: {e}")))?;
+    let config = ModernBertConfig::from_json(&config_json)?;
+    let max_tokens = config.max_position_embeddings;
+
+    let driver = CudaDriver::new()?;
+    let (mut arch, mmap) = driver.load_modern_bert_weights(&weights_path, &config)?;
+    arch.max_layers = max_layers;
+
+    tracing::info!(
+        model_repo,
+        hidden = config.hidden_size,
+        layers = config.num_hidden_layers,
+        heads = config.num_attention_heads,
+        intermediate = config.intermediate_size,
+        max_tokens,
+        "ModernBERT loaded on CUDA (driver/arch)"
+    );
+
+    Ok(Box::new(GenericBackend::new(
+        driver, arch, max_tokens, true, mmap,
+    )))
+}
+
 /// Check whether a model repo uses the `ModernBERT` architecture.
 ///
 /// Downloads and inspects `config.json` to check for `"model_type": "modernbert"`.
 /// Returns `false` on any download or parse error (fail-open for detection).
-#[cfg(any(feature = "metal", feature = "cpu", feature = "cpu-accelerate"))]
+#[cfg(any(
+    feature = "cuda",
+    feature = "metal",
+    feature = "cpu",
+    feature = "cpu-accelerate"
+))]
 fn is_modernbert_model(model_repo: &str) -> bool {
     let Ok(api) = hf_hub::api::sync::Api::new() else {
         return false;

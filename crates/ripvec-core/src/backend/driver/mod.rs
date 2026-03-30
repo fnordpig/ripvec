@@ -14,6 +14,8 @@
 
 #[cfg(any(feature = "cpu", feature = "cpu-accelerate"))]
 pub mod cpu;
+#[cfg(feature = "cuda")]
+pub mod cuda;
 #[cfg(feature = "metal")]
 pub mod metal;
 #[cfg(feature = "mlx")]
@@ -806,6 +808,28 @@ pub trait Driver: Send + Sync {
         Err(crate::Error::Metal(
             "FP16 not supported by this driver".into(),
         ))
+    }
+
+    /// Fused split + `GeGLU`: read `[rows, 2*cols]`, write `[rows, cols]`.
+    ///
+    /// Combines [`split_gate_value_f16`](Driver::split_gate_value_f16) and
+    /// [`geglu_f16`](Driver::geglu_f16) into a single kernel, eliminating
+    /// two intermediate `[rows, cols]` buffers and halving HBM round-trips.
+    ///
+    /// Default falls back to separate split + geglu calls.
+    fn fused_split_geglu_f16(
+        &self,
+        output: &mut Self::Tensor,
+        input: &Self::Tensor,
+        rows: usize,
+        cols: usize,
+    ) -> crate::Result<()> {
+        // Default: allocate intermediates and call separately.
+        let n = rows * cols;
+        let mut value = self.alloc_zeros_f16(n)?;
+        let mut gate = self.alloc_zeros_f16(n)?;
+        self.split_gate_value_f16(&mut value, &mut gate, input, rows, cols)?;
+        self.geglu_f16(&value, &gate, output, n)
     }
 }
 
