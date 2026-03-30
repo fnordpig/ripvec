@@ -2865,10 +2865,10 @@ using namespace metal;
 // Fused GEMM: FP16 activations × FP16 weights → FP16 output via FP32 accumulators.
 // Native simdgroup ops throughout — no MFA wrapper.
 //
-// C[M,N] = A[M,K] × B^T[K,N] where A is device float*, B is device half*.
+// C[M,N] = A[M,K] × B^T[K,N] where A and B are device half*.
 // Matches llama.cpp kernel_mul_mm (f16_f32 variant).
 //
-// sa: float[8192 bytes], sb: half[4096 bytes]. Total 12KB.
+// sa: half[2048] = 4096 bytes, sb: half[2048] = 4096 bytes. Total 8KB.
 // Swapped layout: ma[M,K], mb[K,N] → mc = ma×mb = [M,N] (row-major, direct store).
 // BM=64, BN=64, BK=32, 4 simdgroups (128 threads), 16 accumulators.
 // Grid: (ceil(N/64), ceil(M/64), batch)
@@ -2911,12 +2911,12 @@ kernel void gemm_f16w_f32a_kernel(
     threadgroup half sb[2048];  // 32 blocks × 64 halfs = 4096 bytes
 
     constexpr short NL0 = 2;  // BK/16: threads per A row
-    constexpr short NL1 = 4;  // BK/8: threads per B row (TODO: fix to NL1=2 like INT8 kernel)
+    constexpr short NL1 = 2;  // BK/16: threads per B row (64 N-rows × 16 K-elems = 1024)
 
     short lr0 = min(short(tiitg / NL0), short(63));
     short lr1 = min(short(tiitg / NL1), short(63));
     short il0 = short(tiitg % NL0);
-    short iy  = short(8 * (tiitg % NL1));
+    short il1 = short(tiitg % NL1);
 
     device half* x = A_batch + uint(m_start + lr0) * K;
     device half* y = B_batch + uint(n_start + lr1) * K;
@@ -2943,20 +2943,18 @@ kernel void gemm_f16w_f32a_kernel(
             }
         }
 
-        // Load B (FP16) into sb: K-rows, N-cols
-        // NOTE: NL1=4 only loads 32 of 64 N-rows. This is a known bug —
-        // the compute path (RIPVEC_NO_MPS=1) produces wrong results.
-        // The INT8 kernel has the correct NL1=2 fix. TODO: port fix here.
+        // Load B (FP16) into sb: K-rows, N-cols.
+        // Each thread loads 16 K-elements for one N-row (same pattern as INT8 kernel).
         {
-            short sx = short(tiitg % NL1);
-            short sy = lr1 / 8;
-            short lx_n = lr1 % 8;
-            for (short i = 0; i < 8; i++) {
-                short ly_k = i;
-                short ib = short(8 * sx + sy);
-                half val = (loop_k + iy + i < K && n_start + lr1 < N)
-                    ? *(y + iy + i) : half(0.0h);
-                *(sb + 64 * ib + 8 * ly_k + lx_n) = val;
+            short sy_b = lr1 / 8;
+            short ly_n = lr1 % 8;
+            for (short i = 0; i < 16; i++) {
+                short sx_b = short(2 * il1 + i / 8);
+                short lx_k = short(i % 8);
+                short ib = short(8 * sx_b + sy_b);
+                half val = (loop_k + 16 * il1 + i < K && n_start + lr1 < N)
+                    ? *(y + 16 * il1 + i) : half(0.0h);
+                *(sb + 64 * ib + 8 * lx_k + ly_n) = val;
             }
         }
 

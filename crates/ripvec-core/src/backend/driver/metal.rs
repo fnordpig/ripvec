@@ -17,10 +17,10 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::AnyThread;
-use objc2_foundation::{ns_string, NSString, NSUInteger};
+use objc2_foundation::{NSString, NSUInteger, ns_string};
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
     MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
@@ -32,13 +32,13 @@ use objc2_metal_performance_shaders::{
 use safetensors::SafeTensors;
 
 use super::{BatchInputs, Driver};
+use crate::backend::Encoding;
 use crate::backend::arch::classic_bert::{
     ClassicBertArch, ClassicBertLayerWeights, ClassicBertWeights,
 };
 use crate::backend::arch::modern_bert::{
     ModernBertArch, ModernBertLayerWeights, ModernBertWeights, RopeCache,
 };
-use crate::backend::Encoding;
 
 // ---------------------------------------------------------------------------
 // CoreGraphics linkage (required for MTLCreateSystemDefaultDevice)
@@ -3282,11 +3282,7 @@ impl MetalDriver {
             if exp == 0 {
                 // Subnormal or zero
                 let f = (mant as f32) * (1.0 / (1 << 24) as f32);
-                if sign == 1 {
-                    -f
-                } else {
-                    f
-                }
+                if sign == 1 { -f } else { f }
             } else if exp == 31 {
                 // Inf or NaN
                 if mant == 0 {
@@ -3671,6 +3667,165 @@ mod tests {
             }
         }
         eprintln!("[gemm_q8_correctness] max error: {max_err:.6}, PASS");
+    }
+
+    /// FP16 weight GEMM correctness test.
+    /// C_f16[M,N] = A_f16[M,K] × B_f16^T[N,K] using gemm_f16w_f32a_kernel.
+    #[test]
+    #[expect(unsafe_code, reason = "Metal buffer readback requires unsafe")]
+    fn gemm_f16_correctness() {
+        let driver = MetalDriver::new().unwrap();
+        let m: usize = 128;
+        let n: usize = 768;
+        let k: usize = 768;
+
+        // --- Build A (FP16): varying values across K ---
+        let mut a_f32: Vec<f32> = vec![0.0; m * k];
+        for i in 0..m {
+            for j in 0..k {
+                a_f32[i * k + j] = ((i % 8 + 1) as f32) * 0.001 + (j as f32) * 0.0001;
+            }
+        }
+
+        #[inline]
+        fn f32_to_f16(f: f32) -> u16 {
+            let bits = f.to_bits();
+            let sign = (bits >> 31) & 1;
+            let exp = ((bits >> 23) & 0xFF) as i32;
+            let mant = bits & 0x7FFFFF;
+            if exp == 0 {
+                return (sign << 15) as u16;
+            }
+            let new_exp = exp - 127 + 15;
+            if new_exp <= 0 {
+                return (sign << 15) as u16;
+            }
+            if new_exp >= 31 {
+                return ((sign << 15) | (31 << 10)) as u16;
+            }
+            ((sign << 15) | (new_exp as u32) << 10 | (mant >> 13)) as u16
+        }
+
+        #[inline]
+        fn f16_to_f32(bits: u16) -> f32 {
+            let sign = ((bits >> 15) & 1) as u32;
+            let exp = ((bits >> 10) & 0x1F) as u32;
+            let mant = (bits & 0x3FF) as u32;
+            if exp == 0 {
+                return 0.0;
+            }
+            if exp == 31 {
+                return if mant == 0 { f32::INFINITY } else { f32::NAN };
+            }
+            f32::from_bits((sign << 31) | ((exp + 112) << 23) | (mant << 13))
+        }
+
+        let a_f16: Vec<u16> = a_f32.iter().map(|&f| f32_to_f16(f)).collect();
+
+        // --- Build B (FP16): varying values ---
+        let mut b_f32: Vec<f32> = vec![0.0; n * k];
+        for j in 0..n {
+            for kk in 0..k {
+                b_f32[j * k + kk] = ((kk % 5 + 1) as f32) * 0.001 + (j % 10) as f32 * 0.0002;
+            }
+        }
+        let b_f16: Vec<u16> = b_f32.iter().map(|&f| f32_to_f16(f)).collect();
+
+        // --- Expected output: CPU reference using FP16 values ---
+        let mut expected = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f64;
+                for kk in 0..k {
+                    let a_val = f16_to_f32(a_f16[i * k + kk]) as f64;
+                    let b_val = f16_to_f32(b_f16[j * k + kk]) as f64;
+                    sum += a_val * b_val;
+                }
+                expected[i * n + j] = sum as f32;
+            }
+        }
+
+        // --- Upload to GPU ---
+        let a_buf = unsafe {
+            driver
+                .device
+                .newBufferWithBytes_length_options(
+                    std::ptr::NonNull::new(a_f16.as_ptr() as *mut _).unwrap(),
+                    (m * k * 2) as NSUInteger,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap()
+        };
+        let a_tensor = MetalTensor::new(a_buf, 0);
+
+        let b_buf = unsafe {
+            driver
+                .device
+                .newBufferWithBytes_length_options(
+                    std::ptr::NonNull::new(b_f16.as_ptr() as *mut _).unwrap(),
+                    (n * k * 2) as NSUInteger,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap()
+        };
+        let b_tensor = MetalTensor::new(b_buf, 0);
+
+        // Output buffer: FP16, M*N elements
+        let output_tensor = driver.alloc_f16_tensor(m * n).unwrap();
+
+        // --- Dispatch gemm_f16w_f32a_kernel directly ---
+        driver
+            .run_compute("gemm-f16-test", |enc| {
+                enc.setComputePipelineState(&driver.kernels.gemm_f16w_f32a);
+                set_buffer(enc, &a_tensor.buffer, a_tensor.offset, 0);
+                set_buffer(enc, &b_tensor.buffer, b_tensor.offset, 1);
+                set_buffer(enc, &output_tensor.buffer, output_tensor.offset, 2);
+                set_u32_param(enc, m as u32, 3);
+                set_u32_param(enc, n as u32, 4);
+                set_u32_param(enc, k as u32, 5);
+                set_u32_param(enc, 1_u32, 6); // transB = true (B is [N,K])
+                set_u32_param(enc, (m * k) as u32, 7); // stride_A
+                set_u32_param(enc, (n * k) as u32, 8); // stride_B
+                set_u32_param(enc, (m * n) as u32, 9); // stride_C
+                let grid = MTLSize {
+                    width: n.div_ceil(64),
+                    height: m.div_ceil(64),
+                    depth: 1,
+                };
+                let threads = MTLSize {
+                    width: 128,
+                    height: 1,
+                    depth: 1,
+                };
+                enc.dispatchThreadgroups_threadsPerThreadgroup(grid, threads);
+                Ok(())
+            })
+            .unwrap();
+
+        // --- Readback FP16 output ---
+        let result_f16 = unsafe {
+            let ptr = output_tensor.buffer.contents().as_ptr() as *const u16;
+            std::slice::from_raw_parts(ptr, m * n)
+        };
+        let result_f32: Vec<f32> = result_f16.iter().map(|&b| f16_to_f32(b)).collect();
+
+        // --- Compare ---
+        let mut max_err: f32 = 0.0;
+        for i in 0..m {
+            for j in 0..n {
+                let got = result_f32[i * n + j];
+                let exp = expected[i * n + j];
+                let err = (got - exp).abs();
+                if err > max_err {
+                    max_err = err;
+                }
+                assert!(
+                    err < 0.05,
+                    "C[{i},{j}] mismatch: got={got}, expected={exp}, err={err}",
+                );
+            }
+        }
+        eprintln!("[gemm_f16_correctness] max error: {max_err:.6}, PASS");
     }
 
     /// Test `to_host` readback.
