@@ -98,9 +98,6 @@ pub struct ModernBertArch<T> {
     pub global_rope: RopeCache<T>,
     /// `RoPE` cos/sin cache for local attention layers (theta=10000).
     pub local_rope: RopeCache<T>,
-    /// Optional early exit: run only this many encoder layers.
-    /// `None` runs all 22 layers.
-    pub max_layers: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -778,11 +775,6 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
             eps: w.layer_norm_eps,
         };
 
-        let num_layers = self
-            .max_layers
-            .unwrap_or(w.layers.len())
-            .min(w.layers.len());
-
         // FP16 path: f32_to_f16 ONCE → all layers in FP16 → f16_to_f32 ONCE.
         // Falls back to FP32 if the driver doesn't support FP16 ops.
         //
@@ -806,7 +798,7 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
             driver.f32_to_f16(&mut hidden_f16, &hidden_states, total_tokens * hidden)?;
 
             // 22 layers — ALL in FP16.
-            for layer in &w.layers[..num_layers] {
+            for layer in &w.layers {
                 let saved = driver.save_pool_cursor();
 
                 let rope = if layer.is_global {
@@ -829,7 +821,7 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
             hidden_states = hidden_f32;
         } else {
             // === FP32 PATH ===
-            for layer in &w.layers[..num_layers] {
+            for layer in &w.layers {
                 let saved = driver.save_pool_cursor();
 
                 let rope = if layer.is_global {

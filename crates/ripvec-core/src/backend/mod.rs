@@ -124,14 +124,12 @@ pub enum DeviceHint {
     Gpu,
 }
 
-/// Bundled inference optimization parameters passed through to `ModernBertArch`.
+/// Inference optimization parameters passed through to model loading.
 ///
-/// Collected from CLI flags and [`SearchConfig`](crate::embed::SearchConfig).
+/// Currently empty — reserved for future optimizations (quantization,
+/// distillation, etc.) that need to be configured at load time.
 #[derive(Debug, Clone, Default)]
-pub struct InferenceOpts {
-    /// Early-exit layer count (`None` = all 22 layers).
-    pub max_layers: Option<usize>,
-}
+pub struct InferenceOpts {}
 
 /// Construct an embedding backend of the given kind.
 ///
@@ -166,17 +164,6 @@ pub fn load_backend(
         expect(unused_variables, reason = "used when backend features are enabled")
     )]
     device_hint: DeviceHint,
-    #[cfg_attr(
-        not(any(
-            feature = "cuda",
-            feature = "mlx",
-            feature = "cpu",
-            feature = "cpu-accelerate",
-            feature = "metal"
-        )),
-        expect(unused_variables, reason = "used when backend features are enabled")
-    )]
-    opts: &InferenceOpts,
 ) -> crate::Result<Box<dyn EmbedBackend>> {
     match kind {
         #[cfg(feature = "cuda")]
@@ -200,7 +187,7 @@ pub fn load_backend(
         #[cfg(any(feature = "cpu", feature = "cpu-accelerate"))]
         BackendKind::Cpu => {
             if is_modernbert_model(model_repo) {
-                return load_modernbert_cpu(model_repo, opts);
+                return load_modernbert_cpu(model_repo);
             }
             #[cfg(feature = "cpu")]
             {
@@ -220,7 +207,7 @@ pub fn load_backend(
         BackendKind::Metal => {
             // All models route through the driver/arch system.
             if is_modernbert_model(model_repo) {
-                return load_modernbert_metal(model_repo, opts);
+                return load_modernbert_metal(model_repo);
             }
             load_classic_metal(model_repo)
         }
@@ -252,17 +239,6 @@ pub fn detect_backends(
         expect(unused_variables, reason = "used when backend features are enabled")
     )]
     model_repo: &str,
-    #[cfg_attr(
-        not(any(
-            feature = "cuda",
-            feature = "mlx",
-            feature = "cpu",
-            feature = "cpu-accelerate",
-            feature = "metal"
-        )),
-        expect(unused_variables, reason = "used when backend features are enabled")
-    )]
-    opts: &InferenceOpts,
 ) -> crate::Result<Vec<Box<dyn EmbedBackend>>> {
     #[cfg_attr(
         not(any(
@@ -287,7 +263,7 @@ pub fn detect_backends(
     {
         // Route models through the driver/arch system by architecture.
         if is_modernbert_model(model_repo) {
-            if let Ok(b) = load_modernbert_metal(model_repo, opts) {
+            if let Ok(b) = load_modernbert_metal(model_repo) {
                 backends.push(b);
             }
         } else if let Ok(b) = load_classic_metal(model_repo) {
@@ -315,7 +291,7 @@ pub fn detect_backends(
     #[cfg(any(feature = "cpu", feature = "cpu-accelerate"))]
     if !has_gpu {
         if is_modernbert_model(model_repo) {
-            if let Ok(b) = load_modernbert_cpu(model_repo, opts) {
+            if let Ok(b) = load_modernbert_cpu(model_repo) {
                 backends.push(b);
             }
         } else {
@@ -351,10 +327,7 @@ pub fn detect_backends(
 /// Returns an error if no Metal device is available, the model cannot be
 /// downloaded, or weight loading fails.
 #[cfg(feature = "metal")]
-pub fn load_modernbert_metal(
-    model_repo: &str,
-    opts: &InferenceOpts,
-) -> crate::Result<Box<dyn EmbedBackend>> {
+pub fn load_modernbert_metal(model_repo: &str) -> crate::Result<Box<dyn EmbedBackend>> {
     use driver::metal::{MetalDriver, ModernBertConfig};
     use generic::GenericBackend;
     use hf_hub::api::sync::Api;
@@ -380,8 +353,7 @@ pub fn load_modernbert_metal(
     let max_tokens = config.max_position_embeddings;
 
     let driver = MetalDriver::new()?;
-    let (mut arch, mmap) = driver.load_modern_bert_weights(&weights_path, &config)?;
-    arch.max_layers = opts.max_layers;
+    let (arch, mmap) = driver.load_modern_bert_weights(&weights_path, &config)?;
 
     tracing::info!(
         model_repo,
@@ -400,10 +372,7 @@ pub fn load_modernbert_metal(
 
 /// Load `ModernBERT` on CPU via the driver/arch system.
 #[cfg(any(feature = "cpu", feature = "cpu-accelerate"))]
-pub fn load_modernbert_cpu(
-    model_repo: &str,
-    opts: &InferenceOpts,
-) -> crate::Result<Box<dyn EmbedBackend>> {
+pub fn load_modernbert_cpu(model_repo: &str) -> crate::Result<Box<dyn EmbedBackend>> {
     use driver::cpu::{CpuDriver, ModernBertConfig};
     use generic::GenericBackend;
     use hf_hub::api::sync::Api;
@@ -428,8 +397,7 @@ pub fn load_modernbert_cpu(
     let max_tokens = config.max_position_embeddings;
 
     let driver = CpuDriver::new()?;
-    let (mut arch, mmap) = driver.load_modern_bert_weights(&weights_path, &config)?;
-    arch.max_layers = opts.max_layers;
+    let (arch, mmap) = driver.load_modern_bert_weights(&weights_path, &config)?;
 
     tracing::info!(
         model_repo,
@@ -659,28 +627,21 @@ mod tests {
     #[cfg(not(feature = "mlx"))]
     #[test]
     fn load_backend_mlx_not_compiled() {
-        let result = load_backend(
-            BackendKind::Mlx,
-            "test/model",
-            DeviceHint::Cpu,
-            &InferenceOpts::default(),
-        );
+        let result = load_backend(BackendKind::Mlx, "test/model", DeviceHint::Cpu);
         assert!(result.is_err());
     }
 
     #[cfg(feature = "cpu")]
     #[test]
     fn detect_backends_returns_at_least_one() {
-        let backends =
-            detect_backends("BAAI/bge-small-en-v1.5", &InferenceOpts::default()).unwrap();
+        let backends = detect_backends("BAAI/bge-small-en-v1.5").unwrap();
         assert!(!backends.is_empty());
     }
 
     #[cfg(all(feature = "cpu", not(feature = "mlx")))]
     #[test]
     fn detect_backends_returns_at_least_one_backend() {
-        let backends =
-            detect_backends("BAAI/bge-small-en-v1.5", &InferenceOpts::default()).unwrap();
+        let backends = detect_backends("BAAI/bge-small-en-v1.5").unwrap();
         assert!(!backends.is_empty(), "should detect at least one backend");
     }
 
@@ -694,9 +655,7 @@ mod tests {
     fn modernbert_loads_and_embeds() {
         use crate::backend::driver::Driver;
 
-        let backend =
-            load_modernbert_metal("nomic-ai/modernbert-embed-base", &InferenceOpts::default())
-                .expect("load failed");
+        let backend = load_modernbert_metal("nomic-ai/modernbert-embed-base").expect("load failed");
         assert!(backend.is_gpu(), "Metal backend should be GPU");
 
         let enc = Encoding {
@@ -723,7 +682,7 @@ mod tests {
         let config_json: serde_json::Value = serde_json::from_str(&config_str).unwrap();
         let config =
             crate::backend::driver::metal::ModernBertConfig::from_json(&config_json).unwrap();
-        let (mut arch, _mmap) = driver
+        let (arch, _mmap) = driver
             .load_modern_bert_weights(&weights_path, &config)
             .unwrap();
 
@@ -812,7 +771,7 @@ mod tests {
         let nz = s_h[0].iter().filter(|&&v| v.abs() > 1e-10).count();
         eprintln!("STAGE 4 - scores: {nz}/{} nonzero", nh * 8 * 8);
 
-        // Early exit quality sweep — the whole point of ModernBERT
+        // Full forward pass
         use crate::backend::arch::ModelArch;
         let enc2 = Encoding {
             input_ids: vec![1, 100, 200, 300, 2],
@@ -820,7 +779,6 @@ mod tests {
             token_type_ids: vec![0; 5],
         };
 
-        arch.max_layers = None;
         let quick = arch.forward(&driver, &[enc2.clone()]).unwrap();
         let l2: f32 = quick[0].iter().map(|x| x * x).sum::<f32>().sqrt();
         let nz = quick[0].iter().filter(|&&v| v.abs() > 1e-10).count();
@@ -829,35 +787,14 @@ mod tests {
             &quick[0][..3]
         );
 
-        // Get full 22-layer reference embedding
-        arch.max_layers = None;
+        // MRL truncation
+        eprintln!("\n=== ModernBERT MRL Truncation ===");
         let full = arch.forward(&driver, &[enc2.clone()]).unwrap();
         let full_emb = &full[0];
-        eprintln!("\n=== ModernBERT Early Exit Quality ===");
-        eprintln!(
-            "Full 22-layer embedding: {} dims, L2={:.4}",
-            full_emb.len(),
-            full_emb.iter().map(|x| x * x).sum::<f32>().sqrt()
-        );
-
-        // Sweep layers
-        for layers in [1, 2, 4, 6, 8, 11, 14, 17, 20, 22] {
-            arch.max_layers = Some(layers);
-            let result = arch.forward(&driver, &[enc2.clone()]).unwrap();
-            let emb = &result[0];
-            let cos: f32 = emb.iter().zip(full_emb).map(|(a, b)| a * b).sum();
-            eprintln!("  layers={layers:>2}: cosine={cos:.6}");
-        }
-
-        // MRL truncation at full layers
-        eprintln!("\n=== ModernBERT MRL Truncation ===");
-        arch.max_layers = None;
-        let full2 = arch.forward(&driver, &[enc2.clone()]).unwrap();
-        let full_emb2 = &full2[0];
         for dims in [64, 128, 256, 384, 512, 768] {
-            let t: Vec<f32> = full_emb2[..dims].to_vec();
+            let t: Vec<f32> = full_emb[..dims].to_vec();
             let t_norm: f32 = t.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
-            let f_norm: f32 = full_emb2[..dims]
+            let f_norm: f32 = full_emb[..dims]
                 .iter()
                 .map(|x| x * x)
                 .sum::<f32>()
@@ -865,41 +802,15 @@ mod tests {
                 .max(1e-12);
             let cos: f32 = t
                 .iter()
-                .zip(&full_emb2[..dims])
+                .zip(&full_emb[..dims])
                 .map(|(a, b)| a * b)
                 .sum::<f32>()
                 / (t_norm * f_norm);
             eprintln!("  dims={dims:>3}: cosine={cos:.6}");
         }
 
-        // Combined: early exit + MRL
-        eprintln!("\n=== Combined: Early Exit + MRL ===");
-        for layers in [6, 11, 16, 22] {
-            arch.max_layers = Some(layers);
-            let result = arch.forward(&driver, &[enc2.clone()]).unwrap();
-            let emb = &result[0];
-            for dims in [64, 128, 256, 768] {
-                let t: Vec<f32> = emb[..dims].to_vec();
-                let t_norm: f32 = t.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
-                let f_norm: f32 = full_emb[..dims]
-                    .iter()
-                    .map(|x| x * x)
-                    .sum::<f32>()
-                    .sqrt()
-                    .max(1e-12);
-                let cos: f32 = t
-                    .iter()
-                    .zip(&full_emb[..dims])
-                    .map(|(a, b)| a * b)
-                    .sum::<f32>()
-                    / (t_norm * f_norm);
-                eprintln!("  layers={layers:>2} dims={dims:>3}: cosine={cos:.6}");
-            }
-        }
-
         // Throughput benchmark
         eprintln!("\n=== ModernBERT Throughput ===");
-        arch.max_layers = None;
         // Build 32 encodings of varying length
         let mut encs = Vec::new();
         for i in 0..32 {
@@ -981,13 +892,8 @@ mod tests {
         // Compare against CPU backend (reliable reference)
         #[cfg(feature = "cpu")]
         {
-            let cpu = load_backend(
-                BackendKind::Cpu,
-                model_repo,
-                DeviceHint::Cpu,
-                &InferenceOpts::default(),
-            )
-            .expect("CPU load failed");
+            let cpu = load_backend(BackendKind::Cpu, model_repo, DeviceHint::Cpu)
+                .expect("CPU load failed");
             let cpu_result = cpu.embed_batch(std::slice::from_ref(&enc)).unwrap();
             eprintln!("CPU  first 5: {:?}", &cpu_result[0][..5]);
             eprintln!("NEW  first 5: {:?}", &result[0][..5]);

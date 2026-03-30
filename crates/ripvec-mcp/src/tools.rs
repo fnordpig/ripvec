@@ -143,10 +143,7 @@ impl RipvecServer {
         self.text_backend
             .get_or_try_init(|| async {
                 let backends = tokio::task::spawn_blocking(|| {
-                    ripvec_core::backend::detect_backends(
-                        "nomic-ai/modernbert-embed-base",
-                        &ripvec_core::backend::InferenceOpts::default(),
-                    )
+                    ripvec_core::backend::detect_backends("nomic-ai/modernbert-embed-base")
                 })
                 .await
                 .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?

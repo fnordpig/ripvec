@@ -1268,7 +1268,6 @@ impl MetalDriver {
             weights,
             global_rope,
             local_rope,
-            max_layers: None,
         };
 
         Ok((arch, mmap))
