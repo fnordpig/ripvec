@@ -17,10 +17,10 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::{NSString, NSUInteger, ns_string};
+use objc2::AnyThread;
+use objc2_foundation::{ns_string, NSString, NSUInteger};
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
     MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
@@ -32,13 +32,13 @@ use objc2_metal_performance_shaders::{
 use safetensors::SafeTensors;
 
 use super::{BatchInputs, Driver};
-use crate::backend::Encoding;
 use crate::backend::arch::classic_bert::{
     ClassicBertArch, ClassicBertLayerWeights, ClassicBertWeights,
 };
 use crate::backend::arch::modern_bert::{
     ModernBertArch, ModernBertLayerWeights, ModernBertWeights, RopeCache,
 };
+use crate::backend::Encoding;
 
 // ---------------------------------------------------------------------------
 // CoreGraphics linkage (required for MTLCreateSystemDefaultDevice)
@@ -2074,57 +2074,7 @@ impl Driver for MetalDriver {
         k: usize,
         transpose_b: bool,
     ) -> crate::Result<()> {
-        // RIPVEC_NO_MPS=1: use native simdgroup mixed-precision GEMM
-        // (FP32 activations × FP16 weights → FP32 output, zero MPS transitions).
-        static USE_COMPUTE_GEMM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let use_compute = *USE_COMPUTE_GEMM
-            .get_or_init(|| std::env::var("RIPVEC_NO_MPS").is_ok_and(|v| v == "1"));
-
-        if use_compute {
-            // DEBUG: confirm kernel dispatch
-            static LOGGED: std::sync::Once = std::sync::Once::new();
-            LOGGED.call_once(|| eprintln!("[DEBUG] gemm_f16w_f32a dispatch: m={m} n={n} k={k}"));
-            // Check if B has FP16 weights available
-            let b_fp16 = b.fp16.borrow();
-            if let Some(ref fp16_buf) = *b_fp16 {
-                return self.run_compute("gemm-f16w-f32a", |enc| {
-                    enc.setComputePipelineState(&self.kernels.gemm_f16w_f32a);
-                    set_buffer(enc, &a.buffer, a.offset, 0);
-                    set_buffer(enc, fp16_buf, 0, 1);
-                    set_buffer(enc, &output.buffer, output.offset, 2);
-                    set_u32_param(enc, m as u32, 3);
-                    set_u32_param(enc, n as u32, 4);
-                    set_u32_param(enc, k as u32, 5);
-                    set_u32_param(enc, if transpose_b { 1 } else { 0 }, 6);
-                    set_u32_param(enc, (m * k) as u32, 7);
-                    set_u32_param(
-                        enc,
-                        if transpose_b {
-                            (n * k) as u32
-                        } else {
-                            (k * n) as u32
-                        },
-                        8,
-                    );
-                    set_u32_param(enc, (m * n) as u32, 9);
-                    let grid = MTLSize {
-                        width: n.div_ceil(64),
-                        height: m.div_ceil(64),
-                        depth: 1,
-                    };
-                    let threads = MTLSize {
-                        width: 128,
-                        height: 1,
-                        depth: 1,
-                    };
-                    enc.dispatchThreadgroups_threadsPerThreadgroup(grid, threads);
-                    Ok(())
-                });
-            }
-            // No FP16 weights — fall through to MPS or batched compute
-        }
-
-        // MPS GEMM
+        // MPS GEMM (FP32 path always uses MPS — native kernel requires FP16 activations)
         self.run_mps("mps-gemm", |cmd_buf| {
             dispatch_mps_gemm(
                 cmd_buf,
@@ -3282,7 +3232,11 @@ impl MetalDriver {
             if exp == 0 {
                 // Subnormal or zero
                 let f = (mant as f32) * (1.0 / (1 << 24) as f32);
-                if sign == 1 { -f } else { f }
+                if sign == 1 {
+                    -f
+                } else {
+                    f
+                }
             } else if exp == 31 {
                 // Inf or NaN
                 if mant == 0 {
