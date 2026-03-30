@@ -1,0 +1,141 @@
+{
+  "version": 1,
+  "exporter": "tracemeld@0.2.1",
+  "created_at": 1774846850783,
+  "tags": {
+    "path": "cpu",
+    "layers": "22",
+    "corpus": "flask",
+    "checkpoint": "baseline",
+    "task": "CPU (Accelerate BLAS) path — 22 layers, Flask corpus, batch=32, semantic mode"
+  },
+  "value_types": [
+    {
+      "key": "wall_ms",
+      "unit": "milliseconds",
+      "description": "Wall-clock duration"
+    },
+    {
+      "key": "input_tokens",
+      "unit": "none",
+      "description": "Input/prompt tokens consumed"
+    },
+    {
+      "key": "output_tokens",
+      "unit": "none",
+      "description": "Output/completion tokens generated"
+    },
+    {
+      "key": "cost_usd",
+      "unit": "none",
+      "description": "Estimated dollar cost"
+    },
+    {
+      "key": "bytes_read",
+      "unit": "bytes",
+      "description": "Bytes read from disk/network"
+    },
+    {
+      "key": "bytes_written",
+      "unit": "bytes",
+      "description": "Bytes written to disk/network"
+    }
+  ],
+  "source_formats": [],
+  "totals": {
+    "wall_ms": 225527,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cost_usd": 0,
+    "bytes_read": 0,
+    "bytes_written": 0
+  },
+  "kind_breakdown": [],
+  "frame_costs": [],
+  "hotspots": [
+    {
+      "dimension": "wall_ms",
+      "entries": [
+        {
+          "name": "_pthread_cond_wait",
+          "self_cost": 17033,
+          "pct_of_total": 7.55
+        },
+        {
+          "name": "__psynch_cvwait",
+          "self_cost": 17033,
+          "pct_of_total": 7.55
+        },
+        {
+          "name": "start",
+          "self_cost": 8522,
+          "pct_of_total": 3.78
+        },
+        {
+          "name": "main",
+          "self_cost": 8522,
+          "pct_of_total": 3.78
+        },
+        {
+          "name": "std::rt::lang_start_internal::h11fc0900699d88c7",
+          "self_cost": 8522,
+          "pct_of_total": 3.78
+        },
+        {
+          "name": "std::rt::lang_start::_$u7b$$u7b$closure$u7d$$u7d$::habd63c598afcc742",
+          "self_cost": 8522,
+          "pct_of_total": 3.78
+        },
+        {
+          "name": "std::sys::backtrace::__rust_begin_short_backtrace::h08df62e4d8868210",
+          "self_cost": 8522,
+          "pct_of_total": 3.78
+        },
+        {
+          "name": "ripvec::main::hf574deaeec6ccc99",
+          "self_cost": 8522,
+          "pct_of_total": 3.78
+        },
+        {
+          "name": "ripvec_core::embed::search::h66c26d07cf050c86",
+          "self_cost": 8522,
+          "pct_of_total": 3.78
+        },
+        {
+          "name": "ripvec_core::embed::embed_all::h218462388dd10778",
+          "self_cost": 8522,
+          "pct_of_total": 3.78
+        }
+      ]
+    },
+    {
+      "dimension": "input_tokens",
+      "entries": []
+    },
+    {
+      "dimension": "output_tokens",
+      "entries": []
+    },
+    {
+      "dimension": "cost_usd",
+      "entries": []
+    },
+    {
+      "dimension": "bytes_read",
+      "entries": []
+    },
+    {
+      "dimension": "bytes_written",
+      "entries": []
+    }
+  ],
+  "patterns": [],
+  "stats": {
+    "span_count": 0,
+    "sample_count": 97,
+    "frame_count": 77,
+    "lane_count": 2,
+    "error_count": 0,
+    "wall_duration_ms": 0
+  }
+}

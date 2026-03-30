@@ -210,7 +210,10 @@ pub async fn run_background_index(server: &RipvecServer) {
 
     let result = tokio::task::spawn_blocking(move || {
         let model_repo = "nomic-ai/modernbert-embed-base";
-        let backends = ripvec_core::backend::detect_backends(model_repo, None)?;
+        let backends = ripvec_core::backend::detect_backends(
+            model_repo,
+            &ripvec_core::backend::InferenceOpts::default(),
+        )?;
         let tokenizer = ripvec_core::tokenize::load_tokenizer(model_repo)?;
         let cfg = ripvec_core::embed::SearchConfig::default();
         let profiler = ripvec_core::profile::Profiler::noop();

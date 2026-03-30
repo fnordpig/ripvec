@@ -403,6 +403,8 @@ impl CpuDriver {
             global_rope,
             local_rope,
             max_layers: None,
+            skip_layers: Default::default(),
+            prune_ratio: 0.0,
         };
 
         Ok((arch, mmap))

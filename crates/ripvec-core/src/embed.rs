@@ -27,6 +27,18 @@ use tracing::{debug, info_span, instrument, warn};
 use crate::backend::{EmbedBackend, Encoding};
 use crate::chunk::{ChunkConfig, CodeChunk};
 
+/// SVD rank selection for low-rank FFN approximation.
+#[derive(Debug, Clone, Default)]
+pub enum SvdRank {
+    /// Disabled — use original Wi weight (default).
+    #[default]
+    Disabled,
+    /// Per-layer rank from Frobenius norm threshold (1% reconstruction error).
+    Auto,
+    /// Fixed rank for all layers.
+    Fixed(usize),
+}
+
 /// Default batch size for embedding inference.
 pub const DEFAULT_BATCH_SIZE: usize = 32;
 
@@ -64,6 +76,12 @@ pub struct SearchConfig {
     pub file_type: Option<String>,
     /// Search mode: hybrid (default), semantic, or keyword.
     pub mode: crate::hybrid::SearchMode,
+    /// SVD rank for low-rank FFN approximation. Consumed at model load time.
+    pub svd_rank: SvdRank,
+    /// Token pruning ratio at layer 11 (0.0 = disabled, 0.5 = drop 50%).
+    pub prune_ratio: f32,
+    /// Layer indices to skip entirely in the encoder.
+    pub skip_layers: Vec<usize>,
 }
 
 impl Default for SearchConfig {
@@ -76,6 +94,9 @@ impl Default for SearchConfig {
             cascade_dim: None,
             file_type: None,
             mode: crate::hybrid::SearchMode::Hybrid,
+            svd_rank: SvdRank::Disabled,
+            prune_ratio: 0.0,
+            skip_layers: vec![],
         }
     }
 }
@@ -630,7 +651,7 @@ mod tests {
             crate::backend::BackendKind::Cpu,
             "BAAI/bge-small-en-v1.5",
             crate::backend::DeviceHint::Cpu,
-            None,
+            &crate::backend::InferenceOpts::default(),
         )
         .unwrap();
         let tokenizer = crate::tokenize::load_tokenizer("BAAI/bge-small-en-v1.5").unwrap();
@@ -657,7 +678,7 @@ mod tests {
             crate::backend::BackendKind::Cpu,
             "BAAI/bge-small-en-v1.5",
             crate::backend::DeviceHint::Cpu,
-            None,
+            &crate::backend::InferenceOpts::default(),
         )
         .unwrap();
         let tokenizer = crate::tokenize::load_tokenizer("BAAI/bge-small-en-v1.5").unwrap();
@@ -716,7 +737,9 @@ mod tests {
     )]
     fn mrl_retrieval_recall() {
         let model = "BAAI/bge-small-en-v1.5";
-        let backends = crate::backend::detect_backends(model, None).unwrap();
+        let backends =
+            crate::backend::detect_backends(model, &crate::backend::InferenceOpts::default())
+                .unwrap();
         let tokenizer = crate::tokenize::load_tokenizer(model).unwrap();
         let cfg = SearchConfig::default();
         let profiler = crate::profile::Profiler::noop();

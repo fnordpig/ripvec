@@ -143,14 +143,30 @@ fn load_pipeline(
     let backends = {
         let _guard = profiler.phase("model_load");
         let pb = use_progress.then(|| progress::spinner("Loading model\u{2026}"));
-        let max_layers = if args.layers > 0 {
-            Some(args.layers)
-        } else {
-            None
+        let inference_opts = ripvec_core::backend::InferenceOpts {
+            max_layers: if args.layers > 0 {
+                Some(args.layers)
+            } else {
+                None
+            },
+            skip_layers: args
+                .skip_layers
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    s.trim()
+                        .parse::<usize>()
+                        .expect("--skip-layers: invalid integer")
+                })
+                .collect(),
+            prune_ratio: args.prune_ratio,
+            svd_rank: ripvec_core::embed::SvdRank::Disabled, // wired in Task 3
         };
         let result = match args.backend {
-            cli::BackendArg::Auto => ripvec_core::backend::detect_backends(model_repo, max_layers)
-                .context("failed to detect available backends")?,
+            cli::BackendArg::Auto => {
+                ripvec_core::backend::detect_backends(model_repo, &inference_opts)
+                    .context("failed to detect available backends")?
+            }
             ref specific => {
                 let kind = match specific {
                     cli::BackendArg::Cpu => ripvec_core::backend::BackendKind::Cpu,
@@ -166,8 +182,13 @@ fn load_pipeline(
                     }
                 };
                 vec![
-                    ripvec_core::backend::load_backend(kind, model_repo, device_hint, max_layers)
-                        .context("failed to load embedding backend")?,
+                    ripvec_core::backend::load_backend(
+                        kind,
+                        model_repo,
+                        device_hint,
+                        &inference_opts,
+                    )
+                    .context("failed to load embedding backend")?,
                 ]
             }
         };
@@ -181,6 +202,25 @@ fn load_pipeline(
 
     let mode: ripvec_core::hybrid::SearchMode = args.mode.parse().unwrap_or_default();
 
+    let svd_rank = match args.svd_rank.as_str() {
+        "0" => ripvec_core::embed::SvdRank::Disabled,
+        "auto" => ripvec_core::embed::SvdRank::Auto,
+        n => ripvec_core::embed::SvdRank::Fixed(
+            n.parse::<usize>()
+                .expect("--svd-rank must be 0, 'auto', or an integer"),
+        ),
+    };
+    let skip_layers: Vec<usize> = args
+        .skip_layers
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.trim()
+                .parse::<usize>()
+                .expect("--skip-layers must be comma-separated integers")
+        })
+        .collect();
+
     let search_cfg = ripvec_core::embed::SearchConfig {
         batch_size: args.batch_size,
         max_tokens: args.max_tokens,
@@ -193,6 +233,9 @@ fn load_pipeline(
         cascade_dim: None,
         file_type: args.file_type.clone(),
         mode,
+        svd_rank,
+        prune_ratio: args.prune_ratio,
+        skip_layers,
     };
 
     Ok((backends, tokenizer, search_cfg))

@@ -101,6 +101,10 @@ pub struct ModernBertArch<T> {
     /// Optional early exit: run only this many encoder layers.
     /// `None` runs all 22 layers.
     pub max_layers: Option<usize>,
+    /// Layer indices to skip entirely.
+    pub skip_layers: std::collections::HashSet<usize>,
+    /// Token pruning ratio at layer 11 (0.0 = disabled).
+    pub prune_ratio: f32,
 }
 
 // ---------------------------------------------------------------------------

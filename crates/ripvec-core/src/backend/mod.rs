@@ -124,6 +124,21 @@ pub enum DeviceHint {
     Gpu,
 }
 
+/// Bundled inference optimization parameters passed through to `ModernBertArch`.
+///
+/// Collected from CLI flags and [`SearchConfig`](crate::embed::SearchConfig).
+#[derive(Debug, Clone, Default)]
+pub struct InferenceOpts {
+    /// Early-exit layer count (`None` = all 22 layers).
+    pub max_layers: Option<usize>,
+    /// Layer indices to skip entirely.
+    pub skip_layers: std::collections::HashSet<usize>,
+    /// Token pruning ratio at layer 11 (0.0 = disabled).
+    pub prune_ratio: f32,
+    /// SVD rank for low-rank FFN approximation.
+    pub svd_rank: crate::embed::SvdRank,
+}
+
 /// Construct an embedding backend of the given kind.
 ///
 /// Downloads model weights on first use via `hf-hub`. The `device_hint`
@@ -167,7 +182,7 @@ pub fn load_backend(
         )),
         expect(unused_variables, reason = "used when backend features are enabled")
     )]
-    max_layers: Option<usize>,
+    opts: &InferenceOpts,
 ) -> crate::Result<Box<dyn EmbedBackend>> {
     match kind {
         #[cfg(feature = "cuda")]
@@ -191,7 +206,7 @@ pub fn load_backend(
         #[cfg(any(feature = "cpu", feature = "cpu-accelerate"))]
         BackendKind::Cpu => {
             if is_modernbert_model(model_repo) {
-                return load_modernbert_cpu(model_repo, max_layers);
+                return load_modernbert_cpu(model_repo, opts);
             }
             #[cfg(feature = "cpu")]
             {
@@ -211,7 +226,7 @@ pub fn load_backend(
         BackendKind::Metal => {
             // All models route through the driver/arch system.
             if is_modernbert_model(model_repo) {
-                return load_modernbert_metal(model_repo, max_layers);
+                return load_modernbert_metal(model_repo, opts);
             }
             load_classic_metal(model_repo)
         }
@@ -253,7 +268,7 @@ pub fn detect_backends(
         )),
         expect(unused_variables, reason = "used when backend features are enabled")
     )]
-    max_layers: Option<usize>,
+    opts: &InferenceOpts,
 ) -> crate::Result<Vec<Box<dyn EmbedBackend>>> {
     #[cfg_attr(
         not(any(
@@ -278,7 +293,7 @@ pub fn detect_backends(
     {
         // Route models through the driver/arch system by architecture.
         if is_modernbert_model(model_repo) {
-            if let Ok(b) = load_modernbert_metal(model_repo, max_layers) {
+            if let Ok(b) = load_modernbert_metal(model_repo, opts) {
                 backends.push(b);
             }
         } else if let Ok(b) = load_classic_metal(model_repo) {
@@ -306,7 +321,7 @@ pub fn detect_backends(
     #[cfg(any(feature = "cpu", feature = "cpu-accelerate"))]
     if !has_gpu {
         if is_modernbert_model(model_repo) {
-            if let Ok(b) = load_modernbert_cpu(model_repo, max_layers) {
+            if let Ok(b) = load_modernbert_cpu(model_repo, opts) {
                 backends.push(b);
             }
         } else {
@@ -344,7 +359,7 @@ pub fn detect_backends(
 #[cfg(feature = "metal")]
 pub fn load_modernbert_metal(
     model_repo: &str,
-    max_layers: Option<usize>,
+    opts: &InferenceOpts,
 ) -> crate::Result<Box<dyn EmbedBackend>> {
     use driver::metal::{MetalDriver, ModernBertConfig};
     use generic::GenericBackend;
@@ -372,7 +387,9 @@ pub fn load_modernbert_metal(
 
     let driver = MetalDriver::new()?;
     let (mut arch, mmap) = driver.load_modern_bert_weights(&weights_path, &config)?;
-    arch.max_layers = max_layers;
+    arch.max_layers = opts.max_layers;
+    arch.skip_layers = opts.skip_layers.clone();
+    arch.prune_ratio = opts.prune_ratio;
 
     tracing::info!(
         model_repo,
@@ -393,7 +410,7 @@ pub fn load_modernbert_metal(
 #[cfg(any(feature = "cpu", feature = "cpu-accelerate"))]
 pub fn load_modernbert_cpu(
     model_repo: &str,
-    max_layers: Option<usize>,
+    opts: &InferenceOpts,
 ) -> crate::Result<Box<dyn EmbedBackend>> {
     use driver::cpu::{CpuDriver, ModernBertConfig};
     use generic::GenericBackend;
@@ -420,7 +437,9 @@ pub fn load_modernbert_cpu(
 
     let driver = CpuDriver::new()?;
     let (mut arch, mmap) = driver.load_modern_bert_weights(&weights_path, &config)?;
-    arch.max_layers = max_layers;
+    arch.max_layers = opts.max_layers;
+    arch.skip_layers = opts.skip_layers.clone();
+    arch.prune_ratio = opts.prune_ratio;
 
     tracing::info!(
         model_repo,
@@ -650,21 +669,28 @@ mod tests {
     #[cfg(not(feature = "mlx"))]
     #[test]
     fn load_backend_mlx_not_compiled() {
-        let result = load_backend(BackendKind::Mlx, "test/model", DeviceHint::Cpu, None);
+        let result = load_backend(
+            BackendKind::Mlx,
+            "test/model",
+            DeviceHint::Cpu,
+            &InferenceOpts::default(),
+        );
         assert!(result.is_err());
     }
 
     #[cfg(feature = "cpu")]
     #[test]
     fn detect_backends_returns_at_least_one() {
-        let backends = detect_backends("BAAI/bge-small-en-v1.5", None).unwrap();
+        let backends =
+            detect_backends("BAAI/bge-small-en-v1.5", &InferenceOpts::default()).unwrap();
         assert!(!backends.is_empty());
     }
 
     #[cfg(all(feature = "cpu", not(feature = "mlx")))]
     #[test]
     fn detect_backends_returns_at_least_one_backend() {
-        let backends = detect_backends("BAAI/bge-small-en-v1.5", None).unwrap();
+        let backends =
+            detect_backends("BAAI/bge-small-en-v1.5", &InferenceOpts::default()).unwrap();
         assert!(!backends.is_empty(), "should detect at least one backend");
     }
 
@@ -679,7 +705,8 @@ mod tests {
         use crate::backend::driver::Driver;
 
         let backend =
-            load_modernbert_metal("nomic-ai/modernbert-embed-base", None).expect("load failed");
+            load_modernbert_metal("nomic-ai/modernbert-embed-base", &InferenceOpts::default())
+                .expect("load failed");
         assert!(backend.is_gpu(), "Metal backend should be GPU");
 
         let enc = Encoding {
@@ -964,8 +991,13 @@ mod tests {
         // Compare against CPU backend (reliable reference)
         #[cfg(feature = "cpu")]
         {
-            let cpu = load_backend(BackendKind::Cpu, model_repo, DeviceHint::Cpu, None)
-                .expect("CPU load failed");
+            let cpu = load_backend(
+                BackendKind::Cpu,
+                model_repo,
+                DeviceHint::Cpu,
+                &InferenceOpts::default(),
+            )
+            .expect("CPU load failed");
             let cpu_result = cpu.embed_batch(std::slice::from_ref(&enc)).unwrap();
             eprintln!("CPU  first 5: {:?}", &cpu_result[0][..5]);
             eprintln!("NEW  first 5: {:?}", &result[0][..5]);

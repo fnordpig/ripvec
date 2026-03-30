@@ -90,6 +90,19 @@ pub struct Args {
     #[arg(long, default_value_t = 0)]
     pub layers: usize,
 
+    /// SVD rank for low-rank FFN approximation.
+    /// 0 = disabled (default), "auto" = per-layer from Frobenius threshold.
+    #[arg(long, default_value = "0")]
+    pub svd_rank: String,
+
+    /// Token pruning ratio at layer 11 (0.0 = disabled, 0.5 = drop 50%).
+    #[arg(long, default_value_t = 0.0)]
+    pub prune_ratio: f32,
+
+    /// Comma-separated layer indices to skip (e.g., "6,7,13,14").
+    #[arg(long, default_value = "")]
+    pub skip_layers: String,
+
     /// Maximum chunk size in bytes before splitting into windows.
     #[arg(long, default_value_t = 4096)]
     pub max_chunk_bytes: usize,
