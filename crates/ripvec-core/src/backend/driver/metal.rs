@@ -208,6 +208,16 @@ struct KernelPipelines {
     gemm_f16w_f32a: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// INT8-weight GEMM: FP16 activations × INT8 weights + per-row scales → FP16 output.
     gemm_q8w: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+
+    // --- Token pruning pipelines ---
+    /// Per-sequence L2 distance from mean (FP16 hidden → FP32 distances).
+    compute_token_distances_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Per-sequence L2 distance from mean (FP32).
+    compute_token_distances: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Compact hidden states by gathering selected indices (FP16).
+    gather_tokens_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Compact hidden states by gathering selected indices (FP32).
+    gather_tokens: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 impl KernelPipelines {
@@ -270,6 +280,11 @@ impl KernelPipelines {
             gemm_tiled_f16: create_pipeline(device, &gemm_library, "gemm_tiled_f16_kernel")?,
             gemm_f16w_f32a: create_pipeline(device, &native_gemm_library, "gemm_f16w_f32a_kernel")?,
             gemm_q8w: create_pipeline(device, &native_gemm_library, "gemm_q8w_f16a_kernel")?,
+            // Token pruning
+            compute_token_distances_f16: p("compute_token_distances_f16_kernel")?,
+            compute_token_distances: p("compute_token_distances_kernel")?,
+            gather_tokens_f16: p("gather_tokens_f16_kernel")?,
+            gather_tokens: p("gather_tokens_kernel")?,
         })
     }
 }
@@ -996,6 +1011,71 @@ impl MetalDriver {
         }
         .ok_or_else(|| crate::Error::Metal("failed to create buffer from f32 data".into()))?;
         Ok(MetalTensor::new(buffer, 0))
+    }
+
+    /// Create a Metal buffer from i32 data (for token indices).
+    pub fn create_buffer_from_i32(&self, data: &[i32]) -> crate::Result<MetalTensor> {
+        let size = (data.len() * 4) as NSUInteger;
+        let buffer = unsafe {
+            self.device.newBufferWithBytes_length_options(
+                core::ptr::NonNull::new(data.as_ptr() as *mut core::ffi::c_void).unwrap(),
+                size,
+                MTLResourceOptions::StorageModeShared,
+            )
+        }
+        .ok_or_else(|| crate::Error::Metal("failed to create buffer from i32 data".into()))?;
+        Ok(MetalTensor::new(buffer, 0))
+    }
+
+    /// Read FP32 data from a Metal buffer back to CPU (unified memory — no copy needed).
+    pub fn read_f32(&self, tensor: &MetalTensor, n: usize) -> crate::Result<Vec<f32>> {
+        let ptr = tensor.buffer.contents().as_ptr() as *const f32;
+        let offset_elems = tensor.offset / 4;
+        let slice = unsafe { core::slice::from_raw_parts(ptr.add(offset_elems), n) };
+        Ok(slice.to_vec())
+    }
+
+    /// Compute per-sequence token distances from mean (FP16 hidden → FP32 distances).
+    pub fn dispatch_token_distances_f16(
+        &self,
+        hidden: &MetalTensor,
+        distances: &mut MetalTensor,
+        cu_seqlens: &MetalTensor,
+        batch: usize,
+        total_tokens: usize,
+        hidden_dim: usize,
+    ) -> crate::Result<()> {
+        self.run_compute("token-distances-f16", |enc| {
+            enc.setComputePipelineState(&self.kernels.compute_token_distances_f16);
+            set_buffer(enc, &hidden.buffer, hidden.offset, 0);
+            set_buffer(enc, &distances.buffer, distances.offset, 1);
+            set_buffer(enc, &cu_seqlens.buffer, cu_seqlens.offset, 2);
+            set_i32_param(enc, batch as i32, 3);
+            set_i32_param(enc, hidden_dim as i32, 4);
+            dispatch_1d(enc, &self.kernels.compute_token_distances_f16, total_tokens);
+            Ok(())
+        })
+    }
+
+    /// Compact hidden states by gathering selected indices (FP16).
+    pub fn dispatch_gather_tokens_f16(
+        &self,
+        src: &MetalTensor,
+        dst: &mut MetalTensor,
+        indices: &MetalTensor,
+        new_total: usize,
+        hidden_dim: usize,
+    ) -> crate::Result<()> {
+        self.run_compute("gather-tokens-f16", |enc| {
+            enc.setComputePipelineState(&self.kernels.gather_tokens_f16);
+            set_buffer(enc, &src.buffer, src.offset, 0);
+            set_buffer(enc, &dst.buffer, dst.offset, 1);
+            set_buffer(enc, &indices.buffer, indices.offset, 2);
+            set_i32_param(enc, new_total as i32, 3);
+            set_i32_param(enc, hidden_dim as i32, 4);
+            dispatch_1d(enc, &self.kernels.gather_tokens_f16, new_total * hidden_dim);
+            Ok(())
+        })
     }
 
     pub fn ensure_fp16(&self, tensor: &MetalTensor, num_elements: usize) -> crate::Result<()> {
@@ -3244,6 +3324,52 @@ impl Driver for MetalDriver {
     // =======================================================================
     // INT8 weight quantization + dispatch
     // =======================================================================
+
+    // =======================================================================
+    // Token pruning
+    // =======================================================================
+
+    fn compute_token_distances_f16(
+        &self,
+        hidden: &MetalTensor,
+        distances: &mut MetalTensor,
+        cu_seqlens: &MetalTensor,
+        batch: usize,
+        total_tokens: usize,
+        hidden_dim: usize,
+    ) -> crate::Result<()> {
+        self.dispatch_token_distances_f16(
+            hidden,
+            distances,
+            cu_seqlens,
+            batch,
+            total_tokens,
+            hidden_dim,
+        )
+    }
+
+    fn gather_tokens_f16(
+        &self,
+        src: &MetalTensor,
+        dst: &mut MetalTensor,
+        indices: &MetalTensor,
+        new_total: usize,
+        hidden_dim: usize,
+    ) -> crate::Result<()> {
+        self.dispatch_gather_tokens_f16(src, dst, indices, new_total, hidden_dim)
+    }
+
+    fn read_f32(&self, tensor: &MetalTensor, n: usize) -> crate::Result<Vec<f32>> {
+        MetalDriver::read_f32(self, tensor, n)
+    }
+
+    fn create_index_tensor(&self, data: &[i32]) -> crate::Result<MetalTensor> {
+        self.create_buffer_from_i32(data)
+    }
+
+    fn create_f32_tensor(&self, data: &[f32]) -> crate::Result<MetalTensor> {
+        self.create_buffer_from_f32(data)
+    }
 }
 
 // INT8 weight quantization + dispatch (Metal-specific, not on Driver trait).

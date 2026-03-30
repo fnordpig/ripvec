@@ -768,9 +768,9 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
         let batch = encodings.len();
         let hidden = w.hidden_dim;
 
-        let inputs = driver.prepare_batch_unpadded(encodings)?;
-        let max_seq = inputs.max_seq;
-        let total_tokens = inputs.total_tokens;
+        let mut inputs = driver.prepare_batch_unpadded(encodings)?;
+        let mut max_seq = inputs.max_seq;
+        let mut total_tokens = inputs.total_tokens;
 
         // Enter batched mode: all GPU ops encode into ONE command buffer.
         driver.begin_batch()?;
@@ -789,7 +789,7 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
             w.layer_norm_eps,
         )?;
 
-        let g = EncoderGeometry {
+        let mut g = EncoderGeometry {
             batch,
             max_seq,
             total_tokens,
@@ -831,7 +831,7 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
             let mut hidden_f16 = driver.alloc_zeros_f16(total_tokens * hidden)?;
             driver.f32_to_f16(&mut hidden_f16, &hidden_states, total_tokens * hidden)?;
 
-            // 22 layers — ALL in FP16. Zero conversions.
+            // 22 layers — ALL in FP16. Token pruning at layer 11 boundary.
             for (li, layer) in w.layers[..num_layers].iter().enumerate() {
                 if self.skip_layers.contains(&li) {
                     continue;
@@ -850,6 +850,117 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
                     attn_scores_residual_f16(driver, &q, &k, &v, &hidden_f16, layer, &inputs, &g)?;
                 hidden_f16 = ffn_sublayer_f16(driver, &attn_output, layer, &g, &w.zero_bias)?;
                 driver.restore_pool_cursor(saved);
+
+                // Token pruning at layer 11 boundary (after layer index 10).
+                if li == 10 && self.prune_ratio > 0.0 {
+                    // Build cu_seqlens for the distance kernel
+                    let cu: Vec<i32> = std::iter::once(0i32)
+                        .chain(g.seq_lengths.iter().scan(0i32, |acc, &len| {
+                            *acc += len as i32;
+                            Some(*acc)
+                        }))
+                        .collect();
+                    let cu_tensor = driver.create_index_tensor(&cu)?;
+
+                    // 1. Dispatch distance kernel on GPU
+                    let mut distances = driver.alloc_zeros(g.total_tokens)?;
+                    driver.compute_token_distances_f16(
+                        &hidden_f16,
+                        &mut distances,
+                        &cu_tensor,
+                        g.batch,
+                        g.total_tokens,
+                        g.hidden,
+                    )?;
+
+                    // 2. Flush GPU → CPU sync (pool cursors preserved)
+                    driver.flush_batch()?;
+
+                    // 3. Read distances, sort per-sequence, build index list
+                    let dist_vec = driver.read_f32(&distances, g.total_tokens)?;
+                    let mut cursor = 0usize;
+                    let mut new_seq_lengths = Vec::with_capacity(g.batch);
+                    let mut selected_indices = Vec::new();
+
+                    for &seq_len in &g.seq_lengths {
+                        let seq_start = cursor;
+                        let seq_end = cursor + seq_len;
+
+                        let mut token_dists: Vec<(usize, f32)> =
+                            (seq_start..seq_end).map(|i| (i, dist_vec[i])).collect();
+                        // Sort descending — keep tokens farthest from mean
+                        token_dists.sort_unstable_by(|a, b| {
+                            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+
+                        let keep =
+                            ((seq_len as f32 * (1.0 - self.prune_ratio)).ceil() as usize).max(1);
+                        let mut kept: Vec<usize> =
+                            token_dists[..keep].iter().map(|(idx, _)| *idx).collect();
+                        kept.sort_unstable(); // Preserve original token order
+
+                        new_seq_lengths.push(keep);
+                        selected_indices.extend(kept);
+                        cursor = seq_end;
+                    }
+
+                    let new_total = selected_indices.len();
+                    let indices_i32: Vec<i32> =
+                        selected_indices.iter().map(|&i| i as i32).collect();
+
+                    // 4. Upload indices, gather tokens into compacted buffer
+                    let indices_tensor = driver.create_index_tensor(&indices_i32)?;
+                    let mut new_hidden = driver.alloc_zeros_f16(new_total * g.hidden)?;
+                    driver.gather_tokens_f16(
+                        &hidden_f16,
+                        &mut new_hidden,
+                        &indices_tensor,
+                        new_total,
+                        g.hidden,
+                    )?;
+                    hidden_f16 = new_hidden;
+
+                    // 5. Rebuild geometry + masks for remaining layers
+                    let new_max_seq = new_seq_lengths
+                        .iter()
+                        .copied()
+                        .max()
+                        .unwrap_or(1)
+                        .next_multiple_of(8);
+                    total_tokens = new_total;
+                    max_seq = new_max_seq;
+
+                    g = EncoderGeometry {
+                        batch: g.batch,
+                        max_seq: new_max_seq,
+                        total_tokens: new_total,
+                        padded_tokens: g.batch * new_max_seq,
+                        seq_lengths: new_seq_lengths.clone(),
+                        hidden: g.hidden,
+                        num_heads: g.num_heads,
+                        head_dim: g.head_dim,
+                        intermediate: g.intermediate,
+                        local_window: g.local_window,
+                        scale: g.scale,
+                        eps: g.eps,
+                    };
+
+                    // Rebuild float_mask and pooling_mask for new geometry
+                    let padded_total = g.batch * new_max_seq;
+                    let mut float_mask_data = vec![-65504.0f32; padded_total];
+                    let mut pooling_mask_data = vec![0.0f32; padded_total];
+                    for (b, &len) in new_seq_lengths.iter().enumerate() {
+                        for i in 0..len {
+                            float_mask_data[b * new_max_seq + i] = 0.0;
+                            pooling_mask_data[b * new_max_seq + i] = 1.0;
+                        }
+                    }
+                    inputs.float_mask = driver.create_f32_tensor(&float_mask_data)?;
+                    inputs.pooling_mask = driver.create_f32_tensor(&pooling_mask_data)?;
+                    inputs.seq_lengths = new_seq_lengths;
+                    inputs.max_seq = new_max_seq;
+                    inputs.total_tokens = new_total;
+                }
             }
 
             // ONLY conversion #2: F16 → F32 before final LN + pooling.

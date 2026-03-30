@@ -1,0 +1,12 @@
+[
+  {
+    "label": "mps-22L",
+    "cfg": "mps",
+    "layers": 22,
+    "throughput": 92.4,
+    "wall_time": 26.92,
+    "thermal_before": "speed=100% gpu=0% mem=9.4GB",
+    "thermal_after": "speed=100% gpu=91% mem=9.8GB",
+    "returncode": 0
+  }
+]
