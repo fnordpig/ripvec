@@ -67,10 +67,8 @@ pub struct MetalTensor {
     /// uses this buffer with `MPSDataType::Float16` for the weight matrix,
     /// halving memory bandwidth.
     pub fp16: std::cell::RefCell<Option<Retained<ProtocolObject<dyn MTLBuffer>>>>,
-    /// Optional INT8 quantized data + per-row scale. Created by `quantize_q8`.
+    /// Optional block_q8_0 quantized weights (scales embedded in blocks).
     pub q8: std::cell::RefCell<Option<Retained<ProtocolObject<dyn MTLBuffer>>>>,
-    /// Per-row float scales for INT8 dequantization.
-    pub q8_scales: std::cell::RefCell<Option<Retained<ProtocolObject<dyn MTLBuffer>>>>,
 }
 
 impl MetalTensor {
@@ -81,7 +79,6 @@ impl MetalTensor {
             offset,
             fp16: std::cell::RefCell::new(None),
             q8: std::cell::RefCell::new(None),
-            q8_scales: std::cell::RefCell::new(None),
         }
     }
 }
@@ -1255,25 +1252,18 @@ impl MetalDriver {
             self.ensure_fp16(&layer.mlp_wo_weight, wo_elems)?;
 
             if use_q8 {
-                let (q8, scales) =
-                    self.quantize_weights_q8(&layer.qkv_weight, 3 * hidden, hidden)?;
+                let q8 = self.quantize_weights_q8(&layer.qkv_weight, 3 * hidden, hidden)?;
                 *layer.qkv_weight.q8.borrow_mut() = Some(q8.buffer.clone());
-                *layer.qkv_weight.q8_scales.borrow_mut() = Some(scales.buffer.clone());
 
-                let (q8, scales) =
-                    self.quantize_weights_q8(&layer.output_weight, hidden, hidden)?;
+                let q8 = self.quantize_weights_q8(&layer.output_weight, hidden, hidden)?;
                 *layer.output_weight.q8.borrow_mut() = Some(q8.buffer.clone());
-                *layer.output_weight.q8_scales.borrow_mut() = Some(scales.buffer.clone());
 
-                let (q8, scales) =
+                let q8 =
                     self.quantize_weights_q8(&layer.mlp_wi_weight, 2 * intermediate, hidden)?;
                 *layer.mlp_wi_weight.q8.borrow_mut() = Some(q8.buffer.clone());
-                *layer.mlp_wi_weight.q8_scales.borrow_mut() = Some(scales.buffer.clone());
 
-                let (q8, scales) =
-                    self.quantize_weights_q8(&layer.mlp_wo_weight, intermediate, hidden)?;
+                let q8 = self.quantize_weights_q8(&layer.mlp_wo_weight, intermediate, hidden)?;
                 *layer.mlp_wo_weight.q8.borrow_mut() = Some(q8.buffer.clone());
-                *layer.mlp_wo_weight.q8_scales.borrow_mut() = Some(scales.buffer.clone());
             }
         }
 
@@ -2796,15 +2786,13 @@ impl Driver for MetalDriver {
             (&*b.buffer as &ProtocolObject<dyn MTLBuffer>, b.offset)
         };
 
-        // INT8 quantized path: if B has Q8 data, dispatch the INT8 kernel.
-        // This eliminates MPS transitions AND halves weight bandwidth.
+        // INT8 block-quantized path: if B has Q8 data (block_q8_0 format),
+        // dispatch the INT8 kernel. Eliminates MPS transitions + halves weight bandwidth.
         {
             let q8_ref = b.q8.borrow();
-            let q8_scales_ref = b.q8_scales.borrow();
-            if let (Some(q8_buf), Some(scales_buf)) = (&*q8_ref, &*q8_scales_ref) {
+            if let Some(q8_buf) = &*q8_ref {
                 let q8_tensor = MetalTensor::new(q8_buf.clone(), 0);
-                let scales_tensor = MetalTensor::new(scales_buf.clone(), 0);
-                return self.gemm_q8(a, &q8_tensor, &scales_tensor, output, m, n, k, transpose_b);
+                return self.gemm_q8(a, &q8_tensor, output, m, n, k, transpose_b);
             }
         }
 
@@ -3252,24 +3240,21 @@ impl Driver for MetalDriver {
 
 // INT8 weight quantization + dispatch (Metal-specific, not on Driver trait).
 impl MetalDriver {
-    /// Quantize an FP16 weight tensor to INT8 + per-row float scales.
+    /// Quantize an FP16 weight tensor to block_q8_0 format (llama.cpp compatible).
     ///
     /// Input: `weights` — a [`MetalTensor`] whose `.fp16` field (or main buffer)
     /// contains `half[N * K]` in row-major order (N rows, K elements each).
+    /// K must be a multiple of 32.
     ///
-    /// Output: `(q8_tensor, scales_tensor)` where
-    /// - `q8_tensor` is an `MTLBuffer`-backed [`MetalTensor`] with `int8_t[N * K]`
-    /// - `scales_tensor` is an `MTLBuffer`-backed [`MetalTensor`] with `float[N]`
-    ///
-    /// Per-row symmetric quantization: `scale = max_abs(row) / 127`.
-    /// `q = clamp(round(x / scale), -127, 127)`.
+    /// Output: `MetalTensor` with `block_q8_0[N * K/32]` — each block is 34 bytes
+    /// (2 byte half scale + 32 int8 values). Per-block symmetric quantization.
     #[expect(unsafe_code, reason = "Metal SharedMode buffer contents access")]
     pub fn quantize_weights_q8(
         &self,
         weights: &MetalTensor,
         n: usize,
         k: usize,
-    ) -> crate::Result<(MetalTensor, MetalTensor)> {
+    ) -> crate::Result<MetalTensor> {
         // Prefer the pre-converted FP16 buffer when available.
         let fp16_borrow = weights.fp16.borrow();
         let (fp16_buf, fp16_off_bytes) = if let Some(ref buf) = *fp16_borrow {
@@ -3315,67 +3300,79 @@ impl MetalDriver {
             }
         }
 
-        // Quantize row-by-row.
-        let mut q8_data: Vec<i8> = Vec::with_capacity(n * k);
-        let mut scales: Vec<f32> = Vec::with_capacity(n);
+        // Quantize in block_q8_0 format: 32-element blocks, each with own half scale.
+        assert!(k % 32 == 0, "K must be a multiple of 32 for block_q8_0");
+        let blocks_per_row = k / 32;
+        let total_blocks = n * blocks_per_row;
+        let block_size = 34_usize; // 2 (half d) + 32 (int8 qs)
 
-        for row in 0..n {
-            let row_slice = &fp16_raw[row * k..(row + 1) * k];
-
-            let max_abs = row_slice
-                .iter()
-                .map(|&h| f16_to_f32(h).abs())
-                .fold(0.0f32, f32::max);
-
-            let scale = if max_abs == 0.0 {
-                1.0f32
+        // FP32 → FP16 for the scale value
+        #[inline]
+        fn f32_to_f16(f: f32) -> u16 {
+            let bits = f.to_bits();
+            let sign = (bits >> 16) & 0x8000;
+            let exp = ((bits >> 23) & 0xFF) as i32 - 127 + 15;
+            let mant = (bits >> 13) & 0x3FF;
+            if exp <= 0 {
+                (sign | 0) as u16 // flush subnormals to zero
+            } else if exp >= 31 {
+                (sign | 0x7C00) as u16 // inf
             } else {
-                max_abs / 127.0
-            };
-            scales.push(scale);
-
-            for &h in row_slice {
-                let f = f16_to_f32(h);
-                let q = (f / scale).round().clamp(-127.0, 127.0) as i8;
-                q8_data.push(q);
+                (sign | ((exp as u32) << 10) | mant) as u16
             }
         }
 
-        // Upload INT8 data into a shared Metal buffer.
-        let q8_size = (n * k) as NSUInteger;
+        let mut buf: Vec<u8> = Vec::with_capacity(total_blocks * block_size);
+
+        for row in 0..n {
+            let row_data = &fp16_raw[row * k..(row + 1) * k];
+            for blk in 0..blocks_per_row {
+                let start = blk * 32;
+                // Find max abs in this 32-element block
+                let mut max_abs: f32 = 0.0;
+                for i in 0..32 {
+                    let v = f16_to_f32(row_data[start + i]).abs();
+                    if v > max_abs {
+                        max_abs = v;
+                    }
+                }
+                let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 127.0 };
+                let inv_scale = 1.0 / scale;
+
+                // Write half d (2 bytes, little-endian)
+                buf.extend_from_slice(&f32_to_f16(scale).to_le_bytes());
+
+                // Write 32 quantized int8 values
+                for i in 0..32 {
+                    let v = f16_to_f32(row_data[start + i]);
+                    let q = (v * inv_scale).round().clamp(-127.0, 127.0) as i8;
+                    buf.push(q as u8);
+                }
+            }
+        }
+
+        // Upload to Metal buffer
+        let buf_size = buf.len() as NSUInteger;
         let q8_buf = unsafe {
             self.device.newBufferWithBytes_length_options(
-                std::ptr::NonNull::new(q8_data.as_ptr() as *mut _)
-                    .ok_or_else(|| crate::Error::Metal("q8 data ptr is null".into()))?,
-                q8_size,
+                std::ptr::NonNull::new(buf.as_ptr() as *mut _)
+                    .ok_or_else(|| crate::Error::Metal("q8 block data null".into()))?,
+                buf_size,
                 MTLResourceOptions::StorageModeShared,
             )
         }
-        .ok_or_else(|| crate::Error::Metal(format!("q8 buffer alloc failed ({} bytes)", n * k)))?;
+        .ok_or_else(|| crate::Error::Metal(format!("q8 buffer failed ({buf_size} bytes)")))?;
 
-        // Upload per-row scales into a shared Metal buffer.
-        let scales_size = (n * core::mem::size_of::<f32>()) as NSUInteger;
-        let scales_buf = unsafe {
-            self.device.newBufferWithBytes_length_options(
-                std::ptr::NonNull::new(scales.as_ptr() as *mut _)
-                    .ok_or_else(|| crate::Error::Metal("scales ptr is null".into()))?,
-                scales_size,
-                MTLResourceOptions::StorageModeShared,
-            )
-        }
-        .ok_or_else(|| crate::Error::Metal(format!("scales buffer alloc failed ({n} floats)")))?;
-
-        Ok((MetalTensor::new(q8_buf, 0), MetalTensor::new(scales_buf, 0)))
+        Ok(MetalTensor::new(q8_buf, 0))
     }
 
-    /// Dispatch the INT8-weight GEMM kernel.
+    /// Dispatch the INT8-weight GEMM kernel (block_q8_0 format).
     ///
     /// Computes `output_f16 = A_f16 @ B_q8.T` (when `transpose_b = true`)
-    /// dequantizing on-the-fly using per-row scales in `b_scales`.
+    /// dequantizing on-the-fly using per-block scales embedded in block_q8_0.
     ///
     /// - `a_f16`: FP16 activations `[M, K]`
-    /// - `b_q8`: INT8 quantized weights `[N, K]` (transposed weight matrix)
-    /// - `b_scales`: `float[N]` per-row dequantization scales
+    /// - `b_q8`: block_q8_0 quantized weights `[N * K/32]` blocks (34 bytes each)
     /// - `output_f16`: FP16 output `[M, N]`
     #[expect(
         clippy::many_single_char_names,
@@ -3384,14 +3381,14 @@ impl MetalDriver {
     pub fn gemm_q8(
         &self,
         a_f16: &MetalTensor,
-        b_q8: &MetalTensor,
-        b_scales: &MetalTensor,
+        b_q8: &MetalTensor, // block_q8_0 data (scales embedded in blocks)
         output_f16: &mut MetalTensor,
         m: usize,
         n: usize,
         k: usize,
         transpose_b: bool,
     ) -> crate::Result<()> {
+        let blocks_per_row = k / 32;
         self.run_compute("gemm-q8w-f16a", |enc| {
             enc.setComputePipelineState(&self.kernels.gemm_q8w);
             set_buffer(enc, &a_f16.buffer, a_f16.offset, 0);
@@ -3401,18 +3398,9 @@ impl MetalDriver {
             set_u32_param(enc, n as u32, 4);
             set_u32_param(enc, k as u32, 5);
             set_u32_param(enc, if transpose_b { 1 } else { 0 }, 6);
-            set_u32_param(enc, (m * k) as u32, 7);
-            set_u32_param(
-                enc,
-                if transpose_b {
-                    (n * k) as u32
-                } else {
-                    (k * n) as u32
-                },
-                8,
-            );
-            set_u32_param(enc, (m * n) as u32, 9);
-            set_buffer(enc, &b_scales.buffer, b_scales.offset, 10);
+            set_u32_param(enc, (m * k) as u32, 7); // stride_A (half elements)
+            set_u32_param(enc, blocks_per_row as u32, 8); // stride_B (blocks per row)
+            set_u32_param(enc, (m * n) as u32, 9); // stride_C (half elements)
             let grid = MTLSize {
                 width: n.div_ceil(64),
                 height: m.div_ceil(64),
@@ -3524,21 +3512,22 @@ mod tests {
         );
     }
 
-    /// INT8 weight GEMM correctness test.
-    /// C_f16[M,N] = A_f16[M,K] × B_q8^T[N,K] with per-row dequant scales.
+    /// INT8 weight GEMM correctness test (block_q8_0 format).
+    /// C_f16[M,N] = A_f16[M,K] × B_q8^T[N,K] with per-block dequant.
     #[test]
     #[expect(unsafe_code, reason = "Metal buffer readback requires unsafe")]
     fn gemm_q8_correctness() {
         let driver = MetalDriver::new().unwrap();
-        let m: usize = 2;
-        let n: usize = 64;
-        let k: usize = 64;
+        let m: usize = 128;
+        let n: usize = 768;
+        let k: usize = 768;
 
         // --- Build A (FP16): varying values across K to catch axis transposition ---
+        // Keep values small to avoid FP16 overflow at large K (max ~65504).
         let mut a_f32: Vec<f32> = vec![0.0; m * k];
         for i in 0..m {
             for j in 0..k {
-                a_f32[i * k + j] = ((i + 1) as f32) * 0.01 + (j as f32) * 0.001;
+                a_f32[i * k + j] = ((i % 8 + 1) as f32) * 0.001 + (j as f32) * 0.0001;
             }
         }
 
@@ -3578,29 +3567,47 @@ mod tests {
 
         let a_f16: Vec<u16> = a_f32.iter().map(|&f| f32_to_f16(f)).collect();
 
-        // --- Build B (INT8): varying values across both N and K ---
-        let mut b_q8: Vec<i8> = vec![0i8; n * k];
-        let mut scales: Vec<f32> = vec![0.0f32; n];
+        // --- Build B in block_q8_0 format ---
+        // Each block: 2 bytes (half scale) + 32 bytes (int8 values) = 34 bytes.
+        assert!(k % 32 == 0);
+        let blocks_per_row = k / 32;
+        let block_size = 34_usize;
+
+        // Build raw q8 values and per-block scales for CPU reference,
+        // plus the packed block_q8_0 byte stream for the GPU.
+        let mut b_q8_vals: Vec<i8> = vec![0i8; n * k];
+        let mut block_scales_f16: Vec<u16> = vec![0u16; n * blocks_per_row];
+        let mut b_bytes: Vec<u8> = Vec::with_capacity(n * blocks_per_row * block_size);
+
         for j in 0..n {
-            let max_abs = k as f32;
-            scales[j] = max_abs / 127.0;
-            for col in 0..k {
-                let f = ((j + 1) as f32) * 0.1 + (col as f32) * 0.5;
-                b_q8[j * k + col] = (f / scales[j]).round().clamp(-127.0, 127.0) as i8;
+            for blk in 0..blocks_per_row {
+                let scale = 0.005 + (j % 10) as f32 * 0.001 + (blk % 3) as f32 * 0.0005;
+                let scale_f16 = f32_to_f16(scale);
+                block_scales_f16[j * blocks_per_row + blk] = scale_f16;
+
+                // Write half d (2 bytes, little-endian)
+                b_bytes.extend_from_slice(&scale_f16.to_le_bytes());
+
+                // Write 32 quantized int8 values
+                for i in 0..32 {
+                    let col = blk * 32 + i;
+                    let q = ((col as i32 * 3 + j as i32 * 7) % 255 - 127) as i8;
+                    b_q8_vals[j * k + col] = q;
+                    b_bytes.push(q as u8);
+                }
             }
         }
 
-        // --- Expected output: CPU reference ---
-        // C[i,j] = sum_over_k( A_f16[i,k] * (B_q8[j,k] * scales[j]) )
-        //        = A_row_sum * (B_val * scale)
-        // where A_row_sum = sum of k values = k * (i+1)*0.1
+        // --- Expected output: CPU reference using per-block scales ---
         let mut expected = vec![0.0f32; m * n];
         for i in 0..m {
             for j in 0..n {
                 let mut sum = 0.0f64;
                 for kk in 0..k {
                     let a_val = f16_to_f32(a_f16[i * k + kk]) as f64;
-                    let b_val = (b_q8[j * k + kk] as f64) * (scales[j] as f64);
+                    let blk_idx = kk / 32;
+                    let scale = f16_to_f32(block_scales_f16[j * blocks_per_row + blk_idx]) as f64;
+                    let b_val = (b_q8_vals[j * k + kk] as f64) * scale;
                     sum += a_val * b_val;
                 }
                 expected[i * n + j] = sum as f32;
@@ -3624,41 +3631,20 @@ mod tests {
             driver
                 .device
                 .newBufferWithBytes_length_options(
-                    std::ptr::NonNull::new(b_q8.as_ptr() as *mut _).unwrap(),
-                    (n * k) as NSUInteger,
+                    std::ptr::NonNull::new(b_bytes.as_ptr() as *mut _).unwrap(),
+                    b_bytes.len() as NSUInteger,
                     MTLResourceOptions::StorageModeShared,
                 )
                 .unwrap()
         };
         let b_tensor = MetalTensor::new(b_buf, 0);
 
-        let scales_buf = unsafe {
-            driver
-                .device
-                .newBufferWithBytes_length_options(
-                    std::ptr::NonNull::new(scales.as_ptr() as *mut _).unwrap(),
-                    (n * 4) as NSUInteger,
-                    MTLResourceOptions::StorageModeShared,
-                )
-                .unwrap()
-        };
-        let scales_tensor = MetalTensor::new(scales_buf, 0);
-
         // Output buffer: FP16, M*N elements
         let mut output_tensor = driver.alloc_f16_tensor(m * n).unwrap();
 
         // --- Dispatch ---
         driver
-            .gemm_q8(
-                &a_tensor,
-                &b_tensor,
-                &scales_tensor,
-                &mut output_tensor,
-                m,
-                n,
-                k,
-                true,
-            )
+            .gemm_q8(&a_tensor, &b_tensor, &mut output_tensor, m, n, k, true)
             .unwrap();
 
         // --- Readback FP16 output ---

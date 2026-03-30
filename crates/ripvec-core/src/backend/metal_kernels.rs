@@ -3033,31 +3033,37 @@ kernel void gemm_f16w_f32a_kernel(
 // Same architecture as gemm_f16w_f32a_kernel but B is int8_t* + per-row scale.
 // Dequantize: half_val = half(float(q) * scale[n])
 // ---------------------------------------------------------------------------
+// Block Q8_0: 32 quantized int8 values + half scale. 34 bytes per block.
+// Matches llama.cpp's block_q8_0 layout.
+struct block_q8_0 {
+    half d;         // scale factor for this block
+    int8_t qs[32];  // quantized values
+};
+
 kernel void gemm_q8w_f16a_kernel(
     device float* A_raw         [[buffer(0)]],
-    device float* B_raw         [[buffer(1)]],   // actually int8_t*
+    device float* B_raw         [[buffer(1)]],   // actually block_q8_0*
     device float* C_raw         [[buffer(2)]],   // actually half*
     constant uint& M            [[buffer(3)]],
     constant uint& N            [[buffer(4)]],
     constant uint& K            [[buffer(5)]],
     constant uint& transB       [[buffer(6)]],
     constant uint& stride_A     [[buffer(7)]],
-    constant uint& stride_B     [[buffer(8)]],
+    constant uint& stride_B     [[buffer(8)]],  // in block_q8_0 units per row: K/32
     constant uint& stride_C     [[buffer(9)]],
-    device float* scales_raw    [[buffer(10)]],   // per-row scales, float[N]
     uint3 tg_pos                [[threadgroup_position_in_grid]],
     ushort sgitg                [[simdgroup_index_in_threadgroup]],
     ushort lane_id              [[thread_index_in_simdgroup]],
     ushort tiitg                [[thread_index_in_threadgroup]]
 ) {
     device half* A = (device half*)A_raw;
-    device int8_t* B_q8 = (device int8_t*)B_raw;
+    device block_q8_0* B_q8 = (device block_q8_0*)B_raw;
     device half* C = (device half*)C_raw;
-    device float* scales = scales_raw;
 
     uint batch_idx = tg_pos.z;
     device half* A_batch = A + batch_idx * stride_A;
-    device int8_t* B_q8_batch = B_q8 + batch_idx * stride_B;
+    // stride_B is blocks per row (K/32). Each row of B has stride_B blocks.
+    device block_q8_0* B_q8_batch = B_q8 + batch_idx * N * stride_B;
     device half* C_batch = C + batch_idx * stride_C;
 
     uint m_start = tg_pos.y * 64;
@@ -3075,9 +3081,9 @@ kernel void gemm_q8w_f16a_kernel(
     short il1 = short(tiitg % NL1);
 
     device half* x = A_batch + uint(m_start + lr0) * K;
-    // B_q8 is [N, K] for transB=true, so row lr1 starts at (n_start + lr1) * K
-    device int8_t* y_q8 = B_q8_batch + uint(n_start + lr1) * K;
-    float b_scale = (n_start + lr1 < N) ? scales[n_start + lr1] : 0.0f;
+    // B_q8 row lr1: (n_start + lr1) * blocks_per_row blocks from start
+    uint blocks_per_row = K / 32;
+    device block_q8_0* y_row = B_q8_batch + uint(n_start + lr1) * blocks_per_row;
 
     simdgroup_float8x8 mc[16];
     for (short i = 0; i < 16; i++) {
@@ -3101,27 +3107,34 @@ kernel void gemm_q8w_f16a_kernel(
             }
         }
 
-        // Load B (INT8 + dequantize) into sb: K-rows, N-cols.
-        // Mirrors A-loading: NL1=2, each thread loads 16 K-elements for one
-        // of 64 N-rows, filling all 32 blocks (4 K-blocks × 8 N-blocks).
+        // Load B (block_q8_0 + dequantize) into sb: K-rows, N-cols.
+        // Each thread loads 16 K-elements for one N-row.
+        // BK=32 = one full block_q8_0. The 16 elements this thread loads
+        // come from the block at (loop_k/32 + il1)-th block of this row.
+        // The block's scale is read once, then 16 qs values are dequantized.
         {
-            short sy_b = lr1 / 8;    // N-block index (0..7)
-            short ly_n = lr1 % 8;    // N-within-block (0..7)
+            short sy_b = lr1 / 8;
+            short ly_n = lr1 % 8;
             for (short i = 0; i < 16; i++) {
-                short sx_b = short(2 * il1 + i / 8);  // K-block index (0..3)
-                short lx_k = short(i % 8);             // K-within-block (0..7)
+                short sx_b = short(2 * il1 + i / 8);
+                short lx_k = short(i % 8);
                 short ib = short(8 * sx_b + sy_b);
                 half val = half(0.0h);
                 if (loop_k + 16 * il1 + i < K && n_start + lr1 < N) {
-                    int8_t q = *(y_q8 + 16 * il1 + i);
-                    val = half(float(q) * b_scale);
+                    // Which block within this row? K position = loop_k + 16*il1 + i
+                    uint k_pos = loop_k + 16 * il1 + i;
+                    uint block_idx = k_pos / 32;
+                    uint within_block = k_pos % 32;
+                    device block_q8_0* blk = y_row + block_idx;
+                    float d = float(blk->d);
+                    int8_t q = blk->qs[within_block];
+                    val = half(float(q) * d);
                 }
                 *(sb + 64 * ib + 8 * lx_k + ly_n) = val;
             }
         }
 
         x += 32;
-        y_q8 += 32;
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
