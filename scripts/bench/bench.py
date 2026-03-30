@@ -457,7 +457,7 @@ def run_benchmark(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        timeout=300,  # 5 min max per run
+        timeout=600,  # 10 min max per run
     )
     wall_time = time.monotonic() - t0
     ticker.stop()
