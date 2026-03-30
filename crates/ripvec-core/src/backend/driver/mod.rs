@@ -570,6 +570,22 @@ pub trait Driver: Send + Sync {
         ))
     }
 
+    /// Mixed-precision GEMM: FP16 inputs → FP32 output via native simdgroup ops.
+    fn gemm_mixed(
+        &self,
+        _a_f16: &Self::Tensor,
+        _b_f16: &Self::Tensor,
+        _output_f32: &mut Self::Tensor,
+        _m: usize,
+        _n: usize,
+        _k: usize,
+        _transpose_b: bool,
+    ) -> crate::Result<()> {
+        Err(crate::Error::Metal(
+            "gemm_mixed not supported by this driver".into(),
+        ))
+    }
+
     /// FP16 GEMM: `output = A * B` (or `A * B^T`). All tensors are half.
     fn gemm_f16(
         &self,

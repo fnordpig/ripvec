@@ -1,0 +1,12 @@
+[
+  {
+    "label": "mps-3L",
+    "cfg": "mps",
+    "layers": 3,
+    "throughput": 446.5,
+    "wall_time": 6.48,
+    "thermal_before": "speed=100% gpu=0% mem=19.2GB",
+    "thermal_after": "speed=100% gpu=77% mem=14.8GB",
+    "returncode": 0
+  }
+]

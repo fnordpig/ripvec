@@ -2645,6 +2645,60 @@ impl Driver for MetalDriver {
     }
 
     // =======================================================================
+    fn gemm_mixed(
+        &self,
+        a_f16: &MetalTensor,
+        b_f16: &MetalTensor,
+        output_f32: &mut MetalTensor,
+        m: usize,
+        n: usize,
+        k: usize,
+        transpose_b: bool,
+    ) -> crate::Result<()> {
+        let b_fp16_ref = b_f16.fp16.borrow();
+        let (b_buf, b_off) = if let Some(ref fp16_buf) = *b_fp16_ref {
+            (fp16_buf as &ProtocolObject<dyn MTLBuffer>, 0)
+        } else {
+            (
+                &*b_f16.buffer as &ProtocolObject<dyn MTLBuffer>,
+                b_f16.offset,
+            )
+        };
+        self.run_compute("gemm-mixed-f16-to-f32", |enc| {
+            enc.setComputePipelineState(&self.kernels.gemm_f16w_f32a);
+            set_buffer(enc, &a_f16.buffer, a_f16.offset, 0);
+            set_buffer(enc, b_buf, b_off, 1);
+            set_buffer(enc, &output_f32.buffer, output_f32.offset, 2);
+            set_u32_param(enc, m as u32, 3);
+            set_u32_param(enc, n as u32, 4);
+            set_u32_param(enc, k as u32, 5);
+            set_u32_param(enc, if transpose_b { 1 } else { 0 }, 6);
+            set_u32_param(enc, (m * k) as u32, 7);
+            set_u32_param(
+                enc,
+                if transpose_b {
+                    (n * k) as u32
+                } else {
+                    (k * n) as u32
+                },
+                8,
+            );
+            set_u32_param(enc, (m * n) as u32, 9);
+            let grid = MTLSize {
+                width: n.div_ceil(64),
+                height: m.div_ceil(64),
+                depth: 1,
+            };
+            let threads = MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            };
+            enc.dispatchThreadgroups_threadsPerThreadgroup(grid, threads);
+            Ok(())
+        })
+    }
+
     // FP16 operations for full half-precision pipeline
     // =======================================================================
 
@@ -2714,45 +2768,11 @@ impl Driver for MetalDriver {
             .get_or_init(|| std::env::var("RIPVEC_NO_MPS").is_ok_and(|v| v == "1"));
 
         if use_compute {
-            self.run_compute("tiled-gemm-f16", |enc| {
-                enc.setComputePipelineState(&self.kernels.gemm_tiled_f16);
-                set_buffer(enc, &a.buffer, a.offset, 0);
-                set_buffer(enc, b_buf, b_off, 1);
-                set_buffer(enc, &output.buffer, output.offset, 2);
-                // Parameters: M, N, K, transB, stride_A, stride_B, stride_C
-                let trans_val: u32 = if transpose_b { 1 } else { 0 };
-                set_u32_param(enc, m as u32, 3);
-                set_u32_param(enc, n as u32, 4);
-                set_u32_param(enc, k as u32, 5);
-                set_u32_param(enc, trans_val, 6);
-                set_u32_param(enc, (m * k) as u32, 7); // stride_A (unused for non-batched)
-                set_u32_param(
-                    enc,
-                    if transpose_b {
-                        (n * k) as u32
-                    } else {
-                        (k * n) as u32
-                    },
-                    8,
-                );
-                set_u32_param(enc, (m * n) as u32, 9); // stride_C
-
-                // Grid: (ceil(N/64), ceil(M/64), 1)
-                let grid_x = n.div_ceil(64);
-                let grid_y = m.div_ceil(64);
-                let grid = MTLSize {
-                    width: grid_x,
-                    height: grid_y,
-                    depth: 1,
-                };
-                let threads = MTLSize {
-                    width: 128,
-                    height: 1,
-                    depth: 1,
-                };
-                enc.dispatchThreadgroups_threadsPerThreadgroup(grid, threads);
-                Ok(())
-            })
+            // Option 1: FP16 in → native GEMM → FP32 temp → f32_to_f16 → FP16 out
+            let mut temp_f32 = self.alloc_tensor(m * n)?;
+            self.gemm_mixed(a, b, &mut temp_f32, m, n, k, transpose_b)?;
+            self.f32_to_f16(output, &temp_f32, m * n)?;
+            Ok(())
         } else {
             self.run_mps("mps-gemm-f16", |cmd_buf| {
                 dispatch_mps_gemm(

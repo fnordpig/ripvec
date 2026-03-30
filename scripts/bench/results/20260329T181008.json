@@ -1,0 +1,12 @@
+[
+  {
+    "label": "compute-3L",
+    "cfg": "compute",
+    "layers": 3,
+    "throughput": 234.3,
+    "wall_time": 11.26,
+    "thermal_before": "speed=100% gpu=0% mem=14.0GB",
+    "thermal_after": "speed=100% gpu=78% mem=16.1GB",
+    "returncode": 0
+  }
+]
