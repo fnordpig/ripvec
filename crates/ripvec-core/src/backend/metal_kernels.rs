@@ -3066,13 +3066,13 @@ kernel void gemm_q8w_f16a_kernel(
     threadgroup half sa[2048];
     threadgroup half sb[2048];
 
-    constexpr short NL0 = 2;
-    constexpr short NL1 = 4;
+    constexpr short NL0 = 2;  // BK/16: threads per A row (64 M-rows × 16 K-elems = 1024)
+    constexpr short NL1 = 2;  // BK/16: threads per B row (64 N-rows × 16 K-elems = 1024)
 
-    short lr0 = min(short(tiitg / NL0), short(63));
-    short lr1 = min(short(tiitg / NL1), short(63));
+    short lr0 = min(short(tiitg / NL0), short(63));  // M-row for A loading
+    short lr1 = min(short(tiitg / NL1), short(63));   // N-row for B loading
     short il0 = short(tiitg % NL0);
-    short iy  = short(8 * (tiitg % NL1));
+    short il1 = short(tiitg % NL1);
 
     device half* x = A_batch + uint(m_start + lr0) * K;
     // B_q8 is [N, K] for transB=true, so row lr1 starts at (n_start + lr1) * K
@@ -3101,22 +3101,27 @@ kernel void gemm_q8w_f16a_kernel(
             }
         }
 
-        // Load B (INT8 + dequantize) into sb: K-rows, N-cols
+        // Load B (INT8 + dequantize) into sb: K-rows, N-cols.
+        // Mirrors A-loading: NL1=2, each thread loads 16 K-elements for one
+        // of 64 N-rows, filling all 32 blocks (4 K-blocks × 8 N-blocks).
         {
-            short sx = short(tiitg % NL1);
-            short sy = lr1 / 8;
-            short lx_n = lr1 % 8;
-            for (short i = 0; i < 8; i++) {
-                short ly_k = i;
-                short ib = short(8 * sx + sy);
+            short sy_b = lr1 / 8;    // N-block index (0..7)
+            short ly_n = lr1 % 8;    // N-within-block (0..7)
+            for (short i = 0; i < 16; i++) {
+                short sx_b = short(2 * il1 + i / 8);  // K-block index (0..3)
+                short lx_k = short(i % 8);             // K-within-block (0..7)
+                short ib = short(8 * sx_b + sy_b);
                 half val = half(0.0h);
-                if (loop_k + iy + i < K && n_start + lr1 < N) {
-                    int8_t q = *(y_q8 + iy + i);
+                if (loop_k + 16 * il1 + i < K && n_start + lr1 < N) {
+                    int8_t q = *(y_q8 + 16 * il1 + i);
                     val = half(float(q) * b_scale);
                 }
-                *(sb + 64 * ib + 8 * ly_k + lx_n) = val;
+                *(sb + 64 * ib + 8 * lx_k + ly_n) = val;
             }
         }
+
+        x += 32;
+        y_q8 += 32;
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
