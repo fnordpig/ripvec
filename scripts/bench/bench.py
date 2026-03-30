@@ -312,6 +312,7 @@ def expand_configs(
     configs: list[str],
     layers: list[int],
     batch_sizes: list[int] | None = None,
+    extra_args: list[str] | None = None,
 ) -> list[tuple[str, dict[str, object]]]:
     """Return list of (label, spec) pairs.
 
@@ -331,23 +332,25 @@ def expand_configs(
                 else:
                     label = f"{cfg}-{L}L"
                 env: dict[str, str] = {}
-                extra_args: list[str] = []
+                cli: list[str] = []
 
                 if cfg == "compute":
                     env["RIPVEC_NO_MPS"] = "1"
                 elif cfg == "cpu":
-                    extra_args += ["--device", "cpu"]
+                    cli += ["--device", "cpu"]
                 # mps: default, no extra env/args
 
-                extra_args += ["--layers", str(L)]
+                cli += ["--layers", str(L)]
                 if bs > 0:
-                    extra_args += ["-b", str(bs)]
+                    cli += ["-b", str(bs)]
+                if extra_args:
+                    cli += extra_args
                 result.append(
                     (
                         label,
                         {
                             "env": env,
-                            "args": extra_args,
+                            "args": cli,
                             "layers": L,
                             "batch": bs,
                             "cfg": cfg,
@@ -652,6 +655,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use sudo powermetrics for thermal pressure (requires NOPASSWD sudoers entry)",
     )
+    p.add_argument(
+        "--extra-args",
+        default="",
+        metavar="ARGS",
+        help="Extra args passed to ripvec (e.g., '--svd-rank auto --skip-layers 6,7')",
+    )
     return p
 
 
@@ -697,7 +706,8 @@ def main() -> int:
         print("Run: cargo build --release", file=sys.stderr)
         return 1
 
-    configs = expand_configs(args.configs, args.layers, args.batch_sizes)
+    parsed_extra = args.extra_args.split() if args.extra_args else None
+    configs = expand_configs(args.configs, args.layers, args.batch_sizes, parsed_extra)
 
     # --validate mode
     if args.validate:
