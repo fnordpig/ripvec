@@ -149,17 +149,6 @@ fn load_pipeline(
             } else {
                 None
             },
-            skip_layers: args
-                .skip_layers
-                .split(',')
-                .filter(|s| !s.is_empty())
-                .map(|s| {
-                    s.trim()
-                        .parse::<usize>()
-                        .expect("--skip-layers: invalid integer")
-                })
-                .collect(),
-            prune_ratio: args.prune_ratio,
             svd_rank: ripvec_core::embed::SvdRank::Disabled, // wired in Task 3
         };
         let result = match args.backend {
@@ -210,17 +199,6 @@ fn load_pipeline(
                 .expect("--svd-rank must be 0, 'auto', or an integer"),
         ),
     };
-    let skip_layers: Vec<usize> = args
-        .skip_layers
-        .split(',')
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            s.trim()
-                .parse::<usize>()
-                .expect("--skip-layers must be comma-separated integers")
-        })
-        .collect();
-
     let search_cfg = ripvec_core::embed::SearchConfig {
         batch_size: args.batch_size,
         max_tokens: args.max_tokens,
@@ -234,8 +212,6 @@ fn load_pipeline(
         file_type: args.file_type.clone(),
         mode,
         svd_rank,
-        prune_ratio: args.prune_ratio,
-        skip_layers,
     };
 
     Ok((backends, tokenizer, search_cfg))

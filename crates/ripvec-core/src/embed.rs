@@ -78,10 +78,6 @@ pub struct SearchConfig {
     pub mode: crate::hybrid::SearchMode,
     /// SVD rank for low-rank FFN approximation. Consumed at model load time.
     pub svd_rank: SvdRank,
-    /// Token pruning ratio at layer 11 (0.0 = disabled, 0.5 = drop 50%).
-    pub prune_ratio: f32,
-    /// Layer indices to skip entirely in the encoder.
-    pub skip_layers: Vec<usize>,
 }
 
 impl Default for SearchConfig {
@@ -95,8 +91,6 @@ impl Default for SearchConfig {
             file_type: None,
             mode: crate::hybrid::SearchMode::Hybrid,
             svd_rank: SvdRank::Disabled,
-            prune_ratio: 0.0,
-            skip_layers: vec![],
         }
     }
 }

@@ -807,57 +807,6 @@ pub trait Driver: Send + Sync {
             "FP16 not supported by this driver".into(),
         ))
     }
-    // ----- Token pruning helpers -----
-
-    /// Compute per-sequence L2 distance from mean (FP16 hidden → FP32 distances).
-    fn compute_token_distances_f16(
-        &self,
-        _hidden: &Self::Tensor,
-        _distances: &mut Self::Tensor,
-        _cu_seqlens: &Self::Tensor,
-        _batch: usize,
-        _total_tokens: usize,
-        _hidden_dim: usize,
-    ) -> crate::Result<()> {
-        Err(crate::Error::Other(anyhow::anyhow!(
-            "compute_token_distances_f16 not implemented"
-        )))
-    }
-
-    /// Compact hidden states by gathering selected indices (FP16).
-    fn gather_tokens_f16(
-        &self,
-        _src: &Self::Tensor,
-        _dst: &mut Self::Tensor,
-        _indices: &Self::Tensor,
-        _new_total: usize,
-        _hidden_dim: usize,
-    ) -> crate::Result<()> {
-        Err(crate::Error::Other(anyhow::anyhow!(
-            "gather_tokens_f16 not implemented"
-        )))
-    }
-
-    /// Read FP32 data from a tensor back to host.
-    fn read_f32(&self, _tensor: &Self::Tensor, _n: usize) -> crate::Result<Vec<f32>> {
-        Err(crate::Error::Other(anyhow::anyhow!(
-            "read_f32 not implemented"
-        )))
-    }
-
-    /// Create a tensor from i32 index data (CPU → GPU upload).
-    fn create_index_tensor(&self, _data: &[i32]) -> crate::Result<Self::Tensor> {
-        Err(crate::Error::Other(anyhow::anyhow!(
-            "create_index_tensor not implemented"
-        )))
-    }
-
-    /// Create a tensor from f32 data (CPU → GPU upload).
-    fn create_f32_tensor(&self, _data: &[f32]) -> crate::Result<Self::Tensor> {
-        Err(crate::Error::Other(anyhow::anyhow!(
-            "create_f32_tensor not implemented"
-        )))
-    }
 }
 
 /// Batch input tensors on device, produced by [`Driver::prepare_batch`].

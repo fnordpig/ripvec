@@ -132,10 +132,6 @@ pub enum DeviceHint {
 pub struct InferenceOpts {
     /// Early-exit layer count (`None` = all 22 layers).
     pub max_layers: Option<usize>,
-    /// Layer indices to skip entirely.
-    pub skip_layers: std::collections::HashSet<usize>,
-    /// Token pruning ratio at layer 11 (0.0 = disabled).
-    pub prune_ratio: f32,
     /// SVD rank for low-rank FFN approximation.
     pub svd_rank: crate::embed::SvdRank,
 }
@@ -390,8 +386,6 @@ pub fn load_modernbert_metal(
     let (mut arch, mmap) =
         driver.load_modern_bert_weights(&weights_path, &config, &opts.svd_rank)?;
     arch.max_layers = opts.max_layers;
-    arch.skip_layers = opts.skip_layers.clone();
-    arch.prune_ratio = opts.prune_ratio;
 
     tracing::info!(
         model_repo,
@@ -441,8 +435,6 @@ pub fn load_modernbert_cpu(
     let (mut arch, mmap) =
         driver.load_modern_bert_weights(&weights_path, &config, &opts.svd_rank)?;
     arch.max_layers = opts.max_layers;
-    arch.skip_layers = opts.skip_layers.clone();
-    arch.prune_ratio = opts.prune_ratio;
 
     tracing::info!(
         model_repo,
