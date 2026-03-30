@@ -3027,4 +3027,151 @@ kernel void gemm_f16w_f32a_kernel(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// INT8 weight GEMM: FP16 activations × INT8 weights → FP16 output.
+// Same architecture as gemm_f16w_f32a_kernel but B is int8_t* + per-row scale.
+// Dequantize: half_val = half(float(q) * scale[n])
+// ---------------------------------------------------------------------------
+kernel void gemm_q8w_f16a_kernel(
+    device float* A_raw         [[buffer(0)]],
+    device float* B_raw         [[buffer(1)]],   // actually int8_t*
+    device float* C_raw         [[buffer(2)]],   // actually half*
+    constant uint& M            [[buffer(3)]],
+    constant uint& N            [[buffer(4)]],
+    constant uint& K            [[buffer(5)]],
+    constant uint& transB       [[buffer(6)]],
+    constant uint& stride_A     [[buffer(7)]],
+    constant uint& stride_B     [[buffer(8)]],
+    constant uint& stride_C     [[buffer(9)]],
+    device float* scales_raw    [[buffer(10)]],   // per-row scales, float[N]
+    uint3 tg_pos                [[threadgroup_position_in_grid]],
+    ushort sgitg                [[simdgroup_index_in_threadgroup]],
+    ushort lane_id              [[thread_index_in_simdgroup]],
+    ushort tiitg                [[thread_index_in_threadgroup]]
+) {
+    device half* A = (device half*)A_raw;
+    device int8_t* B_q8 = (device int8_t*)B_raw;
+    device half* C = (device half*)C_raw;
+    device float* scales = scales_raw;
+
+    uint batch_idx = tg_pos.z;
+    device half* A_batch = A + batch_idx * stride_A;
+    device int8_t* B_q8_batch = B_q8 + batch_idx * stride_B;
+    device half* C_batch = C + batch_idx * stride_C;
+
+    uint m_start = tg_pos.y * 64;
+    uint n_start = tg_pos.x * 64;
+
+    threadgroup half sa[2048];
+    threadgroup half sb[2048];
+
+    constexpr short NL0 = 2;
+    constexpr short NL1 = 4;
+
+    short lr0 = min(short(tiitg / NL0), short(63));
+    short lr1 = min(short(tiitg / NL1), short(63));
+    short il0 = short(tiitg % NL0);
+    short iy  = short(8 * (tiitg % NL1));
+
+    device half* x = A_batch + uint(m_start + lr0) * K;
+    // B_q8 is [N, K] for transB=true, so row lr1 starts at (n_start + lr1) * K
+    device int8_t* y_q8 = B_q8_batch + uint(n_start + lr1) * K;
+    float b_scale = (n_start + lr1 < N) ? scales[n_start + lr1] : 0.0f;
+
+    simdgroup_float8x8 mc[16];
+    for (short i = 0; i < 16; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    for (uint loop_k = 0; loop_k < K; loop_k += 32) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Load A (device half*) into sa. Same as FP16 kernel.
+        {
+            short sy = lr0 / 8;
+            short ly = lr0 % 8;
+            for (short i = 0; i < 16; i++) {
+                short sx = short(2 * il0 + i / 8);
+                short lx = short(i % 8);
+                short ib = short(8 * sx + sy);
+                half val = (loop_k + 16 * il0 + i < K && m_start + lr0 < M)
+                    ? *(x + 16 * il0 + i) : half(0.0h);
+                *(sa + 64 * ib + 8 * ly + lx) = val;
+            }
+        }
+
+        // Load B (INT8 + dequantize) into sb: K-rows, N-cols
+        {
+            short sx = short(tiitg % NL1);
+            short sy = lr1 / 8;
+            short lx_n = lr1 % 8;
+            for (short i = 0; i < 8; i++) {
+                short ly_k = i;
+                short ib = short(8 * sx + sy);
+                half val = half(0.0h);
+                if (loop_k + iy + i < K && n_start + lr1 < N) {
+                    int8_t q = *(y_q8 + iy + i);
+                    val = half(float(q) * b_scale);
+                }
+                *(sb + 64 * ib + 8 * ly_k + lx_n) = val;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup half* base_sa = sa + 4 * 64 * (sgitg % 2);
+        threadgroup half* base_sb = sb + 4 * 64 * (sgitg / 2);
+
+        for (short ik = 0; ik < 4; ik++) {
+            simdgroup_half8x8 ma[4];
+            simdgroup_half8x8 mb[4];
+
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
+            for (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], base_sa + 64 * i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
+            for (short j = 0; j < 4; j++) {
+                simdgroup_load(mb[j], base_sb + 64 * j, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll
+            for (short i = 0; i < 16; i++) {
+                simdgroup_multiply_accumulate(mc[i], ma[i / 4], mb[i % 4], mc[i]);
+            }
+
+            base_sa += 8 * 64;
+            base_sb += 8 * 64;
+        }
+    }
+
+    // Per-tile fused store (same as FP16 kernel)
+    threadgroup float scratch[4 * 64];
+    ushort sg_row = sgitg % 2;
+    ushort sg_col = sgitg / 2;
+    threadgroup float* my_scratch = scratch + sgitg * 64;
+
+    #pragma unroll
+    for (short i = 0; i < 16; i++) {
+        short m_tile = i / 4;
+        short n_tile = i % 4;
+        uint m_base = m_start + sg_row * 32 + m_tile * 8;
+        uint n_base = n_start + sg_col * 32 + n_tile * 8;
+
+        simdgroup_store(mc[i], my_scratch, 8, 0, false);
+
+        for (ushort e = lane_id; e < 64; e += 32) {
+            ushort lr = e / 8;
+            ushort lc = e % 8;
+            uint gm = m_base + lr;
+            uint gn = n_base + lc;
+            if (gm < M && gn < N) {
+                C_batch[gm * N + gn] = half(my_scratch[e]);
+            }
+        }
+    }
+}
 ";
