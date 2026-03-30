@@ -67,6 +67,10 @@ pub struct MetalTensor {
     /// uses this buffer with `MPSDataType::Float16` for the weight matrix,
     /// halving memory bandwidth.
     pub fp16: std::cell::RefCell<Option<Retained<ProtocolObject<dyn MTLBuffer>>>>,
+    /// Optional INT8 quantized data + per-row scale. Created by `quantize_q8`.
+    pub q8: std::cell::RefCell<Option<Retained<ProtocolObject<dyn MTLBuffer>>>>,
+    /// Per-row float scales for INT8 dequantization.
+    pub q8_scales: std::cell::RefCell<Option<Retained<ProtocolObject<dyn MTLBuffer>>>>,
 }
 
 impl MetalTensor {
@@ -76,6 +80,8 @@ impl MetalTensor {
             buffer,
             offset,
             fp16: std::cell::RefCell::new(None),
+            q8: std::cell::RefCell::new(None),
+            q8_scales: std::cell::RefCell::new(None),
         }
     }
 }
@@ -1233,6 +1239,8 @@ impl MetalDriver {
         // The gemm_f16 kernel reads from MetalTensor.fp16 for weight matrices.
         // Norm weights (small [hidden] vectors) stay FP32 — the FP16 LN kernel
         // accepts FP32 weight/bias directly.
+        let use_q8 = std::env::var("RIPVEC_Q8").is_ok_and(|v| v == "1");
+
         for layer in &weights.layers {
             let qkv_elems = 3 * hidden * hidden;
             self.ensure_fp16(&layer.qkv_weight, qkv_elems)?;
@@ -1245,6 +1253,28 @@ impl MetalDriver {
 
             let wo_elems = hidden * intermediate;
             self.ensure_fp16(&layer.mlp_wo_weight, wo_elems)?;
+
+            if use_q8 {
+                let (q8, scales) =
+                    self.quantize_weights_q8(&layer.qkv_weight, 3 * hidden, hidden)?;
+                *layer.qkv_weight.q8.borrow_mut() = Some(q8.buffer.clone());
+                *layer.qkv_weight.q8_scales.borrow_mut() = Some(scales.buffer.clone());
+
+                let (q8, scales) =
+                    self.quantize_weights_q8(&layer.output_weight, hidden, hidden)?;
+                *layer.output_weight.q8.borrow_mut() = Some(q8.buffer.clone());
+                *layer.output_weight.q8_scales.borrow_mut() = Some(scales.buffer.clone());
+
+                let (q8, scales) =
+                    self.quantize_weights_q8(&layer.mlp_wi_weight, 2 * intermediate, hidden)?;
+                *layer.mlp_wi_weight.q8.borrow_mut() = Some(q8.buffer.clone());
+                *layer.mlp_wi_weight.q8_scales.borrow_mut() = Some(scales.buffer.clone());
+
+                let (q8, scales) =
+                    self.quantize_weights_q8(&layer.mlp_wo_weight, intermediate, hidden)?;
+                *layer.mlp_wo_weight.q8.borrow_mut() = Some(q8.buffer.clone());
+                *layer.mlp_wo_weight.q8_scales.borrow_mut() = Some(scales.buffer.clone());
+            }
         }
 
         let arch = ModernBertArch {
@@ -2765,6 +2795,18 @@ impl Driver for MetalDriver {
         } else {
             (&*b.buffer as &ProtocolObject<dyn MTLBuffer>, b.offset)
         };
+
+        // INT8 quantized path: if B has Q8 data, dispatch the INT8 kernel.
+        // This eliminates MPS transitions AND halves weight bandwidth.
+        {
+            let q8_ref = b.q8.borrow();
+            let q8_scales_ref = b.q8_scales.borrow();
+            if let (Some(q8_buf), Some(scales_buf)) = (&*q8_ref, &*q8_scales_ref) {
+                let q8_tensor = MetalTensor::new(q8_buf.clone(), 0);
+                let scales_tensor = MetalTensor::new(scales_buf.clone(), 0);
+                return self.gemm_q8(a, &q8_tensor, &scales_tensor, output, m, n, k, transpose_b);
+            }
+        }
 
         // RIPVEC_NO_MPS=1 uses the tiled compute GEMM to eliminate encoder
         // transitions (88 per ModernBERT forward pass → 0).
