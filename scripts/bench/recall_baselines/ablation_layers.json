@@ -1,0 +1,156 @@
+[
+  {
+    "layer": 0,
+    "semantic_recall": 2.9,
+    "hybrid_recall": 58.0,
+    "sem_loss": 97.1,
+    "hyb_loss": 42.0
+  },
+  {
+    "layer": 21,
+    "semantic_recall": 29.8,
+    "hybrid_recall": 69.3,
+    "sem_loss": 70.2,
+    "hyb_loss": 30.7
+  },
+  {
+    "layer": 15,
+    "semantic_recall": 37.6,
+    "hybrid_recall": 82.0,
+    "sem_loss": 62.4,
+    "hyb_loss": 18.0
+  },
+  {
+    "layer": 7,
+    "semantic_recall": 63.8,
+    "hybrid_recall": 85.3,
+    "sem_loss": 36.2,
+    "hyb_loss": 14.7
+  },
+  {
+    "layer": 18,
+    "semantic_recall": 65.7,
+    "hybrid_recall": 92.7,
+    "sem_loss": 34.3,
+    "hyb_loss": 7.3
+  },
+  {
+    "layer": 4,
+    "semantic_recall": 66.2,
+    "hybrid_recall": 92.7,
+    "sem_loss": 33.8,
+    "hyb_loss": 7.3
+  },
+  {
+    "layer": 3,
+    "semantic_recall": 69.3,
+    "hybrid_recall": 89.3,
+    "sem_loss": 30.7,
+    "hyb_loss": 10.7
+  },
+  {
+    "layer": 14,
+    "semantic_recall": 71.7,
+    "hybrid_recall": 96.0,
+    "sem_loss": 28.3,
+    "hyb_loss": 4.0
+  },
+  {
+    "layer": 2,
+    "semantic_recall": 75.2,
+    "hybrid_recall": 85.3,
+    "sem_loss": 24.8,
+    "hyb_loss": 14.7
+  },
+  {
+    "layer": 11,
+    "semantic_recall": 79.0,
+    "hybrid_recall": 85.3,
+    "sem_loss": 21.0,
+    "hyb_loss": 14.7
+  },
+  {
+    "layer": 6,
+    "semantic_recall": 81.4,
+    "hybrid_recall": 92.7,
+    "sem_loss": 18.6,
+    "hyb_loss": 7.3
+  },
+  {
+    "layer": 12,
+    "semantic_recall": 82.4,
+    "hybrid_recall": 85.3,
+    "sem_loss": 17.6,
+    "hyb_loss": 14.7
+  },
+  {
+    "layer": 20,
+    "semantic_recall": 85.2,
+    "hybrid_recall": 93.3,
+    "sem_loss": 14.8,
+    "hyb_loss": 6.7
+  },
+  {
+    "layer": 8,
+    "semantic_recall": 88.6,
+    "hybrid_recall": 88.7,
+    "sem_loss": 11.4,
+    "hyb_loss": 11.3
+  },
+  {
+    "layer": 10,
+    "semantic_recall": 88.6,
+    "hybrid_recall": 84.7,
+    "sem_loss": 11.4,
+    "hyb_loss": 15.3
+  },
+  {
+    "layer": 13,
+    "semantic_recall": 88.6,
+    "hybrid_recall": 85.3,
+    "sem_loss": 11.4,
+    "hyb_loss": 14.7
+  },
+  {
+    "layer": 17,
+    "semantic_recall": 88.6,
+    "hybrid_recall": 89.3,
+    "sem_loss": 11.4,
+    "hyb_loss": 10.7
+  },
+  {
+    "layer": 19,
+    "semantic_recall": 91.0,
+    "hybrid_recall": 96.0,
+    "sem_loss": 9.0,
+    "hyb_loss": 4.0
+  },
+  {
+    "layer": 1,
+    "semantic_recall": 91.4,
+    "hybrid_recall": 81.3,
+    "sem_loss": 8.6,
+    "hyb_loss": 18.7
+  },
+  {
+    "layer": 5,
+    "semantic_recall": 91.4,
+    "hybrid_recall": 92.0,
+    "sem_loss": 8.6,
+    "hyb_loss": 8.0
+  },
+  {
+    "layer": 9,
+    "semantic_recall": 91.4,
+    "hybrid_recall": 85.3,
+    "sem_loss": 8.6,
+    "hyb_loss": 14.7
+  },
+  {
+    "layer": 16,
+    "semantic_recall": 91.4,
+    "hybrid_recall": 96.7,
+    "sem_loss": 8.6,
+    "hyb_loss": 3.3
+  }
+]
