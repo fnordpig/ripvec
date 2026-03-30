@@ -140,6 +140,15 @@ fn load_pipeline(
     tokenizers::Tokenizer,
     ripvec_core::embed::SearchConfig,
 )> {
+    let svd_rank = match args.svd_rank.as_str() {
+        "0" => ripvec_core::embed::SvdRank::Disabled,
+        "auto" => ripvec_core::embed::SvdRank::Auto,
+        n => ripvec_core::embed::SvdRank::Fixed(
+            n.parse::<usize>()
+                .expect("--svd-rank must be 0, 'auto', or an integer"),
+        ),
+    };
+
     let backends = {
         let _guard = profiler.phase("model_load");
         let pb = use_progress.then(|| progress::spinner("Loading model\u{2026}"));
@@ -149,7 +158,7 @@ fn load_pipeline(
             } else {
                 None
             },
-            svd_rank: ripvec_core::embed::SvdRank::Disabled, // wired in Task 3
+            svd_rank: svd_rank.clone(),
         };
         let result = match args.backend {
             cli::BackendArg::Auto => {
@@ -191,14 +200,6 @@ fn load_pipeline(
 
     let mode: ripvec_core::hybrid::SearchMode = args.mode.parse().unwrap_or_default();
 
-    let svd_rank = match args.svd_rank.as_str() {
-        "0" => ripvec_core::embed::SvdRank::Disabled,
-        "auto" => ripvec_core::embed::SvdRank::Auto,
-        n => ripvec_core::embed::SvdRank::Fixed(
-            n.parse::<usize>()
-                .expect("--svd-rank must be 0, 'auto', or an integer"),
-        ),
-    };
     let search_cfg = ripvec_core::embed::SearchConfig {
         batch_size: args.batch_size,
         max_tokens: args.max_tokens,

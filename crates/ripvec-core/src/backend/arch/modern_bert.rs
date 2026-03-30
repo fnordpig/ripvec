@@ -808,7 +808,7 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
         // FP16 path: f32_to_f16 ONCE → all layers in FP16 → f16_to_f32 ONCE.
         // Falls back to FP32 if the driver doesn't support FP16 ops.
         //
-        // MPS FP16 GEMM uses Apple's proprietary AMX coprocessor and achieves
+        // MPS FP16 GEMM uses Apple's proprietary AMX coprocessor (72/s).
         // RIPVEC_NO_MPS=1: force FP32 activations + compute GEMM path.
         // The gemm_f16w_f32a_kernel uses native simdgroup ops with FP16 weights
         // and FP32 activations — no MFA wrapper, no type conversion at store.

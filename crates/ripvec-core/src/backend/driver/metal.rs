@@ -201,8 +201,6 @@ struct KernelPipelines {
     rope_encode_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Full FP16 batched GEMM (half A, half B, half C).
     gemm_batched_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    /// Tiled FP16 GEMM with threadgroup memory (64×64×16, 4 simdgroups).
-    gemm_tiled_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Mixed-precision GEMM: FP32 activations × FP16 weights → FP32 output.
     /// Native simdgroup ops, no MFA wrapper.
     gemm_f16w_f32a: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -267,7 +265,6 @@ impl KernelPipelines {
             unpad_from_batch_f16: p("unpad_from_batch_f16_kernel")?,
             rope_encode_f16: p("rope_encode_f16_kernel")?,
             gemm_batched_f16: create_pipeline(device, &gemm_library, "gemm_batched_f16_kernel")?,
-            gemm_tiled_f16: create_pipeline(device, &gemm_library, "gemm_tiled_f16_kernel")?,
             gemm_f16w_f32a: create_pipeline(device, &native_gemm_library, "gemm_f16w_f32a_kernel")?,
             gemm_q8w: create_pipeline(device, &native_gemm_library, "gemm_q8w_f16a_kernel")?,
         })
@@ -979,11 +976,6 @@ impl MetalDriver {
         self.turboquant_scan_gpu(&gpu, centroid_q, n_vectors, n_pairs, n_levels)
     }
 
-    /// Pre-convert a weight tensor to FP16 on the GPU.
-    ///
-    /// The FP16 buffer is stored inside the tensor's `fp16` field and used
-    /// automatically by [`gemm`] for the weight (B) matrix. The FP16 offset
-    /// is `original_offset / 2` (half the bytes per element).
     /// Create a Metal buffer from FP32 data (for SVD factors and similar computed weights).
     pub fn create_buffer_from_f32(&self, data: &[f32]) -> crate::Result<MetalTensor> {
         let size = (data.len() * 4) as NSUInteger;
@@ -998,6 +990,11 @@ impl MetalDriver {
         Ok(MetalTensor::new(buffer, 0))
     }
 
+    /// Pre-convert a weight tensor to FP16 on the GPU.
+    ///
+    /// The FP16 buffer is stored inside the tensor's `fp16` field and used
+    /// automatically by [`MetalDriver::gemm`] for the weight (B) matrix. The FP16 offset
+    /// is `original_offset / 2` (half the bytes per element).
     pub fn ensure_fp16(&self, tensor: &MetalTensor, num_elements: usize) -> crate::Result<()> {
         if tensor.fp16.borrow().is_some() {
             return Ok(());

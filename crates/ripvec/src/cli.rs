@@ -91,9 +91,9 @@ pub struct Args {
     pub layers: usize,
 
     /// SVD rank for low-rank FFN approximation.
-    /// "auto" (default) = per-layer rank from Frobenius threshold (1% error).
-    /// 0 = disabled. Integer = fixed rank for all layers.
-    #[arg(long, default_value = "auto")]
+    /// 0 = disabled (default). "auto" = per-layer from Frobenius threshold.
+    /// Integer = fixed rank for all layers. Adds ~4s to model load time.
+    #[arg(long, default_value = "0")]
     pub svd_rank: String,
 
     /// Maximum chunk size in bytes before splitting into windows.

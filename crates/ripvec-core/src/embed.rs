@@ -90,7 +90,7 @@ impl Default for SearchConfig {
             cascade_dim: None,
             file_type: None,
             mode: crate::hybrid::SearchMode::Hybrid,
-            svd_rank: SvdRank::Disabled,
+            svd_rank: SvdRank::default(),
         }
     }
 }
