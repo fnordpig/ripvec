@@ -498,8 +498,10 @@ pub fn load_modernbert_cuda(
         "ModernBERT loaded on CUDA (driver/arch)"
     );
 
-    Ok(Box::new(GenericBackend::new(
-        driver, arch, max_tokens, true, mmap,
+    // CUDA benefits from larger batches to saturate GPU SMs (128 SMs on RTX 4090).
+    // Metal uses 32 (AMX coprocessor-limited). CUDA can handle 128+ easily.
+    Ok(Box::new(GenericBackend::with_max_batch(
+        driver, arch, max_tokens, true, mmap, 32,
     )))
 }
 
