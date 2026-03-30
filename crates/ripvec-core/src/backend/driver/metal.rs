@@ -17,10 +17,10 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::{NSString, NSUInteger, ns_string};
+use objc2::AnyThread;
+use objc2_foundation::{ns_string, NSString, NSUInteger};
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
     MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
@@ -32,13 +32,13 @@ use objc2_metal_performance_shaders::{
 use safetensors::SafeTensors;
 
 use super::{BatchInputs, Driver};
-use crate::backend::Encoding;
 use crate::backend::arch::classic_bert::{
     ClassicBertArch, ClassicBertLayerWeights, ClassicBertWeights,
 };
 use crate::backend::arch::modern_bert::{
     ModernBertArch, ModernBertLayerWeights, ModernBertWeights, RopeCache,
 };
+use crate::backend::Encoding;
 
 // ---------------------------------------------------------------------------
 // CoreGraphics linkage (required for MTLCreateSystemDefaultDevice)
@@ -3206,7 +3206,10 @@ impl Driver for MetalDriver {
     // =======================================================================
     // INT8 weight quantization + dispatch
     // =======================================================================
+}
 
+// INT8 weight quantization + dispatch (Metal-specific, not on Driver trait).
+impl MetalDriver {
     /// Quantize an FP16 weight tensor to INT8 + per-row float scales.
     ///
     /// Input: `weights` — a [`MetalTensor`] whose `.fp16` field (or main buffer)
@@ -3236,35 +3239,65 @@ impl Driver for MetalDriver {
             )
         };
 
-        // Read FP16 data from the CPU-accessible shared buffer.
-        let fp16_slice: &[half::f16] = unsafe {
+        // Read FP16 data as raw u16 from the CPU-accessible shared buffer.
+        let fp16_raw: &[u16] = unsafe {
             let base = fp16_buf.contents().as_ptr().cast::<u8>();
-            let ptr = base.add(fp16_off_bytes).cast::<half::f16>();
+            let ptr = base.add(fp16_off_bytes).cast::<u16>();
             std::slice::from_raw_parts(ptr, n * k)
         };
+
+        // FP16 → FP32 conversion (IEEE 754 half-precision).
+        #[inline]
+        fn f16_to_f32(bits: u16) -> f32 {
+            let sign = ((bits >> 15) & 1) as u32;
+            let exp = ((bits >> 10) & 0x1F) as u32;
+            let mant = (bits & 0x3FF) as u32;
+            if exp == 0 {
+                // Subnormal or zero
+                let f = (mant as f32) * (1.0 / (1 << 24) as f32);
+                if sign == 1 {
+                    -f
+                } else {
+                    f
+                }
+            } else if exp == 31 {
+                // Inf or NaN
+                if mant == 0 {
+                    if sign == 1 {
+                        f32::NEG_INFINITY
+                    } else {
+                        f32::INFINITY
+                    }
+                } else {
+                    f32::NAN
+                }
+            } else {
+                let f_bits = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+                f32::from_bits(f_bits)
+            }
+        }
 
         // Quantize row-by-row.
         let mut q8_data: Vec<i8> = Vec::with_capacity(n * k);
         let mut scales: Vec<f32> = Vec::with_capacity(n);
 
         for row in 0..n {
-            let row_slice = &fp16_slice[row * k..(row + 1) * k];
+            let row_slice = &fp16_raw[row * k..(row + 1) * k];
 
-            // Find max absolute value for this row.
             let max_abs = row_slice
                 .iter()
-                .map(|&h| h.to_f32().abs())
+                .map(|&h| f16_to_f32(h).abs())
                 .fold(0.0f32, f32::max);
 
             let scale = if max_abs == 0.0 {
-                1.0f32 // avoid divide-by-zero; all values will quantize to 0
+                1.0f32
             } else {
                 max_abs / 127.0
             };
             scales.push(scale);
 
             for &h in row_slice {
-                let f = h.to_f32();
+                let f = f16_to_f32(h);
                 let q = (f / scale).round().clamp(-127.0, 127.0) as i8;
                 q8_data.push(q);
             }
