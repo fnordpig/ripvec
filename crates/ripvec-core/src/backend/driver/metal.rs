@@ -203,6 +203,8 @@ struct KernelPipelines {
     /// Mixed-precision GEMM: FP32 activations × FP16 weights → FP32 output.
     /// Native simdgroup ops, no MFA wrapper.
     gemm_f16w_f32a: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// INT8-weight GEMM: FP16 activations × INT8 weights + per-row scales → FP16 output.
+    gemm_q8w: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 impl KernelPipelines {
@@ -264,6 +266,7 @@ impl KernelPipelines {
             gemm_batched_f16: create_pipeline(device, &gemm_library, "gemm_batched_f16_kernel")?,
             gemm_tiled_f16: create_pipeline(device, &gemm_library, "gemm_tiled_f16_kernel")?,
             gemm_f16w_f32a: create_pipeline(device, &native_gemm_library, "gemm_f16w_f32a_kernel")?,
+            gemm_q8w: create_pipeline(device, &native_gemm_library, "gemm_q8w_f16a_kernel")?,
         })
     }
 }
@@ -3196,6 +3199,160 @@ impl Driver for MetalDriver {
             set_i32_param(enc, rows as i32, 3);
             set_i32_param(enc, cols as i32, 4);
             dispatch_1d(enc, &self.kernels.split_gate_value_f16, total);
+            Ok(())
+        })
+    }
+
+    // =======================================================================
+    // INT8 weight quantization + dispatch
+    // =======================================================================
+
+    /// Quantize an FP16 weight tensor to INT8 + per-row float scales.
+    ///
+    /// Input: `weights` — a [`MetalTensor`] whose `.fp16` field (or main buffer)
+    /// contains `half[N * K]` in row-major order (N rows, K elements each).
+    ///
+    /// Output: `(q8_tensor, scales_tensor)` where
+    /// - `q8_tensor` is an `MTLBuffer`-backed [`MetalTensor`] with `int8_t[N * K]`
+    /// - `scales_tensor` is an `MTLBuffer`-backed [`MetalTensor`] with `float[N]`
+    ///
+    /// Per-row symmetric quantization: `scale = max_abs(row) / 127`.
+    /// `q = clamp(round(x / scale), -127, 127)`.
+    #[expect(unsafe_code, reason = "Metal SharedMode buffer contents access")]
+    pub fn quantize_weights_q8(
+        &self,
+        weights: &MetalTensor,
+        n: usize,
+        k: usize,
+    ) -> crate::Result<(MetalTensor, MetalTensor)> {
+        // Prefer the pre-converted FP16 buffer when available.
+        let fp16_borrow = weights.fp16.borrow();
+        let (fp16_buf, fp16_off_bytes) = if let Some(ref buf) = *fp16_borrow {
+            (buf as &ProtocolObject<dyn MTLBuffer>, 0usize)
+        } else {
+            (
+                &*weights.buffer as &ProtocolObject<dyn MTLBuffer>,
+                weights.offset,
+            )
+        };
+
+        // Read FP16 data from the CPU-accessible shared buffer.
+        let fp16_slice: &[half::f16] = unsafe {
+            let base = fp16_buf.contents().as_ptr().cast::<u8>();
+            let ptr = base.add(fp16_off_bytes).cast::<half::f16>();
+            std::slice::from_raw_parts(ptr, n * k)
+        };
+
+        // Quantize row-by-row.
+        let mut q8_data: Vec<i8> = Vec::with_capacity(n * k);
+        let mut scales: Vec<f32> = Vec::with_capacity(n);
+
+        for row in 0..n {
+            let row_slice = &fp16_slice[row * k..(row + 1) * k];
+
+            // Find max absolute value for this row.
+            let max_abs = row_slice
+                .iter()
+                .map(|&h| h.to_f32().abs())
+                .fold(0.0f32, f32::max);
+
+            let scale = if max_abs == 0.0 {
+                1.0f32 // avoid divide-by-zero; all values will quantize to 0
+            } else {
+                max_abs / 127.0
+            };
+            scales.push(scale);
+
+            for &h in row_slice {
+                let f = h.to_f32();
+                let q = (f / scale).round().clamp(-127.0, 127.0) as i8;
+                q8_data.push(q);
+            }
+        }
+
+        // Upload INT8 data into a shared Metal buffer.
+        let q8_size = (n * k) as NSUInteger;
+        let q8_buf = unsafe {
+            self.device.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(q8_data.as_ptr() as *mut _)
+                    .ok_or_else(|| crate::Error::Metal("q8 data ptr is null".into()))?,
+                q8_size,
+                MTLResourceOptions::StorageModeShared,
+            )
+        }
+        .ok_or_else(|| crate::Error::Metal(format!("q8 buffer alloc failed ({} bytes)", n * k)))?;
+
+        // Upload per-row scales into a shared Metal buffer.
+        let scales_size = (n * core::mem::size_of::<f32>()) as NSUInteger;
+        let scales_buf = unsafe {
+            self.device.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(scales.as_ptr() as *mut _)
+                    .ok_or_else(|| crate::Error::Metal("scales ptr is null".into()))?,
+                scales_size,
+                MTLResourceOptions::StorageModeShared,
+            )
+        }
+        .ok_or_else(|| crate::Error::Metal(format!("scales buffer alloc failed ({n} floats)")))?;
+
+        Ok((MetalTensor::new(q8_buf, 0), MetalTensor::new(scales_buf, 0)))
+    }
+
+    /// Dispatch the INT8-weight GEMM kernel.
+    ///
+    /// Computes `output_f16 = A_f16 @ B_q8.T` (when `transpose_b = true`)
+    /// dequantizing on-the-fly using per-row scales in `b_scales`.
+    ///
+    /// - `a_f16`: FP16 activations `[M, K]`
+    /// - `b_q8`: INT8 quantized weights `[N, K]` (transposed weight matrix)
+    /// - `b_scales`: `float[N]` per-row dequantization scales
+    /// - `output_f16`: FP16 output `[M, N]`
+    #[expect(
+        clippy::many_single_char_names,
+        reason = "m, n, k are standard GEMM parameter names from BLAS"
+    )]
+    pub fn gemm_q8(
+        &self,
+        a_f16: &MetalTensor,
+        b_q8: &MetalTensor,
+        b_scales: &MetalTensor,
+        output_f16: &mut MetalTensor,
+        m: usize,
+        n: usize,
+        k: usize,
+        transpose_b: bool,
+    ) -> crate::Result<()> {
+        self.run_compute("gemm-q8w-f16a", |enc| {
+            enc.setComputePipelineState(&self.kernels.gemm_q8w);
+            set_buffer(enc, &a_f16.buffer, a_f16.offset, 0);
+            set_buffer(enc, &b_q8.buffer, b_q8.offset, 1);
+            set_buffer(enc, &output_f16.buffer, output_f16.offset, 2);
+            set_u32_param(enc, m as u32, 3);
+            set_u32_param(enc, n as u32, 4);
+            set_u32_param(enc, k as u32, 5);
+            set_u32_param(enc, if transpose_b { 1 } else { 0 }, 6);
+            set_u32_param(enc, (m * k) as u32, 7);
+            set_u32_param(
+                enc,
+                if transpose_b {
+                    (n * k) as u32
+                } else {
+                    (k * n) as u32
+                },
+                8,
+            );
+            set_u32_param(enc, (m * n) as u32, 9);
+            set_buffer(enc, &b_scales.buffer, b_scales.offset, 10);
+            let grid = MTLSize {
+                width: n.div_ceil(64),
+                height: m.div_ceil(64),
+                depth: 1,
+            };
+            let threads = MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            };
+            enc.dispatchThreadgroups_threadsPerThreadgroup(grid, threads);
             Ok(())
         })
     }
