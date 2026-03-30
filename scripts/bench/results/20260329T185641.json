@@ -1,0 +1,42 @@
+[
+  {
+    "label": "mps-3L",
+    "cfg": "mps",
+    "layers": 3,
+    "throughput": 421.5,
+    "wall_time": 7.91,
+    "thermal_before": "speed=100% gpu=49% mem=20.7GB",
+    "thermal_after": "speed=100% gpu=92% mem=12.5GB",
+    "returncode": 0
+  },
+  {
+    "label": "mps-22L",
+    "cfg": "mps",
+    "layers": 22,
+    "throughput": 71.9,
+    "wall_time": 34.3,
+    "thermal_before": "speed=100% gpu=40% mem=12.6GB",
+    "thermal_after": "speed=100% gpu=96% mem=12.5GB",
+    "returncode": 0
+  },
+  {
+    "label": "compute-3L",
+    "cfg": "compute",
+    "layers": 3,
+    "throughput": 311.6,
+    "wall_time": 8.74,
+    "thermal_before": "speed=100% gpu=27% mem=12.6GB",
+    "thermal_after": "speed=100% gpu=95% mem=13.3GB",
+    "returncode": 0
+  },
+  {
+    "label": "compute-22L",
+    "cfg": "compute",
+    "layers": 22,
+    "throughput": 47.3,
+    "wall_time": 51.52,
+    "thermal_before": "speed=100% gpu=28% mem=11.1GB",
+    "thermal_after": "speed=100% gpu=70% mem=10.7GB",
+    "returncode": 0
+  }
+]

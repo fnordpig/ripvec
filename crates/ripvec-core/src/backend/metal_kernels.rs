@@ -2994,37 +2994,37 @@ kernel void gemm_f16w_f32a_kernel(
         }
     }
 
-    // Fused store: FP32 accumulators → device half* via threadgroup scratch.
-    // 4 passes: one simdgroup stores 32×32 floats to scratch per pass,
-    // then all 128 threads convert float→half and write to device.
-    threadgroup float* scratch = (threadgroup float*)sa;
+    // Per-tile fused store: for each 8×8 accumulator tile, simdgroup_store
+    // to a tiny 64-float scratch, then the same 32 threads immediately
+    // convert float→half and write to device. No cross-simdgroup barriers.
+    // Each simdgroup has its own 64-float scratch region (256 bytes × 4 = 1KB).
+    threadgroup float scratch[4 * 64];  // 4 simdgroups × 64 floats = 1024 bytes
 
     ushort sg_row = sgitg % 2;
     ushort sg_col = sgitg / 2;
+    threadgroup float* my_scratch = scratch + sgitg * 64;
 
-    for (short pass = 0; pass < 4; pass++) {
-        if (sgitg == ushort(pass)) {
-            #pragma unroll
-            for (short i = 0; i < 16; i++) {
-                short m_tile = i / 4;
-                short n_tile = i % 4;
-                simdgroup_store(mc[i], scratch + m_tile * 8 + n_tile * 8 * 32, 32, 0, false);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    #pragma unroll
+    for (short i = 0; i < 16; i++) {
+        short m_tile = i / 4;
+        short n_tile = i % 4;
+        uint m_base = m_start + sg_row * 32 + m_tile * 8;
+        uint n_base = n_start + sg_col * 32 + n_tile * 8;
 
-        uint pass_m = m_start + (pass % 2) * 32;
-        uint pass_n = n_start + (pass / 2) * 32;
-        for (uint idx = tiitg; idx < 32 * 32; idx += 128) {
-            uint lm = idx % 32;
-            uint ln = idx / 32;
-            uint gm = pass_m + lm;
-            uint gn = pass_n + ln;
+        // Store 8×8 float tile to per-simdgroup scratch (row-major, stride 8)
+        simdgroup_store(mc[i], my_scratch, 8, 0, false);
+
+        // Each of the 32 threads in this simdgroup writes 2 elements
+        // (simdgroup_store laid out 64 floats = 32 threads × 2 elements)
+        for (ushort e = lane_id; e < 64; e += 32) {
+            ushort lr = e / 8;
+            ushort lc = e % 8;
+            uint gm = m_base + lr;
+            uint gn = n_base + lc;
             if (gm < M && gn < N) {
-                C_batch[gm * N + gn] = half(scratch[ln * 32 + lm]);
+                C_batch[gm * N + gn] = half(my_scratch[e]);
             }
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 ";
