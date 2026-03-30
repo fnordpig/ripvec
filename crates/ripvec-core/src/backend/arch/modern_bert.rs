@@ -39,6 +39,12 @@ pub struct ModernBertLayerWeights<T> {
     pub mlp_norm_weight: T,
     /// Whether this layer uses global (full) or local (sliding window) attention.
     pub is_global: bool,
+    /// Low-rank SVD factor A for Wi: `[k, hidden]`. Present when `--svd-rank` is set.
+    pub svd_wi_a: Option<T>,
+    /// Low-rank SVD factor B for Wi: `[2*intermediate, k]`. Present when `--svd-rank` is set.
+    pub svd_wi_b: Option<T>,
+    /// SVD rank (k) for this layer. 0 if SVD not applied.
+    pub svd_rank: usize,
 }
 
 /// Full `ModernBERT` model weights, generic over tensor type.
@@ -378,18 +384,27 @@ fn ffn_sublayer<D: Driver>(
         g.eps,
     )?;
 
-    // Wi projection: [total_tokens, hidden] @ [2*inter, hidden]^T => [total_tokens, 2*inter]
+    // Wi projection: either one full GEMM or two low-rank GEMMs via SVD.
     let double_inter = 2 * g.intermediate;
     let mut wi_out = driver.alloc_zeros(g.total_tokens * double_inter)?;
-    driver.gemm(
-        &mlp_normed,
-        &layer.mlp_wi_weight,
-        &mut wi_out,
-        g.total_tokens,
-        double_inter,
-        g.hidden,
-        true,
-    )?;
+    if let (Some(a), Some(b)) = (&layer.svd_wi_a, &layer.svd_wi_b) {
+        // Low-rank: Z = X @ A^T  [M, hidden] @ [k, hidden]^T → [M, k]
+        let k = layer.svd_rank;
+        let mut z = driver.alloc_zeros(g.total_tokens * k)?;
+        driver.gemm(&mlp_normed, a, &mut z, g.total_tokens, k, g.hidden, true)?;
+        // Y = Z @ B^T  [M, k] @ [2*inter, k]^T → [M, 2*inter]
+        driver.gemm(&z, b, &mut wi_out, g.total_tokens, double_inter, k, true)?;
+    } else {
+        driver.gemm(
+            &mlp_normed,
+            &layer.mlp_wi_weight,
+            &mut wi_out,
+            g.total_tokens,
+            double_inter,
+            g.hidden,
+            true,
+        )?;
+    }
 
     // Split Wi output into value [total_tokens, inter] and gate [total_tokens, inter].
     let n_elements = g.total_tokens * g.intermediate;
@@ -677,18 +692,25 @@ fn ffn_sublayer_f16<D: Driver>(
         g.eps,
     )?;
 
-    // Wi projection — FP16 GEMM.
+    // Wi projection — FP16 GEMM (or two low-rank GEMMs via SVD).
     let double_inter = 2 * g.intermediate;
     let mut wi_out = driver.alloc_zeros_f16(g.total_tokens * double_inter)?;
-    driver.gemm_f16(
-        &mlp_normed,
-        &layer.mlp_wi_weight,
-        &mut wi_out,
-        g.total_tokens,
-        double_inter,
-        g.hidden,
-        true,
-    )?;
+    if let (Some(a), Some(b)) = (&layer.svd_wi_a, &layer.svd_wi_b) {
+        let k = layer.svd_rank;
+        let mut z = driver.alloc_zeros_f16(g.total_tokens * k)?;
+        driver.gemm_f16(&mlp_normed, a, &mut z, g.total_tokens, k, g.hidden, true)?;
+        driver.gemm_f16(&z, b, &mut wi_out, g.total_tokens, double_inter, k, true)?;
+    } else {
+        driver.gemm_f16(
+            &mlp_normed,
+            &layer.mlp_wi_weight,
+            &mut wi_out,
+            g.total_tokens,
+            double_inter,
+            g.hidden,
+            true,
+        )?;
+    }
 
     // Split + GeGLU — FP16.
     let n_elements = g.total_tokens * g.intermediate;

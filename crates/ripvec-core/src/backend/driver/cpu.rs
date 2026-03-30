@@ -323,6 +323,7 @@ impl CpuDriver {
         &self,
         weights_path: &Path,
         config: &ModernBertConfig,
+        svd_rank: &crate::embed::SvdRank,
     ) -> crate::Result<(ModernBertArch<Vec<f32>>, memmap2::Mmap)> {
         let file = std::fs::File::open(weights_path).map_err(|e| crate::Error::Io {
             path: weights_path.display().to_string(),
@@ -371,6 +372,9 @@ impl CpuDriver {
                 mlp_wo_weight,
                 mlp_norm_weight,
                 is_global,
+                svd_wi_a: None,
+                svd_wi_b: None,
+                svd_rank: 0,
             });
         }
 
@@ -378,6 +382,30 @@ impl CpuDriver {
         let emb_norm_weight = load_tensor_flat(&tensors, "embeddings.norm.weight")?;
         let final_norm_weight = load_tensor_flat(&tensors, "final_norm.weight")?;
         let zero_bias = vec![0.0f32; hidden];
+
+        // SVD decomposition of Wi weights (if requested).
+        if !matches!(svd_rank, crate::embed::SvdRank::Disabled) {
+            let wi_rows = 2 * intermediate;
+            let wi_cols = hidden;
+            for (li, layer) in layers.iter_mut().enumerate() {
+                if let Some(factors) = crate::backend::svd::decompose_wi(
+                    &layer.mlp_wi_weight,
+                    wi_rows,
+                    wi_cols,
+                    svd_rank,
+                ) {
+                    tracing::info!(
+                        layer = li,
+                        rank = factors.k,
+                        error = format!("{:.4}%", factors.error * 100.0),
+                        "SVD Wi decomposition"
+                    );
+                    layer.svd_wi_a = Some(factors.a);
+                    layer.svd_wi_b = Some(factors.b);
+                    layer.svd_rank = factors.k;
+                }
+            }
+        }
 
         let weights = ModernBertWeights {
             tok_embeddings,
