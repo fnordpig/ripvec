@@ -301,7 +301,7 @@ kernel void fused_scale_mask_softmax_kernel(
     // Pass 2: exp(x - max) and sum
     float thread_sum = 0.0;
     for (int i = int(tid); i < seq; i += int(tpg)) {
-        float val = exp(row_data[i] - row_max);
+        float val = fast::exp(row_data[i] - row_max);
         row_data[i] = val;
         thread_sum += val;
     }
@@ -968,7 +968,7 @@ kernel void fused_scale_mask_softmax_windowed_kernel(
     // Pass 2: exp(x - max) and sum
     float thread_sum = 0.0;
     for (int i = int(tid); i < seq; i += int(tpg)) {
-        float val = exp(row_data[i] - row_max);
+        float val = fast::exp(row_data[i] - row_max);
         row_data[i] = val;
         thread_sum += val;
     }
@@ -1335,7 +1335,7 @@ kernel void fused_scale_mask_softmax_f16_kernel(
     // Pass 2: exp(x - max) and sum
     float thread_sum = 0.0;
     for (int i = int(tid); i < seq; i += int(tpg)) {
-        float val = exp(float(row_data[i]) - row_max);
+        float val = fast::exp(float(row_data[i]) - row_max);
         row_data[i] = half(val);
         thread_sum += val;
     }
@@ -1397,7 +1397,7 @@ kernel void fused_scale_mask_softmax_windowed_f16_kernel(
     // Pass 2: exp(x - max) and sum
     float thread_sum = 0.0;
     for (int i = int(tid); i < seq; i += int(tpg)) {
-        float val = exp(float(row_data[i]) - row_max);
+        float val = fast::exp(float(row_data[i]) - row_max);
         row_data[i] = half(val);
         thread_sum += val;
     }
