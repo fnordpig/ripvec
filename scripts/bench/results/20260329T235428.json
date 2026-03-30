@@ -1,0 +1,32 @@
+[
+  {
+    "label": "mps-22L",
+    "cfg": "mps",
+    "layers": 22,
+    "throughput": 89.6,
+    "wall_time": 27.73,
+    "thermal_before": "speed=100% gpu=0% mem=16.4GB",
+    "thermal_after": "speed=100% gpu=94% mem=12.8GB",
+    "returncode": 0
+  },
+  {
+    "label": "compute-22L",
+    "cfg": "compute",
+    "layers": 22,
+    "throughput": 72.6,
+    "wall_time": 33.97,
+    "thermal_before": "speed=100% gpu=0% mem=12.5GB",
+    "thermal_after": "speed=100% gpu=97% mem=13.9GB",
+    "returncode": 0
+  },
+  {
+    "label": "cpu-22L",
+    "cfg": "cpu",
+    "layers": 22,
+    "throughput": 88.3,
+    "wall_time": 28.11,
+    "thermal_before": "speed=100% gpu=0% mem=11.4GB",
+    "thermal_after": "speed=100% gpu=95% mem=12.5GB",
+    "returncode": 0
+  }
+]

@@ -832,7 +832,10 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
             driver.f32_to_f16(&mut hidden_f16, &hidden_states, total_tokens * hidden)?;
 
             // 22 layers — ALL in FP16. Zero conversions.
-            for layer in &w.layers[..num_layers] {
+            for (li, layer) in w.layers[..num_layers].iter().enumerate() {
+                if self.skip_layers.contains(&li) {
+                    continue;
+                }
                 let saved = driver.save_pool_cursor();
 
                 let rope = if layer.is_global {
@@ -856,6 +859,9 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
         } else {
             // === FP32 PATH ===
             for (li, layer) in w.layers[..num_layers].iter().enumerate() {
+                if self.skip_layers.contains(&li) {
+                    continue;
+                }
                 let saved = driver.save_pool_cursor();
 
                 let rope = if layer.is_global {
@@ -871,11 +877,6 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
                 hidden_states = ffn_sublayer(driver, &attn_output, layer, &g, &w.zero_bias)?;
 
                 driver.restore_pool_cursor(saved);
-
-                // No encoder segmentation needed — 400+ dispatches per encoder is fine.
-                // Earlier "hangs" were from per-layer segment_encoder() overhead
-                // (118ms each × 22 = 2.6s), not encoder overflow.
-                let _ = li;
             }
         }
 
