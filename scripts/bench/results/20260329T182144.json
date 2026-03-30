@@ -1,0 +1,22 @@
+[
+  {
+    "label": "mps-3L",
+    "cfg": "mps",
+    "layers": 3,
+    "throughput": 24.1,
+    "wall_time": 100.17,
+    "thermal_before": "speed=100% gpu=0% mem=13.8GB",
+    "thermal_after": "speed=100% gpu=25% mem=14.0GB",
+    "returncode": 0
+  },
+  {
+    "label": "compute-3L",
+    "cfg": "compute",
+    "layers": 3,
+    "throughput": null,
+    "wall_time": 14.21,
+    "thermal_before": "speed=100% gpu=0% mem=14.0GB",
+    "thermal_after": "speed=100% gpu=26% mem=13.4GB",
+    "returncode": -15
+  }
+]

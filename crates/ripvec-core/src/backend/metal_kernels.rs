@@ -2853,8 +2853,16 @@ kernel void gemm_tiled_f16_kernel(
     }
 }
 
+// gemm_f16w_f32a_kernel moved to NATIVE_GEMM_KERNEL below.
+";
+
+/// Native simdgroup GEMM — separate Metal library to avoid compiler interference.
+pub const NATIVE_GEMM_KERNEL: &str = r"
+#include <metal_stdlib>
+using namespace metal;
+
 // ---------------------------------------------------------------------------
-// Mixed-precision GEMM: FP32 activations × FP16 weights → FP32 output.
+// Fused GEMM: FP16 activations × FP16 weights → FP16 output via FP32 accumulators.
 // Native simdgroup ops throughout — no MFA wrapper.
 //
 // C[M,N] = A[M,K] × B^T[K,N] where A is device float*, B is device half*.
@@ -2867,9 +2875,9 @@ kernel void gemm_tiled_f16_kernel(
 // ---------------------------------------------------------------------------
 
 kernel void gemm_f16w_f32a_kernel(
-    device float* A             [[buffer(0)]],
-    device half*  B             [[buffer(1)]],
-    device float* C             [[buffer(2)]],
+    device float* A_raw         [[buffer(0)]],   // actually half*, cast below
+    device float* B_raw         [[buffer(1)]],   // actually half*, cast below
+    device float* C_raw         [[buffer(2)]],   // actually half*, cast below
     constant uint& M            [[buffer(3)]],
     constant uint& N            [[buffer(4)]],
     constant uint& K            [[buffer(5)]],
@@ -2882,10 +2890,15 @@ kernel void gemm_f16w_f32a_kernel(
     ushort lane_id              [[thread_index_in_simdgroup]],
     ushort tiitg                [[thread_index_in_threadgroup]]
 ) {
+    // Cast float* args to half* — avoids Metal driver regression from half* pipeline state.
+    device half* A = (device half*)A_raw;
+    device half* B = (device half*)B_raw;
+    device half* C = (device half*)C_raw;
+
     uint batch_idx = tg_pos.z;
-    device float* A_batch = A + batch_idx * stride_A;
-    device half*  B_batch = B + batch_idx * stride_B;
-    device float* C_batch = C + batch_idx * stride_C;
+    device half* A_batch = A + batch_idx * stride_A;
+    device half* B_batch = B + batch_idx * stride_B;
+    device half* C_batch = C + batch_idx * stride_C;
 
     uint m_start = tg_pos.y * 64;
     uint n_start = tg_pos.x * 64;
@@ -2905,7 +2918,7 @@ kernel void gemm_f16w_f32a_kernel(
     short il0 = short(tiitg % NL0);
     short iy  = short(8 * (tiitg % NL1));
 
-    device float* x = A_batch + uint(m_start + lr0) * K;
+    device half* x = A_batch + uint(m_start + lr0) * K;
     device half*  y = B_batch + uint(n_start + lr1) * K;
 
     simdgroup_float8x8 mc[16];
@@ -2916,8 +2929,7 @@ kernel void gemm_f16w_f32a_kernel(
     for (uint loop_k = 0; loop_k < K; loop_k += 32) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Load A (device float*) into sa (threadgroup half*): float→half conversion.
-        // Halves load bandwidth (critical at M=35762 where A is 110MB).
+        // Load A (device half*) into sa (threadgroup half*). No conversion.
         {
             short sy = lr0 / 8;
             short ly = lr0 % 8;
@@ -2926,7 +2938,7 @@ kernel void gemm_f16w_f32a_kernel(
                 short lx = short(i % 8);
                 short ib = short(8 * sx + sy);
                 half val = (loop_k + 16 * il0 + i < K && m_start + lr0 < M)
-                    ? half(*(x + 16 * il0 + i)) : half(0.0h);
+                    ? *(x + 16 * il0 + i) : half(0.0h);
                 *(sa + 64 * ib + 8 * ly + lx) = val;
             }
         }
@@ -2982,20 +2994,37 @@ kernel void gemm_f16w_f32a_kernel(
         }
     }
 
-    // Store: mc[M, N] → device float* directly. No transpose, no conversion.
+    // Fused store: FP32 accumulators → device half* via threadgroup scratch.
+    // 4 passes: one simdgroup stores 32×32 floats to scratch per pass,
+    // then all 128 threads convert float→half and write to device.
+    threadgroup float* scratch = (threadgroup float*)sa;
+
     ushort sg_row = sgitg % 2;
     ushort sg_col = sgitg / 2;
 
-    #pragma unroll
-    for (short i = 0; i < 16; i++) {
-        short m_tile = i / 4;
-        short n_tile = i % 4;
-        uint m_base = m_start + sg_row * 32 + m_tile * 8;
-        uint n_base = n_start + sg_col * 32 + n_tile * 8;
-
-        if (m_base < M && n_base < N) {
-            simdgroup_store(mc[i], C_batch + m_base * N + n_base, N, 0, false);
+    for (short pass = 0; pass < 4; pass++) {
+        if (sgitg == ushort(pass)) {
+            #pragma unroll
+            for (short i = 0; i < 16; i++) {
+                short m_tile = i / 4;
+                short n_tile = i % 4;
+                simdgroup_store(mc[i], scratch + m_tile * 8 + n_tile * 8 * 32, 32, 0, false);
+            }
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint pass_m = m_start + (pass % 2) * 32;
+        uint pass_n = n_start + (pass / 2) * 32;
+        for (uint idx = tiitg; idx < 32 * 32; idx += 128) {
+            uint lm = idx % 32;
+            uint ln = idx / 32;
+            uint gm = pass_m + lm;
+            uint gn = pass_n + ln;
+            if (gm < M && gn < N) {
+                C_batch[gm * N + gn] = half(scratch[ln * 32 + lm]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 ";

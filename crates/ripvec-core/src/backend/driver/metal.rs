@@ -212,6 +212,8 @@ impl KernelPipelines {
         let p = |name: &str| create_pipeline(device, &library, name);
 
         let gemm_library = compile_library(device, crate::backend::metal_kernels::GEMM_KERNEL)?;
+        let native_gemm_library =
+            compile_library(device, crate::backend::metal_kernels::NATIVE_GEMM_KERNEL)?;
 
         Ok(Self {
             embedding_lookup: p("embedding_lookup_kernel")?,
@@ -261,7 +263,7 @@ impl KernelPipelines {
             rope_encode_f16: p("rope_encode_f16_kernel")?,
             gemm_batched_f16: create_pipeline(device, &gemm_library, "gemm_batched_f16_kernel")?,
             gemm_tiled_f16: create_pipeline(device, &gemm_library, "gemm_tiled_f16_kernel")?,
-            gemm_f16w_f32a: create_pipeline(device, &gemm_library, "gemm_f16w_f32a_kernel")?,
+            gemm_f16w_f32a: create_pipeline(device, &native_gemm_library, "gemm_f16w_f32a_kernel")?,
         })
     }
 }
@@ -2768,11 +2770,41 @@ impl Driver for MetalDriver {
             .get_or_init(|| std::env::var("RIPVEC_NO_MPS").is_ok_and(|v| v == "1"));
 
         if use_compute {
-            // Option 1: FP16 in → native GEMM → FP32 temp → f32_to_f16 → FP16 out
-            let mut temp_f32 = self.alloc_tensor(m * n)?;
-            self.gemm_mixed(a, b, &mut temp_f32, m, n, k, transpose_b)?;
-            self.f32_to_f16(output, &temp_f32, m * n)?;
-            Ok(())
+            // Fused: FP16 in → native simdgroup GEMM (FP32 accumulators) →
+            // fused float→half store → FP16 out. No temp buffer.
+            self.run_compute("gemm-fused-f16", |enc| {
+                enc.setComputePipelineState(&self.kernels.gemm_f16w_f32a);
+                set_buffer(enc, &a.buffer, a.offset, 0);
+                set_buffer(enc, b_buf, b_off, 1);
+                set_buffer(enc, &output.buffer, output.offset, 2);
+                set_u32_param(enc, m as u32, 3);
+                set_u32_param(enc, n as u32, 4);
+                set_u32_param(enc, k as u32, 5);
+                set_u32_param(enc, if transpose_b { 1 } else { 0 }, 6);
+                set_u32_param(enc, (m * k) as u32, 7);
+                set_u32_param(
+                    enc,
+                    if transpose_b {
+                        (n * k) as u32
+                    } else {
+                        (k * n) as u32
+                    },
+                    8,
+                );
+                set_u32_param(enc, (m * n) as u32, 9);
+                let grid = MTLSize {
+                    width: n.div_ceil(64),
+                    height: m.div_ceil(64),
+                    depth: 1,
+                };
+                let threads = MTLSize {
+                    width: 128,
+                    height: 1,
+                    depth: 1,
+                };
+                enc.dispatchThreadgroups_threadsPerThreadgroup(grid, threads);
+                Ok(())
+            })
         } else {
             self.run_mps("mps-gemm-f16", |cmd_buf| {
                 dispatch_mps_gemm(
