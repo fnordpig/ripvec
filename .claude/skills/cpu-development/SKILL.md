@@ -21,7 +21,7 @@ CpuDriver (driver/cpu.rs)
 
 System BLAS libraries use internal multi-threading for large GEMMs. This conflicts with rayon's parallelism:
 
-**Single-backend mode** (ModernBERT): One worker thread runs the forward pass. BLAS uses all cores for intra-GEMM parallelism. This is optimal — 72/s on M2 Max.
+**Single-backend mode** (ModernBERT): One worker thread runs the forward pass. BLAS uses all cores for intra-GEMM parallelism. This is optimal — 73.5/s on M2 Max.
 
 **Multi-backend mode** (BGE-small with multiple workers): Each rayon worker calls BLAS, causing mutex contention. Fix: call `force_single_threaded_blas()` per worker thread to force single-threaded BLAS, letting rayon handle inter-batch parallelism.
 
@@ -43,7 +43,7 @@ fn force_single_threaded_blas() {
 
 | Platform | BLAS | Feature flag | Notes |
 |----------|------|--------------|-------|
-| macOS (Apple Silicon) | Accelerate (AMX) | `cpu-accelerate` | Uses AMX coprocessor, 72/s ModernBERT |
+| macOS (Apple Silicon) | Accelerate (AMX) | `cpu-accelerate` | Uses AMX coprocessor, 73.5/s ModernBERT |
 | macOS (Intel) | Accelerate (vecLib) | `cpu-accelerate` | SSE/AVX, slower than Apple Silicon |
 | Linux (x86_64) | OpenBLAS | `cpu` | Compile with `RUSTFLAGS="-C target-cpu=native"` for AVX2/AVX-512 |
 | Linux (AMD) | AOCL | `cpu` | Link against `libblis` for zen3/zen4 optimized GEMM |
@@ -63,12 +63,10 @@ The CPU backend was added in ~200 lines because CpuDriver already implemented ev
 ## Performance Characteristics
 
 CPU ModernBERT at 22 layers on M2 Max:
-- **72/s** — competitive with Metal MPS (73/s)
+- **73.5/s** — competitive with Metal MPS (73.8/s)
 - BLAS uses AMX coprocessor for GEMMs (same hardware MPS uses internally)
 - Zero dispatch overhead (synchronous BLAS calls vs Metal encoder transitions)
 - Memory bandwidth is shared (unified memory on Apple Silicon)
-
-At 14 layers: **118/s** (identical to Metal — both ALU-bound, same hardware)
 
 ## Debugging CPU Issues
 

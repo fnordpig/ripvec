@@ -21,7 +21,7 @@ Cargo workspace with three crates:
 - `ripvec-mcp` — MCP server binary (rmcp, 6 tools + 1 resource)
 
 ### Backends (in detection priority order)
-- **Metal** (default on macOS) — custom MSL kernels + MPS GEMMs, 312/s on M2 Max
+- **Metal** (default on macOS) — custom MSL kernels + MPS GEMMs, 73/s ModernBERT, 312/s BGE-small on M2 Max
 - **MLX** (fallback on macOS) — mlx-rs, lazy eval graph fusion
 - **CUDA** (Linux) — cudarc, custom CUDA kernels, FP16 tensor core GEMM
 - **CPU** (everywhere) — ndarray + system BLAS (Accelerate/OpenBLAS/AOCL)

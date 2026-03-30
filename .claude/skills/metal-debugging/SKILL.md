@@ -23,8 +23,8 @@ Metal failures fall into five categories. Identify which one before investigatin
 
 **Never assume encoder dispatch limits or watchdog timers.** Test empirically:
 
-1. **Vary layers**: If layers=3 works but layers=15 hangs, check if it's time-based (vary batch size at same layer count) or dispatch-based (same dispatches, different sizes).
-2. **Vary batch size**: Same layer count, batch=1 vs batch=32. If batch=1 works, the hang is from large matrix sizes overwhelming the GPU, not dispatch count.
+1. **Vary batch size**: batch=1 vs batch=32. If batch=1 works, the hang is from large matrix sizes overwhelming the GPU, not dispatch count.
+2. **Vary sequence length**: Same batch size, short vs long sequences. Isolates whether it's time-based or dispatch-based.
 3. **No-op kernel test**: Replace the kernel body with `return;` — if the hang persists, the issue is dispatch overhead, not kernel compute.
 4. **Single K-tile test**: Add `if (loop_k >= 32) return;` — if the single tile is slow, the bottleneck is cooperative tgmem loads, not the compute loop.
 
@@ -55,8 +55,8 @@ Common NaN sources:
 
 Test for regressions after any kernel source change:
 ```bash
-# Before: record baseline MPS throughput
-./target/release/ripvec "test" -n 1 . --layers 3 --profile 2>&1 | rg 'done in'
+# Before: record baseline MPS throughput (use bench.py, not ad-hoc commands)
+uv run scripts/bench/bench.py --configs mps --no-build
 # After: must match within 5%
 ```
 

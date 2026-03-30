@@ -16,13 +16,13 @@ xcrun xctrace record \
   --time-limit 15s \
   --no-prompt \
   --target-stdout /dev/null \
-  --launch -- ./target/release/ripvec "session" -n 1 . --layers 3 --mode semantic -T 0.0
+  --launch -- ./target/release/ripvec "session" -n 1 . --mode semantic -T 0.0
 ```
 
 **Critical rules:**
 - Use `--env VAR=VALUE` for environment variables — parent shell env does NOT propagate
-- Use ripvec's own code (`.`, ~1000 chunks) with layers=3 — keeps traces <500MB
-- Flask corpus at 22 layers produces 8GB+ traces that fail to export
+- Use ripvec's own code (`.`, ~1000 chunks) — keeps traces <500MB
+- Flask corpus produces 8GB+ traces that fail to export; prefer the ripvec corpus for profiling
 - Metal System Trace template requires GPU events to export — compute-only (zero MPS) paths may fail with "Document Missing Template Error" on large captures
 
 ## tracemeld Analysis Workflow

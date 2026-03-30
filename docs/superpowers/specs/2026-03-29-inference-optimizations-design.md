@@ -2,6 +2,16 @@
 
 **Date:** 2026-03-29
 **Status:** Approved
+
+**Outcome (2026-03-30):** Implemented and tested all four optimizations.
+Only `fast::exp()` survived — SVD, token pruning, and layer skipping were
+all removed after failing quality or throughput validation:
+- **fast::exp()**: Shipped (always on). +0.3% throughput, zero recall loss.
+- **SVD**: Removed. 4.5s load penalty exceeded FLOP savings (-8% net).
+- **Token pruning**: Removed. Even 10% pruning caused 11% semantic recall loss.
+- **Layer skipping**: Removed. Per-layer ablation showed no safe layers to skip.
+- **--layers early exit**: Also removed. All 22 layers required for quality.
+
 **Goal:** Maximize ModernBERT embedding throughput while staying within recall budgets: ≤10% semantic Recall@10 loss, ≤2% hybrid Recall@10 loss.
 
 ---

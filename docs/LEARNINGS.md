@@ -4,6 +4,10 @@
 > Written by walking forward through the session's context, noting each wrong
 > turn and what fixed it.
 
+> **Note (2026-03-30):** Throughput numbers in this document are from the
+> development session and may not reflect current performance. Current
+> baselines: MPS 73.8/s, compute 59.4/s, CPU 73.5/s (Flask corpus, 22L).
+
 ---
 
 ## Procedural Mistakes

@@ -1,3 +1,8 @@
+> **SUPERSEDED (2026-03-29):** This plan was replaced by
+> `2026-03-29-inference-optimizations.md`. The `--layers` flag from this
+> plan was later implemented and then removed after ablation proved all
+> 22 layers are needed for quality.
+
 # ModernBERT Metal Inference Optimization Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

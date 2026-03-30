@@ -1,3 +1,8 @@
+> **COMPLETED (2026-03-30):** This plan was fully executed. Only Task 1
+> (fast::exp) produced a shippable result. Tasks 3-7 (SVD, layer skip,
+> token pruning) were implemented, benchmarked, and removed after failing
+> quality/throughput validation. See the spec for detailed outcomes.
+
 # ModernBERT Inference Optimizations Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

@@ -1,6 +1,6 @@
 ---
 name: general-benchmarking
-description: This skill should be used when benchmarking ripvec throughput on any backend, running performance comparisons, evaluating recall/quality at different layer counts, using bench.py, or doing regression testing. Also use when the user mentions "bench.py", "throughput", "benchmark", "recall", "regression test", "batch size sweep", or "performance comparison".
+description: This skill should be used when benchmarking ripvec throughput on any backend, running performance comparisons, evaluating recall/quality, using bench.py, or doing regression testing. Also use when the user mentions "bench.py", "throughput", "benchmark", "recall", "regression test", "batch size sweep", or "performance comparison".
 ---
 
 # ripvec Benchmarking Guide
@@ -11,10 +11,10 @@ All benchmarking MUST use `scripts/bench/bench.py`. Never run ad-hoc Bash comman
 
 ```bash
 # Throughput benchmark (single config)
-uv run scripts/bench/bench.py --configs mps --no-build --layers 22
+uv run scripts/bench/bench.py --configs mps --no-build
 
 # Compare multiple configurations
-uv run scripts/bench/bench.py --configs mps compute cpu --no-build --layers 3 22
+uv run scripts/bench/bench.py --configs mps compute cpu --no-build
 
 # Batch size sweep
 uv run scripts/bench/bench.py --configs mps --batch-sizes 32 64 128 --no-build
@@ -22,8 +22,11 @@ uv run scripts/bench/bench.py --configs mps --batch-sizes 32 64 128 --no-build
 # Correctness validation (top-3 rankings must match across configs)
 uv run scripts/bench/bench.py --validate --configs mps compute --no-build
 
-# Recall evaluation (layer count quality vs 22-layer baseline)
-uv run scripts/bench/bench.py --recall --layers 10 14 16 18 22 --no-build
+# Pass extra ripvec flags (e.g. for experimental options)
+uv run scripts/bench/bench.py --configs mps --no-build --extra-args "--some-flag value"
+
+# Use a different corpus
+uv run scripts/bench/bench.py --configs mps --no-build --corpus tests/corpus/code/flask
 
 # Thermal check only
 uv run scripts/bench/bench.py --thermals
@@ -65,14 +68,14 @@ Flask is the standard for commit messages and PR numbers. ripvec code is for fas
 
 Before committing any backend change:
 
-1. **Record baseline**: `uv run scripts/bench/bench.py --configs mps --no-build --layers 3`
+1. **Record baseline**: `uv run scripts/bench/bench.py --configs mps --no-build`
 2. Make the change, `cargo build --release`
-3. **Verify**: `uv run scripts/bench/bench.py --configs mps --no-build --layers 3`
+3. **Verify**: `uv run scripts/bench/bench.py --configs mps --no-build`
 4. Must match within 5%. If adding new kernels, MPS regression is possible (see metal-debugging skill)
 
 ## Recall Evaluation
 
-ModernBERT concentrates semantic quality in the final layers. Layer shedding results:
+`scripts/recall_eval.py` measures Recall@10 against a reference set. `scripts/ablation_layers.py` ran the per-layer ablation that proved all 22 layers are needed:
 
 | Layers | Recall@10 vs 22L |
 |--------|------------------|
@@ -80,7 +83,7 @@ ModernBERT concentrates semantic quality in the final layers. Layer shedding res
 | 14 | ~9% (garbage) |
 | 22 | 100% (baseline) |
 
-**Cannot cut layers for quality.** All 22 are required.
+**Cannot cut layers for quality.** All 22 are required — per-layer ablation confirmed this conclusively.
 
 ## Extending bench.py
 
@@ -92,8 +95,8 @@ Healthy throughput ranges (Flask corpus, M2 Max, 22 layers):
 
 | Backend | Expected | Alarm if below |
 |---------|----------|----------------|
-| Metal MPS FP16 | 70-75/s | <60/s |
-| Metal compute FP16 | 45-50/s | <35/s |
-| CPU Accelerate | 70-75/s | <60/s |
+| Metal MPS FP16 | ~73.8/s | <60/s |
+| Metal compute FP16 | ~59.4/s | <45/s |
+| CPU Accelerate | ~73.5/s | <60/s |
 | INT8 block_q8_0 | 30-35/s | <25/s |
 | BGE-small MPS | 340-360/s | <300/s |

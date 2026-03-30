@@ -103,9 +103,9 @@ graph LR
 
 ### Why Two Paths?
 
-**MPS** uses Apple's proprietary AMX coprocessor for matrix multiplication — undocumented hardware unavailable to compute shaders. MPS achieves ~72/s at 22 layers.
+**MPS** uses Apple's proprietary AMX coprocessor for matrix multiplication — undocumented hardware unavailable to compute shaders. MPS achieves ~73.8/s at 22 layers.
 
-**Native compute** uses standard `simdgroup_multiply_accumulate` on the GPU's ALU. It eliminates MPS encoder transitions (88 per forward pass, ~7% overhead) but is 26% slower per-FLOP. Achieves ~47/s at 22 layers.
+**Native compute** uses standard `simdgroup_multiply_accumulate` on the GPU's ALU. It eliminates MPS encoder transitions (88 per forward pass, ~7% overhead) but is 26% slower per-FLOP. Achieves ~59.4/s at 22 layers.
 
 The native path exists to:
 1. Enable INT8 quantization (MPS can't dequantize custom formats)
@@ -319,9 +319,9 @@ After removing all segmentation, 22 layers completes at 31/s (compute path) with
 
 MPS's `MPSMatrixMultiplication` accesses the AMX (Apple Matrix coprocessor) — dedicated matrix multiplication hardware that is unavailable to Metal compute shaders. This is why:
 
-- MPS FP16: **72/s** (AMX hardware)
-- Native compute FP16: **47/s** (GPU ALU via simdgroup MACs)
-- CPU Accelerate BLAS: **72/s** (also AMX, via the CPU side)
+- MPS FP16: **73.8/s** (AMX hardware)
+- Native compute FP16: **59.4/s** (GPU ALU via simdgroup MACs)
+- CPU Accelerate BLAS: **73.5/s** (also AMX, via the CPU side)
 
 The native compute kernel at 47/s has **95%+ GPU utilization** and **0.5% driver overhead**. The gap is pure per-FLOP throughput, not scheduling or overhead. Custom kernels cannot match MPS on Apple Silicon for dense matrix multiplication.
 
@@ -355,7 +355,7 @@ FP32 activations cause 2× the cache pressure and DRAM fetches vs FP16. This is 
 | **Weight GEMMs** | MPS FP16 | Native compute (broken in gemm()) | INT8 block_q8_0 | MPS FP32 |
 | **Attention GEMMs** | MPS batched FP16 | MPS batched FP16 | MPS batched FP16 | MPS batched FP32 |
 | **Element-wise** | FP16 kernels | FP32 kernels | FP16 kernels | FP32 kernels |
-| **Throughput (22L)** | **72/s** | ~47/s | **35/s** | **54/s** |
+| **Throughput (22L)** | **73.8/s** | ~59.4/s | **35/s** | **54/s** |
 
 ---
 
@@ -408,7 +408,7 @@ xcrun xctrace record \
   --time-limit 15s \
   --no-prompt \
   --target-stdout /dev/null \
-  --launch -- ./target/release/ripvec "test" -n 1 . --layers 3 --profile
+  --launch -- ./target/release/ripvec "test" -n 1 . --profile
 
 # Compute path (must use --env, short captures only)
 xcrun xctrace record \
@@ -418,12 +418,13 @@ xcrun xctrace record \
   --no-prompt \
   --env RIPVEC_NO_MPS=1 \
   --target-stdout /dev/null \
-  --launch -- ./target/release/ripvec "test" -n 1 . --layers 1 --mode semantic -T 0.0
+  --launch -- ./target/release/ripvec "test" -n 1 . --mode semantic -T 0.0
 ```
 
 **Key constraints:**
 - `--env` is required for environment variables (parent shell env NOT propagated)
-- Use ripvec's own code (`.`) with layers=1-3 — Flask at 22 layers produces 8GB+ traces
+- Use ripvec's own code (`.`) for short captures — Flask at 22 layers produces 8GB+ traces
+- The `--layers` flag has been removed; all 22 layers always run
 - Compute-only traces may fail to export on large captures ("Document Missing Template Error")
 
 ### tracemeld Integration
