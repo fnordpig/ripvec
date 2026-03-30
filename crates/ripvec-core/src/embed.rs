@@ -27,18 +27,6 @@ use tracing::{debug, info_span, instrument, warn};
 use crate::backend::{EmbedBackend, Encoding};
 use crate::chunk::{ChunkConfig, CodeChunk};
 
-/// SVD rank selection for low-rank FFN approximation.
-#[derive(Debug, Clone, Default)]
-pub enum SvdRank {
-    /// Disabled — use original Wi weight (default).
-    #[default]
-    Disabled,
-    /// Per-layer rank from Frobenius norm threshold (1% reconstruction error).
-    Auto,
-    /// Fixed rank for all layers.
-    Fixed(usize),
-}
-
 /// Default batch size for embedding inference.
 pub const DEFAULT_BATCH_SIZE: usize = 32;
 
@@ -76,8 +64,6 @@ pub struct SearchConfig {
     pub file_type: Option<String>,
     /// Search mode: hybrid (default), semantic, or keyword.
     pub mode: crate::hybrid::SearchMode,
-    /// SVD rank for low-rank FFN approximation. Consumed at model load time.
-    pub svd_rank: SvdRank,
 }
 
 impl Default for SearchConfig {
@@ -90,7 +76,6 @@ impl Default for SearchConfig {
             cascade_dim: None,
             file_type: None,
             mode: crate::hybrid::SearchMode::Hybrid,
-            svd_rank: SvdRank::default(),
         }
     }
 }

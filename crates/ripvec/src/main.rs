@@ -140,15 +140,6 @@ fn load_pipeline(
     tokenizers::Tokenizer,
     ripvec_core::embed::SearchConfig,
 )> {
-    let svd_rank = match args.svd_rank.as_str() {
-        "0" => ripvec_core::embed::SvdRank::Disabled,
-        "auto" => ripvec_core::embed::SvdRank::Auto,
-        n => ripvec_core::embed::SvdRank::Fixed(
-            n.parse::<usize>()
-                .expect("--svd-rank must be 0, 'auto', or an integer"),
-        ),
-    };
-
     let backends = {
         let _guard = profiler.phase("model_load");
         let pb = use_progress.then(|| progress::spinner("Loading model\u{2026}"));
@@ -158,7 +149,6 @@ fn load_pipeline(
             } else {
                 None
             },
-            svd_rank: svd_rank.clone(),
         };
         let result = match args.backend {
             cli::BackendArg::Auto => {
@@ -212,7 +202,6 @@ fn load_pipeline(
         cascade_dim: None,
         file_type: args.file_type.clone(),
         mode,
-        svd_rank,
     };
 
     Ok((backends, tokenizer, search_cfg))

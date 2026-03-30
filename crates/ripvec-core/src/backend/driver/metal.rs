@@ -976,20 +976,6 @@ impl MetalDriver {
         self.turboquant_scan_gpu(&gpu, centroid_q, n_vectors, n_pairs, n_levels)
     }
 
-    /// Create a Metal buffer from FP32 data (for SVD factors and similar computed weights).
-    pub fn create_buffer_from_f32(&self, data: &[f32]) -> crate::Result<MetalTensor> {
-        let size = (data.len() * 4) as NSUInteger;
-        let buffer = unsafe {
-            self.device.newBufferWithBytes_length_options(
-                core::ptr::NonNull::new(data.as_ptr() as *mut core::ffi::c_void).unwrap(),
-                size,
-                MTLResourceOptions::StorageModeShared,
-            )
-        }
-        .ok_or_else(|| crate::Error::Metal("failed to create buffer from f32 data".into()))?;
-        Ok(MetalTensor::new(buffer, 0))
-    }
-
     /// Pre-convert a weight tensor to FP16 on the GPU.
     ///
     /// The FP16 buffer is stored inside the tensor's `fp16` field and used
@@ -1127,7 +1113,6 @@ impl MetalDriver {
         &self,
         weights_path: &Path,
         config: &ModernBertConfig,
-        svd_rank: &crate::embed::SvdRank,
     ) -> crate::Result<(ModernBertArch<MetalTensor>, memmap2::Mmap)> {
         // 1. mmap the safetensors file
         let file = std::fs::File::open(weights_path).map_err(|e| crate::Error::Io {
@@ -1214,9 +1199,6 @@ impl MetalDriver {
                 mlp_wo_weight: tensor_at(mlp_wo_offset),
                 mlp_norm_weight: tensor_at(mlp_norm_offset),
                 is_global,
-                svd_wi_a: None,
-                svd_wi_b: None,
-                svd_rank: 0,
             });
         }
 
@@ -1228,7 +1210,7 @@ impl MetalDriver {
         // Allocate a zero-filled buffer for the dummy LN bias.
         let zero_bias = self.alloc_tensor(hidden)?;
 
-        let mut weights = ModernBertWeights {
+        let weights = ModernBertWeights {
             tok_embeddings: tensor_at(tok_emb_offset),
             emb_norm_weight: tensor_at(emb_norm_offset),
             final_norm_weight: tensor_at(final_norm_offset),
@@ -1246,36 +1228,6 @@ impl MetalDriver {
         let max_seq = config.max_position_embeddings;
         let global_rope = build_rope_cache(self, head_dim, max_seq, config.global_rope_theta)?;
         let local_rope = build_rope_cache(self, head_dim, max_seq, config.local_rope_theta)?;
-
-        // SVD decomposition of Wi weights (if requested).
-        if !matches!(svd_rank, crate::embed::SvdRank::Disabled) {
-            let wi_rows = 2 * intermediate;
-            let wi_cols = hidden;
-            for (li, layer) in weights.layers.iter_mut().enumerate() {
-                // Read Wi data from mmap (FP32, little-endian)
-                let wi_offset = layer.mlp_wi_weight.offset;
-                let wi_bytes = wi_rows * wi_cols * 4;
-                let wi_slice = &mmap[wi_offset..wi_offset + wi_bytes];
-                let wi_data: Vec<f32> = wi_slice
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                    .collect();
-
-                if let Some(factors) =
-                    crate::backend::svd::decompose_wi(&wi_data, wi_rows, wi_cols, svd_rank)
-                {
-                    tracing::info!(
-                        layer = li,
-                        rank = factors.k,
-                        error = format!("{:.4}%", factors.error * 100.0),
-                        "SVD Wi decomposition"
-                    );
-                    layer.svd_wi_a = Some(self.create_buffer_from_f32(&factors.a)?);
-                    layer.svd_wi_b = Some(self.create_buffer_from_f32(&factors.b)?);
-                    layer.svd_rank = factors.k;
-                }
-            }
-        }
 
         // Pre-convert all projection weights to FP16 for the full FP16 pipeline.
         // The gemm_f16 kernel reads from MetalTensor.fp16 for weight matrices.
@@ -1295,14 +1247,6 @@ impl MetalDriver {
 
             let wo_elems = hidden * intermediate;
             self.ensure_fp16(&layer.mlp_wo_weight, wo_elems)?;
-
-            // FP16-convert SVD factors if present
-            if let Some(ref a) = layer.svd_wi_a {
-                self.ensure_fp16(a, layer.svd_rank * hidden)?;
-            }
-            if let Some(ref b) = layer.svd_wi_b {
-                self.ensure_fp16(b, 2 * intermediate * layer.svd_rank)?;
-            }
 
             if use_q8 {
                 let q8 = self.quantize_weights_q8(&layer.qkv_weight, 3 * hidden, hidden)?;

@@ -16,7 +16,6 @@ pub mod generic;
 pub mod metal_kernels;
 #[cfg(feature = "mlx")]
 pub mod mlx;
-pub mod svd;
 
 /// Pre-tokenized encoding ready for inference.
 ///
@@ -132,8 +131,6 @@ pub enum DeviceHint {
 pub struct InferenceOpts {
     /// Early-exit layer count (`None` = all 22 layers).
     pub max_layers: Option<usize>,
-    /// SVD rank for low-rank FFN approximation.
-    pub svd_rank: crate::embed::SvdRank,
 }
 
 /// Construct an embedding backend of the given kind.
@@ -383,8 +380,7 @@ pub fn load_modernbert_metal(
     let max_tokens = config.max_position_embeddings;
 
     let driver = MetalDriver::new()?;
-    let (mut arch, mmap) =
-        driver.load_modern_bert_weights(&weights_path, &config, &opts.svd_rank)?;
+    let (mut arch, mmap) = driver.load_modern_bert_weights(&weights_path, &config)?;
     arch.max_layers = opts.max_layers;
 
     tracing::info!(
@@ -432,8 +428,7 @@ pub fn load_modernbert_cpu(
     let max_tokens = config.max_position_embeddings;
 
     let driver = CpuDriver::new()?;
-    let (mut arch, mmap) =
-        driver.load_modern_bert_weights(&weights_path, &config, &opts.svd_rank)?;
+    let (mut arch, mmap) = driver.load_modern_bert_weights(&weights_path, &config)?;
     arch.max_layers = opts.max_layers;
 
     tracing::info!(
@@ -729,7 +724,7 @@ mod tests {
         let config =
             crate::backend::driver::metal::ModernBertConfig::from_json(&config_json).unwrap();
         let (mut arch, _mmap) = driver
-            .load_modern_bert_weights(&weights_path, &config, &crate::embed::SvdRank::Disabled)
+            .load_modern_bert_weights(&weights_path, &config)
             .unwrap();
 
         let hidden = driver
