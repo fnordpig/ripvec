@@ -2911,7 +2911,7 @@ kernel void gemm_f16w_f32a_kernel(
     threadgroup half sb[2048];  // 32 blocks × 64 halfs = 4096 bytes
 
     constexpr short NL0 = 2;  // BK/16: threads per A row
-    constexpr short NL1 = 4;  // BK/8: threads per B row
+    constexpr short NL1 = 4;  // BK/8: threads per B row (TODO: fix to NL1=2 like INT8 kernel)
 
     short lr0 = min(short(tiitg / NL0), short(63));
     short lr1 = min(short(tiitg / NL1), short(63));
@@ -2919,7 +2919,7 @@ kernel void gemm_f16w_f32a_kernel(
     short iy  = short(8 * (tiitg % NL1));
 
     device half* x = A_batch + uint(m_start + lr0) * K;
-    device half*  y = B_batch + uint(n_start + lr1) * K;
+    device half* y = B_batch + uint(n_start + lr1) * K;
 
     simdgroup_float8x8 mc[16];
     for (short i = 0; i < 16; i++) {
@@ -2944,6 +2944,9 @@ kernel void gemm_f16w_f32a_kernel(
         }
 
         // Load B (FP16) into sb: K-rows, N-cols
+        // NOTE: NL1=4 only loads 32 of 64 N-rows. This is a known bug —
+        // the compute path (RIPVEC_NO_MPS=1) produces wrong results.
+        // The INT8 kernel has the correct NL1=2 fix. TODO: port fix here.
         {
             short sx = short(tiitg % NL1);
             short sy = lr1 / 8;
