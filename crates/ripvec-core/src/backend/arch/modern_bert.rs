@@ -691,12 +691,7 @@ fn ffn_sublayer_f16<D: Driver>(
     // Eliminates two intermediate buffers and halves HBM bandwidth.
     let n_elements = g.total_tokens * g.intermediate;
     let mut activated = driver.alloc_zeros_f16(n_elements)?;
-    driver.fused_split_geglu_f16(
-        &mut activated,
-        &wi_out,
-        g.total_tokens,
-        g.intermediate,
-    )?;
+    driver.fused_split_geglu_f16(&mut activated, &wi_out, g.total_tokens, g.intermediate)?;
 
     // Wo projection — FP16 GEMM.
     let mut mlp_out = driver.alloc_zeros_f16(g.total_tokens * g.hidden)?;

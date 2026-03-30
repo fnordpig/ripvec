@@ -12,6 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use cudarc::cublas::{CudaBlas, sys};
+use cudarc::cublaslt::{self, CudaBlasLT, MatmulShared};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut,
     LaunchConfig, PushKernelArg,
@@ -88,23 +89,30 @@ unsafe fn launch_kernel(
 // CudaTensor
 // ---------------------------------------------------------------------------
 
-/// Opaque GPU tensor handle: FP32 device buffer + optional FP16 companion.
+/// Opaque GPU tensor handle: FP32 device buffer + optional FP16/INT8 companions.
 ///
 /// The FP16 companion is created at weight-load time for GEMM weight matrices.
 /// FP16 GEMM paths read from the companion; FP32 kernels read from the primary.
+/// The INT8 companion enables cuBLASLt INT8 tensor core GEMMs with fused scaling.
 pub struct CudaTensor {
     /// Primary FP32 device buffer.
     f32_buf: CudaSlice<f32>,
     /// Optional FP16 companion for weight matrices (used by FP16 GEMM path).
     fp16: Option<CudaSlice<u16>>,
+    /// Optional INT8 quantized weights (per-channel symmetric).
+    int8: Option<CudaSlice<i8>>,
+    /// Per-column scale factors for INT8 weights: `fp_value = int8_value * scale[col]`.
+    int8_col_scales: Option<CudaSlice<f32>>,
 }
 
 impl CudaTensor {
-    /// Create a new tensor with no FP16 companion.
+    /// Create a new tensor with no FP16 or INT8 companion.
     fn new(buf: CudaSlice<f32>) -> Self {
         Self {
             f32_buf: buf,
             fp16: None,
+            int8: None,
+            int8_col_scales: None,
         }
     }
 
@@ -116,6 +124,8 @@ impl CudaTensor {
         Self {
             f32_buf: dummy_f32,
             fp16: Some(f16_buf),
+            int8: None,
+            int8_col_scales: None,
         }
     }
 
@@ -1138,6 +1148,99 @@ extern "C" __global__ void residual_add_f16_kernel(
     }
 }
 
+// =========================================================================
+// INT8 quantization kernels
+// =========================================================================
+
+// Per-column max abs -> scale for weight quantization at load time.
+extern "C" __global__ void quantize_col_scales_kernel(
+    float* scales, const unsigned short* weights, int rows, int cols
+) {
+    int col = blockIdx.x;
+    if (col >= cols) return;
+    extern __shared__ float sdata[];
+    float local_max = 0.0f;
+    for (int r = threadIdx.x; r < rows; r += blockDim.x) {
+        float v; H2F(weights[r * cols + col], v);
+        local_max = fmaxf(local_max, fabsf(v));
+    }
+    float col_max = block_reduce_max(local_max, sdata);
+    if (threadIdx.x == 0) scales[col] = fmaxf(col_max, 1e-12f) / 127.0f;
+}
+
+// Flat element-wise quantization: FP16 -> INT8 using pre-computed per-column scales.
+extern "C" __global__ void quantize_weights_i8_kernel(
+    signed char* output, const unsigned short* weights, const float* scales,
+    int rows, int cols
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * cols) return;
+    int col = idx % cols;
+    float v; H2F(weights[idx], v);
+    int q = __float2int_rn(v / scales[col]);
+    q = max(-127, min(127, q));
+    output[idx] = (signed char)q;
+}
+
+// Per-row fused quantize: find max|a| per row, compute scale, quantize in one pass.
+extern "C" __global__ void quantize_activation_rowwise_kernel(
+    signed char* output, float* scales_out,
+    const unsigned short* activations, int rows, int cols
+) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    extern __shared__ float sdata[];
+    const unsigned short* row_data = activations + row * cols;
+    signed char* row_out = output + row * cols;
+    float local_max = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float v; H2F(row_data[i], v);
+        local_max = fmaxf(local_max, fabsf(v));
+    }
+    float row_max = block_reduce_max(local_max, sdata);
+    float scale = fmaxf(row_max, 1e-12f) / 127.0f;
+    if (threadIdx.x == 0) scales_out[row] = scale;
+    float inv_scale = 1.0f / scale;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float v; H2F(row_data[i], v);
+        int q = __float2int_rn(v * inv_scale);
+        q = max(-127, min(127, q));
+        row_out[i] = (signed char)q;
+    }
+}
+
+// Dequantize INT32 GEMM output to FP16 with per-row/per-col scales.
+// One block per row; vectorised int4 loads for bandwidth.
+extern "C" __global__ void dequantize_i32_to_f16_kernel(
+    unsigned short* output, const int* input,
+    const float* act_row_scales, const float* weight_col_scales,
+    int m, int n
+) {
+    int row = blockIdx.x;
+    if (row >= m) return;
+    float a_scale = act_row_scales[row];
+    const int* row_in = input + row * n;
+    unsigned short* row_out = output + row * n;
+    // Vectorised: process 4 ints at a time (16 bytes per load).
+    int n4 = n / 4;
+    for (int i = threadIdx.x; i < n4; i += blockDim.x) {
+        int col = i * 4;
+        int4 vals = reinterpret_cast<const int4*>(row_in)[i];
+        float v0 = (float)vals.x * a_scale * weight_col_scales[col];
+        float v1 = (float)vals.y * a_scale * weight_col_scales[col + 1];
+        float v2 = (float)vals.z * a_scale * weight_col_scales[col + 2];
+        float v3 = (float)vals.w * a_scale * weight_col_scales[col + 3];
+        unsigned short h0, h1, h2, h3;
+        F2H(v0, h0); F2H(v1, h1); F2H(v2, h2); F2H(v3, h3);
+        row_out[col] = h0; row_out[col+1] = h1; row_out[col+2] = h2; row_out[col+3] = h3;
+    }
+    for (int col = n4 * 4 + threadIdx.x; col < n; col += blockDim.x) {
+        float val = (float)row_in[col] * a_scale * weight_col_scales[col];
+        unsigned short h; F2H(val, h);
+        row_out[col] = h;
+    }
+}
+
 extern "C" __global__ void pad_to_batch_f16_kernel(
     unsigned short* padded, const unsigned short* flat,
     const int* cu_seqlens, int max_seq, int dim, int batch
@@ -1233,13 +1336,32 @@ struct KernelPipelines {
     residual_add_f16: CudaFunction,
     pad_to_batch_f16: CudaFunction,
     unpad_from_batch_f16: CudaFunction,
+    // INT8 quantization kernels
+    quantize_col_scales: CudaFunction,
+    quantize_weights_i8: CudaFunction,
+    quantize_activation_rowwise: CudaFunction,
+    dequantize_i32_to_f16: CudaFunction,
 }
 
 impl KernelPipelines {
     /// Compile all CUDA kernels and load function handles.
     fn compile(ctx: &Arc<CudaContext>) -> crate::Result<(Arc<CudaModule>, Self)> {
+        // Detect GPU compute capability at runtime instead of hardcoding.
+        // CUDA 13+ dropped support for sm_70; the 4090 is sm_89.
+        use cudarc::driver::sys::CUdevice_attribute;
+        let major = ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+            .map_err(cuda_err)?;
+        let minor = ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
+            .map_err(cuda_err)?;
+        // Leak the arch string — compiled once at startup, lives forever.
+        // Use `compute_XX` (virtual arch) not `sm_XX` (real arch) to generate
+        // forward-compatible PTX. This avoids "unsupported PTX version" errors
+        // when the NVRTC toolkit is newer than the driver (e.g. toolkit 13.2,
+        // driver 13.1).
+        let arch_string: &'static str =
+            Box::leak(format!("compute_{major}{minor}").into_boxed_str());
         let opts = CompileOptions {
-            arch: Some("sm_70"),
+            arch: Some(arch_string),
             ..Default::default()
         };
         let ptx = compile_ptx_with_opts(MODERN_KERNELS, opts).map_err(cuda_err)?;
@@ -1299,6 +1421,11 @@ impl KernelPipelines {
                 residual_add_f16: load("residual_add_f16_kernel")?,
                 pad_to_batch_f16: load("pad_to_batch_f16_kernel")?,
                 unpad_from_batch_f16: load("unpad_from_batch_f16_kernel")?,
+                // INT8 quantization kernels
+                quantize_col_scales: load("quantize_col_scales_kernel")?,
+                quantize_weights_i8: load("quantize_weights_i8_kernel")?,
+                quantize_activation_rowwise: load("quantize_activation_rowwise_kernel")?,
+                dequantize_i32_to_f16: load("dequantize_i32_to_f16_kernel")?,
             },
         ))
     }
@@ -1320,6 +1447,12 @@ pub struct CudaDriver {
     stream: Arc<CudaStream>,
     /// cuBLAS handle for matrix multiplications.
     blas: CudaBlas,
+    /// cuBLASLt handle for INT8 tensor core GEMMs with fused scale epilogue.
+    blas_lt: CudaBlasLT,
+    /// Workspace buffer for cuBLASLt matmul heuristics (4 MiB, or 32 MiB on Hopper).
+    lt_workspace: CudaSlice<u8>,
+    /// Size of the cuBLASLt workspace in bytes.
+    lt_workspace_size: usize,
     /// Pre-compiled kernel function handles.
     kernels: KernelPipelines,
     /// Compiled NVRTC module (kept alive for kernel function references).
@@ -1360,12 +1493,26 @@ impl CudaDriver {
         }
         let stream = ctx.default_stream();
         let blas = CudaBlas::new(stream.clone()).map_err(cuda_err)?;
+        let blas_lt = CudaBlasLT::new(stream.clone()).map_err(cuda_err)?;
+
+        // Allocate cuBLASLt workspace (4 MiB default, 32 MiB on Hopper SM90+).
+        let major = ctx
+            .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+            .map_err(cuda_err)?;
+        let lt_workspace_size = if major >= 9 { 33_554_432 } else { 4_194_304 };
+        // SAFETY: workspace is scratch memory; cuBLASLt manages its contents internally.
+        #[expect(unsafe_code, reason = "workspace is scratch memory for cuBLASLt")]
+        let lt_workspace = unsafe { stream.alloc::<u8>(lt_workspace_size) }.map_err(cuda_err)?;
+
         let (module, kernels) = KernelPipelines::compile(&ctx)?;
 
         Ok(Self {
             _ctx: ctx,
             stream,
             blas,
+            blas_lt,
+            lt_workspace,
+            lt_workspace_size,
             kernels,
             _module: module,
         })
@@ -1378,14 +1525,20 @@ impl CudaDriver {
     /// approach like Metal's (where `Retained<MTLBuffer>` is refcounted) doesn't
     /// work. Instead we allocate on demand via the async allocator, which amortises
     /// `cuMemAlloc` overhead across the stream.
-    #[expect(unsafe_code, reason = "alloc returns uninitialised memory; caller overwrites")]
+    #[expect(
+        unsafe_code,
+        reason = "alloc returns uninitialised memory; caller overwrites"
+    )]
     fn alloc_tensor(&self, n: usize) -> crate::Result<CudaSlice<f32>> {
         // SAFETY: caller guarantees the buffer is fully written before any read.
         unsafe { self.stream.alloc::<f32>(n) }.map_err(cuda_err)
     }
 
     /// Allocate an FP16 tensor (uninitialised — caller must overwrite).
-    #[expect(unsafe_code, reason = "alloc returns uninitialised memory; caller overwrites")]
+    #[expect(
+        unsafe_code,
+        reason = "alloc returns uninitialised memory; caller overwrites"
+    )]
     fn alloc_f16_tensor(&self, n: usize) -> crate::Result<CudaSlice<u16>> {
         // SAFETY: caller guarantees the buffer is fully written before any read.
         unsafe { self.stream.alloc::<u16>(n) }.map_err(cuda_err)
@@ -1480,6 +1633,51 @@ impl CudaDriver {
             Ok(output)
         };
 
+        // Helper: quantize FP16 weights to INT8 with per-column symmetric scaling.
+        let quantize_i8 = |fp16: &CudaSlice<u16>,
+                           rows: usize,
+                           cols: usize|
+         -> crate::Result<(CudaSlice<i8>, CudaSlice<f32>)> {
+            // Phase 1: compute per-column scales (one block per column).
+            let mut scales = self.stream.alloc_zeros::<f32>(cols).map_err(cuda_err)?;
+            let threads = 256_u32;
+            let shared = (threads / 32) * 4;
+            let rows_i = rows as i32;
+            let cols_i = cols as i32;
+            {
+                let mut builder = self
+                    .stream
+                    .launch_builder(&self.kernels.quantize_col_scales);
+                builder.arg(&mut scales);
+                builder.arg(fp16);
+                builder.arg(&rows_i);
+                builder.arg(&cols_i);
+                // SAFETY: one block per column; reads fp16[rows*cols], writes scales[cols].
+                // Shared mem holds (threads/32) floats for warp-level reduction.
+                unsafe {
+                    launch_kernel(builder, launch_per_row(cols, threads, shared))?;
+                }
+            }
+            // Phase 2: quantize each element to INT8.
+            let total = rows * cols;
+            let mut i8_buf = unsafe { self.stream.alloc::<i8>(total) }.map_err(cuda_err)?;
+            {
+                let mut builder = self
+                    .stream
+                    .launch_builder(&self.kernels.quantize_weights_i8);
+                builder.arg(&mut i8_buf);
+                builder.arg(fp16);
+                builder.arg(&scales);
+                builder.arg(&rows_i);
+                builder.arg(&cols_i);
+                // SAFETY: reads fp16[total] and scales[cols], writes i8_buf[total].
+                unsafe {
+                    launch_kernel(builder, launch_1d(total))?;
+                }
+            }
+            Ok((i8_buf, scales))
+        };
+
         // 3. Build per-layer weights
         let mut layers = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
@@ -1502,23 +1700,38 @@ impl CudaDriver {
             let wi_fp16 = convert_f16(&wi_f32, 2 * intermediate * hidden)?;
             let mlp_wo_fp16 = convert_f16(&mlp_wo_f32, hidden * intermediate)?;
 
+            // INT8 quantize each GEMM weight matrix for cuBLASLt tensor core path.
+            // Weights are [out_features, in_features] row-major.
+            let (qkv_i8, qkv_scales) = quantize_i8(&qkv_fp16, 3 * hidden, hidden)?;
+            let (wo_i8, wo_scales) = quantize_i8(&wo_fp16, hidden, hidden)?;
+            let (wi_i8, wi_scales) = quantize_i8(&wi_fp16, 2 * intermediate, hidden)?;
+            let (mlp_wo_i8, mlp_wo_scales) = quantize_i8(&mlp_wo_fp16, hidden, intermediate)?;
+
             layers.push(ModernBertLayerWeights {
                 qkv_weight: CudaTensor {
                     f32_buf: qkv_f32,
                     fp16: Some(qkv_fp16),
+                    int8: Some(qkv_i8),
+                    int8_col_scales: Some(qkv_scales),
                 },
                 output_weight: CudaTensor {
                     f32_buf: wo_f32,
                     fp16: Some(wo_fp16),
+                    int8: Some(wo_i8),
+                    int8_col_scales: Some(wo_scales),
                 },
                 attn_norm_weight: attn_norm_f32.map(CudaTensor::new),
                 mlp_wi_weight: CudaTensor {
                     f32_buf: wi_f32,
                     fp16: Some(wi_fp16),
+                    int8: Some(wi_i8),
+                    int8_col_scales: Some(wi_scales),
                 },
                 mlp_wo_weight: CudaTensor {
                     f32_buf: mlp_wo_f32,
                     fp16: Some(mlp_wo_fp16),
+                    int8: Some(mlp_wo_i8),
+                    int8_col_scales: Some(mlp_wo_scales),
                 },
                 mlp_norm_weight: CudaTensor::new(mlp_norm_f32),
                 is_global,
@@ -1560,6 +1773,177 @@ impl CudaDriver {
         };
 
         Ok((arch, mmap))
+    }
+
+    /// Perform INT8 GEMM via cuBLASLt with fused per-row/per-column scale epilogue.
+    ///
+    /// Computes: `output_f16 = (A_i8 @ B_i8^T) * a_row_scales * b_col_scales`
+    /// in a single cuBLASLt call, eliminating the separate dequantize kernel.
+    ///
+    /// The activation matrix A is quantized on-the-fly from FP16 to INT8 with
+    /// per-row scaling; weight matrix B is pre-quantized at load time with
+    /// per-column scaling.
+    ///
+    /// # cuBLAS column-major convention
+    ///
+    /// For row-major A\[m,k\] x B\[n,k\]^T = C\[m,n\]:
+    /// - cuBLAS sees: C(n,m) = B(n,k) x A(k,m) with `transa=N` on B, `transb=T` on A
+    /// - Or equivalently: set transa/transb on the *cuBLAS* operands
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if activation quantization or the cuBLASLt matmul fails.
+    #[expect(
+        unsafe_code,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::too_many_lines,
+        reason = "cuBLASLt raw API requires unsafe; int casts match CUDA types"
+    )]
+    /// INT8 GEMM via `cublasGemmEx` with per-row dequantize.
+    ///
+    /// Flow: quantize A (FP16→INT8) → `cublasGemmEx(I8×I8→I32)` → per-row
+    /// dequantize+convert (INT32→FP16 with row×col scales).
+    ///
+    /// The dequantize uses a per-row kernel (one block per row) to amortize
+    /// the scale lookup and apply vectorised INT32→FP16 conversion.
+    #[expect(
+        unsafe_code,
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "cuBLAS INT8 GEMM requires unsafe FFI; args mirror cuBLAS API"
+    )]
+    fn gemm_i8_impl(
+        &self,
+        a_fp16_tensor: &CudaTensor,
+        b_i8: &CudaSlice<i8>,
+        b_col_scales: &CudaSlice<f32>,
+        output: &mut CudaTensor,
+        m: usize,
+        n: usize,
+        k: usize,
+        transpose_b: bool,
+    ) -> crate::Result<()> {
+        let a_f16 = a_fp16_tensor
+            .fp16_ref()
+            .ok_or_else(|| crate::Error::Cuda("gemm_i8: A has no FP16 buffer".into()))?;
+        let out_f16 = output
+            .fp16
+            .as_mut()
+            .ok_or_else(|| crate::Error::Cuda("gemm_i8: output has no FP16 buffer".into()))?;
+
+        // 1. Per-row quantize activations (FP16 -> INT8 + row scales).
+        let mut a_row_scales =
+            // SAFETY: kernel will fully overwrite all m elements before they are read.
+            unsafe { self.stream.alloc::<f32>(m) }.map_err(cuda_err)?;
+        let mut a_i8 =
+            // SAFETY: kernel will fully overwrite all m*k elements before they are read.
+            unsafe { self.stream.alloc::<i8>(m * k) }.map_err(cuda_err)?;
+        {
+            let threads = 256_u32;
+            let shared = (threads / 32) * 4;
+            let rows_i = m as i32;
+            let cols_i = k as i32;
+            let mut builder = self
+                .stream
+                .launch_builder(&self.kernels.quantize_activation_rowwise);
+            builder.arg(&mut a_i8);
+            builder.arg(&mut a_row_scales);
+            builder.arg(a_f16);
+            builder.arg(&rows_i);
+            builder.arg(&cols_i);
+            // SAFETY: one block per row; reads a_f16[m*k], writes a_i8[m*k] + a_row_scales[m].
+            // Shared mem holds (threads/32) floats for warp-level block_reduce_max.
+            unsafe { launch_kernel(builder, launch_per_row(m, threads, shared))? };
+        }
+
+        // 2. cublasGemmEx: INT8 × INT8 → INT32 (tensor cores).
+        // CUDA 13.1 bug: FP32 output from INT8 GEMM returns NOT_SUPPORTED.
+        // Use INT32 output and dequantize separately. Fixed in CUDA 13.2.
+        let c_elements = m * n;
+        let m_i = m as i32;
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let alpha_i32 = 1_i32;
+        let beta_i32 = 0_i32;
+        let handle = *self.blas.handle();
+
+        let mut c_i32: CudaSlice<i32> =
+            // SAFETY: GEMM will fully overwrite all m*n elements.
+            unsafe { self.stream.alloc::<i32>(c_elements) }.map_err(cuda_err)?;
+
+        {
+            let (a_ptr, _a_sync) = a_i8.device_ptr(&self.stream);
+            let (b_ptr, _b_sync) = b_i8.device_ptr(&self.stream);
+            let (c_ptr, _c_sync) = c_i32.device_ptr_mut(&self.stream);
+
+            if transpose_b {
+                // cuBLAS col-major: C(n,m) = B_T(n,k) @ A(k,m)
+                // SAFETY: INT8 buffers correctly sized; FP32 output with int→float.
+                unsafe {
+                    sys::cublasGemmEx(
+                        handle,
+                        sys::cublasOperation_t::CUBLAS_OP_T,
+                        sys::cublasOperation_t::CUBLAS_OP_N,
+                        n_i, m_i, k_i,
+                        std::ptr::from_ref(&alpha_i32).cast(),
+                        b_ptr as *const _,
+                        sys::cudaDataType_t::CUDA_R_8I, k_i,
+                        a_ptr as *const _,
+                        sys::cudaDataType_t::CUDA_R_8I, k_i,
+                        std::ptr::from_ref(&beta_i32).cast(),
+                        c_ptr as *mut _,
+                        sys::cudaDataType_t::CUDA_R_32I, n_i,
+                        sys::cublasComputeType_t::CUBLAS_COMPUTE_32I,
+                        sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+                    )
+                    .result()
+                    .map_err(cuda_err)?;
+                }
+            } else {
+                // SAFETY: see above.
+                unsafe {
+                    sys::cublasGemmEx(
+                        handle,
+                        sys::cublasOperation_t::CUBLAS_OP_N,
+                        sys::cublasOperation_t::CUBLAS_OP_N,
+                        n_i, m_i, k_i,
+                        std::ptr::from_ref(&alpha_i32).cast(),
+                        b_ptr as *const _,
+                        sys::cudaDataType_t::CUDA_R_8I, n_i,
+                        a_ptr as *const _,
+                        sys::cudaDataType_t::CUDA_R_8I, k_i,
+                        std::ptr::from_ref(&beta_i32).cast(),
+                        c_ptr as *mut _,
+                        sys::cudaDataType_t::CUDA_R_32I, n_i,
+                        sys::cublasComputeType_t::CUBLAS_COMPUTE_32I,
+                        sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+                    )
+                    .result()
+                    .map_err(cuda_err)?;
+                }
+            }
+        } // drop borrow guards
+
+        // 3. Per-row scale + convert: FP16[i,j] = FP32[i,j] * a_row_scale[i] * b_col_scale[j]
+        // FP32 output already has the dot product; just need to apply quant scales.
+        // One block per row — a_scale is loaded once per row (amortized).
+        {
+            let threads = 256_u32;
+            let mut builder = self
+                .stream
+                .launch_builder(&self.kernels.dequantize_i32_to_f16);
+            builder.arg(out_f16);
+            builder.arg(&c_i32);
+            builder.arg(&a_row_scales);
+            builder.arg(b_col_scales);
+            builder.arg(&m_i);
+            builder.arg(&n_i);
+            // SAFETY: one block per row; reads m×n FP32, writes m×n FP16.
+            unsafe { launch_kernel(builder, launch_per_row(m, threads, 0))? };
+        }
+
+        Ok(())
     }
 }
 
@@ -2722,6 +3106,12 @@ impl Driver for CudaDriver {
         k: usize,
         transpose_b: bool,
     ) -> crate::Result<()> {
+        // INT8 fast path: if B has pre-quantized INT8 weights, use cuBLASLt
+        // with fused per-row/per-column scale epilogue (eliminates dequantize kernel).
+        if let (Some(b_i8), Some(b_scales)) = (&b.int8, &b.int8_col_scales) {
+            return self.gemm_i8_impl(a, b_i8, b_scales, output, m, n, k, transpose_b);
+        }
+
         let alpha = 1.0_f32;
         let beta = 0.0_f32;
         let handle = *self.blas.handle();
@@ -3229,12 +3619,9 @@ impl Driver for CudaDriver {
         let inp_f16 = input.fp16_ref().ok_or_else(|| {
             crate::Error::Cuda("fused_split_geglu_f16: input has no FP16 buffer".into())
         })?;
-        let out_f16 = output
-            .fp16
-            .as_mut()
-            .ok_or_else(|| {
-                crate::Error::Cuda("fused_split_geglu_f16: output has no FP16 buffer".into())
-            })?;
+        let out_f16 = output.fp16.as_mut().ok_or_else(|| {
+            crate::Error::Cuda("fused_split_geglu_f16: output has no FP16 buffer".into())
+        })?;
 
         let mut builder = self
             .stream

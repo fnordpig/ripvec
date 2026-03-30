@@ -32,7 +32,7 @@ accelerate-src = { version = "0.3", optional = true }
 memmap2 = "0.9"
 safetensors = "0.6"
 mlx-rs = { version = "0.25", optional = true, features = ["safetensors"] }
-cudarc = { version = "0.19", optional = true, features = ["cublas", "cublaslt", "driver", "nvrtc", "f16", "cuda-version-from-build-system"] }
+cudarc = { version = "0.19.4", optional = true, features = ["cublas", "cublaslt", "driver", "nvrtc", "f16", "cuda-13010"] }
 objc2 = { version = "0.6", optional = true }
 objc2-metal = { version = "0.3", optional = true, features = [
     "MTLDevice", "MTLBuffer", "MTLCommandQueue", "MTLCommandBuffer",

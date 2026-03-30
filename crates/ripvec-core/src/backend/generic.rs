@@ -58,13 +58,7 @@ impl<D: Driver, A: ModelArch<D>> GenericBackend<D, A> {
     /// `max_batch` controls how many encodings are sent in each forward pass.
     /// Metal: 32 (optimal for M2 Max AMX). CUDA: 128+ (needs more work to
     /// saturate 128 SMs on RTX 4090).
-    pub fn new(
-        driver: D,
-        arch: A,
-        max_tokens: usize,
-        is_gpu: bool,
-        mmap: memmap2::Mmap,
-    ) -> Self {
+    pub fn new(driver: D, arch: A, max_tokens: usize, is_gpu: bool, mmap: memmap2::Mmap) -> Self {
         Self::with_max_batch(driver, arch, max_tokens, is_gpu, mmap, 32)
     }
 
