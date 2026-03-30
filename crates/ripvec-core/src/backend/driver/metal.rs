@@ -17,10 +17,10 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::{NSString, NSUInteger, ns_string};
+use objc2::AnyThread;
+use objc2_foundation::{ns_string, NSString, NSUInteger};
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
     MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
@@ -32,13 +32,13 @@ use objc2_metal_performance_shaders::{
 use safetensors::SafeTensors;
 
 use super::{BatchInputs, Driver};
-use crate::backend::Encoding;
 use crate::backend::arch::classic_bert::{
     ClassicBertArch, ClassicBertLayerWeights, ClassicBertWeights,
 };
 use crate::backend::arch::modern_bert::{
     ModernBertArch, ModernBertLayerWeights, ModernBertWeights, RopeCache,
 };
+use crate::backend::Encoding;
 
 // ---------------------------------------------------------------------------
 // CoreGraphics linkage (required for MTLCreateSystemDefaultDevice)
@@ -3282,7 +3282,11 @@ impl MetalDriver {
             if exp == 0 {
                 // Subnormal or zero
                 let f = (mant as f32) * (1.0 / (1 << 24) as f32);
-                if sign == 1 { -f } else { f }
+                if sign == 1 {
+                    -f
+                } else {
+                    f
+                }
             } else if exp == 31 {
                 // Inf or NaN
                 if mant == 0 {
@@ -3374,10 +3378,6 @@ impl MetalDriver {
     /// - `a_f16`: FP16 activations `[M, K]`
     /// - `b_q8`: block_q8_0 quantized weights `[N * K/32]` blocks (34 bytes each)
     /// - `output_f16`: FP16 output `[M, N]`
-    #[expect(
-        clippy::many_single_char_names,
-        reason = "m, n, k are standard GEMM parameter names from BLAS"
-    )]
     pub fn gemm_q8(
         &self,
         a_f16: &MetalTensor,
