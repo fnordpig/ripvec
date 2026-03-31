@@ -173,3 +173,57 @@ Every major optimization that worked came from studying llama.cpp:
 - Separate `simdgroup_load` for A and B tiles
 
 **Lesson**: Clone the reference, read the code, copy the architecture. Don't reinvent.
+
+---
+
+## CUDA Backend Lessons (Session 2)
+
+### 19. cudarc CudaSlice::clone() Is a Full D2D Memcpy
+
+**What happened**: Implemented a Metal-style buffer pool where `alloc_tensor` returns `pool[cursor].clone()`. On Metal, `Retained<MTLBuffer>::clone()` is a refcount bump (free). On CUDA, `CudaSlice::clone()` calls `cuMemcpyDtoDAsync` — a full device-to-device copy. Result: 4.5s of D2D copies, 59/s instead of 541/s.
+
+**Fix**: Remove pool entirely. Use cudarc's async allocator (`unsafe { stream.alloc() }`) which amortizes allocation overhead across the stream. Pool-based reuse requires either `Arc<CudaSlice>` (ownership complexity) or a bump allocator (different abstraction).
+
+**Lesson**: Backend abstractions that work on one platform (Metal refcounted buffers) may have completely different performance characteristics on another (CUDA owned buffers). Profile before assuming a pattern transfers.
+
+### 20. cudarc Event Tracking Overhead
+
+**What happened**: cudarc 0.19 automatically records events on every buffer access for multi-stream synchronization. With single-stream usage (all our CUDA work), this is pure overhead — 130K+ events per forward pass.
+
+**Fix**: `ctx.disable_event_tracking()` at driver initialization. Safe because we use a single stream.
+
+### 21. INT8 Tensor Core Overhead vs Savings
+
+**What happened**: INT8 GEMMs were 3.7× faster than FP16 (7.1s vs 26s). But per-row activation quantization (1.7s) + INT32→FP16 dequantization (7.0s) ate all the savings. Net: 410/s INT8 vs 432/s FP16.
+
+**Root cause**: 57K separate dequantize kernel launches. Each is tiny (M~50, N~768) but carries 5μs CPU dispatch overhead. The dequantize reads INT32 (4B/element) + writes FP16 (2B) = 6B/element bandwidth.
+
+**What would fix it**: cuBLASLt `A_SCALE_POINTER`/`B_SCALE_POINTER` fuses dequantization into the GEMM epilogue (zero separate kernel). Available in CUDA 12.0+ but the cuBLASLt `NOT_SUPPORTED` error on CUDA 13.1 blocked this path. CUDA 13.2 reportedly fixes INT8 matmul issues.
+
+**Lesson**: Quantization only pays off when the quant/dequant overhead is amortized. For small-M GEMMs at batch=32, the overhead dominates. Either fuse into the GEMM epilogue or increase batch size.
+
+### 22. NVRTC Arch Flag and CUDA Version Compatibility
+
+**What happened**: Hardcoded `sm_70` in NVRTC compile options. Worked on CUDA 12.0. CUDA 13.x dropped support for old SM targets, causing "invalid value for --gpu-architecture" at runtime.
+
+**Fix**: Detect compute capability at runtime via `CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR/MINOR`, use `compute_XX` (virtual arch, forward-compatible PTX) instead of `sm_XX` (real arch, tied to specific GPU).
+
+### 23. Streaming Pipeline Deadlock
+
+**What happened**: The streaming pipeline (chunk→tokenize→embed) was already implemented but disabled with `false &&` due to a deadlock. Stage 2's closure captured `batch_tx` by reference (not value), so it never dropped when the thread exited → channel never closed → Stage 3 waited forever.
+
+**Fix**: Add `move` to Stage 2's closure so `batch_tx` is captured by value and drops when the thread exits.
+
+**Lesson**: With `crossbeam_channel`, the channel closes when ALL senders drop. If a sender is borrowed (not moved) into a thread, it outlives the thread and the channel stays open.
+
+### 24. Progress Bar in Streaming Mode
+
+**What happened**: `embed_distributed` has an internal `done_counter` that resets to 0 on each call. In streaming mode, it's called per-batch, so the profiler sees done counts of 32, 32, 32... instead of 32, 64, 96... The total also jumped because it tracked chunks produced (upstream) rather than chunks embedded.
+
+**Fix**: Pass `Profiler::noop()` to `embed_distributed` in streaming mode. Drive progress from the streaming loop with a cumulative counter. Show byte-based progress (total known from walk phase) instead of chunk-based (unknown until chunking finishes).
+
+### 25. MCP Server Missing CUDA Feature
+
+**What happened**: `ripvec-mcp` on Linux was built with `features = ["cpu"]` only — no CUDA. Query embedding used 4 CPU cores (OpenBLAS) instead of the RTX 4090. 50-60s warmup per query.
+
+**Fix**: Add `cuda` to the non-macOS platform dependencies. Also cache on-demand indices by canonical path so `incremental_index` (which walks the entire source tree) only runs once per root per session.
