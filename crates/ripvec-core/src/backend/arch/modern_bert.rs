@@ -476,28 +476,20 @@ fn attn_prenorm_qkv_f16<D: Driver>(
         true,
     )?;
 
-    // Pad QKV for attention layout.
-    let mut qkv_padded = driver.alloc_zeros_f16(g.padded_tokens * 3 * g.hidden)?;
-    driver.pad_to_batch_f16(
-        &qkv,
-        &mut qkv_padded,
-        &g.seq_lengths,
-        g.max_seq,
-        3 * g.hidden,
-    )?;
-
-    // Split into Q, K, V — all FP16.
+    // Fused pad + QKV split: flat → Q, K, V in per-head layout directly.
+    // Eliminates the padded intermediate buffer and its 2 memory round-trips.
     let padded = g.padded_tokens;
     let mut q = driver.alloc_zeros_f16(padded * g.hidden)?;
     let mut k = driver.alloc_zeros_f16(padded * g.hidden)?;
     let mut v = driver.alloc_zeros_f16(padded * g.hidden)?;
-    driver.qkv_split_f16(
+    driver.fused_pad_qkv_split_f16(
         &mut q,
         &mut k,
         &mut v,
-        &qkv_padded,
-        g.batch,
+        &qkv,
+        &g.seq_lengths,
         g.max_seq,
+        g.batch,
         g.hidden,
         g.num_heads,
         g.head_dim,
@@ -603,25 +595,17 @@ fn attn_scores_residual_f16<D: Driver>(
         batch_heads,
     )?;
 
-    // Reshape heads — FP16.
-    let mut context = driver.alloc_zeros_f16(g.padded_tokens * g.hidden)?;
-    driver.attn_reshape_f16(
-        &mut context,
-        &attn_out,
-        g.batch,
-        g.max_seq,
-        g.num_heads,
-        g.head_dim,
-    )?;
-
-    // Unpad FIRST — FP16: [padded_tokens, H] → [total_tokens, H].
+    // Fused reshape + unpad: [batch*heads, max_seq, head_dim] → [total_tokens, hidden].
+    // Eliminates the padded context intermediate buffer.
     let mut context_unpacked = driver.alloc_zeros_f16(g.total_tokens * g.hidden)?;
-    driver.unpad_from_batch_f16(
-        &context,
+    driver.fused_reshape_unpad_f16(
         &mut context_unpacked,
+        &attn_out,
         &g.seq_lengths,
         g.max_seq,
-        g.hidden,
+        g.batch,
+        g.num_heads,
+        g.head_dim,
     )?;
 
     // Output projection on unpadded — FP16: [total_tokens, H] × [H, H].

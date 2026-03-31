@@ -1054,6 +1054,74 @@ extern "C" __global__ void attn_reshape_f16_kernel(
     output[idx] = heads[heads_idx];
 }
 
+// Fused pad + QKV split: read flat [total_tokens, 3*hidden] → write Q,K,V [batch*heads, max_seq, head_dim].
+// Eliminates the padded intermediate buffer and its 2 memory round-trips.
+extern "C" __global__ void fused_pad_qkv_split_f16_kernel(
+    unsigned short* q, unsigned short* k, unsigned short* v,
+    const unsigned short* qkv_flat,
+    const int* cu_seqlens,
+    int batch, int max_seq, int hidden, int num_heads, int head_dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * num_heads * max_seq * head_dim;
+    if (idx >= total) return;
+
+    // Decompose output index: [batch*num_heads, max_seq, head_dim]
+    int per_head = max_seq * head_dim;
+    int bh = idx / per_head;
+    int rem = idx % per_head;
+    int t = rem / head_dim;
+    int d = rem % head_dim;
+    int b = bh / num_heads;
+    int h = bh % num_heads;
+
+    int seq_start = cu_seqlens[b];
+    int seq_len = cu_seqlens[b + 1] - seq_start;
+
+    if (t < seq_len) {
+        // Read from flat: qkv_flat[(seq_start + t) * 3*hidden + h*head_dim + d] for Q
+        int flat_base = (seq_start + t) * 3 * hidden;
+        q[idx] = qkv_flat[flat_base + h * head_dim + d];
+        k[idx] = qkv_flat[flat_base + hidden + h * head_dim + d];
+        v[idx] = qkv_flat[flat_base + 2 * hidden + h * head_dim + d];
+    } else {
+        unsigned short zero; F2H(0.0f, zero);
+        q[idx] = zero;
+        k[idx] = zero;
+        v[idx] = zero;
+    }
+}
+
+// Fused attn_reshape + unpad: read [batch*heads, max_seq, head_dim] → write [total_tokens, hidden].
+// Eliminates the padded context intermediate.
+extern "C" __global__ void fused_reshape_unpad_f16_kernel(
+    unsigned short* flat, const unsigned short* heads,
+    const int* cu_seqlens,
+    int batch, int max_seq, int num_heads, int head_dim
+) {
+    int hidden = num_heads * head_dim;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    // Iterate over output: [total_tokens, hidden]
+    // We need total_tokens but don't have it — use batch*max_seq and skip padding.
+    int total = batch * max_seq * hidden;
+    if (idx >= total) return;
+
+    int b = idx / (max_seq * hidden);
+    int rem = idx % (max_seq * hidden);
+    int t = rem / hidden;
+    int flat_hd = rem % hidden;
+
+    int seq_start = cu_seqlens[b];
+    int seq_len = cu_seqlens[b + 1] - seq_start;
+
+    if (t < seq_len) {
+        int h = flat_hd / head_dim;
+        int d = flat_hd % head_dim;
+        int heads_idx = (b * num_heads + h) * (max_seq * head_dim) + t * head_dim + d;
+        flat[(seq_start + t) * hidden + flat_hd] = heads[heads_idx];
+    }
+}
+
 extern "C" __global__ void rope_encode_f16_kernel(
     unsigned short* q_or_k,
     const float* cos_table, const float* sin_table,
@@ -1335,6 +1403,8 @@ struct KernelPipelines {
     fused_split_geglu_f16: CudaFunction,
     residual_add_f16: CudaFunction,
     pad_to_batch_f16: CudaFunction,
+    fused_pad_qkv_split_f16: CudaFunction,
+    fused_reshape_unpad_f16: CudaFunction,
     unpad_from_batch_f16: CudaFunction,
     // INT8 quantization kernels
     quantize_col_scales: CudaFunction,
@@ -1420,6 +1490,8 @@ impl KernelPipelines {
                 fused_split_geglu_f16: load("fused_split_geglu_f16_kernel")?,
                 residual_add_f16: load("residual_add_f16_kernel")?,
                 pad_to_batch_f16: load("pad_to_batch_f16_kernel")?,
+                fused_pad_qkv_split_f16: load("fused_pad_qkv_split_f16_kernel")?,
+                fused_reshape_unpad_f16: load("fused_reshape_unpad_f16_kernel")?,
                 unpad_from_batch_f16: load("unpad_from_batch_f16_kernel")?,
                 // INT8 quantization kernels
                 quantize_col_scales: load("quantize_col_scales_kernel")?,
@@ -3537,6 +3609,97 @@ impl Driver for CudaDriver {
         builder.arg(&batch_i);
         // SAFETY: FP16 gather with cu_seqlens boundaries.
         // SAFETY: kernel args set above; config matches element count.
+        unsafe { launch_kernel(builder, launch_1d(total)) }
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "mirrors pad + qkv_split args")]
+    fn fused_pad_qkv_split_f16(
+        &self,
+        q: &mut CudaTensor,
+        k: &mut CudaTensor,
+        v: &mut CudaTensor,
+        qkv_flat: &CudaTensor,
+        seq_lengths: &[usize],
+        max_seq: usize,
+        batch: usize,
+        hidden: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> crate::Result<()> {
+        let total = batch * num_heads * max_seq * head_dim;
+        let cu_dev = self.build_cu_seqlens(seq_lengths)?;
+        let batch_i = batch as i32;
+        let max_seq_i = max_seq as i32;
+        let hidden_i = hidden as i32;
+        let nh_i = num_heads as i32;
+        let hd_i = head_dim as i32;
+
+        let qkv_f16 = qkv_flat.fp16_ref().ok_or_else(|| {
+            crate::Error::Cuda("fused_pad_qkv_split_f16: qkv has no FP16".into())
+        })?;
+        let q_f16 = q.fp16.as_mut().ok_or_else(|| {
+            crate::Error::Cuda("fused_pad_qkv_split_f16: q has no FP16".into())
+        })?;
+        let k_f16 = k.fp16.as_mut().ok_or_else(|| {
+            crate::Error::Cuda("fused_pad_qkv_split_f16: k has no FP16".into())
+        })?;
+        let v_f16 = v.fp16.as_mut().ok_or_else(|| {
+            crate::Error::Cuda("fused_pad_qkv_split_f16: v has no FP16".into())
+        })?;
+
+        let mut builder = self
+            .stream
+            .launch_builder(&self.kernels.fused_pad_qkv_split_f16);
+        builder.arg(q_f16);
+        builder.arg(k_f16);
+        builder.arg(v_f16);
+        builder.arg(qkv_f16);
+        builder.arg(&cu_dev);
+        builder.arg(&batch_i);
+        builder.arg(&max_seq_i);
+        builder.arg(&hidden_i);
+        builder.arg(&nh_i);
+        builder.arg(&hd_i);
+        // SAFETY: reads flat QKV with cu_seqlens, writes to Q/K/V per-head layout.
+        unsafe { launch_kernel(builder, launch_1d(total)) }
+    }
+
+    fn fused_reshape_unpad_f16(
+        &self,
+        flat: &mut CudaTensor,
+        heads: &CudaTensor,
+        seq_lengths: &[usize],
+        max_seq: usize,
+        batch: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> crate::Result<()> {
+        let hidden = num_heads * head_dim;
+        let total = batch * max_seq * hidden;
+        let cu_dev = self.build_cu_seqlens(seq_lengths)?;
+        let batch_i = batch as i32;
+        let max_seq_i = max_seq as i32;
+        let nh_i = num_heads as i32;
+        let hd_i = head_dim as i32;
+
+        let heads_f16 = heads.fp16_ref().ok_or_else(|| {
+            crate::Error::Cuda("fused_reshape_unpad_f16: heads has no FP16".into())
+        })?;
+        let flat_f16 = flat.fp16.as_mut().ok_or_else(|| {
+            crate::Error::Cuda("fused_reshape_unpad_f16: flat has no FP16".into())
+        })?;
+
+        let mut builder = self
+            .stream
+            .launch_builder(&self.kernels.fused_reshape_unpad_f16);
+        builder.arg(flat_f16);
+        builder.arg(heads_f16);
+        builder.arg(&cu_dev);
+        builder.arg(&batch_i);
+        builder.arg(&max_seq_i);
+        builder.arg(&nh_i);
+        builder.arg(&hd_i);
+        // SAFETY: reads per-head layout, writes to flat using cu_seqlens.
         unsafe { launch_kernel(builder, launch_1d(total)) }
     }
 
