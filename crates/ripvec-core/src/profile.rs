@@ -254,6 +254,20 @@ impl Profiler {
         }
     }
 
+    /// Update the total chunk count for the embed phase.
+    ///
+    /// Used by the streaming pipeline where the total isn't known at
+    /// [`embed_begin`] time. Only updates if the new total is larger
+    /// than the current one (monotonic).
+    pub fn embed_begin_update_total(&self, total: usize) {
+        if let Self::Active { embed, .. } = self
+            && let Ok(mut state) = embed.lock()
+            && total > state.total_chunks
+        {
+            state.total_chunks = total;
+        }
+    }
+
     /// Called after each chunk is embedded. Prints periodic progress.
     #[expect(
         clippy::cast_precision_loss,

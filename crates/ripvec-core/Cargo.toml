@@ -46,6 +46,7 @@ block2 = { version = "0.6", optional = true }
 objc2-metal-performance-shaders = { version = "0.3", optional = true, features = [
     "MPSMatrixMultiplication", "MPSMatrix", "MPSKernel", "MPSCore", "MPSCoreTypes",
 ] }
+crossbeam-channel = "0.5"
 memchr = "2.7"
 blake3 = "1.8.3"
 rkyv = { version = "0.8.15", features = ["bytecheck"] }

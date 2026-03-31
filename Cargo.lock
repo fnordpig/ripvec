@@ -3225,6 +3225,7 @@ dependencies = [
  "blas-src",
  "block2",
  "criterion",
+ "crossbeam-channel",
  "cudarc",
  "dirs",
  "half",
