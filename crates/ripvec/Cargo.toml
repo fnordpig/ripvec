@@ -3,6 +3,7 @@ name = "ripvec"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Semantic code search CLI — like ripgrep but for meaning"
 
 [[bin]]
