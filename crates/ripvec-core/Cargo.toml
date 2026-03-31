@@ -32,7 +32,7 @@ accelerate-src = { version = "0.3", optional = true }
 memmap2 = "0.9"
 safetensors = "0.6"
 mlx-rs = { version = "0.25", optional = true, features = ["safetensors"] }
-cudarc = { version = "0.19", optional = true, features = ["cublas", "driver", "nvrtc", "cuda-version-from-build-system"] }
+cudarc = { version = "0.19.4", optional = true, features = ["cublas", "cublaslt", "driver", "nvrtc", "f16", "cuda-13010"] }
 objc2 = { version = "0.6", optional = true }
 objc2-metal = { version = "0.3", optional = true, features = [
     "MTLDevice", "MTLBuffer", "MTLCommandQueue", "MTLCommandBuffer",
@@ -46,8 +46,10 @@ block2 = { version = "0.6", optional = true }
 objc2-metal-performance-shaders = { version = "0.3", optional = true, features = [
     "MPSMatrixMultiplication", "MPSMatrix", "MPSKernel", "MPSCore", "MPSCoreTypes",
 ] }
+crossbeam-channel = "0.5"
 memchr = "2.7"
 blake3 = "1.8.3"
+zstd = "0.13"
 rkyv = { version = "0.8.15", features = ["bytecheck"] }
 dirs = "6.0.0"
 serde = { workspace = true, features = ["derive"] }

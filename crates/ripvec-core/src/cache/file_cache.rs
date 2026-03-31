@@ -19,26 +19,45 @@ pub struct FileCache {
     pub hidden_dim: usize,
 }
 
+/// Magic bytes to identify zstd-compressed cache objects.
+/// Uncompressed (legacy) objects start with rkyv data which never begins with
+/// these bytes, so detection is unambiguous.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
 impl FileCache {
-    /// Serialize to rkyv bytes.
+    /// Serialize to zstd-compressed rkyv bytes.
+    ///
+    /// Embedding vectors compress ~8:1 with zstd because most values cluster
+    /// near zero. Level 1 matches level 3 ratio on this data with faster compression.
     ///
     /// # Panics
     ///
     /// Panics if serialization fails (should not happen for valid data).
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        rkyv::to_bytes::<rkyv::rancor::Error>(self)
-            .expect("FileCache serialization should never fail")
-            .to_vec()
+        let raw = rkyv::to_bytes::<rkyv::rancor::Error>(self)
+            .expect("FileCache serialization should never fail");
+        zstd::encode_all(raw.as_slice(), 1)
+            .expect("zstd compression should never fail on valid data")
     }
 
-    /// Deserialize from rkyv bytes.
+    /// Deserialize from (optionally zstd-compressed) rkyv bytes.
+    ///
+    /// Transparently handles both compressed and legacy uncompressed objects
+    /// by checking for the zstd magic number.
     ///
     /// # Errors
     ///
-    /// Returns an error if the bytes are not a valid rkyv archive.
+    /// Returns an error if the bytes are not a valid archive.
     pub fn from_bytes(bytes: &[u8]) -> crate::Result<Self> {
-        rkyv::from_bytes::<Self, rkyv::rancor::Error>(bytes)
+        let raw = if bytes.len() >= 4 && bytes[..4] == ZSTD_MAGIC {
+            zstd::decode_all(bytes)
+                .map_err(|e| crate::Error::Other(anyhow::anyhow!("zstd decompression failed: {e}")))?
+        } else {
+            // Legacy uncompressed format — pass through.
+            bytes.to_vec()
+        };
+        rkyv::from_bytes::<Self, rkyv::rancor::Error>(&raw)
             .map_err(|e| crate::Error::Other(anyhow::anyhow!("rkyv deserialization failed: {e}")))
     }
 }

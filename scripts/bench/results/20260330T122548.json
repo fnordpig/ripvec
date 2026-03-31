@@ -1,0 +1,12 @@
+[
+  {
+    "label": "cuda-22L",
+    "cfg": "cuda",
+    "layers": 22,
+    "throughput": 382.2,
+    "wall_time": 57.63,
+    "thermal_before": "n/a",
+    "thermal_after": "n/a",
+    "returncode": 0
+  }
+]

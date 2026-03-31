@@ -14,6 +14,8 @@
 
 #[cfg(any(feature = "cpu", feature = "cpu-accelerate"))]
 pub mod cpu;
+#[cfg(feature = "cuda")]
+pub mod cuda;
 #[cfg(feature = "metal")]
 pub mod metal;
 #[cfg(feature = "mlx")]
@@ -806,6 +808,75 @@ pub trait Driver: Send + Sync {
         Err(crate::Error::Metal(
             "FP16 not supported by this driver".into(),
         ))
+    }
+
+    /// Fused split + `GeGLU`: read `[rows, 2*cols]`, write `[rows, cols]`.
+    ///
+    /// Combines [`split_gate_value_f16`](Driver::split_gate_value_f16) and
+    /// [`geglu_f16`](Driver::geglu_f16) into a single kernel, eliminating
+    /// two intermediate `[rows, cols]` buffers and halving HBM round-trips.
+    ///
+    /// Default falls back to separate split + geglu calls.
+    fn fused_split_geglu_f16(
+        &self,
+        output: &mut Self::Tensor,
+        input: &Self::Tensor,
+        rows: usize,
+        cols: usize,
+    ) -> crate::Result<()> {
+        // Default: allocate intermediates and call separately.
+        let n = rows * cols;
+        let mut value = self.alloc_zeros_f16(n)?;
+        let mut gate = self.alloc_zeros_f16(n)?;
+        self.split_gate_value_f16(&mut value, &mut gate, input, rows, cols)?;
+        self.geglu_f16(&value, &gate, output, n)
+    }
+
+    /// Fused pad + QKV split: flat `[total_tokens, 3*hidden]` → Q, K, V
+    /// each `[batch*heads, max_seq, head_dim]`.
+    ///
+    /// Eliminates the padded intermediate buffer. Default calls pad then split.
+    #[expect(clippy::too_many_arguments, reason = "mirrors pad + qkv_split args")]
+    fn fused_pad_qkv_split_f16(
+        &self,
+        q: &mut Self::Tensor,
+        k: &mut Self::Tensor,
+        v: &mut Self::Tensor,
+        qkv_flat: &Self::Tensor,
+        seq_lengths: &[usize],
+        max_seq: usize,
+        batch: usize,
+        hidden: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> crate::Result<()> {
+        // Default: pad then split.
+        let padded_tokens = batch * max_seq;
+        let mut qkv_padded = self.alloc_zeros_f16(padded_tokens * 3 * hidden)?;
+        self.pad_to_batch_f16(qkv_flat, &mut qkv_padded, seq_lengths, max_seq, 3 * hidden)?;
+        self.qkv_split_f16(q, k, v, &qkv_padded, batch, max_seq, hidden, num_heads, head_dim)
+    }
+
+    /// Fused attn_reshape + unpad: `[batch*heads, max_seq, head_dim]` →
+    /// `[total_tokens, hidden]`.
+    ///
+    /// Eliminates the padded context intermediate. Default calls reshape then unpad.
+    fn fused_reshape_unpad_f16(
+        &self,
+        flat: &mut Self::Tensor,
+        heads: &Self::Tensor,
+        seq_lengths: &[usize],
+        max_seq: usize,
+        batch: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> crate::Result<()> {
+        // Default: reshape then unpad.
+        let hidden = num_heads * head_dim;
+        let padded_tokens = batch * max_seq;
+        let mut context = self.alloc_zeros_f16(padded_tokens * hidden)?;
+        self.attn_reshape_f16(&mut context, heads, batch, max_seq, num_heads, head_dim)?;
+        self.unpad_from_batch_f16(&context, flat, seq_lengths, max_seq, hidden)
     }
 }
 

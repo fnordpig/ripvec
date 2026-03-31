@@ -1,8 +1,15 @@
-//! Parallel batch embedding pipeline.
+//! Parallel batch embedding pipeline with streaming backpressure.
 //!
-//! Three-phase architecture: discover files (I/O-bound via `ignore`),
-//! chunk in parallel (CPU-bound via `rayon`), then embed in parallel
-//! batches using any [`EmbedBackend`] implementation.
+//! Two pipeline modes:
+//!
+//! - **Batch mode** (< `STREAMING_THRESHOLD` files): walk, chunk all, tokenize
+//!   all, sort by length, embed. Simple and optimal for small corpora.
+//!
+//! - **Streaming mode** (>= `STREAMING_THRESHOLD` files): three-stage pipeline
+//!   with bounded channels. Chunks flow through: rayon chunk workers ->
+//!   tokenize+batch collector -> GPU embed consumer. The GPU starts after the
+//!   first `batch_size` encodings are ready (~50ms), not after all chunks are
+//!   done. Backpressure prevents unbounded memory growth.
 //!
 //! # Batch inference
 //!
@@ -19,6 +26,7 @@
 //! from Rust while the device parallelizes internally.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use rayon::prelude::*;
@@ -29,6 +37,19 @@ use crate::chunk::{ChunkConfig, CodeChunk};
 
 /// Default batch size for embedding inference.
 pub const DEFAULT_BATCH_SIZE: usize = 32;
+
+/// File count threshold for switching from batch to streaming pipeline.
+///
+/// Below this, the batch path (chunk all -> tokenize all -> sort -> embed)
+/// is simpler and allows global sort-by-length optimization. Above this,
+/// streaming eliminates GPU idle time during chunking/tokenization.
+const STREAMING_THRESHOLD: usize = 1000;
+
+/// Number of batch-sized buffers in the embed channel for backpressure.
+///
+/// Keeps memory bounded: at most `RING_SIZE * batch_size` encodings in flight.
+/// Matches the ring-buffer depth documented on [`EmbedBackend`].
+const RING_SIZE: usize = 4;
 
 /// Runtime configuration for the search pipeline.
 ///
@@ -98,6 +119,13 @@ pub struct SearchResult {
 /// Accepts multiple backends for hybrid scheduling — chunks are distributed
 /// across all backends via work-stealing (see [`embed_distributed`]).
 ///
+/// Automatically selects between two pipeline modes:
+/// - **Batch** (< `STREAMING_THRESHOLD` files): chunk all, tokenize all, sort
+///   by length, embed. Optimal for small corpora.
+/// - **Streaming** (>= `STREAMING_THRESHOLD` files): three-stage pipeline with
+///   bounded channels. GPU starts after the first batch is ready, not after all
+///   chunks are done. Eliminates GPU idle time during chunking/tokenization.
+///
 /// # Errors
 ///
 /// Returns an error if file walking, chunking, or embedding fails.
@@ -124,8 +152,31 @@ pub fn embed_all(
         files
     };
 
+    if files.len() >= STREAMING_THRESHOLD {
+        // Compute total source bytes for byte-based progress (known after walk).
+        let total_bytes: u64 = files
+            .iter()
+            .filter_map(|p| p.metadata().ok())
+            .map(|m| m.len())
+            .sum();
+        embed_all_streaming(&files, total_bytes, backends, tokenizer, cfg, profiler)
+    } else {
+        embed_all_batch(&files, backends, tokenizer, cfg, profiler)
+    }
+}
+
+/// Batch pipeline: chunk all -> tokenize all -> sort by length -> embed.
+///
+/// Optimal for small corpora where the global sort-by-length optimization
+/// matters more than eliminating GPU idle time.
+fn embed_all_batch(
+    files: &[std::path::PathBuf],
+    backends: &[&dyn EmbedBackend],
+    tokenizer: &tokenizers::Tokenizer,
+    cfg: &SearchConfig,
+    profiler: &crate::profile::Profiler,
+) -> crate::Result<(Vec<CodeChunk>, Vec<Vec<f32>>)> {
     // Phase 2: Chunk all files in parallel.
-    // Large files are mmap'd to avoid heap allocation; small files use read_to_string.
     let chunks: Vec<CodeChunk> = {
         let _span = info_span!("chunk", file_count = files.len()).entered();
         let chunk_start = Instant::now();
@@ -137,7 +188,6 @@ pub fn embed_all(
                     return vec![];
                 };
                 let chunks = if text_mode {
-                    // Force plain-text sliding windows for all files
                     crate::chunk::chunk_text(path, &source, &cfg.chunk)
                 } else {
                     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -145,7 +195,6 @@ pub fn embed_all(
                         Some(lang_config) => {
                             crate::chunk::chunk_file(path, &source, &lang_config, &cfg.chunk)
                         }
-                        // Unrecognized extension: fall back to plain-text windows
                         None => crate::chunk::chunk_text(path, &source, &cfg.chunk),
                     }
                 };
@@ -205,6 +254,227 @@ pub fn embed_all(
         .unzip();
 
     Ok((chunks, embeddings))
+}
+
+/// Streaming pipeline: chunk -> tokenize -> batch -> embed with backpressure.
+///
+/// Three concurrent stages connected by bounded channels:
+///
+/// 1. **Chunk producers** (rayon pool, in a scoped thread): read + parse files,
+///    send chunks to channel.
+/// 2. **Tokenize + batch collector** (scoped thread): tokenize chunks, sort
+///    within batch windows, send full batches to the embed channel.
+/// 3. **Embed consumer** (main thread): calls `embed_distributed` on each
+///    batch, collects results.
+///
+/// The bounded channels provide natural backpressure: if the GPU falls behind,
+/// the tokenize stage blocks, which blocks chunk producers via the chunk channel.
+/// If chunking is fast and the GPU is slow, at most
+/// `8 * batch_size + RING_SIZE * batch_size` items are in memory.
+///
+/// Uses `std::thread::scope` so all threads can borrow the caller's stack
+/// (`tokenizer`, `backends`, `profiler`) without `'static` bounds.
+#[expect(
+    clippy::too_many_lines,
+    reason = "streaming pipeline has inherent complexity in thread coordination"
+)]
+fn embed_all_streaming(
+    files: &[std::path::PathBuf],
+    total_bytes: u64,
+    backends: &[&dyn EmbedBackend],
+    tokenizer: &tokenizers::Tokenizer,
+    cfg: &SearchConfig,
+    profiler: &crate::profile::Profiler,
+) -> crate::Result<(Vec<CodeChunk>, Vec<Vec<f32>>)> {
+    use crossbeam_channel::bounded;
+
+    let bs = cfg.batch_size.max(1);
+    let max_tokens_cfg = cfg.max_tokens;
+    let model_max = backends[0].max_tokens();
+    let file_count = files.len();
+    let text_mode = cfg.text_mode;
+    let chunk_config = cfg.chunk.clone();
+
+    // Bounded channel from chunk producers -> tokenize+batch stage.
+    // Factor of 8 gives enough buffering for rayon parallelism without
+    // unbounded growth (at most ~8 batches worth of chunks in flight).
+    let (chunk_tx, chunk_rx) = bounded::<CodeChunk>(bs * 8);
+
+    // Bounded channel from tokenize+batch stage -> embed consumer.
+    // RING_SIZE batches in flight provides enough pipeline depth for GPU
+    // to stay busy while the next batch is being tokenized.
+    let (batch_tx, batch_rx) = bounded::<Vec<(Encoding, CodeChunk)>>(RING_SIZE);
+
+    // Shared counters for profiling across the streaming pipeline.
+    let total_chunks_produced = AtomicUsize::new(0);
+    let bytes_chunked = AtomicUsize::new(0);
+    let chunk_start = Instant::now();
+
+    // All stages run inside std::thread::scope so they can borrow from the
+    // caller's stack (tokenizer, backends, profiler, files, etc.).
+    std::thread::scope(|scope| {
+        // --- Stage 1: Chunk producers (rayon inside a scoped thread) ---
+        //
+        // Spawns a scoped thread that drives rayon's par_iter. Each file is
+        // chunked independently and chunks are sent into the bounded channel.
+        // If the channel is full, rayon workers block, providing backpressure.
+        scope.spawn(|| {
+            let _span = info_span!("chunk_stream", file_count).entered();
+            files.par_iter().for_each(|path| {
+                let Some(source) = read_source(path) else {
+                    return;
+                };
+                let chunks = if text_mode {
+                    crate::chunk::chunk_text(path, &source, &chunk_config)
+                } else {
+                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    match crate::languages::config_for_extension(ext) {
+                        Some(lang_config) => {
+                            crate::chunk::chunk_file(path, &source, &lang_config, &chunk_config)
+                        }
+                        None => crate::chunk::chunk_text(path, &source, &chunk_config),
+                    }
+                };
+                let n = chunks.len();
+                let file_bytes = source.len();
+                for chunk in chunks {
+                    // Channel disconnected means downstream errored; stop.
+                    if chunk_tx.send(chunk).is_err() {
+                        return;
+                    }
+                }
+                profiler.chunk_thread_report(n);
+                total_chunks_produced.fetch_add(n, Ordering::Relaxed);
+                bytes_chunked.fetch_add(file_bytes, Ordering::Relaxed);
+            });
+            // chunk_tx is dropped here, closing the channel — but the borrow
+            // of chunk_tx lives until the scoped thread ends. We need to
+            // explicitly drop it so the tokenize stage sees the channel close.
+            drop(chunk_tx);
+        });
+
+        // --- Stage 2: Tokenize + batch collector (scoped thread) ---
+        //
+        // Receives individual chunks, tokenizes each (HuggingFace tokenizer
+        // is Send + Sync), and accumulates into batch-sized buffers. Within
+        // each buffer, entries are sorted by descending token count — the same
+        // padding-reduction optimization as the batch path, applied locally.
+        let tokenize_handle = scope.spawn(move || -> crate::Result<()> {
+            let _span = info_span!("tokenize_stream").entered();
+            let mut buffer: Vec<(Encoding, CodeChunk)> = Vec::with_capacity(bs);
+
+            for chunk in &chunk_rx {
+                match tokenize(
+                    &chunk.enriched_content,
+                    tokenizer,
+                    max_tokens_cfg,
+                    model_max,
+                ) {
+                    Ok(encoding) => {
+                        buffer.push((encoding, chunk));
+                        if buffer.len() >= bs {
+                            // Sort within batch by descending token count.
+                            buffer.sort_by(|a, b| b.0.input_ids.len().cmp(&a.0.input_ids.len()));
+                            let batch = std::mem::replace(&mut buffer, Vec::with_capacity(bs));
+                            if batch_tx.send(batch).is_err() {
+                                // Embed consumer dropped; stop tokenizing.
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            file = %chunk.file_path, err = %e,
+                            "tokenization failed, skipping chunk"
+                        );
+                    }
+                }
+            }
+
+            // Flush remaining partial batch.
+            if !buffer.is_empty() {
+                buffer.sort_by(|a, b| b.0.input_ids.len().cmp(&a.0.input_ids.len()));
+                let _ = batch_tx.send(buffer);
+            }
+            // batch_tx drops here, closing the embed channel.
+
+            Ok(())
+        });
+
+        // --- Stage 3: Embed consumer (main thread within scope) ---
+        //
+        // Receives sorted batches, embeds via the backend(s), collects results.
+        // Profiler is driven from here since this thread owns the reference.
+        let _span = info_span!("embed_stream").entered();
+
+        // Total isn't known upfront in streaming mode; start at 0 and update.
+        profiler.embed_begin(0);
+
+        let mut all_chunks: Vec<CodeChunk> = Vec::new();
+        let mut all_embeddings: Vec<Vec<f32>> = Vec::new();
+        let mut embed_error: Option<crate::Error> = None;
+
+        let mut cumulative_done: usize = 0;
+        for batch in &batch_rx {
+            let batch_len = batch.len();
+            let (encodings, chunks): (Vec<Encoding>, Vec<CodeChunk>) = batch.into_iter().unzip();
+
+            // Wrap as Option<Encoding> for embed_distributed compatibility.
+            let opt_encodings: Vec<Option<Encoding>> = encodings.into_iter().map(Some).collect();
+
+            // Pass noop profiler to embed_distributed — its internal done counter
+            // resets per call (0→batch_size), which corrupts our global progress.
+            let noop = crate::profile::Profiler::noop();
+            match embed_distributed(&opt_encodings, backends, bs, &noop) {
+                Ok(batch_embeddings) => {
+                    cumulative_done += batch_len;
+                    // Byte-based progress: total_bytes known from walk, bytes_chunked
+                    // tracks how much source data has been processed through the pipeline.
+                    let processed = bytes_chunked.load(Ordering::Relaxed) as u64;
+                    profiler.embed_tick_bytes(cumulative_done, processed, total_bytes);
+
+                    for (chunk, emb) in chunks.into_iter().zip(batch_embeddings) {
+                        if !emb.is_empty() {
+                            all_chunks.push(chunk);
+                            all_embeddings.push(emb);
+                        }
+                    }
+                }
+                Err(e) => {
+                    embed_error = Some(e);
+                    // break exits the for loop; batch_rx drops naturally after.
+                    break;
+                }
+            }
+        }
+
+        // Report chunk summary now that all stages have completed (or errored).
+        let final_total = total_chunks_produced.load(Ordering::Relaxed);
+        profiler.chunk_summary(final_total, file_count, chunk_start.elapsed());
+        // Set the final total so embed_done shows the correct summary.
+        profiler.embed_begin_update_total(cumulative_done);
+        profiler.embed_tick(cumulative_done);
+        profiler.embed_done();
+
+        // Wait for tokenize thread and check for errors.
+        let tokenize_result = tokenize_handle.join();
+
+        // Error priority: embed > tokenize > thread panic.
+        if let Some(e) = embed_error {
+            return Err(e);
+        }
+        match tokenize_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(crate::Error::Other(anyhow::anyhow!(
+                    "tokenize thread panicked"
+                )));
+            }
+        }
+
+        Ok((all_chunks, all_embeddings))
+    })
 }
 
 /// Search a directory for code chunks semantically similar to a query.

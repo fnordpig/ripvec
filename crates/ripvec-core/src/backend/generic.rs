@@ -33,6 +33,9 @@ pub struct GenericBackend<D: Driver, A: ModelArch<D>> {
     max_tokens: usize,
     /// Whether this backend runs on a GPU.
     is_gpu: bool,
+    /// Maximum encodings per forward pass. Larger batches saturate GPU SMs better
+    /// but use more memory. Default: 32 (Metal-tuned). CUDA can handle 128+.
+    max_batch: usize,
     /// Keeps the memory-mapped safetensors file alive.
     ///
     /// Must outlive the weight tensors in `arch` — declared last for correct
@@ -50,12 +53,30 @@ impl<D: Driver, A: ModelArch<D>> GenericBackend<D, A> {
     /// For GPU backends, runs a warm-up forward pass to prime the buffer pool.
     /// This is skipped for large models (max_tokens > 1024) where the warm-up
     /// cost exceeds the benefit.
+    /// Create a new generic backend.
+    ///
+    /// `max_batch` controls how many encodings are sent in each forward pass.
+    /// Metal: 32 (optimal for M2 Max AMX). CUDA: 128+ (needs more work to
+    /// saturate 128 SMs on RTX 4090).
     pub fn new(driver: D, arch: A, max_tokens: usize, is_gpu: bool, mmap: memmap2::Mmap) -> Self {
+        Self::with_max_batch(driver, arch, max_tokens, is_gpu, mmap, 32)
+    }
+
+    /// Create with explicit max batch size.
+    pub fn with_max_batch(
+        driver: D,
+        arch: A,
+        max_tokens: usize,
+        is_gpu: bool,
+        mmap: memmap2::Mmap,
+        max_batch: usize,
+    ) -> Self {
         let backend = Self {
             driver,
             arch,
             max_tokens,
             is_gpu,
+            max_batch,
             _mmap: mmap,
         };
         // Warm up buffer pool: run a dummy forward to pre-allocate Metal buffers.
@@ -93,12 +114,12 @@ where
     A: ModelArch<D> + Send + Sync + 'static,
 {
     fn embed_batch(&self, encodings: &[Encoding]) -> crate::Result<Vec<Vec<f32>>> {
-        const MAX_BATCH: usize = 32;
-        if encodings.len() <= MAX_BATCH {
+        let max_batch = self.max_batch;
+        if encodings.len() <= max_batch {
             return self.arch.forward(&self.driver, encodings);
         }
         let mut all = Vec::with_capacity(encodings.len());
-        for chunk in encodings.chunks(MAX_BATCH) {
+        for chunk in encodings.chunks(max_batch) {
             let mut results = self.arch.forward(&self.driver, chunk)?;
             all.append(&mut results);
         }

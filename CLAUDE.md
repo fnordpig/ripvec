@@ -21,10 +21,10 @@ Cargo workspace with three crates:
 - `ripvec-mcp` — MCP server binary (rmcp, 6 tools + 1 resource)
 
 ### Backends (in detection priority order)
-- **Metal** (default on macOS) — custom MSL kernels + MPS GEMMs, 73/s ModernBERT, 312/s BGE-small on M2 Max
+- **Metal** (default on macOS) — custom MSL kernels + MPS GEMMs, 73.8/s on M2 Max
 - **MLX** (fallback on macOS) — mlx-rs, lazy eval graph fusion
-- **CUDA** (Linux) — cudarc, custom CUDA kernels, FP16 tensor core GEMM
-- **CPU** (everywhere) — ndarray + system BLAS (Accelerate/OpenBLAS/AOCL)
+- **CUDA** (Linux) — cudarc 0.19.4, cuBLAS tensor core FP16/INT8 GEMMs + custom NVRTC kernels, 435/s on RTX 4090
+- **CPU** (everywhere) — ndarray + system BLAS (Accelerate/OpenBLAS/AOCL), 73.5/s on M2 Max
 
 ### Models
 - **BGE-small-en-v1.5** (--fast) — ClassicBert, 384-dim, CLS pooling
@@ -66,7 +66,19 @@ Cargo workspace with three crates:
 - Metal: `_mmap` field must outlive `weight_buffer` (drop order matters)
 - BGE-small uses CLS pooling; ModernBERT uses mean pooling — don't mix
 - All embeddings are L2-normalized; cosine similarity = dot product
-- Metal MAX_BATCH=32 for optimal padding; MLX MAX_BATCH=64
+- Metal MAX_BATCH=32 for optimal padding; MLX MAX_BATCH=64; CUDA MAX_BATCH=32
+- CUDA: `CudaSlice::clone()` does full D2D memcpy (not refcount) — never pool via clone
+- CUDA: disable cudarc event tracking for single-stream usage (`ctx.disable_event_tracking()`)
+- CUDA: use `compute_XX` (not `sm_XX`) for NVRTC arch to avoid PTX version mismatches
+- Cache objects are zstd-compressed (level 1, ~8× smaller)
+
+## Streaming pipeline
+For corpora >= 1000 files, `embed_all` uses a three-stage streaming pipeline:
+1. **Chunk** (rayon par_iter) → bounded channel → 2. **Tokenize** (single thread) → bounded channel → 3. **GPU embed** (main thread)
+- Backpressure via `crossbeam_channel::bounded`
+- GPU starts after first batch (~50ms), not after all files chunked
+- Progress shown in bytes (total known from walk), not chunks (unknown until done)
+- Small corpora use batch path (global sort-by-length for better padding)
 
 ## Before committing
 Run: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test --workspace`

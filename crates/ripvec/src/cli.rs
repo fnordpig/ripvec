@@ -77,9 +77,10 @@ pub struct Args {
 
     /// Maximum tokens per chunk fed to the model (0 = unlimited).
     ///
-    /// Capping tokens controls inference cost: 128 tokens is 7.7× faster
-    /// than 512. CLS pooling means early tokens carry the most semantic weight.
-    #[arg(long, default_value_t = 0)]
+    /// Capping tokens controls inference cost and GPU memory. Tree-sitter
+    /// chunks are typically 50-200 tokens; 512 covers virtually all code chunks.
+    /// Set to 0 for unlimited (model max, up to 8192 — may OOM on GPU).
+    #[arg(long, default_value_t = 512)]
     pub max_tokens: usize,
 
     /// Maximum chunk size in bytes before splitting into windows.

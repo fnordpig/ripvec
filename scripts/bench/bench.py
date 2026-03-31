@@ -338,6 +338,8 @@ def expand_configs(
                     env["RIPVEC_NO_MPS"] = "1"
                 elif cfg == "cpu":
                     cli += ["--device", "cpu"]
+                elif cfg == "cuda":
+                    cli += ["--backend", "cuda"]
                 # mps: default, no extra env/args
 
                 cli += ["--layers", str(L)]
@@ -602,7 +604,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--configs",
         nargs="+",
         default=["mps", "compute", "cpu"],
-        choices=["mps", "compute", "cpu"],
+        choices=["mps", "compute", "cpu", "cuda"],
         metavar="CONFIG",
         help="Configs to benchmark (default: mps compute cpu)",
     )

@@ -1,0 +1,2912 @@
+{
+  "version": 1,
+  "exporter": "tracemeld@0.2.2",
+  "created_at": 1774898311060,
+  "tags": {
+    "path": "cuda",
+    "layers": "22",
+    "corpus": "flask",
+    "throughput": "541.0",
+    "checkpoint": "after",
+    "task": "Phase 2A: Remove pool D2D cloning + disable event tracking — 59.0 → 541.0/s (9.2×)"
+  },
+  "value_types": [
+    {
+      "key": "wall_ms",
+      "unit": "milliseconds",
+      "description": "Wall-clock duration"
+    },
+    {
+      "key": "input_tokens",
+      "unit": "none",
+      "description": "Input/prompt tokens consumed"
+    },
+    {
+      "key": "output_tokens",
+      "unit": "none",
+      "description": "Output/completion tokens generated"
+    },
+    {
+      "key": "cost_usd",
+      "unit": "none",
+      "description": "Estimated dollar cost"
+    },
+    {
+      "key": "bytes_read",
+      "unit": "bytes",
+      "description": "Bytes read from disk/network"
+    },
+    {
+      "key": "bytes_written",
+      "unit": "bytes",
+      "description": "Bytes written to disk/network"
+    },
+    {
+      "key": "bytes",
+      "unit": "bytes",
+      "description": "Memory transfer size"
+    },
+    {
+      "key": "threads",
+      "unit": "none",
+      "description": "Thread count (grid * block)"
+    },
+    {
+      "key": "shared_mem_bytes",
+      "unit": "bytes",
+      "description": "Shared memory per block"
+    },
+    {
+      "key": "registers",
+      "unit": "none",
+      "description": "Registers per thread"
+    }
+  ],
+  "source_formats": [],
+  "totals": {
+    "wall_ms": 11327.704053977908,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cost_usd": 0,
+    "bytes_read": 0,
+    "bytes_written": 0,
+    "bytes": 5124771012,
+    "threads": 211032000000,
+    "shared_mem_bytes": 528210944,
+    "registers": 2269556
+  },
+  "kind_breakdown": [
+    {
+      "kind": "cuda_api",
+      "totals": {
+        "wall_ms": 4003.5227579999832,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cost_usd": 0,
+        "bytes_read": 0,
+        "bytes_written": 0,
+        "bytes": 0,
+        "threads": 0,
+        "shared_mem_bytes": 0,
+        "registers": 0
+      },
+      "span_count": 208438,
+      "error_count": 0
+    },
+    {
+      "kind": "cuda_sync",
+      "totals": {
+        "wall_ms": 3678.303975000001,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cost_usd": 0,
+        "bytes_read": 0,
+        "bytes_written": 0,
+        "bytes": 0,
+        "threads": 0,
+        "shared_mem_bytes": 0,
+        "registers": 0
+      },
+      "span_count": 476,
+      "error_count": 0
+    },
+    {
+      "kind": "kernel",
+      "totals": {
+        "wall_ms": 3580.644396999986,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cost_usd": 0,
+        "bytes_read": 0,
+        "bytes_written": 0,
+        "bytes": 0,
+        "threads": 211032000000,
+        "shared_mem_bytes": 528210944,
+        "registers": 2269556
+      },
+      "span_count": 32486,
+      "error_count": 0
+    },
+    {
+      "kind": "memcpy",
+      "totals": {
+        "wall_ms": 47.06268500000063,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cost_usd": 0,
+        "bytes_read": 0,
+        "bytes_written": 0,
+        "bytes": 4900835284,
+        "threads": 0,
+        "shared_mem_bytes": 0,
+        "registers": 0
+      },
+      "span_count": 4166,
+      "error_count": 0
+    },
+    {
+      "kind": "memset",
+      "totals": {
+        "wall_ms": 18.170238999999146,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cost_usd": 0,
+        "bytes_read": 0,
+        "bytes_written": 0,
+        "bytes": 223935728,
+        "threads": 0,
+        "shared_mem_bytes": 0,
+        "registers": 0
+      },
+      "span_count": 32383,
+      "error_count": 0
+    }
+  ],
+  "frame_costs": [
+    {
+      "stack": "cuda_api:cuStreamSynchronize",
+      "self_cost": [
+        3677.044346,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        3677.044346,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "call_count": 76
+    },
+    {
+      "stack": "cuda_sync:Stream wait sync",
+      "self_cost": [
+        3677.013180000001,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        3677.013180000001,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "call_count": 76
+    },
+    {
+      "stack": "cuda_api:cuLaunchKernel;kernel:fused_scale_mask_softmax_windowed_f16_kernel",
+      "self_cost": [
+        556.9149259999981,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        32027885568,
+        1089536,
+        23408
+      ],
+      "total_cost": [
+        556.9149259999981,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        32027885568,
+        1089536,
+        23408
+      ],
+      "call_count": 1064
+    },
+    {
+      "stack": "cuda_api:cudaLaunchKernel_v7000;kernel:void cutlass::Kernel<cutlass_80_tensorop_f16_s16816gemm_relu_f16_128x256_32x3_tn_align8>(T1::Params)",
+      "self_cost": [
+        438.9162009999996,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        400998400,
+        118407168,
+        375804
+      ],
+      "total_cost": [
+        438.9162009999996,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        400998400,
+        118407168,
+        375804
+      ],
+      "call_count": 1606
+    },
+    {
+      "stack": "cuda_api:cuLaunchKernel;kernel:fused_scale_mask_softmax_f16_kernel",
+      "self_cost": [
+        311.56063899999907,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        18301648896,
+        622592,
+        12160
+      ],
+      "total_cost": [
+        311.56063899999907,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        18301648896,
+        622592,
+        12160
+      ],
+      "call_count": 608
+    },
+    {
+      "stack": "cuda_api:cudaLaunchKernel_v7000;kernel:ampere_fp16_s1688gemm_fp16_128x128_ldg8_f2f_stages_32x1_tn",
+      "self_cost": [
+        308.0459880000004,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        938049024,
+        28114944,
+        200772
+      ],
+      "total_cost": [
+        308.0459880000004,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        938049024,
+        28114944,
+        200772
+      ],
+      "call_count": 858
+    },
+    {
+      "stack": "cuda_api:cudaLaunchKernel_v7000;kernel:void cutlass::Kernel<cutlass_80_tensorop_f16_s16816gemm_relu_f16_64x64_32x6_nn_align8>(T1::Params)",
+      "self_cost": [
+        249.812735,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        264929280,
+        24870912,
+        54648
+      ],
+      "total_cost": [
+        249.812735,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        264929280,
+        24870912,
+        54648
+      ],
+      "call_count": 506
+    },
+    {
+      "stack": "cuda_api:cudaLaunchKernel_v7000;kernel:void cutlass::Kernel<cutlass_80_tensorop_f16_s16816gemm_relu_f16_256x128_32x3_tn_align8>(T1::Params)",
+      "self_cost": [
+        218.95628900000065,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        222306304,
+        139493376,
+        438944
+      ],
+      "total_cost": [
+        218.95628900000065,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        222306304,
+        139493376,
+        438944
+      ],
+      "call_count": 1892
+    },
+    {
+      "stack": "cuda_api:cudaLaunchKernel_v7000;kernel:ampere_fp16_s1688gemm_fp16_128x128_ldg8_f2f_tn",
+      "self_cost": [
+        186.00326599999997,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        170260992,
+        23789568,
+        184404
+      ],
+      "total_cost": [
+        186.00326599999997,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        170260992,
+        23789568,
+        184404
+      ],
+      "call_count": 726
+    },
+    {
+      "stack": "cuda_api:cuLaunchKernel;kernel:pad_to_batch_f16_kernel",
+      "self_cost": [
+        165.11594800000046,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        37747150848,
+        0,
+        26752
+      ],
+      "total_cost": [
+        165.11594800000046,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        37747150848,
+        0,
+        26752
+      ],
+      "call_count": 1672
+    },
+    {
+      "stack": "cuda_api:cuLaunchKernel;kernel:qkv_split_f16_kernel",
+      "self_cost": [
+        143.31184399999964,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        12582383616,
+        0,
+        30096
+      ],
+      "total_cost": [
+        143.31184399999964,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        12582383616,
+        0,
+        30096
+      ],
+      "call_count": 1672
+    },
+    {
+      "stack": "cuda_api:cuLaunchKernel;kernel:split_gate_value_f16_kernel",
+      "self_cost": [
+        133.3806820000013,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        17648919552,
+        0,
+        26752
+      ],
+      "total_cost": [
+        133.3806820000013,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        17648919552,
+        0,
+        26752
+      ],
+      "call_count": 1672
+    },
+    {
+      "stack": "cuda_api:cuLaunchKernel;kernel:residual_add_f16_kernel",
+      "self_cost": [
+        125.69315200000052,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        23531768832,
+        0,
+        53504
+      ],
+      "total_cost": [
+        125.69315200000052,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        23531768832,
+        0,
+        53504
+      ],
+      "call_count": 3344
+    },
+    {
+      "stack": "cuda_api:cuMemAllocAsync",
+      "self_cost": [
+        125.16414699998414,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        125.16414699998414,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "call_count": 68247
+    },
+    {
+      "stack": "cuda_api:cudaLaunchKernel_v7000;kernel:ampere_fp16_s16816gemm_fp16_256x128_ldg8_f2f_stages_32x3_tn",
+      "self_cost": [
+        123.91806500000006,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        93891072,
+        35684352,
+        107448
+      ],
+      "total_cost": [
+        123.91806500000006,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        93891072,
+        35684352,
+        107448
+      ],
+      "call_count": 484
+    },
+    {
+      "stack": "cuda_api:cuLaunchKernel;kernel:layer_norm_f16_kernel",
+      "self_cost": [
+        123.03802999999978,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        7665651968,
+        6692864,
+        62092
+      ],
+      "total_cost": [
+        123.03802999999978,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        7665651968,
+        6692864,
+        62092
+      ],
+      "call_count": 3268
+    },
+    {
+      "stack": "cuda_api:cuLaunchKernel;kernel:geglu_f16_kernel",
+      "self_cost": [
+        97.24232000000008,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        17648919552,
+        0,
+        26752
+      ],
+      "total_cost": [
+        97.24232000000008,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        17648919552,
+        0,
+        26752
+      ],
+      "call_count": 1672
+    },
+    {
+      "stack": "cuda_api:cuMemsetD8Async",
+      "self_cost": [
+        69.32533699999996,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        87.1566939999986,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "call_count": 32009
+    },
+    {
+      "stack": "cuda_api:cuLaunchKernel",
+      "self_cost": [
+        3.0182960000000008,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        83.68621699999956,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "call_count": 22432
+    },
+    {
+      "stack": "cuda_api:cuLaunchKernel;kernel:rope_encode_f16_kernel",
+      "self_cost": [
+        74.74122999999973,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        12582383616,
+        0,
+        60192
+      ],
+      "total_cost": [
+        74.74122999999973,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        12582383616,
+        0,
+        60192
+      ],
+      "call_count": 3344
+    },
+    {
+      "stack": "cuda_api:cudaLaunchKernel_v7000;kernel:ampere_fp16_s16816gemm_fp16_64x64_ldg8_f2f_stages_64x5_nn",
+      "self_cost": [
+        66.20702100000001,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        31358976,
+        1802240,
+        2156
+      ],
+      "total_cost": [
+        66.20702100000001,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        31358976,
+        1802240,
+        2156
+      ],
+      "call_count": 22
+    },
+    {
+      "stack": "cuda_api:cuMemcpyHtoDAsync_v2",
+      "self_cost": [
+        22.626416999999968,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        62.72069600000025,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "call_count": 3938
+    },
+    {
+      "stack": "cuda_api:cuMemFreeAsync",
+      "self_cost": [
+        61.860018999992576,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        61.860018999992576,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "call_count": 68247
+    },
+    {
+      "stack": "cuda_api:cudaLaunchKernel_v7000;kernel:ampere_fp16_s1688gemm_fp16_256x64_ldg8_f2f_stages_32x1_tn",
+      "self_cost": [
+        58.073125,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        275742720,
+        15319040,
+        87516
+      ],
+      "total_cost": [
+        58.073125,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        275742720,
+        15319040,
+        87516
+      ],
+      "call_count": 374
+    },
+    {
+      "stack": "cuda_api:cuLaunchKernel;kernel:attn_reshape_f16_kernel",
+      "self_cost": [
+        52.32690499999992,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        12582383616,
+        0,
+        26752
+      ],
+      "total_cost": [
+        52.32690499999992,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        12582383616,
+        0,
+        26752
+      ],
+      "call_count": 1672
+    },
+    {
+      "stack": "cuda_api:cudaLaunchKernel_v7000",
+      "self_cost": [
+        5.306438,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        47.43300699999993,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "call_count": 10054
+    },
+    {
+      "stack": "cuda_api:cuLaunchKernel;kernel:unpad_from_batch_f16_kernel",
+      "self_cost": [
+        46.13416600000014,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        12582383616,
+        0,
+        26752
+      ],
+      "total_cost": [
+        46.13416600000014,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        12582383616,
+        0,
+        26752
+      ],
+      "call_count": 1672
+    },
+    {
+      "stack": "cuda_api:cuMemcpyHtoDAsync_v2;memcpy:HtoD",
+      "self_cost": [
+        40.09903300000065,
+        0,
+        0,
+        0,
+        0,
+        0,
+        615008212,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        40.09903300000065,
+        0,
+        0,
+        0,
+        0,
+        0,
+        615008212,
+        0,
+        0,
+        0
+      ],
+      "call_count": 3938
+    },
+    {
+      "stack": "cuda_api:cuLibraryUnload",
+      "self_cost": [
+        21.332602999999995,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        21.332602999999995,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "call_count": 10
+    },
+    {
+      "stack": "cuda_api:cudaLaunchKernel_v7000;kernel:void cutlass::Kernel<cutlass_80_wmma_tensorop_f16_s161616gemm_f16_32x32_64x1_nn_align8>(T1::Params)",
+      "self_cost": [
+        19.88834799999996,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        419561472,
+        10272768,
+        67584
+      ],
+      "total_cost": [
+        19.88834799999996,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        419561472,
+        10272768,
+        67584
+      ],
+      "call_count": 1056
+    },
+    {
+      "stack": "cuda_api:cuMemsetD8Async;memset",
+      "self_cost": [
+        17.831356999999638,
+        0,
+        0,
+        0,
+        0,
+        0,
+        223703408,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        17.831356999999638,
+        0,
+        0,
+        0,
+        0,
+        0,
+        223703408,
+        0,
+        0,
+        0
+      ],
+      "call_count": 32009
+    },
+    {
+      "stack": "cuda_api:cudaLaunchKernel_v7000;kernel:void cutlass::Kernel<cutlass_80_tensorop_f16_s16816gemm_relu_f16_128x128_32x4_tn_align8>(T1::Params)",
+      "self_cost": [
+        16.927246000000057,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        10002432,
+        41811968,
+        149292
+      ],
+      "total_cost": [
+        16.927246000000057,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        10002432,
+        41811968,
+        149292
+      ],
+      "call_count": 638
+    },
+    {
+      "stack": "cuda_api:cudaLaunchKernel_v7000;kernel:ampere_fp16_s16816gemm_fp16_128x64_ldg8_f2f_stages_64x4_tn",
+      "self_cost": [
+        12.90350499999998,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        11303424,
+        32440320,
+        52140
+      ],
+      "total_cost": [
+        12.90350499999998,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        11303424,
+        32440320,
+        52140
+      ],
+      "call_count": 330
+    },
+    {
+      "stack": "cuda_api:cudaFree_v3020",
+      "self_cost": [
+        10.43027,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        10.43027,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "call_count": 5
+    },
+    {
+      "stack": "cuda_api:cuLaunchKernel;kernel:layer_norm_kernel",
+      "self_cost": [
+        8.248277,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        356541952,
+        311296,
+        2888
+      ],
+      "total_cost": [
+        8.248277,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        356541952,
+        311296,
+        2888
+      ],
+      "call_count": 152
+    },
+    {
+      "stack": "cuda_api:cudaLaunchKernel_v7000;kernel:ampere_fp16_s1688gemm_fp16_64x128_sliced1x2_ldg8_f2f_nn",
+      "self_cost": [
+        7.496962999999997,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        6488064,
+        1441792,
+        9944
+      ],
+      "total_cost": [
+        7.496962999999997,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        6488064,
+        1441792,
+        9944
+      ],
+      "call_count": 44
+    },
+    {
+      "stack": "cuda_api:cuMemcpyDtoDAsync_v2;memcpy:kind8",
+      "self_cost": [
+        6.534464,
+        0,
+        0,
+        0,
+        0,
+        0,
+        4278503424,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        6.534464,
+        0,
+        0,
+        0,
+        0,
+        0,
+        4278503424,
+        0,
+        0,
+        0
+      ],
+      "call_count": 152
+    },
+    {
+      "stack": "cuda_api:cudaLaunchKernel_v7000;kernel:void cutlass::Kernel<cutlass_80_wmma_tensorop_f16_s161616gemm_f16_32x32_32x1_tn_align8>(T1::Params)",
+      "self_cost": [
+        5.8872970000000135,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        467140608,
+        1576960,
+        14784
+      ],
+      "total_cost": [
+        5.8872970000000135,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        467140608,
+        1576960,
+        14784
+      ],
+      "call_count": 308
+    },
+    {
+      "stack": "cuda_api:cudaLaunchKernel_v7000;kernel:void cutlass::Kernel<cutlass_80_tensorop_f16_s16816gemm_relu_f16_128x128_32x5_tn_align8>(T1::Params)",
+      "self_cost": [
+        5.609818000000001,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        4190208,
+        7208960,
+        20592
+      ],
+      "total_cost": [
+        5.609818000000001,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        4190208,
+        7208960,
+        20592
+      ],
+      "call_count": 88
+    },
+    {
+      "stack": "cuda_api:cudaLaunchKernel_v7000;kernel:ampere_fp16_s1688gemm_fp16_128x256_ldg8_f2f_stages_32x1_tn",
+      "self_cost": [
+        3.665774,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        2466816,
+        5767168,
+        20592
+      ],
+      "total_cost": [
+        3.665774,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        2466816,
+        5767168,
+        20592
+      ],
+      "call_count": 88
+    },
+    {
+      "stack": "cuda_api:cuLaunchKernel;kernel:pad_to_batch_kernel",
+      "self_cost": [
+        3.6109260000000014,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        571926528,
+        0,
+        1292
+      ],
+      "total_cost": [
+        3.6109260000000014,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        571926528,
+        0,
+        1292
+      ],
+      "call_count": 76
+    },
+    {
+      "stack": "cuda_api:cuLaunchKernel;kernel:f32_to_f16_kernel",
+      "self_cost": [
+        3.1614210000000007,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        645110016,
+        0,
+        2624
+      ],
+      "total_cost": [
+        3.1614210000000007,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        645110016,
+        0,
+        2624
+      ],
+      "call_count": 164
+    },
+    {
+      "stack": "cuda_api:cudaLaunchKernel_v7000;kernel:void cutlass::Kernel<cutlass_80_wmma_tensorop_f16_s161616gemm_f16_32x32_64x1_tn_align8>(T1::Params)",
+      "self_cost": [
+        2.884397999999993,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        160038912,
+        5068800,
+        34650
+      ],
+      "total_cost": [
+        2.884397999999993,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        160038912,
+        5068800,
+        34650
+      ],
+      "call_count": 550
+    },
+    {
+      "stack": "cuda_api:cuMemcpyDtoHAsync_v2",
+      "self_cost": [
+        1.793089000000001,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        2.222277,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "call_count": 76
+    },
+    {
+      "stack": "cuda_api:cuLaunchKernel;kernel:f16_to_f32_kernel",
+      "self_cost": [
+        2.1194970000000004,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        534812928,
+        0,
+        1216
+      ],
+      "total_cost": [
+        2.1194970000000004,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        534812928,
+        0,
+        1216
+      ],
+      "call_count": 76
+    },
+    {
+      "stack": "cuda_api:cuLaunchKernel;kernel:embedding_lookup_kernel",
+      "self_cost": [
+        1.9597219999999995,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        534812928,
+        0,
+        1216
+      ],
+      "total_cost": [
+        1.9597219999999995,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        534812928,
+        0,
+        1216
+      ],
+      "call_count": 76
+    },
+    {
+      "stack": "cuda_api:cuLaunchKernel;kernel:mean_pool_kernel",
+      "self_cost": [
+        1.8827900000000002,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1830912,
+        0,
+        3040
+      ],
+      "total_cost": [
+        1.8827900000000002,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1830912,
+        0,
+        3040
+      ],
+      "call_count": 76
+    },
+    {
+      "stack": "cuda_api:cuMemcpyDtoDAsync_v2",
+      "self_cost": [
+        0.24363500000000002,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        1.4087090000000002,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "call_count": 152
+    },
+    {
+      "stack": "cuda_api:cudaLaunchKernel_v7000;kernel:ampere_fp16_s16816gemm_fp16_128x64_ldg8_f2f_stages_32x6_tn",
+      "self_cost": [
+        1.3385060000000002,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1419264,
+        6488064,
+        12496
+      ],
+      "total_cost": [
+        1.3385060000000002,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1419264,
+        6488064,
+        12496
+      ],
+      "call_count": 88
+    },
+    {
+      "stack": "cuda_api:cudaMemsetAsync_v3020",
+      "self_cost": [
+        0.7631810000000001,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        1.1020629999999998,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "call_count": 374
+    },
+    {
+      "stack": "cuda_api:cudaLaunchKernel_v7000;kernel:ampere_fp16_s16816gemm_fp16_128x128_ldg8_f2f_stages_32x5_tn",
+      "self_cost": [
+        1.0007089999999996,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        709632,
+        3604480,
+        9944
+      ],
+      "total_cost": [
+        1.0007089999999996,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        709632,
+        3604480,
+        9944
+      ],
+      "call_count": 44
+    },
+    {
+      "stack": "cuda_api:cuModuleLoadData",
+      "self_cost": [
+        0.958775,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        0.958775,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "call_count": 1
+    },
+    {
+      "stack": "cuda_api:cudaDeviceSynchronize_v3020",
+      "self_cost": [
+        0.8805559999999999,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        0.8805559999999999,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "call_count": 4
+    },
+    {
+      "stack": "cuda_sync:Context sync",
+      "self_cost": [
+        0.8724959999999998,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        0.8724959999999998,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "call_count": 4
+    },
+    {
+      "stack": "cuda_api:cudaLaunchKernel_v7000;kernel:ampere_fp16_s16816gemm_fp16_64x64_ldg8_f2f_stages_64x5_tn",
+      "self_cost": [
+        0.712292,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        811008,
+        7208960,
+        8976
+      ],
+      "total_cost": [
+        0.712292,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        811008,
+        7208960,
+        8976
+      ],
+      "call_count": 88
+    },
+    {
+      "stack": "cuda_api:cudaEventRecord_v3020",
+      "self_cost": [
+        0.6697329999999998,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        0.6697329999999998,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "call_count": 396
+    },
+    {
+      "stack": "cuda_api:cudaEventQuery_v3020",
+      "self_cost": [
+        0.6284509999999992,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        0.6284509999999992,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "call_count": 396
+    },
+    {
+      "stack": "cuda_api:cudaLaunchKernel_v7000;kernel:void cutlass::Kernel<cutlass_80_tensorop_f16_s16816gemm_relu_f16_128x64_32x6_tn_align8>(T1::Params)",
+      "self_cost": [
+        0.6199709999999998,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        630784,
+        3244032,
+        6512
+      ],
+      "total_cost": [
+        0.6199709999999998,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        630784,
+        3244032,
+        6512
+      ],
+      "call_count": 44
+    },
+    {
+      "stack": "cuda_api:cudaStreamGetCaptureInfo_v2_v11030",
+      "self_cost": [
+        0.5793519999999983,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        0.5793519999999983,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "call_count": 1210
+    },
+    {
+      "stack": "cuda_api:cuModuleUnload",
+      "self_cost": [
+        0.551633,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        0.551633,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "call_count": 1
+    },
+    {
+      "stack": "cuda_api:cudaLaunchKernel_v7000;kernel:ampere_fp16_s16816gemm_fp16_128x128_ldg8_f2f_stages_64x3_tn",
+      "self_cost": [
+        0.4809609999999999,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        185856,
+        2162688,
+        5412
+      ],
+      "total_cost": [
+        0.4809609999999999,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        185856,
+        2162688,
+        5412
+      ],
+      "call_count": 22
+    },
+    {
+      "stack": "cuda_api:cuMemcpyDtoHAsync_v2;memcpy:DtoH",
+      "self_cost": [
+        0.429188,
+        0,
+        0,
+        0,
+        0,
+        0,
+        7323648,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        0.429188,
+        0,
+        0,
+        0,
+        0,
+        0,
+        7323648,
+        0,
+        0,
+        0
+      ],
+      "call_count": 76
+    },
+    {
+      "stack": "cuda_sync:Event sync",
+      "self_cost": [
+        0.41829899999999964,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        0.41829899999999964,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "call_count": 396
+    },
+    {
+      "stack": "cuda_api:cudaLaunchKernel_v7000;kernel:void cutlass::Kernel<cutlass_80_wmma_tensorop_f16_s161616gemm_f16_32x32_128x2_tn_align8>(T1::Params)",
+      "self_cost": [
+        0.3539860000000001,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        473088,
+        2230272,
+        6204
+      ],
+      "total_cost": [
+        0.3539860000000001,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        473088,
+        2230272,
+        6204
+      ],
+      "call_count": 66
+    },
+    {
+      "stack": "cuda_api:cudaMemsetAsync_v3020;memset",
+      "self_cost": [
+        0.33888200000000124,
+        0,
+        0,
+        0,
+        0,
+        0,
+        232320,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        0.33888200000000124,
+        0,
+        0,
+        0,
+        0,
+        0,
+        232320,
+        0,
+        0,
+        0
+      ],
+      "call_count": 374
+    },
+    {
+      "stack": "cuda_api:cuGetProcAddress_v2",
+      "self_cost": [
+        0.15308000000000024,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        0.15308000000000024,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "call_count": 766
+    },
+    {
+      "stack": "cuda_api:cudaMalloc_v3020",
+      "self_cost": [
+        0.149511,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        0.149511,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "call_count": 3
+    },
+    {
+      "stack": "cuda_api:cuLaunchKernel;kernel:l2_normalize_kernel",
+      "self_cost": [
+        0.13203199999999995,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        610304,
+        77824,
+        1216
+      ],
+      "total_cost": [
+        0.13203199999999995,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        610304,
+        77824,
+        1216
+      ],
+      "call_count": 76
+    },
+    {
+      "stack": "cuda_api:cudaLaunchKernel_v7000;kernel:void cutlass::Kernel<cutlass_80_tensorop_f16_s16816gemm_relu_f16_64x64_32x6_tn_align8>(T1::Params)",
+      "self_cost": [
+        0.11436799999999998,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        225280,
+        1081344,
+        2112
+      ],
+      "total_cost": [
+        0.11436799999999998,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        225280,
+        1081344,
+        2112
+      ],
+      "call_count": 22
+    },
+    {
+      "stack": "cuda_api:cudaLaunchKernel_v7000;kernel:void cutlass::Kernel<cutlass_80_wmma_tensorop_f16_s161616gemm_f16_16x16_64x1_tn_align8>(T1::Params)",
+      "self_cost": [
+        0.07647999999999998,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        135168,
+        202752,
+        3124
+      ],
+      "total_cost": [
+        0.07647999999999998,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        135168,
+        202752,
+        3124
+      ],
+      "call_count": 44
+    },
+    {
+      "stack": "cuda_api:cudaLaunchKernel_v7000;kernel:void cutlass::Kernel<cutlass_80_wmma_tensorop_f16_s161616gemm_f16_16x16_32x1_nn_align8>(T1::Params)",
+      "self_cost": [
+        0.07548800000000001,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        540672,
+        123904,
+        2772
+      ],
+      "total_cost": [
+        0.07548800000000001,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        540672,
+        123904,
+        2772
+      ],
+      "call_count": 44
+    },
+    {
+      "stack": "cuda_api:cuLaunchKernel;kernel:build_attn_mask_kernel",
+      "self_cost": [
+        0.07337700000000004,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        744960,
+        0,
+        1216
+      ],
+      "total_cost": [
+        0.07337700000000004,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        744960,
+        0,
+        1216
+      ],
+      "call_count": 76
+    },
+    {
+      "stack": "cuda_api:cudaLaunchKernel_v7000;kernel:void splitKreduce_kernel<(int)32, (int)16, int, __half, __half, float, __half, (bool)1, (bool)0, (bool)0>(cublasSplitKParams<T6>, const T4 *, const T5 *, T5 *, const T6 *, const T6 *, const T7 *, const T4 *, T7 *, void *, long, T6 *, int *)",
+      "self_cost": [
+        0.02771299999999999,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        270336,
+        0,
+        814
+      ],
+      "total_cost": [
+        0.02771299999999999,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        270336,
+        0,
+        814
+      ],
+      "call_count": 22
+    },
+    {
+      "stack": "cuda_api:cudaEventCreateWithFlags_v3020",
+      "self_cost": [
+        0.022820000000000003,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        0.022820000000000003,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "call_count": 18
+    },
+    {
+      "stack": "cuda_api:cudaEventDestroy_v3020",
+      "self_cost": [
+        0.014249000000000003,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        0.014249000000000003,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "call_count": 18
+    },
+    {
+      "stack": "cuda_api:cuInit",
+      "self_cost": [
+        0.00341,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        0.00341,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "call_count": 2
+    },
+    {
+      "stack": "cuda_api:cuCtxSetCurrent",
+      "self_cost": [
+        0.00278,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        0.00278,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "call_count": 1
+    },
+    {
+      "stack": "cuda_api:cuModuleGetLoadingMode",
+      "self_cost": [
+        0.00063,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "total_cost": [
+        0.00063,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "call_count": 2
+    }
+  ],
+  "hotspots": [
+    {
+      "dimension": "wall_ms",
+      "entries": [
+        {
+          "name": "cuda_api:cuStreamSynchronize",
+          "self_cost": 497.743039,
+          "pct_of_total": 4.39
+        },
+        {
+          "name": "cuda_sync:Stream wait sync",
+          "self_cost": 497.741939,
+          "pct_of_total": 4.39
+        },
+        {
+          "name": "cuda_api:cuStreamSynchronize",
+          "self_cost": 225.985906,
+          "pct_of_total": 1.99
+        },
+        {
+          "name": "cuda_sync:Stream wait sync",
+          "self_cost": 225.984576,
+          "pct_of_total": 1.99
+        },
+        {
+          "name": "cuda_api:cuStreamSynchronize",
+          "self_cost": 210.377015,
+          "pct_of_total": 1.86
+        },
+        {
+          "name": "cuda_sync:Stream wait sync",
+          "self_cost": 210.375975,
+          "pct_of_total": 1.86
+        },
+        {
+          "name": "cuda_api:cuStreamSynchronize",
+          "self_cost": 204.019378,
+          "pct_of_total": 1.8
+        },
+        {
+          "name": "cuda_sync:Stream wait sync",
+          "self_cost": 204.017988,
+          "pct_of_total": 1.8
+        },
+        {
+          "name": "cuda_api:cuStreamSynchronize",
+          "self_cost": 192.886054,
+          "pct_of_total": 1.7
+        },
+        {
+          "name": "cuda_sync:Stream wait sync",
+          "self_cost": 192.885054,
+          "pct_of_total": 1.7
+        }
+      ]
+    },
+    {
+      "dimension": "input_tokens",
+      "entries": [
+        {
+          "name": "cuda_api:cuCtxSetCurrent",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        }
+      ]
+    },
+    {
+      "dimension": "output_tokens",
+      "entries": [
+        {
+          "name": "cuda_api:cuCtxSetCurrent",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        }
+      ]
+    },
+    {
+      "dimension": "cost_usd",
+      "entries": [
+        {
+          "name": "cuda_api:cuCtxSetCurrent",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        }
+      ]
+    },
+    {
+      "dimension": "bytes_read",
+      "entries": [
+        {
+          "name": "cuda_api:cuCtxSetCurrent",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        }
+      ]
+    },
+    {
+      "dimension": "bytes_written",
+      "entries": [
+        {
+          "name": "cuda_api:cuCtxSetCurrent",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        },
+        {
+          "name": "cuda_api:cuGetProcAddress_v2",
+          "self_cost": 0,
+          "pct_of_total": 0
+        }
+      ]
+    },
+    {
+      "dimension": "bytes",
+      "entries": [
+        {
+          "name": "memcpy:HtoD",
+          "self_cost": 154730496,
+          "pct_of_total": 3.02
+        },
+        {
+          "name": "memcpy:kind8",
+          "self_cost": 106859520,
+          "pct_of_total": 2.09
+        },
+        {
+          "name": "memcpy:kind8",
+          "self_cost": 106859520,
+          "pct_of_total": 2.09
+        },
+        {
+          "name": "memcpy:kind8",
+          "self_cost": 100982784,
+          "pct_of_total": 1.97
+        },
+        {
+          "name": "memcpy:kind8",
+          "self_cost": 100982784,
+          "pct_of_total": 1.97
+        },
+        {
+          "name": "memcpy:kind8",
+          "self_cost": 98549760,
+          "pct_of_total": 1.92
+        },
+        {
+          "name": "memcpy:kind8",
+          "self_cost": 98549760,
+          "pct_of_total": 1.92
+        },
+        {
+          "name": "memcpy:kind8",
+          "self_cost": 95803392,
+          "pct_of_total": 1.87
+        },
+        {
+          "name": "memcpy:kind8",
+          "self_cost": 95803392,
+          "pct_of_total": 1.87
+        },
+        {
+          "name": "memcpy:kind8",
+          "self_cost": 92934144,
+          "pct_of_total": 1.81
+        }
+      ]
+    },
+    {
+      "dimension": "threads",
+      "entries": [
+        {
+          "name": "kernel:fused_scale_mask_softmax_f16_kernel",
+          "self_cost": 180092928,
+          "pct_of_total": 0.09
+        },
+        {
+          "name": "kernel:fused_scale_mask_softmax_windowed_f16_kernel",
+          "self_cost": 180092928,
+          "pct_of_total": 0.09
+        },
+        {
+          "name": "kernel:fused_scale_mask_softmax_windowed_f16_kernel",
+          "self_cost": 180092928,
+          "pct_of_total": 0.09
+        },
+        {
+          "name": "kernel:fused_scale_mask_softmax_f16_kernel",
+          "self_cost": 180092928,
+          "pct_of_total": 0.09
+        },
+        {
+          "name": "kernel:fused_scale_mask_softmax_windowed_f16_kernel",
+          "self_cost": 180092928,
+          "pct_of_total": 0.09
+        },
+        {
+          "name": "kernel:fused_scale_mask_softmax_windowed_f16_kernel",
+          "self_cost": 180092928,
+          "pct_of_total": 0.09
+        },
+        {
+          "name": "kernel:fused_scale_mask_softmax_f16_kernel",
+          "self_cost": 180092928,
+          "pct_of_total": 0.09
+        },
+        {
+          "name": "kernel:fused_scale_mask_softmax_windowed_f16_kernel",
+          "self_cost": 180092928,
+          "pct_of_total": 0.09
+        },
+        {
+          "name": "kernel:fused_scale_mask_softmax_windowed_f16_kernel",
+          "self_cost": 180092928,
+          "pct_of_total": 0.09
+        },
+        {
+          "name": "kernel:fused_scale_mask_softmax_f16_kernel",
+          "self_cost": 180092928,
+          "pct_of_total": 0.09
+        }
+      ]
+    },
+    {
+      "dimension": "shared_mem_bytes",
+      "entries": [
+        {
+          "name": "kernel:ampere_fp16_s16816gemm_fp16_128x64_ldg8_f2f_stages_64x4_tn",
+          "self_cost": 98304,
+          "pct_of_total": 0.02
+        },
+        {
+          "name": "kernel:ampere_fp16_s16816gemm_fp16_128x64_ldg8_f2f_stages_64x4_tn",
+          "self_cost": 98304,
+          "pct_of_total": 0.02
+        },
+        {
+          "name": "kernel:ampere_fp16_s16816gemm_fp16_128x64_ldg8_f2f_stages_64x4_tn",
+          "self_cost": 98304,
+          "pct_of_total": 0.02
+        },
+        {
+          "name": "kernel:ampere_fp16_s16816gemm_fp16_128x64_ldg8_f2f_stages_64x4_tn",
+          "self_cost": 98304,
+          "pct_of_total": 0.02
+        },
+        {
+          "name": "kernel:ampere_fp16_s16816gemm_fp16_128x64_ldg8_f2f_stages_64x4_tn",
+          "self_cost": 98304,
+          "pct_of_total": 0.02
+        },
+        {
+          "name": "kernel:ampere_fp16_s16816gemm_fp16_128x64_ldg8_f2f_stages_64x4_tn",
+          "self_cost": 98304,
+          "pct_of_total": 0.02
+        },
+        {
+          "name": "kernel:ampere_fp16_s16816gemm_fp16_128x64_ldg8_f2f_stages_64x4_tn",
+          "self_cost": 98304,
+          "pct_of_total": 0.02
+        },
+        {
+          "name": "kernel:ampere_fp16_s16816gemm_fp16_128x64_ldg8_f2f_stages_64x4_tn",
+          "self_cost": 98304,
+          "pct_of_total": 0.02
+        },
+        {
+          "name": "kernel:ampere_fp16_s16816gemm_fp16_128x64_ldg8_f2f_stages_64x4_tn",
+          "self_cost": 98304,
+          "pct_of_total": 0.02
+        },
+        {
+          "name": "kernel:ampere_fp16_s16816gemm_fp16_128x64_ldg8_f2f_stages_64x4_tn",
+          "self_cost": 98304,
+          "pct_of_total": 0.02
+        }
+      ]
+    },
+    {
+      "dimension": "registers",
+      "entries": [
+        {
+          "name": "kernel:ampere_fp16_s1688gemm_fp16_128x128_ldg8_f2f_tn",
+          "self_cost": 254,
+          "pct_of_total": 0.01
+        },
+        {
+          "name": "kernel:ampere_fp16_s1688gemm_fp16_128x128_ldg8_f2f_tn",
+          "self_cost": 254,
+          "pct_of_total": 0.01
+        },
+        {
+          "name": "kernel:ampere_fp16_s1688gemm_fp16_128x128_ldg8_f2f_tn",
+          "self_cost": 254,
+          "pct_of_total": 0.01
+        },
+        {
+          "name": "kernel:ampere_fp16_s1688gemm_fp16_128x128_ldg8_f2f_tn",
+          "self_cost": 254,
+          "pct_of_total": 0.01
+        },
+        {
+          "name": "kernel:ampere_fp16_s1688gemm_fp16_128x128_ldg8_f2f_tn",
+          "self_cost": 254,
+          "pct_of_total": 0.01
+        },
+        {
+          "name": "kernel:ampere_fp16_s1688gemm_fp16_128x128_ldg8_f2f_tn",
+          "self_cost": 254,
+          "pct_of_total": 0.01
+        },
+        {
+          "name": "kernel:ampere_fp16_s1688gemm_fp16_128x128_ldg8_f2f_tn",
+          "self_cost": 254,
+          "pct_of_total": 0.01
+        },
+        {
+          "name": "kernel:ampere_fp16_s1688gemm_fp16_128x128_ldg8_f2f_tn",
+          "self_cost": 254,
+          "pct_of_total": 0.01
+        },
+        {
+          "name": "kernel:ampere_fp16_s1688gemm_fp16_128x128_ldg8_f2f_tn",
+          "self_cost": 254,
+          "pct_of_total": 0.01
+        },
+        {
+          "name": "kernel:ampere_fp16_s1688gemm_fp16_128x128_ldg8_f2f_tn",
+          "self_cost": 254,
+          "pct_of_total": 0.01
+        }
+      ]
+    }
+  ],
+  "patterns": [],
+  "stats": {
+    "span_count": 277949,
+    "sample_count": 0,
+    "frame_count": 77,
+    "lane_count": 4,
+    "error_count": 0,
+    "wall_duration_ms": 6274.8629040000005
+  }
+}
