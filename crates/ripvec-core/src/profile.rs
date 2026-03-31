@@ -349,6 +349,64 @@ impl Profiler {
         }
     }
 
+    /// Byte-based progress for streaming mode.
+    ///
+    /// Shows `processed_bytes/total_bytes` as MB with chunk rate. The total is
+    /// known from the walk phase (file sizes), so the denominator is stable.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "display-only: sub-1% precision loss acceptable for MB/rate"
+    )]
+    pub fn embed_tick_bytes(
+        &self,
+        done_chunks: usize,
+        bytes_processed: u64,
+        total_bytes: u64,
+    ) {
+        if let Self::Active {
+            start,
+            interval,
+            embed,
+            ..
+        } = self
+        {
+            let Ok(mut state) = embed.lock() else {
+                return;
+            };
+            let now = Instant::now();
+            let overall_elapsed = now.duration_since(state.phase_start).as_secs_f64();
+            let overall_rate = if overall_elapsed > 0.0 {
+                done_chunks as f64 / overall_elapsed
+            } else {
+                0.0
+            };
+
+            if now.duration_since(state.last_report) >= *interval {
+                let wall = start.elapsed();
+                let report_elapsed = now.duration_since(state.last_report).as_secs_f64();
+                let report_chunks = done_chunks - state.chunks_at_last_report;
+                let window_rate = if report_elapsed > 0.0 {
+                    report_chunks as f64 / report_elapsed
+                } else {
+                    0.0
+                };
+                let mb_done = bytes_processed as f64 / (1024.0 * 1024.0);
+                let mb_total = total_bytes as f64 / (1024.0 * 1024.0);
+                self.report(&format!(
+                    "[{:.1}s]  embed: {:.1}/{:.1} MB (last {:.0}s: {:.1}/s, overall: {:.1}/s)",
+                    wall.as_secs_f64(),
+                    mb_done,
+                    mb_total,
+                    report_elapsed,
+                    window_rate,
+                    overall_rate,
+                ));
+                state.last_report = now;
+                state.chunks_at_last_report = done_chunks;
+            }
+        }
+    }
+
     /// Accumulate time spent waiting for the model mutex lock.
     pub fn embed_lock_wait(&self, duration: Duration) {
         if let Self::Active { embed, .. } = self

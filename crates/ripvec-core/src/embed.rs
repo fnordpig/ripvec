@@ -153,7 +153,13 @@ pub fn embed_all(
     };
 
     if files.len() >= STREAMING_THRESHOLD {
-        embed_all_streaming(&files, backends, tokenizer, cfg, profiler)
+        // Compute total source bytes for byte-based progress (known after walk).
+        let total_bytes: u64 = files
+            .iter()
+            .filter_map(|p| p.metadata().ok())
+            .map(|m| m.len())
+            .sum();
+        embed_all_streaming(&files, total_bytes, backends, tokenizer, cfg, profiler)
     } else {
         embed_all_batch(&files, backends, tokenizer, cfg, profiler)
     }
@@ -274,6 +280,7 @@ fn embed_all_batch(
 )]
 fn embed_all_streaming(
     files: &[std::path::PathBuf],
+    total_bytes: u64,
     backends: &[&dyn EmbedBackend],
     tokenizer: &tokenizers::Tokenizer,
     cfg: &SearchConfig,
@@ -300,7 +307,7 @@ fn embed_all_streaming(
 
     // Shared counters for profiling across the streaming pipeline.
     let total_chunks_produced = AtomicUsize::new(0);
-    let embed_done_counter = AtomicUsize::new(0);
+    let bytes_chunked = AtomicUsize::new(0);
     let chunk_start = Instant::now();
 
     // All stages run inside std::thread::scope so they can borrow from the
@@ -329,6 +336,7 @@ fn embed_all_streaming(
                     }
                 };
                 let n = chunks.len();
+                let file_bytes = source.len();
                 for chunk in chunks {
                     // Channel disconnected means downstream errored; stop.
                     if chunk_tx.send(chunk).is_err() {
@@ -337,6 +345,7 @@ fn embed_all_streaming(
                 }
                 profiler.chunk_thread_report(n);
                 total_chunks_produced.fetch_add(n, Ordering::Relaxed);
+                bytes_chunked.fetch_add(file_bytes, Ordering::Relaxed);
             });
             // chunk_tx is dropped here, closing the channel — but the borrow
             // of chunk_tx lives until the scoped thread ends. We need to
@@ -405,23 +414,24 @@ fn embed_all_streaming(
         let mut all_embeddings: Vec<Vec<f32>> = Vec::new();
         let mut embed_error: Option<crate::Error> = None;
 
+        let mut cumulative_done: usize = 0;
         for batch in &batch_rx {
-            // Update the profiler total as more chunks are produced.
-            let current_total = total_chunks_produced.load(Ordering::Relaxed);
-            if current_total > 0 {
-                profiler.embed_begin_update_total(current_total);
-            }
-
+            let batch_len = batch.len();
             let (encodings, chunks): (Vec<Encoding>, Vec<CodeChunk>) = batch.into_iter().unzip();
 
             // Wrap as Option<Encoding> for embed_distributed compatibility.
             let opt_encodings: Vec<Option<Encoding>> = encodings.into_iter().map(Some).collect();
 
-            match embed_distributed(&opt_encodings, backends, bs, profiler) {
+            // Pass noop profiler to embed_distributed — its internal done counter
+            // resets per call (0→batch_size), which corrupts our global progress.
+            let noop = crate::profile::Profiler::noop();
+            match embed_distributed(&opt_encodings, backends, bs, &noop) {
                 Ok(batch_embeddings) => {
-                    let done = embed_done_counter.fetch_add(chunks.len(), Ordering::Relaxed)
-                        + chunks.len();
-                    profiler.embed_tick(done);
+                    cumulative_done += batch_len;
+                    // Byte-based progress: total_bytes known from walk, bytes_chunked
+                    // tracks how much source data has been processed through the pipeline.
+                    let processed = bytes_chunked.load(Ordering::Relaxed) as u64;
+                    profiler.embed_tick_bytes(cumulative_done, processed, total_bytes);
 
                     for (chunk, emb) in chunks.into_iter().zip(batch_embeddings) {
                         if !emb.is_empty() {
@@ -441,6 +451,9 @@ fn embed_all_streaming(
         // Report chunk summary now that all stages have completed (or errored).
         let final_total = total_chunks_produced.load(Ordering::Relaxed);
         profiler.chunk_summary(final_total, file_count, chunk_start.elapsed());
+        // Set the final total so embed_done shows the correct summary.
+        profiler.embed_begin_update_total(cumulative_done);
+        profiler.embed_tick(cumulative_done);
         profiler.embed_done();
 
         // Wait for tokenize thread and check for errors.
