@@ -40,6 +40,9 @@ pub struct RipvecServer {
     pub tool_router: ToolRouter<Self>,
     /// Cached PageRank-weighted repository graph (built after indexing).
     pub repo_graph: Arc<std::sync::RwLock<Option<ripvec_core::repo_map::RepoGraph>>>,
+    /// Cache of on-demand indices for non-default roots (keyed by canonical path).
+    /// Populated by `search_code`/`search_text` with `root` parameter.
+    pub root_indices: Arc<RwLock<std::collections::HashMap<PathBuf, ripvec_core::hybrid::HybridIndex>>>,
 }
 
 impl rmcp::ServerHandler for RipvecServer {

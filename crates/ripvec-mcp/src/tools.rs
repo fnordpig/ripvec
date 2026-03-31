@@ -135,6 +135,7 @@ impl RipvecServer {
             indexing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tool_router: Self::tool_router(),
             repo_graph: Arc::new(std::sync::RwLock::new(None)),
+            root_indices: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         }
     }
 
@@ -190,8 +191,8 @@ impl RipvecServer {
         offset: usize,
         root: Option<&str>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        // If a custom root was requested, load its index on demand.
-        let on_demand_index: Option<ripvec_core::hybrid::HybridIndex>;
+        // Resolve which index to use: custom root (cached) or default.
+        let custom_root: Option<std::path::PathBuf>;
         if let Some(root_str) = root {
             let root_path = std::path::PathBuf::from(root_str);
             if !root_path.is_dir() {
@@ -200,31 +201,49 @@ impl RipvecServer {
                     None,
                 ));
             }
-            let text_backend = self.load_text_backend().await?;
-            let text_tokenizer = self.load_text_tokenizer().await?;
-            let backend = Arc::clone(text_backend);
-            let tokenizer = Arc::clone(text_tokenizer);
-            let (idx, _stats) = tokio::task::spawn_blocking(move || {
-                let backend_refs: Vec<&dyn ripvec_core::backend::EmbedBackend> =
-                    vec![backend.as_ref()];
-                let cfg = ripvec_core::embed::SearchConfig::default();
-                let profiler = ripvec_core::profile::Profiler::noop();
-                ripvec_core::cache::reindex::incremental_index(
-                    &root_path,
-                    &backend_refs,
-                    &tokenizer,
-                    &cfg,
-                    &profiler,
-                    "nomic-ai/modernbert-embed-base",
-                    None,
-                )
-            })
-            .await
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-            on_demand_index = Some(idx);
+            let canonical = root_path
+                .canonicalize()
+                .unwrap_or_else(|_| root_path.clone());
+
+            // Check if we already have this index cached.
+            {
+                let cache = self.root_indices.read().await;
+                if cache.contains_key(&canonical) {
+                    // Cache hit — skip re-indexing.
+                    custom_root = Some(canonical);
+                } else {
+                    drop(cache);
+                    // Cache miss — load from on-disk cache (instant if pre-indexed).
+                    let text_backend = self.load_text_backend().await?;
+                    let text_tokenizer = self.load_text_tokenizer().await?;
+                    let backend = Arc::clone(text_backend);
+                    let tokenizer = Arc::clone(text_tokenizer);
+                    let canon2 = canonical.clone();
+                    let (idx, _stats) = tokio::task::spawn_blocking(move || {
+                        let backend_refs: Vec<&dyn ripvec_core::backend::EmbedBackend> =
+                            vec![backend.as_ref()];
+                        let cfg = ripvec_core::embed::SearchConfig::default();
+                        let profiler = ripvec_core::profile::Profiler::noop();
+                        ripvec_core::cache::reindex::incremental_index(
+                            &canon2,
+                            &backend_refs,
+                            &tokenizer,
+                            &cfg,
+                            &profiler,
+                            "nomic-ai/modernbert-embed-base",
+                            None,
+                        )
+                    })
+                    .await
+                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                    let mut cache = self.root_indices.write().await;
+                    cache.insert(canonical.clone(), idx);
+                    custom_root = Some(canonical);
+                }
+            }
         } else {
-            on_demand_index = None;
+            custom_root = None;
             // Check default index exists
             let idx_guard = self.index.read().await;
             if idx_guard.is_none() {
@@ -265,10 +284,17 @@ impl RipvecServer {
         .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
         .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
 
-        // Use on-demand index if available, otherwise the default.
+        // Use cached custom-root index or the default.
+        let root_cache_guard;
         let idx_guard;
-        let index: &ripvec_core::hybrid::HybridIndex = if let Some(ref od) = on_demand_index {
-            od
+        let index: &ripvec_core::hybrid::HybridIndex = if let Some(ref canon) = custom_root {
+            root_cache_guard = self.root_indices.read().await;
+            root_cache_guard.get(canon).ok_or_else(|| {
+                rmcp::ErrorData::internal_error(
+                    "Cached index disappeared. Try again.".to_string(),
+                    None,
+                )
+            })?
         } else {
             idx_guard = self.index.read().await;
             idx_guard.as_ref().ok_or_else(|| {
