@@ -34,7 +34,7 @@ metal = ["ripvec-core/metal"]
 ripvec-core = { path = "../ripvec-core", features = ["metal", "mlx", "cpu-accelerate"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-ripvec-core = { path = "../ripvec-core", features = ["cpu", "cuda"] }
+ripvec-core = { path = "../ripvec-core", features = ["cpu"] }
 
 [lints]
 workspace = true
