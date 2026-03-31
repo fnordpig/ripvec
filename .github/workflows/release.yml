@@ -1,10 +1,13 @@
-# Build release binaries and publish a GitHub release.
-# Triggered by pushing a version tag: git tag v0.6.0 && git push --tags
+# Build release binaries, publish GitHub release, and publish to crates.io.
+# Triggered by version bump in workspace Cargo.toml on main, OR manual tag push.
 name: Release
 
 on:
   push:
     tags: ["v*"]
+    branches: [main]
+    paths:
+      - "Cargo.toml"
 
 permissions:
   contents: write
@@ -13,8 +16,57 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Detect version bump and create tag (only runs on main push, not tag push)
+  tag:
+    name: Auto Tag
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.current }}
+      should_release: ${{ steps.version.outputs.tag_exists == 'false' }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Check for version change
+        id: version
+        run: |
+          CURRENT=$(grep -m1 '^version' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          if git rev-parse "v$CURRENT" >/dev/null 2>&1; then
+            echo "tag_exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag_exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create tag
+        if: steps.version.outputs.tag_exists == 'false'
+        run: |
+          VERSION="${{ steps.version.outputs.current }}"
+          git tag "v$VERSION"
+          git push origin "v$VERSION"
+
+  # Resolve version for downstream jobs (works for both tag push and auto-tag)
+  resolve:
+    name: Resolve version
+    needs: [tag]
+    if: always() && (needs.tag.result == 'success' && needs.tag.outputs.should_release == 'true') || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - id: resolve
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=v${{ needs.tag.outputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: Build (${{ matrix.target }})
+    needs: [resolve]
     strategy:
       fail-fast: false
       matrix:
@@ -28,6 +80,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve.outputs.version }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -44,7 +98,7 @@ jobs:
 
       - name: Package binaries
         run: |
-          tag="${GITHUB_REF_NAME}"
+          tag="${{ needs.resolve.outputs.version }}"
           staging="ripvec-${tag}-${{ matrix.target }}"
           mkdir -p "$staging"
           cp target/release/ripvec "$staging/" 2>/dev/null || true
@@ -60,7 +114,7 @@ jobs:
 
   release:
     name: Publish Release
-    needs: build
+    needs: [resolve, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -78,15 +132,19 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.resolve.outputs.version }}
           generate_release_notes: true
           files: release/*
 
   publish:
     name: Publish to crates.io
-    needs: build
+    needs: [resolve, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve.outputs.version }}
+
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install system dependencies
