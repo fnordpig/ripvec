@@ -3,8 +3,8 @@ name = "ripvec-mcp"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "MCP server wrapping ripvec for Claude Code / Cursor integration"
-publish = false
+repository.workspace = true
+description = "MCP server for semantic code search — find code by meaning using vector embeddings and PageRank dependency graphs"
 
 [[bin]]
 name = "ripvec-mcp"
