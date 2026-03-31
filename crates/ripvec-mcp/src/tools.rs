@@ -60,6 +60,10 @@ pub struct SearchParams {
         deserialize_with = "deserialize_number_or_string"
     )]
     pub offset: usize,
+    /// Project root directory to search. Uses the pre-built index if available
+    /// for this path, otherwise falls back to the server's default project root.
+    /// Accepts absolute paths or paths relative to the server's project root.
+    pub root: Option<String>,
 }
 
 /// Parameters for the `find_similar` tool.
@@ -175,17 +179,53 @@ impl RipvecServer {
 
     /// Shared search implementation used by both `search_code` and `search_text`.
     ///
-    /// Checks the index exists, lazy-loads the backend/tokenizer, embeds the
-    /// query, and ranks chunks by cosine similarity.
+    /// When `root` is `Some`, loads the index for that directory from the
+    /// on-disk cache (instant if already indexed). Otherwise uses the
+    /// pre-built in-memory index for the server's default project root.
     async fn run_search(
         &self,
         query: &str,
         top_k: usize,
         threshold: f32,
         offset: usize,
+        root: Option<&str>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        // Check index exists, then drop the read lock before doing embedding work
-        {
+        // If a custom root was requested, load its index on demand.
+        let on_demand_index: Option<ripvec_core::hybrid::HybridIndex>;
+        if let Some(root_str) = root {
+            let root_path = std::path::PathBuf::from(root_str);
+            if !root_path.is_dir() {
+                return Err(rmcp::ErrorData::internal_error(
+                    format!("root is not a directory: {root_str}"),
+                    None,
+                ));
+            }
+            let text_backend = self.load_text_backend().await?;
+            let text_tokenizer = self.load_text_tokenizer().await?;
+            let backend = Arc::clone(text_backend);
+            let tokenizer = Arc::clone(text_tokenizer);
+            let (idx, _stats) = tokio::task::spawn_blocking(move || {
+                let backend_refs: Vec<&dyn ripvec_core::backend::EmbedBackend> =
+                    vec![backend.as_ref()];
+                let cfg = ripvec_core::embed::SearchConfig::default();
+                let profiler = ripvec_core::profile::Profiler::noop();
+                ripvec_core::cache::reindex::incremental_index(
+                    &root_path,
+                    &backend_refs,
+                    &tokenizer,
+                    &cfg,
+                    &profiler,
+                    "nomic-ai/modernbert-embed-base",
+                    None,
+                )
+            })
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+            on_demand_index = Some(idx);
+        } else {
+            on_demand_index = None;
+            // Check default index exists
             let idx_guard = self.index.read().await;
             if idx_guard.is_none() {
                 return Err(if self.indexing.load(Ordering::SeqCst) {
@@ -225,14 +265,19 @@ impl RipvecServer {
         .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
         .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
 
-        // Re-acquire read lock for ranking
-        let idx_guard = self.index.read().await;
-        let index = idx_guard.as_ref().ok_or_else(|| {
-            rmcp::ErrorData::internal_error(
-                "Index was cleared during search. Call reindex.".to_string(),
-                None,
-            )
-        })?;
+        // Use on-demand index if available, otherwise the default.
+        let idx_guard;
+        let index: &ripvec_core::hybrid::HybridIndex = if let Some(ref od) = on_demand_index {
+            od
+        } else {
+            idx_guard = self.index.read().await;
+            idx_guard.as_ref().ok_or_else(|| {
+                rmcp::ErrorData::internal_error(
+                    "Index was cleared during search. Call reindex.".to_string(),
+                    None,
+                )
+            })?
+        };
 
         let ranked = index.search(
             &query_embedding,
@@ -273,7 +318,7 @@ impl RipvecServer {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.run_search(&params.query, params.top_k, params.threshold, params.offset)
+        self.run_search(&params.query, params.top_k, params.threshold, params.offset, params.root.as_deref())
             .await
     }
 
@@ -289,7 +334,7 @@ impl RipvecServer {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.run_search(&params.query, params.top_k, params.threshold, params.offset)
+        self.run_search(&params.query, params.top_k, params.threshold, params.offset, params.root.as_deref())
             .await
     }
 
