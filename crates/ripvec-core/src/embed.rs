@@ -152,10 +152,7 @@ pub fn embed_all(
         files
     };
 
-    // TODO: streaming pipeline hangs after first batch — Stage 2→3 channel
-    // deadlocks. Investigate embed_distributed compatibility with streaming
-    // batches. Using batch path for all sizes until fixed.
-    if false && files.len() >= STREAMING_THRESHOLD {
+    if files.len() >= STREAMING_THRESHOLD {
         embed_all_streaming(&files, backends, tokenizer, cfg, profiler)
     } else {
         embed_all_batch(&files, backends, tokenizer, cfg, profiler)
@@ -353,7 +350,7 @@ fn embed_all_streaming(
         // is Send + Sync), and accumulates into batch-sized buffers. Within
         // each buffer, entries are sorted by descending token count — the same
         // padding-reduction optimization as the batch path, applied locally.
-        let tokenize_handle = scope.spawn(|| -> crate::Result<()> {
+        let tokenize_handle = scope.spawn(move || -> crate::Result<()> {
             let _span = info_span!("tokenize_stream").entered();
             let mut buffer: Vec<(Encoding, CodeChunk)> = Vec::with_capacity(bs);
 
@@ -435,8 +432,7 @@ fn embed_all_streaming(
                 }
                 Err(e) => {
                     embed_error = Some(e);
-                    // Drop batch_rx to signal upstream to stop.
-                    drop(batch_rx);
+                    // break exits the for loop; batch_rx drops naturally after.
                     break;
                 }
             }
