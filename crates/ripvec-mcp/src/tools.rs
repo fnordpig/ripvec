@@ -86,6 +86,8 @@ pub struct FindSimilarParams {
         deserialize_with = "deserialize_number_or_string"
     )]
     pub offset: usize,
+    /// Project root directory. Uses the server's default project root if omitted.
+    pub root: Option<String>,
 }
 
 /// Default number of results to return.
@@ -114,6 +116,22 @@ pub struct RepoMapParams {
     pub max_tokens: usize,
     /// Focus file for topic-sensitive `PageRank` (relative path).
     pub focus_file: Option<String>,
+    /// Project root directory. Uses the server's default project root if omitted.
+    pub root: Option<String>,
+}
+
+/// Parameters for the `reindex` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReindexParams {
+    /// Project root directory to reindex. Uses the server's default project root if omitted.
+    pub root: Option<String>,
+}
+
+/// Parameters for the `index_status` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct IndexStatusParams {
+    /// Project root directory to check. Uses the server's default project root if omitted.
+    pub root: Option<String>,
 }
 
 /// Default token budget for repo map rendering.
@@ -136,6 +154,7 @@ impl RipvecServer {
             tool_router: Self::tool_router(),
             repo_graph: Arc::new(std::sync::RwLock::new(None)),
             root_indices: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            root_graphs: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         }
     }
 
@@ -178,11 +197,86 @@ impl RipvecServer {
             .await
     }
 
+    /// Resolve a `root` parameter to a canonical path, ensuring the index
+    /// and repo graph are cached for that root. Returns `None` if root is
+    /// absent (use default project root).
+    async fn ensure_root(
+        &self,
+        root: Option<&str>,
+    ) -> Result<Option<std::path::PathBuf>, rmcp::ErrorData> {
+        let Some(root_str) = root else {
+            return Ok(None);
+        };
+        let root_path = std::path::PathBuf::from(root_str);
+        if !root_path.is_dir() {
+            return Err(rmcp::ErrorData::internal_error(
+                format!("root is not a directory: {root_str}"),
+                None,
+            ));
+        }
+        let canonical = root_path
+            .canonicalize()
+            .unwrap_or_else(|_| root_path.clone());
+
+        // Ensure index is cached for this root.
+        {
+            let cache = self.root_indices.read().await;
+            if !cache.contains_key(&canonical) {
+                drop(cache);
+                let text_backend = self.load_text_backend().await?;
+                let text_tokenizer = self.load_text_tokenizer().await?;
+                let backend = Arc::clone(text_backend);
+                let tokenizer = Arc::clone(text_tokenizer);
+                let canon2 = canonical.clone();
+                let (idx, _stats) = tokio::task::spawn_blocking(move || {
+                    let backend_refs: Vec<&dyn ripvec_core::backend::EmbedBackend> =
+                        vec![backend.as_ref()];
+                    let cfg = ripvec_core::embed::SearchConfig::default();
+                    let profiler = ripvec_core::profile::Profiler::noop();
+                    ripvec_core::cache::reindex::incremental_index(
+                        &canon2,
+                        &backend_refs,
+                        &tokenizer,
+                        &cfg,
+                        &profiler,
+                        "nomic-ai/modernbert-embed-base",
+                        None,
+                    )
+                })
+                .await
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                let mut cache = self.root_indices.write().await;
+                cache.insert(canonical.clone(), idx);
+            }
+        }
+
+        // Ensure repo graph is cached for this root.
+        {
+            let has_graph = self
+                .root_graphs
+                .read()
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+                .contains_key(&canonical);
+            if !has_graph {
+                let canon2 = canonical.clone();
+                let graph = tokio::task::spawn_blocking(move || {
+                    ripvec_core::repo_map::build_graph(&canon2)
+                })
+                .await
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                self.root_graphs
+                    .write()
+                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+                    .insert(canonical.clone(), graph);
+            }
+        }
+
+        Ok(Some(canonical))
+    }
+
     /// Shared search implementation used by both `search_code` and `search_text`.
-    ///
-    /// When `root` is `Some`, loads the index for that directory from the
-    /// on-disk cache (instant if already indexed). Otherwise uses the
-    /// pre-built in-memory index for the server's default project root.
     async fn run_search(
         &self,
         query: &str,
@@ -191,60 +285,9 @@ impl RipvecServer {
         offset: usize,
         root: Option<&str>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        // Resolve which index to use: custom root (cached) or default.
-        let custom_root: Option<std::path::PathBuf>;
-        if let Some(root_str) = root {
-            let root_path = std::path::PathBuf::from(root_str);
-            if !root_path.is_dir() {
-                return Err(rmcp::ErrorData::internal_error(
-                    format!("root is not a directory: {root_str}"),
-                    None,
-                ));
-            }
-            let canonical = root_path
-                .canonicalize()
-                .unwrap_or_else(|_| root_path.clone());
+        let custom_root = self.ensure_root(root).await?;
 
-            // Check if we already have this index cached.
-            {
-                let cache = self.root_indices.read().await;
-                if cache.contains_key(&canonical) {
-                    // Cache hit — skip re-indexing.
-                    custom_root = Some(canonical);
-                } else {
-                    drop(cache);
-                    // Cache miss — load from on-disk cache (instant if pre-indexed).
-                    let text_backend = self.load_text_backend().await?;
-                    let text_tokenizer = self.load_text_tokenizer().await?;
-                    let backend = Arc::clone(text_backend);
-                    let tokenizer = Arc::clone(text_tokenizer);
-                    let canon2 = canonical.clone();
-                    let (idx, _stats) = tokio::task::spawn_blocking(move || {
-                        let backend_refs: Vec<&dyn ripvec_core::backend::EmbedBackend> =
-                            vec![backend.as_ref()];
-                        let cfg = ripvec_core::embed::SearchConfig::default();
-                        let profiler = ripvec_core::profile::Profiler::noop();
-                        ripvec_core::cache::reindex::incremental_index(
-                            &canon2,
-                            &backend_refs,
-                            &tokenizer,
-                            &cfg,
-                            &profiler,
-                            "nomic-ai/modernbert-embed-base",
-                            None,
-                        )
-                    })
-                    .await
-                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
-                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-                    let mut cache = self.root_indices.write().await;
-                    cache.insert(canonical.clone(), idx);
-                    custom_root = Some(canonical);
-                }
-            }
-        } else {
-            custom_root = None;
-            // Check default index exists
+        if custom_root.is_none() {
             let idx_guard = self.index.read().await;
             if idx_guard.is_none() {
                 return Err(if self.indexing.load(Ordering::SeqCst) {
@@ -344,8 +387,14 @@ impl RipvecServer {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.run_search(&params.query, params.top_k, params.threshold, params.offset, params.root.as_deref())
-            .await
+        self.run_search(
+            &params.query,
+            params.top_k,
+            params.threshold,
+            params.offset,
+            params.root.as_deref(),
+        )
+        .await
     }
 
     /// Search text by semantic meaning.
@@ -360,8 +409,14 @@ impl RipvecServer {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.run_search(&params.query, params.top_k, params.threshold, params.offset, params.root.as_deref())
-            .await
+        self.run_search(
+            &params.query,
+            params.top_k,
+            params.threshold,
+            params.offset,
+            params.root.as_deref(),
+        )
+        .await
     }
 
     /// Find chunks similar to the chunk at a given file location.
@@ -376,10 +431,24 @@ impl RipvecServer {
         &self,
         Parameters(params): Parameters<FindSimilarParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let idx_guard = self.index.read().await;
-        let index = idx_guard.as_ref().ok_or_else(|| {
-            rmcp::ErrorData::internal_error("No index available.".to_string(), None)
-        })?;
+        let custom_root = self.ensure_root(params.root.as_deref()).await?;
+
+        let root_cache_guard;
+        let idx_guard;
+        let index: &ripvec_core::hybrid::HybridIndex = if let Some(ref canon) = custom_root {
+            root_cache_guard = self.root_indices.read().await;
+            root_cache_guard.get(canon).ok_or_else(|| {
+                rmcp::ErrorData::internal_error(
+                    "Cached index disappeared. Try again.".to_string(),
+                    None,
+                )
+            })?
+        } else {
+            idx_guard = self.index.read().await;
+            idx_guard.as_ref().ok_or_else(|| {
+                rmcp::ErrorData::internal_error("No index available.".to_string(), None)
+            })?
+        };
 
         // Convert 0-based input line to 1-based chunk lines
         let target_line = params.line + 1;
@@ -439,41 +508,98 @@ impl RipvecServer {
         name = "reindex",
         description = "Rebuild the search index from scratch. Returns chunk and file counts when done."
     )]
-    async fn reindex(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        // Clear current index
-        {
-            let mut idx = self.index.write().await;
-            *idx = None;
-        }
-
-        let start = Instant::now();
-        run_background_index(self).await;
-        let duration_ms = start.elapsed().as_millis();
-
-        let idx_guard = self.index.read().await;
-        let (chunk_count, file_count) = match idx_guard.as_ref() {
-            Some(index) => {
-                let files = index
-                    .chunks()
-                    .iter()
-                    .map(|c| c.file_path.as_str())
-                    .collect::<HashSet<_>>()
-                    .len();
-                (index.chunks().len(), files)
+    async fn reindex(
+        &self,
+        Parameters(params): Parameters<ReindexParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if let Some(root_str) = params.root.as_deref() {
+            // Reindex a custom root: evict from cache, then re-ensure.
+            let root_path = std::path::PathBuf::from(root_str);
+            if !root_path.is_dir() {
+                return Err(rmcp::ErrorData::internal_error(
+                    format!("root is not a directory: {root_str}"),
+                    None,
+                ));
             }
-            None => (0, 0),
-        };
+            let canonical = root_path
+                .canonicalize()
+                .unwrap_or_else(|_| root_path.clone());
 
-        let response = serde_json::json!({
-            "chunks": chunk_count,
-            "files": file_count,
-            "duration_ms": duration_ms,
-        });
+            // Evict cached index and graph.
+            {
+                let mut cache = self.root_indices.write().await;
+                cache.remove(&canonical);
+            }
+            {
+                let mut cache = self
+                    .root_graphs
+                    .write()
+                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                cache.remove(&canonical);
+            }
 
-        let json = serde_json::to_string_pretty(&response)
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+            let start = Instant::now();
+            self.ensure_root(Some(root_str)).await?;
+            let duration_ms = start.elapsed().as_millis();
 
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+            let cache = self.root_indices.read().await;
+            let (chunk_count, file_count) = match cache.get(&canonical) {
+                Some(index) => {
+                    let files = index
+                        .chunks()
+                        .iter()
+                        .map(|c| c.file_path.as_str())
+                        .collect::<HashSet<_>>()
+                        .len();
+                    (index.chunks().len(), files)
+                }
+                None => (0, 0),
+            };
+
+            let response = serde_json::json!({
+                "chunks": chunk_count,
+                "files": file_count,
+                "duration_ms": duration_ms,
+                "root": canonical.display().to_string(),
+            });
+            let json = serde_json::to_string_pretty(&response)
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+            Ok(CallToolResult::success(vec![Content::text(json)]))
+        } else {
+            // Reindex default project root.
+            {
+                let mut idx = self.index.write().await;
+                *idx = None;
+            }
+
+            let start = Instant::now();
+            run_background_index(self).await;
+            let duration_ms = start.elapsed().as_millis();
+
+            let idx_guard = self.index.read().await;
+            let (chunk_count, file_count) = match idx_guard.as_ref() {
+                Some(index) => {
+                    let files = index
+                        .chunks()
+                        .iter()
+                        .map(|c| c.file_path.as_str())
+                        .collect::<HashSet<_>>()
+                        .len();
+                    (index.chunks().len(), files)
+                }
+                None => (0, 0),
+            };
+
+            let response = serde_json::json!({
+                "chunks": chunk_count,
+                "files": file_count,
+                "duration_ms": duration_ms,
+                "root": self.project_root.display().to_string(),
+            });
+            let json = serde_json::to_string_pretty(&response)
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+            Ok(CallToolResult::success(vec![Content::text(json)]))
+        }
     }
 
     /// Return the current index status.
@@ -484,42 +610,83 @@ impl RipvecServer {
         name = "index_status",
         description = "Check the current index status: readiness, chunk/file counts, and project root."
     )]
-    async fn index_status(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        let is_indexing = self.indexing.load(Ordering::SeqCst);
-        let idx_guard = self.index.read().await;
-        let ready = idx_guard.is_some();
+    async fn index_status(
+        &self,
+        Parameters(params): Parameters<IndexStatusParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if let Some(root_str) = params.root.as_deref() {
+            // Status for a custom root.
+            let root_path = std::path::PathBuf::from(root_str);
+            let canonical = root_path
+                .canonicalize()
+                .unwrap_or_else(|_| root_path.clone());
 
-        let (chunk_count, files_count, ext_counts) = match idx_guard.as_ref() {
-            Some(index) => {
-                let mut files_set = HashSet::new();
-                let mut exts: HashMap<String, usize> = HashMap::new();
-                for chunk in index.chunks() {
-                    files_set.insert(chunk.file_path.as_str());
-                    let ext = std::path::Path::new(&chunk.file_path)
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("(none)")
-                        .to_string();
-                    *exts.entry(ext).or_insert(0) += 1;
+            let cache = self.root_indices.read().await;
+            let (ready, chunk_count, files_count, ext_counts) = match cache.get(&canonical) {
+                Some(index) => {
+                    let mut files_set = HashSet::new();
+                    let mut exts: HashMap<String, usize> = HashMap::new();
+                    for chunk in index.chunks() {
+                        files_set.insert(chunk.file_path.as_str());
+                        let ext = std::path::Path::new(&chunk.file_path)
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("(none)")
+                            .to_string();
+                        *exts.entry(ext).or_insert(0) += 1;
+                    }
+                    (true, index.chunks().len(), files_set.len(), exts)
                 }
-                (index.chunks().len(), files_set.len(), exts)
-            }
-            None => (0, 0, HashMap::new()),
-        };
+                None => (false, 0, 0, HashMap::new()),
+            };
 
-        let response = serde_json::json!({
-            "ready": ready,
-            "indexing": is_indexing,
-            "chunks": chunk_count,
-            "files": files_count,
-            "extensions": ext_counts,
-            "project_root": self.project_root.display().to_string(),
-        });
+            let response = serde_json::json!({
+                "ready": ready,
+                "indexing": false,
+                "chunks": chunk_count,
+                "files": files_count,
+                "extensions": ext_counts,
+                "project_root": canonical.display().to_string(),
+            });
+            let json = serde_json::to_string_pretty(&response)
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+            Ok(CallToolResult::success(vec![Content::text(json)]))
+        } else {
+            // Status for default project root.
+            let is_indexing = self.indexing.load(Ordering::SeqCst);
+            let idx_guard = self.index.read().await;
+            let ready = idx_guard.is_some();
 
-        let json = serde_json::to_string_pretty(&response)
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+            let (chunk_count, files_count, ext_counts) = match idx_guard.as_ref() {
+                Some(index) => {
+                    let mut files_set = HashSet::new();
+                    let mut exts: HashMap<String, usize> = HashMap::new();
+                    for chunk in index.chunks() {
+                        files_set.insert(chunk.file_path.as_str());
+                        let ext = std::path::Path::new(&chunk.file_path)
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("(none)")
+                            .to_string();
+                        *exts.entry(ext).or_insert(0) += 1;
+                    }
+                    (index.chunks().len(), files_set.len(), exts)
+                }
+                None => (0, 0, HashMap::new()),
+            };
 
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+            let response = serde_json::json!({
+                "ready": ready,
+                "indexing": is_indexing,
+                "chunks": chunk_count,
+                "files": files_count,
+                "extensions": ext_counts,
+                "project_root": self.project_root.display().to_string(),
+            });
+            let json = serde_json::to_string_pretty(&response)
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+            Ok(CallToolResult::success(vec![Content::text(json)]))
+        }
     }
 
     /// Check whether the running ripvec-mcp binary is up-to-date with its source.
@@ -604,24 +771,41 @@ impl RipvecServer {
         &self,
         Parameters(params): Parameters<RepoMapParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let graph_guard = self
-            .repo_graph
-            .read()
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        let custom_root = self.ensure_root(params.root.as_deref()).await?;
 
-        let graph = graph_guard.as_ref().ok_or_else(|| {
-            if self.indexing.load(std::sync::atomic::Ordering::SeqCst) {
+        // Get the appropriate repo graph (custom root or default).
+        let root_graphs_guard;
+        let default_guard;
+        let graph: &ripvec_core::repo_map::RepoGraph = if let Some(ref canon) = custom_root {
+            root_graphs_guard = self
+                .root_graphs
+                .read()
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+            root_graphs_guard.get(canon).ok_or_else(|| {
                 rmcp::ErrorData::internal_error(
-                    "Repository graph is still building. Try again shortly.".to_string(),
+                    "Cached repo graph disappeared. Try again.".to_string(),
                     None,
                 )
-            } else {
-                rmcp::ErrorData::internal_error(
-                    "No repository graph available. Call reindex first.".to_string(),
-                    None,
-                )
-            }
-        })?;
+            })?
+        } else {
+            default_guard = self
+                .repo_graph
+                .read()
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+            default_guard.as_ref().ok_or_else(|| {
+                if self.indexing.load(std::sync::atomic::Ordering::SeqCst) {
+                    rmcp::ErrorData::internal_error(
+                        "Repository graph is still building. Try again shortly.".to_string(),
+                        None,
+                    )
+                } else {
+                    rmcp::ErrorData::internal_error(
+                        "No repository graph available. Call reindex first.".to_string(),
+                        None,
+                    )
+                }
+            })?
+        };
 
         // Resolve focus file to an index in the graph
         let focus_idx = params.focus_file.as_deref().and_then(|focus| {
