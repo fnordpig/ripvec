@@ -521,7 +521,7 @@ pub fn search(
     let hybrid = {
         let _span = info_span!("build_hybrid_index").entered();
         let _guard = profiler.phase("build_hybrid_index");
-        crate::hybrid::HybridIndex::new(chunks, embeddings, cfg.cascade_dim)?
+        crate::hybrid::HybridIndex::new(chunks, &embeddings, cfg.cascade_dim)?
     };
 
     let mode = cfg.mode;
@@ -554,12 +554,7 @@ pub fn search(
     let ranked = {
         let _span = info_span!("rank", chunk_count = hybrid.chunks().len()).entered();
         let guard = profiler.phase("rank");
-        // Threshold only applies to semantic modes; keyword/hybrid use RRF scores
-        let threshold = if mode == crate::hybrid::SearchMode::Semantic {
-            0.0 // SearchIndex::rank applies its own threshold
-        } else {
-            0.0
-        };
+        let threshold = 0.0; // all modes use 0.0; SearchIndex::rank applies its own
         let results = hybrid.search(&query_embedding, query, effective_top_k, threshold, mode);
         guard.set_detail(format!(
             "{mode} top {} from {}",

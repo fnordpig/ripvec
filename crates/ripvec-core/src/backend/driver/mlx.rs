@@ -84,6 +84,11 @@ impl Driver for MlxDriver {
 
     // begin_batch / end_batch: no-ops. MLX is always lazy.
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "mlx-rs requires i32 for shape params; ML tensor dims fit in i32"
+    )]
     fn alloc_zeros(&self, n: usize) -> crate::Result<MlxTensor> {
         Array::zeros::<f32>(&[n as i32])
             .map_err(mlx_err)
@@ -97,6 +102,7 @@ impl Driver for MlxDriver {
 
     #[expect(
         clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
         clippy::cast_precision_loss,
         reason = "token IDs, masks, and type IDs from tokenizer are always small non-negative values"
     )]
@@ -159,6 +165,11 @@ impl Driver for MlxDriver {
         })
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "mlx-rs requires i32 for shape params; ML tensor dims fit in i32"
+    )]
     fn pad_to_batch(
         &self,
         flat: &MlxTensor,
@@ -190,6 +201,11 @@ impl Driver for MlxDriver {
         Ok(())
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "mlx-rs requires i32 for shape params; ML tensor dims fit in i32"
+    )]
     fn unpad_from_batch(
         &self,
         padded: &MlxTensor,
@@ -220,6 +236,11 @@ impl Driver for MlxDriver {
         Ok(())
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "mlx-rs requires i32 for shape params; ML tensor dims fit in i32"
+    )]
     fn embedding_lookup(
         &self,
         word_ids: &MlxTensor,
@@ -236,6 +257,11 @@ impl Driver for MlxDriver {
         Ok(MlxTensor(flat))
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "mlx-rs requires i32 for shape params; ML tensor dims fit in i32"
+    )]
     fn add_embeddings(
         &self,
         hidden: &mut MlxTensor,
@@ -255,6 +281,11 @@ impl Driver for MlxDriver {
         Ok(())
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "mlx-rs requires i32 for shape params; ML tensor dims fit in i32"
+    )]
     fn layer_norm(
         &self,
         output: &mut MlxTensor,
@@ -278,6 +309,11 @@ impl Driver for MlxDriver {
     #[expect(
         clippy::many_single_char_names,
         reason = "matches Driver trait signature (m, n, k)"
+    )]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "mlx-rs requires i32 for shape params; ML tensor dims fit in i32"
     )]
     fn gemm(
         &self,
@@ -305,6 +341,11 @@ impl Driver for MlxDriver {
     #[expect(
         clippy::many_single_char_names,
         reason = "matches Driver trait signature (m, n, k)"
+    )]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "mlx-rs requires i32 for shape params; ML tensor dims fit in i32"
     )]
     fn gemm_batched(
         &self,
@@ -336,6 +377,11 @@ impl Driver for MlxDriver {
         Ok(())
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "mlx-rs requires i32 for shape params; ML tensor dims fit in i32"
+    )]
     fn fused_scale_mask_softmax(
         &self,
         scores: &mut MlxTensor,
@@ -391,6 +437,11 @@ impl Driver for MlxDriver {
         self.fused_scale_mask_softmax(scores, mask, batch, num_heads, seq_len, scale)
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "mlx-rs requires i32 for shape params; ML tensor dims fit in i32"
+    )]
     fn build_attn_mask(
         &self,
         output: &mut MlxTensor,
@@ -409,6 +460,11 @@ impl Driver for MlxDriver {
         Ok(())
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "mlx-rs requires i32 for shape params; ML tensor dims fit in i32"
+    )]
     fn qkv_split(
         &self,
         q: &mut MlxTensor,
@@ -460,6 +516,11 @@ impl Driver for MlxDriver {
         Ok(())
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "mlx-rs requires i32 for shape params; ML tensor dims fit in i32"
+    )]
     fn attn_reshape(
         &self,
         output: &mut MlxTensor,
@@ -501,6 +562,11 @@ impl Driver for MlxDriver {
         )))
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "mlx-rs requires i32 for shape params; ML tensor dims fit in i32"
+    )]
     fn split_gate_value(
         &self,
         first: &mut MlxTensor,
@@ -519,6 +585,11 @@ impl Driver for MlxDriver {
         Ok(())
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "mlx-rs requires i32 for shape params; ML tensor dims fit in i32"
+    )]
     fn gelu(&self, x: &mut MlxTensor, n: usize) -> crate::Result<()> {
         let reshaped = mlx_rs::ops::reshape(&x.0, &[n as i32]).map_err(mlx_err)?;
         let activated = mlx_rs::nn::gelu(&reshaped).map_err(mlx_err)?;
@@ -526,6 +597,11 @@ impl Driver for MlxDriver {
         Ok(())
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "mlx-rs requires i32 for shape params; ML tensor dims fit in i32"
+    )]
     fn swiglu(
         &self,
         value: &MlxTensor,
@@ -540,6 +616,11 @@ impl Driver for MlxDriver {
         Ok(())
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "mlx-rs requires i32 for shape params; ML tensor dims fit in i32"
+    )]
     fn geglu(
         &self,
         value: &MlxTensor,
@@ -554,6 +635,11 @@ impl Driver for MlxDriver {
         Ok(())
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "mlx-rs requires i32 for shape params; ML tensor dims fit in i32"
+    )]
     fn fused_bias_gelu(
         &self,
         x: &mut MlxTensor,
@@ -569,6 +655,11 @@ impl Driver for MlxDriver {
         Ok(())
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "mlx-rs requires i32 for shape params; ML tensor dims fit in i32"
+    )]
     fn fused_bias_residual(
         &self,
         output: &mut MlxTensor,
@@ -589,6 +680,11 @@ impl Driver for MlxDriver {
         Ok(())
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "mlx-rs requires i32 for shape params; ML tensor dims fit in i32"
+    )]
     fn fused_residual_layernorm(
         &self,
         output: &mut MlxTensor,
@@ -610,6 +706,11 @@ impl Driver for MlxDriver {
         Ok(())
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "mlx-rs requires i32 for shape params; ML tensor dims fit in i32"
+    )]
     fn residual_add(
         &self,
         output: &mut MlxTensor,
@@ -623,6 +724,11 @@ impl Driver for MlxDriver {
         Ok(())
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "mlx-rs requires i32 for shape params; ML tensor dims fit in i32"
+    )]
     fn add_bias(
         &self,
         x: &mut MlxTensor,
@@ -637,6 +743,11 @@ impl Driver for MlxDriver {
         Ok(())
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "mlx-rs requires i32 for shape params; ML tensor dims fit in i32"
+    )]
     fn cls_pool(
         &self,
         output: &mut MlxTensor,
@@ -654,6 +765,11 @@ impl Driver for MlxDriver {
         Ok(())
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "mlx-rs requires i32 for shape params; ML tensor dims fit in i32"
+    )]
     fn mean_pool(
         &self,
         output: &mut MlxTensor,
@@ -683,6 +799,11 @@ impl Driver for MlxDriver {
         Ok(())
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "mlx-rs requires i32 for shape params; ML tensor dims fit in i32"
+    )]
     fn l2_normalize(&self, data: &mut MlxTensor, rows: usize, cols: usize) -> crate::Result<()> {
         let x = mlx_rs::ops::reshape(&data.0, &[rows as i32, cols as i32]).map_err(mlx_err)?;
         let sq = x.square().map_err(mlx_err)?;
@@ -745,6 +866,11 @@ impl Driver for MlxDriver {
         )))
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "mlx-rs requires i32 for shape params; ML tensor dims fit in i32"
+    )]
     fn to_host(
         &self,
         tensor: &MlxTensor,

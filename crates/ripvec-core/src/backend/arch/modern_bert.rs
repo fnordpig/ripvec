@@ -710,6 +710,10 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
         clippy::many_single_char_names,
         reason = "w, g are standard geometry names; q, k, v are standard attention names"
     )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "forward pass is a single logical unit"
+    )]
     fn forward(&self, driver: &D, encodings: &[Encoding]) -> crate::Result<Vec<Vec<f32>>> {
         let w = &self.weights;
         let batch = encodings.len();

@@ -199,7 +199,7 @@ fn incremental_path(
     // Rebuild HybridIndex (semantic + BM25) from all cached objects
     let (all_chunks, all_embeddings) = load_all_from_store(store, &manifest)?;
     let chunks_total = all_chunks.len();
-    let hybrid = HybridIndex::new(all_chunks, all_embeddings, None)?;
+    let hybrid = HybridIndex::new(all_chunks, &all_embeddings, None)?;
 
     Ok((
         hybrid,
@@ -287,7 +287,7 @@ fn full_index_path(
 
     let chunks_total = chunks.len();
     let files_changed = file_groups.len();
-    let hybrid = HybridIndex::new(chunks, embeddings, None)?;
+    let hybrid = HybridIndex::new(chunks, &embeddings, None)?;
 
     Ok((
         hybrid,

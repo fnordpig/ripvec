@@ -126,6 +126,10 @@ impl PolarCodec {
     }
 
     /// Encode a single vector (convenience, allocates).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `vector.len() != self.dim`.
     #[must_use]
     pub fn encode(&self, vector: &[f32]) -> CompressedCode {
         assert_eq!(vector.len(), self.dim);
@@ -149,6 +153,10 @@ impl PolarCodec {
     ///
     /// Uses BLAS for the rotation: `rotated = vectors × Πᵀ` (one GEMM).
     /// Quantization is scalar but cache-friendly (sequential writes).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `vectors.ncols() != self.dim`.
     #[must_use]
     pub fn encode_batch(&self, vectors: &Array2<f32>) -> CompressedCorpus {
         assert_eq!(vectors.ncols(), self.dim);
@@ -196,6 +204,10 @@ impl PolarCodec {
     ///
     /// Cost: one 768×768 matvec + 384×16 multiply-adds = ~0.08ms.
     /// The returned [`QueryState`] is reused for ALL vectors in the scan.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `query.len() != self.dim`.
     #[must_use]
     pub fn prepare_query(&self, query: &[f32]) -> QueryState {
         assert_eq!(query.len(), self.dim);
@@ -229,6 +241,10 @@ impl PolarCodec {
     ///
     /// At 100K vectors, d=768: ~3.3ms on CPU, ~0.1ms on GPU (future Metal kernel).
     #[must_use]
+    #[expect(
+        clippy::needless_range_loop,
+        reason = "index-based loop is clearer for strided SoA access"
+    )]
     pub fn scan_corpus(&self, corpus: &CompressedCorpus, qs: &QueryState) -> Vec<f32> {
         let n = corpus.n;
         let pairs = corpus.pairs;
@@ -287,6 +303,11 @@ impl PolarCodec {
     }
 
     #[inline]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "normalized angle [0,1) × levels fits in u8 (max 16 levels)"
+    )]
     fn encode_pair(&self, a: f32, b: f32) -> (f32, u8) {
         let r = (a * a + b * b).sqrt();
         let theta = b.atan2(a);

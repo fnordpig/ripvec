@@ -88,11 +88,11 @@ impl HybridIndex {
     /// schema or writer failure).
     pub fn new(
         chunks: Vec<CodeChunk>,
-        embeddings: Vec<Vec<f32>>,
+        embeddings: &[Vec<f32>],
         cascade_dim: Option<usize>,
     ) -> crate::Result<Self> {
         let bm25 = Bm25Index::build(&chunks)?;
-        let semantic = SearchIndex::new(chunks, &embeddings, cascade_dim);
+        let semantic = SearchIndex::new(chunks, embeddings, cascade_dim);
         Ok(Self { semantic, bm25 })
     }
 

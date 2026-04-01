@@ -425,6 +425,10 @@ pub struct ModernBertConfig {
 
 impl ModernBertConfig {
     /// Parse from a `config.json` value.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "HuggingFace config ints always fit in usize; f64 rope/eps values fit in f32"
+    )]
     pub fn from_json(json: &serde_json::Value) -> crate::Result<Self> {
         let get_usize = |key: &str| -> crate::Result<usize> {
             json.get(key)
@@ -1181,6 +1185,10 @@ impl Driver for CpuDriver {
         Ok(())
     }
 
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "seq/window indices are small ML dimensions that fit in isize"
+    )]
     fn banded_qk(
         &self,
         q: &Vec<f32>,
@@ -1214,6 +1222,10 @@ impl Driver for CpuDriver {
         Ok(())
     }
 
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "seq/window indices are small ML dimensions that fit in isize"
+    )]
     fn banded_sv(
         &self,
         scores: &Vec<f32>,

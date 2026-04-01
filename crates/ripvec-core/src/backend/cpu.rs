@@ -147,15 +147,6 @@ fn load_tensor1(tensors: &SafeTensors<'_>, name: &str) -> crate::Result<Array1<f
     Ok(Array1::from_vec(data))
 }
 
-/// Optionally load a 2D tensor -- returns `None` if missing.
-fn try_load_tensor2(tensors: &SafeTensors<'_>, name: &str) -> crate::Result<Option<Array2<f32>>> {
-    if tensors.tensor(name).is_ok() {
-        Ok(Some(load_tensor2(tensors, name)?))
-    } else {
-        Ok(None)
-    }
-}
-
 /// Optionally load a 1D tensor -- returns `None` if missing.
 fn try_load_tensor1(tensors: &SafeTensors<'_>, name: &str) -> crate::Result<Option<Array1<f32>>> {
     if tensors.tensor(name).is_ok() {

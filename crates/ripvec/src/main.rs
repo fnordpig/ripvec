@@ -315,7 +315,7 @@ fn run_interactive(
         format!("{} chunks \u{2502} {}", chunks.len(), breakdown.join(", "))
     };
 
-    let index = ripvec_core::hybrid::HybridIndex::new(chunks, embeddings, None)
+    let index = ripvec_core::hybrid::HybridIndex::new(chunks, &embeddings, None)
         .context("failed to build hybrid index")?;
 
     let mut app = tui::App {

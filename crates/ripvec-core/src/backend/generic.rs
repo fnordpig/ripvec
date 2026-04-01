@@ -63,6 +63,7 @@ impl<D: Driver, A: ModelArch<D>> GenericBackend<D, A> {
     }
 
     /// Create with explicit max batch size.
+    #[expect(clippy::cast_possible_wrap, reason = "warmup seq length is small")]
     pub fn with_max_batch(
         driver: D,
         arch: A,

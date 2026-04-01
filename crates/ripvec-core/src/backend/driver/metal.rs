@@ -931,6 +931,11 @@ impl MetalDriver {
     /// Fast GPU scan using pre-uploaded corpus buffers. Only the centroid table
     /// (24 KB) is uploaded per query. The corpus data stays on GPU.
     #[expect(unsafe_code, reason = "Metal buffer readback")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "n_vectors/n_pairs/n_levels are small ML dimensions that fit in i32"
+    )]
     pub fn turboquant_scan_gpu(
         &self,
         gpu_corpus: &TurboQuantGpuCorpus,
@@ -981,6 +986,11 @@ impl MetalDriver {
     /// The FP16 buffer is stored inside the tensor's `fp16` field and used
     /// automatically by [`MetalDriver::gemm`] for the weight (B) matrix. The FP16 offset
     /// is `original_offset / 2` (half the bytes per element).
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "num_elements is a small ML dimension that fits in i32"
+    )]
     pub fn ensure_fp16(&self, tensor: &MetalTensor, num_elements: usize) -> crate::Result<()> {
         if tensor.fp16.borrow().is_some() {
             return Ok(());
@@ -1108,6 +1118,10 @@ impl MetalDriver {
     #[expect(
         unsafe_code,
         reason = "mmap + newBufferWithBytesNoCopy require unsafe FFI"
+    )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "weight loading is a single logical unit mapping tensor names to fields"
     )]
     pub fn load_modern_bert_weights(
         &self,
@@ -1354,6 +1368,10 @@ impl MetalDriver {
             |offset: usize| -> MetalTensor { MetalTensor::new(weight_buffer.clone(), offset) };
 
         // Helper: read raw f32 data from the mmap at a given byte offset and element count.
+        #[expect(
+            clippy::cast_ptr_alignment,
+            reason = "safetensors data is f32; caller guarantees alignment via safetensors layout"
+        )]
         let read_f32 = |offset: usize, n: usize| -> &[f32] {
             let ptr = unsafe { mmap.as_ptr().add(offset) }.cast::<f32>();
             unsafe { std::slice::from_raw_parts(ptr, n) }
@@ -1546,6 +1564,10 @@ impl ModernBertConfig {
     /// # Errors
     ///
     /// Returns an error if any required field is missing or has an unexpected type.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "HuggingFace config ints always fit in usize; f64 rope/eps values fit in f32"
+    )]
     pub fn from_json(json: &serde_json::Value) -> crate::Result<Self> {
         let get_usize = |key: &str| -> crate::Result<usize> {
             json.get(key)
@@ -2616,6 +2638,10 @@ impl Driver for MetalDriver {
     }
 
     // =======================================================================
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "m/n/k are small ML dimensions that fit in u32"
+    )]
     fn gemm_mixed(
         &self,
         a_f16: &MetalTensor,
@@ -2643,7 +2669,7 @@ impl Driver for MetalDriver {
             set_u32_param(enc, m as u32, 3);
             set_u32_param(enc, n as u32, 4);
             set_u32_param(enc, k as u32, 5);
-            set_u32_param(enc, if transpose_b { 1 } else { 0 }, 6);
+            set_u32_param(enc, u32::from(transpose_b), 6);
             set_u32_param(enc, (m * k) as u32, 7);
             set_u32_param(
                 enc,
@@ -2713,6 +2739,10 @@ impl Driver for MetalDriver {
         clippy::many_single_char_names,
         reason = "a, b, m, n, k are standard GEMM parameter names from BLAS"
     )]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "m/n/k are small ML dimensions that fit in u32"
+    )]
     fn gemm_f16(
         &self,
         a: &MetalTensor,
@@ -2723,6 +2753,10 @@ impl Driver for MetalDriver {
         k: usize,
         transpose_b: bool,
     ) -> crate::Result<()> {
+        // RIPVEC_NO_MPS=1 uses the tiled compute GEMM to eliminate encoder
+        // transitions (88 per ModernBERT forward pass → 0).
+        static USE_COMPUTE_GEMM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
         // B may be a weight tensor (FP32 main + FP16 in .fp16 field)
         // or an FP16 activation (half in main buffer, no .fp16 field).
         let b_fp16 = b.fp16.borrow();
@@ -2742,9 +2776,6 @@ impl Driver for MetalDriver {
             }
         }
 
-        // RIPVEC_NO_MPS=1 uses the tiled compute GEMM to eliminate encoder
-        // transitions (88 per ModernBERT forward pass → 0).
-        static USE_COMPUTE_GEMM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let use_compute = *USE_COMPUTE_GEMM
             .get_or_init(|| std::env::var("RIPVEC_NO_MPS").is_ok_and(|v| v == "1"));
 
@@ -2759,7 +2790,7 @@ impl Driver for MetalDriver {
                 set_u32_param(enc, m as u32, 3);
                 set_u32_param(enc, n as u32, 4);
                 set_u32_param(enc, k as u32, 5);
-                set_u32_param(enc, if transpose_b { 1 } else { 0 }, 6);
+                set_u32_param(enc, u32::from(transpose_b), 6);
                 set_u32_param(enc, (m * k) as u32, 7);
                 set_u32_param(
                     enc,
@@ -3194,37 +3225,31 @@ impl MetalDriver {
     ///
     /// Output: `MetalTensor` with `block_q8_0[N * K/32]` — each block is 34 bytes
     /// (2 byte half scale + 32 int8 values). Per-block symmetric quantization.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `k` is not a multiple of 32.
     #[expect(unsafe_code, reason = "Metal SharedMode buffer contents access")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "IEEE 754 bit manipulation requires controlled narrowing; values are clamped/masked before cast"
+    )]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "Metal SharedMode buffer is u8-typed; we know the underlying data is u16-aligned FP16"
+    )]
     pub fn quantize_weights_q8(
         &self,
         weights: &MetalTensor,
         n: usize,
         k: usize,
     ) -> crate::Result<MetalTensor> {
-        // Prefer the pre-converted FP16 buffer when available.
-        let fp16_borrow = weights.fp16.borrow();
-        let (fp16_buf, fp16_off_bytes) = if let Some(ref buf) = *fp16_borrow {
-            (buf as &ProtocolObject<dyn MTLBuffer>, 0usize)
-        } else {
-            (
-                &*weights.buffer as &ProtocolObject<dyn MTLBuffer>,
-                weights.offset,
-            )
-        };
-
-        // Read FP16 data as raw u16 from the CPU-accessible shared buffer.
-        let fp16_raw: &[u16] = unsafe {
-            let base = fp16_buf.contents().as_ptr().cast::<u8>();
-            let ptr = base.add(fp16_off_bytes).cast::<u16>();
-            std::slice::from_raw_parts(ptr, n * k)
-        };
-
         // FP16 → FP32 conversion (IEEE 754 half-precision).
         #[inline]
         fn f16_to_f32(bits: u16) -> f32 {
-            let sign = ((bits >> 15) & 1) as u32;
-            let exp = ((bits >> 10) & 0x1F) as u32;
-            let mant = (bits & 0x3FF) as u32;
+            let sign = u32::from((bits >> 15) & 1);
+            let exp = u32::from((bits >> 10) & 0x1F);
+            let mant = u32::from(bits & 0x3FF);
             if exp == 0 {
                 // Subnormal or zero
                 let f = (mant as f32) * (1.0 / (1 << 24) as f32);
@@ -3246,27 +3271,48 @@ impl MetalDriver {
             }
         }
 
-        // Quantize in block_q8_0 format: 32-element blocks, each with own half scale.
-        assert!(k % 32 == 0, "K must be a multiple of 32 for block_q8_0");
-        let blocks_per_row = k / 32;
-        let total_blocks = n * blocks_per_row;
-        let block_size = 34_usize; // 2 (half d) + 32 (int8 qs)
-
         // FP32 → FP16 for the scale value
         #[inline]
         fn f32_to_f16(f: f32) -> u16 {
             let bits = f.to_bits();
             let sign = (bits >> 16) & 0x8000;
-            let exp = ((bits >> 23) & 0xFF) as i32 - 127 + 15;
+            let exp = ((bits >> 23) & 0xFF).cast_signed() - 127 + 15;
             let mant = (bits >> 13) & 0x3FF;
             if exp <= 0 {
-                (sign | 0) as u16 // flush subnormals to zero
+                sign as u16 // flush subnormals to zero
             } else if exp >= 31 {
                 (sign | 0x7C00) as u16 // inf
             } else {
-                (sign | ((exp as u32) << 10) | mant) as u16
+                (sign | (exp.cast_unsigned() << 10) | mant) as u16
             }
         }
+
+        // Prefer the pre-converted FP16 buffer when available.
+        let fp16_borrow = weights.fp16.borrow();
+        let (fp16_buf, fp16_off_bytes) = if let Some(ref buf) = *fp16_borrow {
+            (buf as &ProtocolObject<dyn MTLBuffer>, 0usize)
+        } else {
+            (
+                &*weights.buffer as &ProtocolObject<dyn MTLBuffer>,
+                weights.offset,
+            )
+        };
+
+        // Read FP16 data as raw u16 from the CPU-accessible shared buffer.
+        let fp16_raw: &[u16] = unsafe {
+            let base = fp16_buf.contents().as_ptr().cast::<u8>();
+            let ptr = base.add(fp16_off_bytes).cast::<u16>();
+            std::slice::from_raw_parts(ptr, n * k)
+        };
+
+        // Quantize in block_q8_0 format: 32-element blocks, each with own half scale.
+        assert!(
+            k.is_multiple_of(32),
+            "K must be a multiple of 32 for block_q8_0"
+        );
+        let blocks_per_row = k / 32;
+        let total_blocks = n * blocks_per_row;
+        let block_size = 34_usize; // 2 (half d) + 32 (int8 qs)
 
         let mut buf: Vec<u8> = Vec::with_capacity(total_blocks * block_size);
 
@@ -3292,7 +3338,7 @@ impl MetalDriver {
                 for i in 0..32 {
                     let v = f16_to_f32(row_data[start + i]);
                     let q = (v * inv_scale).round().clamp(-127.0, 127.0) as i8;
-                    buf.push(q as u8);
+                    buf.push(q.cast_unsigned());
                 }
             }
         }
@@ -3320,6 +3366,10 @@ impl MetalDriver {
     /// - `a_f16`: FP16 activations `[M, K]`
     /// - `b_q8`: block_q8_0 quantized weights `[N * K/32]` blocks (34 bytes each)
     /// - `output_f16`: FP16 output `[M, N]`
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "m/n/k are small ML dimensions that fit in u32"
+    )]
     pub fn gemm_q8(
         &self,
         a_f16: &MetalTensor,
@@ -3339,7 +3389,7 @@ impl MetalDriver {
             set_u32_param(enc, m as u32, 3);
             set_u32_param(enc, n as u32, 4);
             set_u32_param(enc, k as u32, 5);
-            set_u32_param(enc, if transpose_b { 1 } else { 0 }, 6);
+            set_u32_param(enc, u32::from(transpose_b), 6);
             set_u32_param(enc, (m * k) as u32, 7); // stride_A (half elements)
             set_u32_param(enc, blocks_per_row as u32, 8); // stride_B (blocks per row)
             set_u32_param(enc, (m * n) as u32, 9); // stride_C (half elements)
