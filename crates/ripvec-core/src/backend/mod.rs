@@ -1,7 +1,7 @@
 //! Embedding backend abstraction layer.
 //!
 //! Defines the [`EmbedBackend`] trait that all embedding backends (CPU, CUDA,
-//! MLX) implement, plus the [`Encoding`] input type and [`BackendKind`]
+//! Metal, MLX) implement, plus the [`Encoding`] input type and [`BackendKind`]
 //! discriminant. Use [`load_backend`] to construct a backend by kind.
 
 pub mod arch;

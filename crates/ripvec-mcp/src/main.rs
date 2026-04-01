@@ -1,7 +1,8 @@
 //! MCP server binary for ripvec semantic search.
 //!
-//! Exposes five tools over stdin/stdout using the MCP protocol:
-//! `search_code`, `search_text`, `find_similar`, `reindex`, and `index_status`.
+//! Exposes seven tools over stdin/stdout using the MCP protocol:
+//! `search_code`, `search_text`, `find_similar`, `reindex`, `index_status`,
+//! `get_repo_map`, and `up_to_date`.
 //!
 //! The search index is built in the background on startup. Set `RIPVEC_ROOT`
 //! to override the default project root (current directory).

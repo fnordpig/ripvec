@@ -18,7 +18,7 @@ and cosine similarity ranking. Rust 2024 edition.
 Cargo workspace with three crates:
 - `ripvec-core` — shared library (backends, chunking, embedding, search, repo map, cache)
 - `ripvec` — CLI binary (clap, TUI with ratatui)
-- `ripvec-mcp` — MCP server binary (rmcp, 6 tools + 1 resource)
+- `ripvec-mcp` — MCP server binary (rmcp, 7 tools + 1 resource)
 
 ### Backends (in detection priority order)
 - **Metal** (default on macOS) — custom MSL kernels + MPS GEMMs, 73.8/s on M2 Max
@@ -55,11 +55,17 @@ Cargo workspace with three crates:
 
 ## Chunking architecture
 - Tree-sitter grammars are pluggable via a trait/registry — not hardcoded
-- Support code (Rust, Python, JS/TS, Go, Java, C/C++), structured text
-  (SQL, Jinja2), and plain text (paragraph/sentence splitting)
+- Support code (Rust, Python, JS/TS, Go, Java, C/C++) and plain text
+  (paragraph/sentence splitting via sliding windows)
 - Chunks enriched with scope chains + signatures for better embedding quality
 - `Parser` is not thread-safe — create per-thread via rayon
 - `Query` is Send + Sync — share via Arc
+
+## Search modes
+- `--mode hybrid` (default) — semantic + BM25 fusion via RRF (k=60)
+- `--mode semantic` — pure vector similarity
+- `--mode keyword` — pure BM25 keyword matching
+- `--index` enables persistent cache with incremental re-embedding
 
 ## Key invariants
 - Model weights (~33-100MB) must NOT be committed to git
@@ -70,7 +76,7 @@ Cargo workspace with three crates:
 - CUDA: `CudaSlice::clone()` does full D2D memcpy (not refcount) — never pool via clone
 - CUDA: disable cudarc event tracking for single-stream usage (`ctx.disable_event_tracking()`)
 - CUDA: use `compute_XX` (not `sm_XX`) for NVRTC arch to avoid PTX version mismatches
-- Cache objects are zstd-compressed (level 1, ~8× smaller)
+- Cache objects are zstd-compressed (level 1, ~8x smaller)
 
 ## Streaming pipeline
 For corpora >= 1000 files, `embed_all` uses a three-stage streaming pipeline:

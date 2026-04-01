@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Core library for ripvec semantic code search"
+rust-version.workspace = true
+readme.workspace = true
+keywords = ["semantic-search", "embeddings", "code-search", "tree-sitter", "bert"]
+categories = ["development-tools", "text-processing"]
 
 [dependencies]
 hf-hub.workspace = true

@@ -489,7 +489,7 @@ mod tests {
         // Generate 200 random 768-dim L2-normalized embeddings.
         let dim = 768;
         let n = 200;
-        let mut embeddings: Vec<Vec<f32>> = (0..n)
+        let embeddings: Vec<Vec<f32>> = (0..n)
             .map(|i| {
                 let mut v: Vec<f32> = (0..dim).map(|d| ((i * 17 + d * 31) as f32).sin()).collect();
                 l2_normalize(&mut v);

@@ -1,6 +1,6 @@
 //! MCP tool handlers for semantic search, similarity, and index management.
 //!
-//! All five tools are defined in a single `#[tool_router]` impl block on
+//! All seven tools are defined in a single `#[tool_router]` impl block on
 //! [`RipvecServer`]. Each tool returns JSON via `CallToolResult::success`.
 
 use std::collections::{HashMap, HashSet};

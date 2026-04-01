@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Semantic code search CLI — like ripgrep but for meaning"
+rust-version.workspace = true
+readme.workspace = true
+keywords = ["semantic-search", "code-search", "cli", "ripgrep", "embeddings"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "ripvec"

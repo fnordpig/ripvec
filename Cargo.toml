@@ -8,7 +8,8 @@ version = "0.8.3"
 edition = "2024"
 rust-version = "1.88.0"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/fnordpig/repvec"
+repository = "https://github.com/fnordpig/ripvec"
+readme = "README.md"
 
 [workspace.dependencies]
 # Core inference

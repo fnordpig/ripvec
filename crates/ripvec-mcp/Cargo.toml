@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "MCP server for semantic code search — find code by meaning using vector embeddings and PageRank dependency graphs"
+rust-version.workspace = true
+readme.workspace = true
+keywords = ["mcp", "semantic-search", "code-search", "embeddings", "language-model"]
+categories = ["development-tools", "text-processing"]
 
 [[bin]]
 name = "ripvec-mcp"
