@@ -115,7 +115,3 @@ half val = half(float(blk->qs[k_pos % 32]) * float(blk->d));
 - **Pipeline state types**: All buffer arguments MUST be `device float*` in the signature, cast to actual type inside the kernel. `device half*` triggers a 20× Metal driver regression.
 - **Separate Metal library**: Compile native simdgroup kernels in `NATIVE_GEMM_KERNEL`, not `GEMM_KERNEL`, to avoid MSL compiler cross-effects.
 - **Tile dimensions**: BM=64, BN=64, BK=32. 4 simdgroups (128 threads). 16 accumulators per simdgroup.
-
-## Additional Resources
-
-- `references/llama-cpp-comparison.md` — Line-by-line comparison of our kernel vs llama.cpp's kernel_mul_mm

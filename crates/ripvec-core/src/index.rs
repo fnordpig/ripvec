@@ -3,7 +3,7 @@
 //! Stores all chunk embeddings as a contiguous ndarray matrix so that
 //! re-ranking is a single BLAS matrix-vector multiply via [`crate::similarity::rank_all`].
 //!
-//! Optionally uses [`TurboQuant`](turbo_quant) compression for fast approximate
+//! Optionally uses [`TurboQuant`](crate::turbo_quant::PolarCodec) compression for fast approximate
 //! scanning at monorepo scale (100K+ chunks). `TurboQuant` compresses 768-dim
 //! embeddings from 3072 bytes (FP32) to ~386 bytes (4-bit), giving ~5× faster
 //! scan via sequential memory access + centroid table lookup.
@@ -170,7 +170,7 @@ impl SearchIndex {
     /// 2. Take top `pre_filter_k` approximate candidates.
     /// 3. Re-rank with exact FP32 dot products on the full embedding matrix.
     ///
-    /// Falls back to [`rank`] when no compressed index is available.
+    /// Falls back to [`Self::rank`] when no compressed index is available.
     #[must_use]
     pub fn rank_turboquant(
         &self,
@@ -216,7 +216,7 @@ impl SearchIndex {
     ///    the truncated matrix to find the top `pre_filter_k` candidates.
     /// 2. Re-ranks those candidates using full-dimension dot products.
     ///
-    /// Falls back to [`rank`] when no truncated matrix is available.
+    /// Falls back to [`Self::rank`] when no truncated matrix is available.
     #[must_use]
     pub fn rank_cascade(
         &self,

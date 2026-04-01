@@ -82,7 +82,7 @@
 
 ### 9. The Pipeline State `device half*` Regression
 
-**What happened**: Added `gemm_f16w_f32a_kernel` with `device half*` arguments. MPS throughput dropped from 435/s to 21/s — even though MPS doesn't use this kernel.
+**What happened**: Added `gemm_f16w_f32a_kernel` with `device half*` arguments. MPS FP16 throughput dropped from ~73/s to 21/s — even though MPS doesn't use this kernel.
 
 **First wrong hypothesis**: "MSL compiler regression from complex simdgroup code in the same compilation unit."
 **Second wrong hypothesis**: "Moving to a separate Metal library will fix it."
@@ -231,3 +231,14 @@ Every major optimization that worked came from studying llama.cpp:
 **What happened**: `ripvec-mcp` on Linux was built with `features = ["cpu"]` only — no CUDA. Query embedding used 4 CPU cores (OpenBLAS) instead of the RTX 4090. 50-60s warmup per query.
 
 **Fix**: Add `cuda` to the non-macOS platform dependencies. Also cache on-demand indices by canonical path so `incremental_index` (which walks the entire source tree) only runs once per root per session.
+
+### 26. Inference optimization candidates all failed except fast::exp (Metal)
+
+Designed and benchmarked 4 optimization candidates against quality budgets (<=10% semantic Recall@10 loss, <=2% hybrid):
+
+- **fast::exp()**: +0.3% throughput, zero quality loss. Shipped (always on). 4 line changes in softmax kernels.
+- **SVD low-rank FFN**: -8% net (load penalty exceeds FLOP savings). Two smaller MPS GEMMs have MORE dispatch overhead than the one large GEMM saves.
+- **Token pruning at L11**: +26% at 50% prune, but 34% semantic Recall@10 loss at just 10% prune. Distance-from-mean heuristic removes tokens critical for mean pooling.
+- **Layer skipping**: +22% at skip-4, but 60% semantic loss. Per-layer ablation proved no single layer safely skippable.
+
+**Key finding**: MPS at 95%+ GPU utilization via AMX is at the hardware ceiling. Further throughput gains require model distillation or hardware, not inference tricks.

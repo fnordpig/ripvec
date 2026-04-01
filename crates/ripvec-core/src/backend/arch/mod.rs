@@ -1,7 +1,7 @@
 //! Model architecture trait and variant enum.
 //!
 //! The [`ModelArch`] trait defines how a model architecture composes
-//! [`Driver`](super::driver::Driver) primitives into a complete forward pass
+//! [`Driver`] primitives into a complete forward pass
 //! (embeddings -> encoder layers -> pooling -> normalization).
 //!
 //! Each architecture (ClassicBert, ModernBert) is implemented once

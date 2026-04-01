@@ -5,9 +5,9 @@
 //! No biases anywhere, no position embeddings (`RoPE` only), mean pooling.
 //!
 //! Weight structures are generic over the tensor type `T`, which is
-//! [`Driver::Tensor`](super::super::driver::Driver::Tensor) when wired to a
-//! backend. The [`ModelArch`](super::ModelArch) implementation composes
-//! [`Driver`](super::super::driver::Driver) primitives into the full forward
+//! [`Driver::Tensor`] when wired to a
+//! backend. The [`ModelArch`] implementation composes
+//! [`Driver`] primitives into the full forward
 //! pass.
 
 use super::super::Encoding;
@@ -45,7 +45,7 @@ pub struct ModernBertLayerWeights<T> {
 ///
 /// Includes embedding table, per-layer encoder weights, final norm, and model
 /// geometry. The tensor type `T` becomes
-/// [`Driver::Tensor`](super::super::driver::Driver::Tensor) when loaded onto a
+/// [`Driver::Tensor`] when loaded onto a
 /// specific backend.
 pub struct ModernBertWeights<T> {
     /// Word embedding table `[vocab_size, hidden]`.

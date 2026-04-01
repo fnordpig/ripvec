@@ -149,7 +149,7 @@ begin_batch():
   pool_f16_cursor = 0      ← reset FP16 cursor
 
 Per layer:
-  saved = save_pool_cursor()   ← snapshot both cursors
+  saved = save_pool_cursor()   ← saves FP32 pool cursor only (FP16 cursor is clamped during restore)
   alloc_zeros_f16(n) → pool_f16[cursor++]
   ...layer compute...
   restore_pool_cursor(saved)   ← recycle transient tensors
@@ -323,7 +323,7 @@ MPS's `MPSMatrixMultiplication` accesses the AMX (Apple Matrix coprocessor) — 
 - Native compute FP16: **59.4/s** (GPU ALU via simdgroup MACs)
 - CPU Accelerate BLAS: **73.5/s** (also AMX, via the CPU side)
 
-The native compute kernel at 47/s has **95%+ GPU utilization** and **0.5% driver overhead**. The gap is pure per-FLOP throughput, not scheduling or overhead. Custom kernels cannot match MPS on Apple Silicon for dense matrix multiplication.
+The native compute kernel at 59.4/s has **95%+ GPU utilization** and **0.5% driver overhead**. The gap is pure per-FLOP throughput, not scheduling or overhead. Custom kernels cannot match MPS on Apple Silicon for dense matrix multiplication.
 
 ### 6. FP32 Device Reads Are the Bandwidth Bottleneck
 
@@ -352,7 +352,7 @@ FP32 activations cause 2× the cache pressure and DRAM fetches vs FP16. This is 
 | | Default | `NO_MPS=1` | `Q8=1` | `FP32=1` |
 |---|---|---|---|---|
 | **Forward path** | FP16 | FP32 | FP16 | FP32 |
-| **Weight GEMMs** | MPS FP16 | Native compute (broken in gemm()) | INT8 block_q8_0 | MPS FP32 |
+| **Weight GEMMs** | MPS FP16 | MPS FP32 (NO_MPS forces FP32 path, which uses gemm() → always MPS) | INT8 block_q8_0 | MPS FP32 |
 | **Attention GEMMs** | MPS batched FP16 | MPS batched FP16 | MPS batched FP16 | MPS batched FP32 |
 | **Element-wise** | FP16 kernels | FP32 kernels | FP16 kernels | FP32 kernels |
 | **Throughput (22L)** | **73.8/s** | ~59.4/s | **35/s** | **54/s** |

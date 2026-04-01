@@ -9,7 +9,7 @@
 ## Overview
 
 The CUDA backend implements the `Driver` trait (`crates/ripvec-core/src/backend/driver/cuda.rs`,
-~3,500 lines) enabling `ModernBertArch<CudaTensor>` to run the full 22-layer encoder on
+~4,000 lines) enabling `ModernBertArch<CudaTensor>` to run the full 22-layer encoder on
 NVIDIA GPUs via cudarc 0.19.4.
 
 **Throughput**: 435 chunks/s on RTX 4090 (React corpus, 20K chunks) — 5.9× faster than
@@ -45,7 +45,7 @@ Batched attention GEMMs (Q@K^T, scores@V) always use FP16 via `gemm_batched_f16(
 
 ## Custom CUDA Kernels
 
-~40 kernels compiled via NVRTC at startup. Key optimizations:
+~47 kernels compiled via NVRTC at startup. Key optimizations:
 
 | Kernel | Optimization | Impact |
 |--------|-------------|--------|

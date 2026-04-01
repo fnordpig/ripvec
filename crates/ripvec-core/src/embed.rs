@@ -117,7 +117,7 @@ pub struct SearchResult {
 /// The caller handles query embedding and ranking.
 ///
 /// Accepts multiple backends for hybrid scheduling — chunks are distributed
-/// across all backends via work-stealing (see [`embed_distributed`]).
+/// across all backends via work-stealing (see `embed_distributed`).
 ///
 /// Automatically selects between two pipeline modes:
 /// - **Batch** (< `STREAMING_THRESHOLD` files): chunk all, tokenize all, sort

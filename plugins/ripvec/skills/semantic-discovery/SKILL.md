@@ -78,6 +78,6 @@ When search_code returns results from many files:
 
 ## search_text vs search_code
 
-- `search_code` uses code-optimized embeddings (CodeRankEmbed) — better for source code
-- `search_text` uses general text embeddings (BGE) — better for READMEs, docs, comments
+- `search_code` — optimized for source code semantics
+- `search_text` — optimized for documentation, READMEs, comments
 - When unsure, try `search_code` first

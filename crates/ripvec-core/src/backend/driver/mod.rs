@@ -53,7 +53,7 @@ pub trait Driver: Send + Sync {
     /// Begin batched mode: all subsequent operations encode into one dispatch.
     ///
     /// GPU drivers accumulate into a single command buffer; CPU is a no-op.
-    /// Call [`end_batch`] to commit. This eliminates per-call overhead.
+    /// Call [`Self::end_batch`] to commit. This eliminates per-call overhead.
     fn begin_batch(&self) -> crate::Result<()> {
         Ok(())
     }

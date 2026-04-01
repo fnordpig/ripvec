@@ -257,7 +257,7 @@ impl Profiler {
     /// Update the total chunk count for the embed phase.
     ///
     /// Used by the streaming pipeline where the total isn't known at
-    /// [`embed_begin`] time. Only updates if the new total is larger
+    /// [`Self::embed_begin`] time. Only updates if the new total is larger
     /// than the current one (monotonic).
     pub fn embed_begin_update_total(&self, total: usize) {
         if let Self::Active { embed, .. } = self

@@ -82,7 +82,3 @@ These are `RefCell<Option<Retained<MTLBuffer>>>` — lazily populated at model l
 **Buffer size mismatch**: `pad_to_batch` and `unpad_from_batch` must NOT re-allocate the caller's buffer. The caller controls sizing via `alloc_zeros`.
 
 **FP16/FP32 path confusion**: The `use_f16` flag controls which path runs. Element-wise kernels have separate FP16 variants (`_f16` suffix). Mixing FP32 activations with FP16 kernels produces garbage.
-
-## Additional Resources
-
-- `references/adding-backends.md` — Step-by-step guide for porting ModernBERT to new backends

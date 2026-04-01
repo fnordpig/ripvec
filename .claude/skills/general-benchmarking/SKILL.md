@@ -40,6 +40,7 @@ uv run scripts/bench/bench.py --thermals
 | `compute` | `RIPVEC_NO_MPS=1` | Metal compute | Native simdgroup GEMM, zero MPS transitions |
 | `cpu` | `--device cpu` | CPU (Accelerate/OpenBLAS) | BLAS-backed, works everywhere |
 | `q8` | `RIPVEC_Q8=1` | Metal INT8 | block_q8_0 quantized weights |
+| `cuda` | `--backend cuda` | CUDA FP16 tensor cores | ~435/s |
 
 ## Thermal Monitoring
 

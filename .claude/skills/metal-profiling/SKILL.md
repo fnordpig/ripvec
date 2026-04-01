@@ -91,7 +91,3 @@ save_baseline(name: "gemm-native-v1", checkpoint: "after", task: "iteration 1")
 ```
 
 Always diff against the original baseline for total impact. Diff against the previous iteration to isolate each step's contribution.
-
-## Additional Resources
-
-- `references/tracemeld-cheatsheet.md` — Quick reference for all tracemeld MCP tool parameters

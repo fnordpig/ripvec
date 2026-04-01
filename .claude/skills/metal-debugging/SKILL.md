@@ -80,6 +80,3 @@ Small matrices (4×4) pass but full-scale (35762×2304) fails when:
 - NL1 only loads 32 of 64 N-rows (simdgroups 2+3 read uninitialized tgmem)
 - Pointer advances (`x += 32; y += 32`) are missing in the K-loop
 
-## Additional Resources
-
-Consult `references/metal-pitfalls.md` for the complete catalog of Metal driver bugs and workarounds discovered in ripvec development.

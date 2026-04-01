@@ -18,7 +18,6 @@ Proven patterns for leveraging opus, sonnet, and haiku agents effectively on GPU
 | **Adding a dependency / flag** | Haiku | Simple Cargo.toml edit, CLI flag plumbing |
 | **Benchmark comparison** | Sonnet | Run bench.py, parse output, report numbers |
 | **llama.cpp research** | Opus | Reading unfamiliar C/Metal code, extracting architectural insights |
-| **NomicBert/CodeRankEmbed removal** | Sonnet (parallel) | Two agents: one for CLI/docs, one for backend code |
 | **Git bisect** | Sonnet | Mechanical: checkout, build, test, report |
 
 ## Prompt Patterns That Work
@@ -139,7 +138,7 @@ Reserve Opus for tasks requiring multi-step reasoning: kernel debugging, archite
 Agents that benchmark MUST use bench.py:
 ```
 Include in agent prompt:
-"Benchmark with: uv run scripts/bench/bench.py --configs mps --no-build --layers 3
+"Benchmark with: uv run scripts/bench/bench.py --configs mps --layers 22
 Do NOT run ad-hoc Bash benchmarks."
 ```
 

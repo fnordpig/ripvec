@@ -26,7 +26,7 @@ Always isolate variables one at a time:
 1. **Backend**: `--device cpu` vs default (Metal). If CPU works but Metal doesn't, it's a GPU issue.
 2. **Model**: `--fast` (BGE-small 12L) vs default (ModernBERT 22L). If BGE works, it's ModernBERT-specific.
 3. **Corpus**: ripvec code (`.`) vs Flask corpus. If small works but large doesn't, it's a scaling issue.
-4. **Layers**: `--layers 1` → `--layers 5` → `--layers 22`. Find the exact layer count where it breaks.
+4. **Corpus size**: Use a smaller corpus (e.g., a single file) to isolate embedding vs ranking issues. Compare `--mode semantic` vs `--mode hybrid` to isolate search mode problems.
 5. **Batch size**: `-b 1` vs `-b 32`. If batch=1 works, it's a batching/padding issue.
 6. **Mode**: `--mode semantic` vs `--mode keyword` vs `--mode hybrid`. Isolates embedding vs BM25 vs fusion.
 

@@ -1,86 +1,84 @@
 ---
 name: cuda-development
-description: This skill should be used when working on ripvec's CUDA backend, implementing CUDA kernels, porting ModernBERT to NVIDIA GPUs, or debugging cudarc/CUDA issues. Also use when the user mentions "CUDA", "cudarc", "PTX", "warp shuffle", "tensor core", "NVIDIA", or "CudaDriver".
+description: This skill should be used when working on ripvec's CUDA backend, optimizing CUDA kernels, debugging cudarc/cuBLAS issues, or investigating INT8/cuDNN features. Also use when the user mentions "CUDA", "cudarc", "PTX", "warp shuffle", "tensor core", "NVIDIA", "CudaDriver", or "nsys".
 ---
 
 # CUDA Backend Development
 
-The CUDA backend is the least developed — it supports ClassicBert (BGE-small) only. ModernBERT support requires implementing the remaining Driver trait methods.
+The CUDA backend is fully shipped at **435 chunks/s on RTX 4090** — the fastest backend by 6x over Metal MPS (73.8/s). It supports ModernBERT via the Driver/Arch abstraction with FP16 tensor cores and fused CUDA kernels.
 
-## Current State
+## Architecture
 
-`crates/ripvec-core/src/backend/cuda.rs` — monolithic ClassicBert implementation using cudarc.
+Two CUDA files exist in the codebase:
 
-**What exists:**
-- Device initialization, PTX compilation
-- FP32 GEMMs via cuBLAS
-- Element-wise kernels (embedding lookup, layer norm, GELU, softmax)
-- Attention (Q@K^T, scores@V, masking)
-- CLS pooling, L2 normalize
+- `crates/ripvec-core/src/backend/driver/cuda.rs` (~4000 lines) — **ModernBERT CudaDriver** implementing ~40 Driver trait methods. This is the production CUDA path.
+- `crates/ripvec-core/src/backend/cuda.rs` — Legacy monolithic ClassicBert backend (BGE-small). Used only with `--fast` flag.
 
-**What's missing for ModernBERT:**
-- alternating local/global attention (windowed attention for local layers)
-- GeGLU activation (currently only GELU)
-- `split_gate_value` kernel (splits FFN intermediate into gate + value)
-- RoPE encoding
-- Mean pooling (only CLS pooling exists)
-- `fused_residual_layernorm` (combined residual add + layer norm)
+The CudaDriver follows the same Driver/Arch split as Metal and CPU: `ModernBertArch<CudaTensor>` runs the generic forward pass, CudaDriver provides hardware primitives.
 
-## Approach: Driver Extraction (Recommended)
-
-The research agent assessed two approaches:
-
-**Option A (recommended)**: Extract a CudaDriver from the monolithic code. Implement missing Driver trait methods. Then `ModernBertArch<CudaTensor>` runs the generic forward pass.
-
-**Option B**: Add ModernBERT as a variant in the monolithic backend (how NomicBert was done before removal). Rejected — creates code duplication and doesn't benefit from the Driver/Arch abstraction.
-
-## Implementation Plan
-
-1. **Define `CudaTensor`**: Wrapper around cudarc `CudaSlice<f32>` with offset (similar to `MetalTensor`)
-2. **Implement FP32 Driver methods**: Start with what cuBLAS provides (gemm, gemm_batched). Implement element-wise ops as CUDA kernels.
-3. **Missing kernels** (~5 new kernels):
-   - `rope_encode_kernel`: Apply rotary position embeddings
-   - `geglu_kernel`: GeGLU activation (gelu(value) * gate)
-   - `split_gate_value_kernel`: Split [total, 2*inter] → [total, inter] × 2
-   - `fused_residual_layernorm_kernel`: Residual add + layer norm in one pass
-   - `mean_pool_kernel`: Mean pooling with mask
-4. **Weight loading**: `load_modern_bert_weights` reading safetensors
-5. **Wire into mod.rs**: `load_modernbert_cuda()` and routing
-
-## cudarc Patterns
+### CudaTensor
 
 ```rust
-// Kernel launch
-let func = module.get_func("kernel_name")?;
-let cfg = LaunchConfig::for_num_elems(n as u32);
-unsafe { func.launch(cfg, (&output, &input, n as i32)) }?;
-
-// cuBLAS GEMM
-let blas = CudaBlas::new(device.clone())?;
-unsafe {
-    blas.gemm(
-        cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T,
-        cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
-        n as i32, m as i32, k as i32,
-        &alpha, b_ptr, k as i32,
-        a_ptr, k as i32,
-        &beta, c_ptr, n as i32,
-    )?;
+pub struct CudaTensor {
+    pub(crate) slice: CudaSlice<f32>,
+    pub(crate) offset: usize,
 }
 ```
 
-## Performance Expectations
+### GEMM dispatch
 
-Based on the CPU experience: implementing the Driver trait methods is the main work. The GEMM performance comes from cuBLAS (NVIDIA's hand-tuned library, comparable to MPS on Apple Silicon). Custom CUDA kernels for element-wise ops are straightforward — much simpler than Metal because CUDA has mature tooling and no MPS encoder transition overhead.
+FP16 tensor cores via `cublasGemmEx` with FP16 inputs, FP32 compute, FP32 output. INT8 path (behind `RIPVEC_Q8=1`) uses `CUDA_R_8I` inputs, `CUDA_R_32I` output, `CUBLAS_COMPUTE_32I`.
 
-**Expected**: Competitive with CPU on consumer GPUs (RTX 3060+). Faster on datacenter GPUs (A100/H100) due to tensor cores and higher memory bandwidth.
+### Custom kernels (~47)
 
-## Warp Shuffle Optimization (Phase 5.2)
+All compiled at runtime via NVRTC. Key fused kernels that boosted throughput:
+- `fused_split_geglu_f16` — eliminates separate split + geglu dispatch
+- `fused_pad_qkv_split_f16` — pad + QKV split in one kernel
+- `fused_reshape_unpad_f16` — attention output reshape + unpad
 
-Six kernels could benefit from warp shuffles for parallel reduction:
-- Layer norm (sum + sum-of-squares reduction)
-- Softmax (max + sum reduction)
-- L2 normalize (sum-of-squares reduction)
-- Mean pool (sum reduction)
+## Critical CUDA-specific lessons
 
-Each currently uses shared memory reduction. Warp shuffles (`__shfl_down_sync`) eliminate shared memory for within-warp reductions.
+1. **No pool pattern**: `CudaSlice::clone()` does full D2D memcpy (unlike Metal's refcounted buffers). Allocate fresh each time — the async allocator handles reuse.
+2. **Disable event tracking**: `ctx.disable_event_tracking()` eliminates per-buffer event overhead (cudarc 0.19 records 130K+ events automatically).
+3. **Runtime SM arch detection**: `cuDeviceGetAttribute(COMPUTE_CAPABILITY_MAJOR/MINOR)` → `compute_XX` (not `sm_XX` to avoid PTX version mismatches with newer NVRTC).
+4. **INT8 per-tensor scale is disastrous**: Single-block reduction scanning ALL elements before every GEMM. Use per-row quantization.
+5. **cuBLASLt INT8 has CUDA 13.1 bug**: `A_SCALE_POINTER`/`B_SCALE_POINTER` rejected as NOT_SUPPORTED. Needs CUDA 13.2.
+6. **perf on Linux**: Use `--call-graph fp` NOT `dwarf` — CUDA driver debug symbols break dwarf unwinding.
+
+## INT8 tensor cores
+
+Investigated but not production-ready:
+- GEMMs are 3.7x faster with INT8 tensor cores
+- But dequantize overhead (7s for 57K kernel launches) eats the savings
+- Net result: -5% vs FP16 at batch=32
+- **Fix**: cuBLASLt epilogue fusion (A_SCALE_POINTER/B_SCALE_POINTER) eliminates the dequantize entirely — needs CUDA 13.2 driver
+
+## Profiling workflow
+
+```bash
+# Capture with nsys
+nsys profile --trace=cuda,nvtx,cublas -o /tmp/profile ./target/release/ripvec "query" corpus/
+
+# Export to sqlite for tracemeld
+nsys export --type sqlite -o /tmp/profile.sqlite /tmp/profile.nsys-rep
+
+# Import into tracemeld
+import_profile(source: "/tmp/profile.sqlite", format: "nsight_sqlite")
+hotspots(dimension: "wall_ms")
+focus_function("softmax")
+```
+
+For CPU-side profiling on Linux:
+```bash
+perf record -g --call-graph fp ./target/release/ripvec "query" corpus/
+inferno-collapse-perf < perf.data > collapsed.txt
+# Import collapsed stacks into tracemeld
+```
+
+## Future work
+
+- **cuDNN fused multi-head attention**: Single biggest remaining GPU optimization. Fuses Q@K^T + softmax + scores@V into one kernel, eliminating softmax bottleneck (16% of GPU time).
+- **cuBLASLt INT8 epilogue fusion**: When CUDA 13.2 driver ships. Projected ~530/s.
+- **CUDA Graphs**: Blocked by CudaSlice Drop + async allocator ownership in Rust. Would save ~3.9s CPU overhead.
+- **cuBLASLt algorithm heuristic tuning**: `cublasLtMatmulAlgGetHeuristic` searches for optimal CUTLASS kernel per GEMM shape.
+- **Warp shuffle reductions**: 6 kernels (layer_norm, softmax, L2_normalize, mean_pool, banded_softmax, fused_residual_layernorm) currently use shared memory reduction. `__shfl_down_sync` eliminates shared memory for within-warp reductions.

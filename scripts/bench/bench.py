@@ -342,7 +342,7 @@ def expand_configs(
                     cli += ["--backend", "cuda"]
                 # mps: default, no extra env/args
 
-                cli += ["--layers", str(L)]
+                # --layers was removed from CLI; layer count tracked for labeling only
                 if bs > 0:
                     cli += ["-b", str(bs)]
                 if extra_args:

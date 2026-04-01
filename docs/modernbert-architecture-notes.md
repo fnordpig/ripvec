@@ -99,6 +99,9 @@ No token_type embeddings (single-sequence model).
 
 ## Implementation Priority for Each Backend
 
+> **Note**: All items below are fully implemented across all three backends (Metal, CPU, CUDA).
+> This section is preserved for historical reference of the original implementation plan.
+
 ### Metal (primary)
 
 1. GeGLU kernel: `geglu_kernel(value, gate, n)` — trivial (GELU * gate)
