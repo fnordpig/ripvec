@@ -357,12 +357,7 @@ impl Profiler {
         clippy::cast_precision_loss,
         reason = "display-only: sub-1% precision loss acceptable for MB/rate"
     )]
-    pub fn embed_tick_bytes(
-        &self,
-        done_chunks: usize,
-        bytes_processed: u64,
-        total_bytes: u64,
-    ) {
+    pub fn embed_tick_bytes(&self, done_chunks: usize, bytes_processed: u64, total_bytes: u64) {
         if let Self::Active {
             start,
             interval,

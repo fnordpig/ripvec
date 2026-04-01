@@ -51,8 +51,9 @@ impl FileCache {
     /// Returns an error if the bytes are not a valid archive.
     pub fn from_bytes(bytes: &[u8]) -> crate::Result<Self> {
         let raw = if bytes.len() >= 4 && bytes[..4] == ZSTD_MAGIC {
-            zstd::decode_all(bytes)
-                .map_err(|e| crate::Error::Other(anyhow::anyhow!("zstd decompression failed: {e}")))?
+            zstd::decode_all(bytes).map_err(|e| {
+                crate::Error::Other(anyhow::anyhow!("zstd decompression failed: {e}"))
+            })?
         } else {
             // Legacy uncompressed format — pass through.
             bytes.to_vec()

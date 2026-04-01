@@ -854,7 +854,17 @@ pub trait Driver: Send + Sync {
         let padded_tokens = batch * max_seq;
         let mut qkv_padded = self.alloc_zeros_f16(padded_tokens * 3 * hidden)?;
         self.pad_to_batch_f16(qkv_flat, &mut qkv_padded, seq_lengths, max_seq, 3 * hidden)?;
-        self.qkv_split_f16(q, k, v, &qkv_padded, batch, max_seq, hidden, num_heads, head_dim)
+        self.qkv_split_f16(
+            q,
+            k,
+            v,
+            &qkv_padded,
+            batch,
+            max_seq,
+            hidden,
+            num_heads,
+            head_dim,
+        )
     }
 
     /// Fused attn_reshape + unpad: `[batch*heads, max_seq, head_dim]` →

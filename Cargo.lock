@@ -3192,7 +3192,7 @@ dependencies = [
 
 [[package]]
 name = "ripvec"
-version = "0.1.0"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3217,7 +3217,7 @@ dependencies = [
 
 [[package]]
 name = "ripvec-core"
-version = "0.1.0"
+version = "0.8.3"
 dependencies = [
  "accelerate-src",
  "anyhow",
@@ -3269,7 +3269,7 @@ dependencies = [
 
 [[package]]
 name = "ripvec-mcp"
-version = "0.1.0"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "notify",

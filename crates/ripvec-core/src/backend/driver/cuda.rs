@@ -1419,9 +1419,11 @@ impl KernelPipelines {
         // Detect GPU compute capability at runtime instead of hardcoding.
         // CUDA 13+ dropped support for sm_70; the 4090 is sm_89.
         use cudarc::driver::sys::CUdevice_attribute;
-        let major = ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+        let major = ctx
+            .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
             .map_err(cuda_err)?;
-        let minor = ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
+        let minor = ctx
+            .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
             .map_err(cuda_err)?;
         // Leak the arch string — compiled once at startup, lives forever.
         // Use `compute_XX` (virtual arch) not `sm_XX` (real arch) to generate
@@ -1957,15 +1959,20 @@ impl CudaDriver {
                         handle,
                         sys::cublasOperation_t::CUBLAS_OP_T,
                         sys::cublasOperation_t::CUBLAS_OP_N,
-                        n_i, m_i, k_i,
+                        n_i,
+                        m_i,
+                        k_i,
                         std::ptr::from_ref(&alpha_i32).cast(),
                         b_ptr as *const _,
-                        sys::cudaDataType_t::CUDA_R_8I, k_i,
+                        sys::cudaDataType_t::CUDA_R_8I,
+                        k_i,
                         a_ptr as *const _,
-                        sys::cudaDataType_t::CUDA_R_8I, k_i,
+                        sys::cudaDataType_t::CUDA_R_8I,
+                        k_i,
                         std::ptr::from_ref(&beta_i32).cast(),
                         c_ptr as *mut _,
-                        sys::cudaDataType_t::CUDA_R_32I, n_i,
+                        sys::cudaDataType_t::CUDA_R_32I,
+                        n_i,
                         sys::cublasComputeType_t::CUBLAS_COMPUTE_32I,
                         sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
                     )
@@ -1979,15 +1986,20 @@ impl CudaDriver {
                         handle,
                         sys::cublasOperation_t::CUBLAS_OP_N,
                         sys::cublasOperation_t::CUBLAS_OP_N,
-                        n_i, m_i, k_i,
+                        n_i,
+                        m_i,
+                        k_i,
                         std::ptr::from_ref(&alpha_i32).cast(),
                         b_ptr as *const _,
-                        sys::cudaDataType_t::CUDA_R_8I, n_i,
+                        sys::cudaDataType_t::CUDA_R_8I,
+                        n_i,
                         a_ptr as *const _,
-                        sys::cudaDataType_t::CUDA_R_8I, k_i,
+                        sys::cudaDataType_t::CUDA_R_8I,
+                        k_i,
                         std::ptr::from_ref(&beta_i32).cast(),
                         c_ptr as *mut _,
-                        sys::cudaDataType_t::CUDA_R_32I, n_i,
+                        sys::cudaDataType_t::CUDA_R_32I,
+                        n_i,
                         sys::cublasComputeType_t::CUBLAS_COMPUTE_32I,
                         sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
                     )
@@ -3634,18 +3646,21 @@ impl Driver for CudaDriver {
         let nh_i = num_heads as i32;
         let hd_i = head_dim as i32;
 
-        let qkv_f16 = qkv_flat.fp16_ref().ok_or_else(|| {
-            crate::Error::Cuda("fused_pad_qkv_split_f16: qkv has no FP16".into())
-        })?;
-        let q_f16 = q.fp16.as_mut().ok_or_else(|| {
-            crate::Error::Cuda("fused_pad_qkv_split_f16: q has no FP16".into())
-        })?;
-        let k_f16 = k.fp16.as_mut().ok_or_else(|| {
-            crate::Error::Cuda("fused_pad_qkv_split_f16: k has no FP16".into())
-        })?;
-        let v_f16 = v.fp16.as_mut().ok_or_else(|| {
-            crate::Error::Cuda("fused_pad_qkv_split_f16: v has no FP16".into())
-        })?;
+        let qkv_f16 = qkv_flat
+            .fp16_ref()
+            .ok_or_else(|| crate::Error::Cuda("fused_pad_qkv_split_f16: qkv has no FP16".into()))?;
+        let q_f16 = q
+            .fp16
+            .as_mut()
+            .ok_or_else(|| crate::Error::Cuda("fused_pad_qkv_split_f16: q has no FP16".into()))?;
+        let k_f16 = k
+            .fp16
+            .as_mut()
+            .ok_or_else(|| crate::Error::Cuda("fused_pad_qkv_split_f16: k has no FP16".into()))?;
+        let v_f16 = v
+            .fp16
+            .as_mut()
+            .ok_or_else(|| crate::Error::Cuda("fused_pad_qkv_split_f16: v has no FP16".into()))?;
 
         let mut builder = self
             .stream
