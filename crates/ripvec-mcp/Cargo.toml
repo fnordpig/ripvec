@@ -15,7 +15,7 @@ name = "ripvec-mcp"
 path = "src/main.rs"
 
 [dependencies]
-ripvec-core = { path = "../ripvec-core", version = "0.8.3" }
+ripvec-core = { path = "../ripvec-core", version = "0.9.0" }
 rmcp.workspace = true
 tokio.workspace = true
 serde.workspace = true
@@ -35,10 +35,10 @@ metal = ["ripvec-core/metal"]
 
 # Auto-enable platform-appropriate backends
 [target.'cfg(target_os = "macos")'.dependencies]
-ripvec-core = { path = "../ripvec-core", version = "0.8.3", features = ["metal", "mlx", "cpu-accelerate"] }
+ripvec-core = { path = "../ripvec-core", version = "0.9.0", features = ["metal", "mlx", "cpu-accelerate"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-ripvec-core = { path = "../ripvec-core", version = "0.8.3", features = ["cpu"] }
+ripvec-core = { path = "../ripvec-core", version = "0.9.0", features = ["cpu"] }
 
 [lints]
 workspace = true
