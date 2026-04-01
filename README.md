@@ -92,28 +92,43 @@ Drop that in `.mcp.json` and Claude Code / Cursor gets 7 tools:
 `index_status`, `up_to_date`. Your AI can now search by meaning instead of
 grepping blindly.
 
-### Persistent index — skip re-embedding
+### No setup required — and no index required either
+
+ripvec works out of the box with **zero configuration**. Just point it at a
+directory and search. No pre-indexing step, no database, no config files:
+
+```sh
+ripvec "error handling" ~/src/some-project   # Just works. No setup.
+```
+
+### Persistent index with live updates
+
+For repeated searches, add `--index` to cache embeddings:
 
 ```sh
 ripvec "query" --index           # First run embeds, subsequent runs are instant
 ripvec "query" --index --reindex # Force rebuild
 ```
 
-Only changed files are re-embedded. Uses zstd-compressed incremental caching.
+The index uses a **Merkle-tree diffing system** modeled on git's object store:
+content-addressed chunks with per-directory hash trees detect exactly which
+files changed since the last run. Only modified files are re-embedded — everything
+else loads from zstd-compressed cache (~8x smaller than raw). The MCP server
+uses this with a file watcher for **live re-indexing** as you edit code (2-second
+debounce).
 
 ## How fast?
 
-On a Flask codebase (2,383 code chunks):
+**Without an index** (one-shot search):
 
-| Setup | Embedding speed | First search | Indexed search |
-|-------|----------------|-------------|---------------|
-| RTX 4090 (CUDA) | **435 chunks/s** | ~5s | instant |
-| M2 Max (Metal) | **73.8 chunks/s** | ~32s | instant |
-| M2 Max (CPU) | **73.5 chunks/s** | ~32s | instant |
+| Setup | Embedding speed | Wall clock (Flask, 2383 chunks) |
+|-------|----------------|-------------------------------|
+| RTX 4090 (CUDA) | **435 chunks/s** | ~5s |
+| M2 Max (Metal) | **73.8 chunks/s** | ~32s |
+| M2 Max (CPU) | **73.5 chunks/s** | ~32s |
 
-With `--index`, the first run embeds; every subsequent run searches in
-milliseconds. On a 15MB Go codebase (~15K chunks), CUDA indexes in ~35s.
-After that, searches are instant.
+**With an index** (subsequent searches): **instant** (milliseconds).
+On a 15MB Go codebase (~15K chunks), CUDA indexes in ~35s on first run.
 
 ## Supported languages
 
@@ -123,6 +138,28 @@ Tree-sitter semantic chunking (functions, classes, methods with scope context):
 Every other file type gets sliding-window plain-text chunking. The embedding
 model understands code semantics regardless of language — you can search
 YAML, SQL, Markdown, config files, anything.
+
+## How ripvec compares
+
+**vs grep / ripgrep** — ripvec finds code by meaning. grep finds code by text.
+Use both — ripvec for "find the retry logic", grep for "find `TODO`".
+
+**vs Sourcegraph / GitHub search** — ripvec runs locally on your machine. Your
+code never leaves your laptop. No servers, no subscriptions, no cloud.
+
+**vs Serena / LSP tools** — ripvec finds *what* code to look at. LSP tells you
+the *details* (definitions, references, types). They're complementary — ripvec
+answers "where is authentication handled?" and LSP answers "who calls
+`authenticate()` and what does it return?"
+
+**vs grepai / mgrep / cloud tools** — ripvec is self-contained. No Ollama, no
+API keys, no Docker, no external embedding service. One binary, bundled model
+weights, GPU acceleration on hardware you already own.
+
+**vs Bloop** — Bloop was archived in January 2025. ripvec fills the same niche
+(Rust, semantic, local, open source) with better technology: ModernBERT
+embeddings, hybrid BM25+vector ranking, PageRank repo maps, and Metal/CUDA
+GPU acceleration.
 
 ## How it works
 
