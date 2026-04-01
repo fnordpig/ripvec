@@ -1,163 +1,170 @@
 # ripvec
 
-Semantic code search — like ripgrep, but for meaning.
+**Semantic code search — like ripgrep, but for meaning.**
 
-ripvec finds code by what it *does*, not what it says. Ask "retry logic with
-exponential backoff" and get the actual implementation, even if the code never
-uses those words. Built on ModernBERT embeddings, tree-sitter chunking,
-PageRank-weighted repo maps, and cosine similarity ranking.
+```sh
+$ ripvec "retry logic with exponential backoff" ~/src/my-project
 
-## Features
+ 1. retry_handler.rs:42-78                                        [0.91]
+    pub async fn with_retry<F, T>(f: F, max_attempts: u32) -> Result<T>
+    where F: Fn() -> Future<Output = Result<T>> {
+        let mut delay = Duration::from_millis(100);
+        for attempt in 0..max_attempts {
+            match f().await {
+                Ok(v) => return Ok(v),
+                Err(e) if attempt < max_attempts - 1 => {
+                    sleep(delay).await;
+                    delay *= 2;  // exponential backoff
+    ...
 
-- **Semantic search**: natural-language queries over codebases of any size
-- **Interactive TUI**: embed once, then search as you type with live results
-- **MCP server**: plug into Claude Code, Cursor, or any MCP-compatible editor
-- **Hybrid ranking**: fuses semantic similarity with BM25 keyword matching
-- **Persistent index**: incremental re-embedding — only changed files are re-processed
-- **PageRank repo map**: structural overview ranking files by import-graph centrality
-- **GPU-accelerated**: Metal, CUDA, and MLX backends with automatic detection
+ 2. http_client.rs:156-189                                        [0.84]
+    impl HttpClient {
+        async fn request_with_backoff(&self, req: Request) -> Response {
+    ...
+```
 
-## Installation
+grep can't do this. ripvec understands what code *does*, not just what it says.
+The function is called `with_retry` and the variable is `delay` — no mention of
+"exponential backoff" anywhere — but ripvec finds it because it understands the
+*meaning*.
+
+## Why ripvec?
+
+**You describe the behavior, ripvec finds the code.**
+
+| What you're looking for | grep / ripgrep | ripvec |
+|------------------------|----------------|--------|
+| "retry with backoff" | Finds nothing (code says `delay *= 2`) | Finds the retry handler |
+| "database connection pooling" | Matches comments mentioning "pool" | Finds the actual pool implementation |
+| "authentication middleware" | Matches `// TODO: add auth` | Finds the auth guard/middleware |
+| "WebSocket lifecycle" | Matches the string "WebSocket" | Finds connect/disconnect/reconnect handlers |
+
+ripvec embeds your codebase into a vector space using ModernBERT, then ranks
+results by cosine similarity. It also fuses BM25 keyword matching for hybrid
+search that catches both meaning *and* exact terms.
+
+## Install
 
 ```sh
 cargo install ripvec ripvec-mcp
 ```
 
-On macOS, Metal and MLX backends are enabled automatically. On Linux with an
-NVIDIA GPU, build with CUDA support:
+That's it. Model weights download automatically on first run (~100MB).
+
+macOS gets Metal GPU acceleration by default. Linux gets CPU, or add CUDA:
 
 ```sh
 cargo install ripvec ripvec-mcp --features cuda
 ```
 
-### Requirements
+## Usage
 
-- Rust 1.88+ (2024 edition)
-- macOS: Xcode Command Line Tools (provides Metal framework)
-- Linux + CUDA: NVIDIA GPU with CUDA toolkit (optional, CPU fallback always available)
-
-## Quick Start
-
-### One-shot search
+### Search from the command line
 
 ```sh
-# Search the current directory
-ripvec "error handling with retries"
-
-# Search a specific project, show top 5 results
-ripvec "database connection pooling" ~/src/my-project -n 5
-
-# Use the fast model for quicker results
-ripvec "authentication middleware" --fast
+ripvec "error handling" .                    # Search current directory
+ripvec "form validation hooks" -n 5          # Top 5 results
+ripvec "database migration" --mode keyword   # BM25 only (fast, exact)
+ripvec "auth flow" --fast                    # Lighter model, 4x faster
 ```
 
-### Interactive TUI
+### Interactive TUI — search as you type
 
 ```sh
-# Launch TUI mode with persistent index
 ripvec -i --index .
-
-# Type queries interactively, results update as you type
-# Press Enter to open a result in your editor
 ```
 
-### MCP Server (for AI editors)
+Embeds your codebase once, then gives you instant search-as-you-type with
+syntax-highlighted previews. Press Enter to open in your editor.
 
-```sh
-# Start the MCP server (reads RIPVEC_ROOT or uses cwd)
-RIPVEC_ROOT=/path/to/project ripvec-mcp
-```
-
-Add to your editor's MCP config (`.mcp.json`):
+### MCP server — give your AI editor semantic search
 
 ```json
 {
   "mcpServers": {
-    "ripvec": {
-      "command": "ripvec-mcp",
-      "env": { "RIPVEC_ROOT": "/path/to/project" }
-    }
+    "ripvec": { "command": "ripvec-mcp" }
   }
 }
 ```
 
-The MCP server provides 7 tools: `search_code`, `search_text`, `find_similar`,
-`get_repo_map`, `reindex`, `index_status`, and `up_to_date`.
+Drop that in `.mcp.json` and Claude Code / Cursor gets 7 tools:
+`search_code`, `search_text`, `find_similar`, `get_repo_map`, `reindex`,
+`index_status`, `up_to_date`. Your AI can now search by meaning instead of
+grepping blindly.
 
-## Performance
+### Persistent index — skip re-embedding
 
-Throughput on ModernBERT (768-dim, 22 layers):
+```sh
+ripvec "query" --index           # First run embeds, subsequent runs are instant
+ripvec "query" --index --reindex # Force rebuild
+```
 
-| Backend | Hardware | Throughput | Notes |
-|---------|----------|-----------|-------|
-| CUDA FP16 | RTX 4090 | **435 chunks/s** | cuBLAS tensor cores + fused kernels |
-| Metal MPS FP16 | M2 Max | **73.8 chunks/s** | Production macOS default |
-| CPU (Accelerate) | M2 Max | **73.5 chunks/s** | Apple AMX coprocessor via BLAS |
-| BGE-small MPS | M2 Max | **349 chunks/s** | `--fast` flag, 384-dim model |
+Only changed files are re-embedded. Uses zstd-compressed incremental caching.
 
-## Supported Languages
+## How fast?
 
-Tree-sitter semantic chunking for:
-Rust, Python, JavaScript/TypeScript, Go, Java, C/C++
+On a Flask codebase (2,383 code chunks):
 
-All other file types fall back to sliding-window plain-text chunking.
-Semantic search works on any text file regardless of language.
+| Setup | Embedding speed | First search | Indexed search |
+|-------|----------------|-------------|---------------|
+| RTX 4090 (CUDA) | **435 chunks/s** | ~5s | instant |
+| M2 Max (Metal) | **73.8 chunks/s** | ~32s | instant |
+| M2 Max (CPU) | **73.5 chunks/s** | ~32s | instant |
 
-## Architecture
+With `--index`, the first run embeds; every subsequent run searches in
+milliseconds. On a 15MB Go codebase (~15K chunks), CUDA indexes in ~35s.
+After that, searches are instant.
+
+## Supported languages
+
+Tree-sitter semantic chunking (functions, classes, methods with scope context):
+**Rust, Python, JavaScript/TypeScript, Go, Java, C/C++**
+
+Every other file type gets sliding-window plain-text chunking. The embedding
+model understands code semantics regardless of language — you can search
+YAML, SQL, Markdown, config files, anything.
+
+## How it works
+
+1. **Walk** your codebase, respecting `.gitignore`
+2. **Chunk** files into semantic units via tree-sitter (or sliding windows)
+3. **Embed** each chunk using ModernBERT (768-dim vectors, GPU-accelerated)
+4. **Rank** by cosine similarity to your query + BM25 keyword fusion
+5. **Cache** embeddings for instant subsequent searches
+
+The search index also includes a PageRank-weighted repo map — a structural
+overview showing which files are architecturally central based on their
+import graph. Use `get_repo_map` in the MCP server or `ripvec --repo-map`.
+
+---
+
+## For contributors
+
+### Architecture
 
 Cargo workspace with three crates:
 
-| Crate | Description |
-|-------|-------------|
-| [`ripvec-core`](crates/ripvec-core) | Shared library: backends, chunking, embedding, search, repo map, cache |
-| [`ripvec`](crates/ripvec) | CLI binary with clap args and ratatui TUI |
-| [`ripvec-mcp`](crates/ripvec-mcp) | MCP server binary for AI editor integration |
+| Crate | Role |
+|-------|------|
+| [`ripvec-core`](crates/ripvec-core) | Backends, chunking, embedding, search, repo map, cache |
+| [`ripvec`](crates/ripvec) | CLI binary (clap + ratatui TUI) |
+| [`ripvec-mcp`](crates/ripvec-mcp) | MCP server binary (rmcp) |
 
-### Embedding Models
+### GPU backends
 
-- **ModernBERT** (default) — `nomic-ai/modernbert-embed-base`, 768-dim, mean pooling
-- **BGE-small-en-v1.5** (`--fast`) — `BAAI/bge-small-en-v1.5`, 384-dim, CLS pooling
-
-Model weights are downloaded automatically from Hugging Face on first run.
-
-### GPU Backends
-
-Detected automatically at startup:
-
-| Backend | Platform | Implementation |
-|---------|----------|---------------|
-| Metal | macOS (default) | Custom MSL kernels + MPS GEMMs |
-| MLX | macOS (fallback) | mlx-rs with lazy eval graph fusion |
+| Backend | Platform | How |
+|---------|----------|-----|
+| Metal | macOS (default) | Custom MSL kernels + MPS GEMMs via AMX |
+| MLX | macOS (fallback) | mlx-rs, lazy eval graph fusion |
 | CUDA | Linux | cudarc + cuBLAS FP16 tensor cores + fused NVRTC kernels |
 | CPU | Everywhere | ndarray + system BLAS (Accelerate / OpenBLAS) |
 
-Override with `--backend metal|mlx|cuda|cpu`.
+### Embedding models
 
-## Search Modes
+- **ModernBERT** (default) — `nomic-ai/modernbert-embed-base`, 768-dim, mean pooling, 22 layers
+- **BGE-small** (`--fast`) — `BAAI/bge-small-en-v1.5`, 384-dim, CLS pooling, 12 layers
 
-```sh
-ripvec "query" --mode hybrid    # Default: semantic + BM25 fusion
-ripvec "query" --mode semantic  # Pure vector similarity
-ripvec "query" --mode keyword   # Pure BM25 keyword matching
-```
-
-## Persistent Index
-
-```sh
-# Build index on first run, reuse on subsequent runs
-ripvec "query" --index
-
-# Force full rebuild
-ripvec "query" --index --reindex
-
-# Clear cached index
-ripvec --clear-cache
-```
-
-The index uses zstd-compressed object storage with incremental re-embedding.
-Only files that changed since the last run are re-processed.
-
-## Documentation
+### Docs
 
 - [Metal/MPS Architecture](docs/METAL_MPS_ARCHITECTURE.md)
 - [CUDA Architecture](docs/CUDA_ARCHITECTURE.md)
@@ -165,9 +172,4 @@ Only files that changed since the last run are re-processed.
 
 ## License
 
-Licensed under either of
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
-- MIT License ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
-
-at your option.
+Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at your option.
