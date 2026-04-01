@@ -252,16 +252,16 @@ dependencies = [
 
 [[package]]
 name = "blake3"
-version = "1.8.3"
+version = "1.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2468ef7d57b3fb7e16b576e8377cdbde2320c60e1491e961d11da40fc4f02a2d"
+checksum = "4d2d5991425dfd0785aed03aedcf0b321d61975c9b5b3689c774a2610ae0b51e"
 dependencies = [
  "arrayref",
  "arrayvec",
  "cc",
  "cfg-if",
  "constant_time_eq",
- "cpufeatures 0.2.17",
+ "cpufeatures",
 ]
 
 [[package]]
@@ -441,7 +441,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6f8d983286843e49675a4b7a2d174efe136dc93a18d69130dd18198a6c167601"
 dependencies = [
  "cfg-if",
- "cpufeatures 0.3.0",
+ "cpufeatures",
  "rand_core 0.10.0",
 ]
 
@@ -665,15 +665,6 @@ name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
-
-[[package]]
-name = "cpufeatures"
-version = "0.2.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280"
-dependencies = [
- "libc",
-]
 
 [[package]]
 name = "cpufeatures"
@@ -2471,9 +2462,9 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
 name = "openblas-build"
-version = "0.10.14"
+version = "0.10.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20d370acc586f21e12b1922e462439f0e98412e617f7642eb5e63df7ea211066"
+checksum = "cd235aa8876fa5c4be452efde09b9b8bafa19aea0bf14a4926508213082439a3"
 dependencies = [
  "anyhow",
  "cc",
@@ -2485,9 +2476,9 @@ dependencies = [
 
 [[package]]
 name = "openblas-src"
-version = "0.10.14"
+version = "0.10.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e1042a867cd2effa3a188ab302acd8851b7eac58a7ae06496456e1172a1b456"
+checksum = "fccd2c4f5271ab871f2069cb6f1a13ef2c0db50e1145ce03428ee541f4c63c4f"
 dependencies = [
  "dirs",
  "openblas-build",
@@ -3316,9 +3307,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp"
-version = "1.2.0"
+version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba6b9d2f0efe2258b23767f1f9e0054cfbcac9c2d6f81a031214143096d7864f"
+checksum = "2231b2c085b371c01bc90c0e6c1cab8834711b6394533375bdbf870b0166d419"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3338,9 +3329,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp-macros"
-version = "1.2.0"
+version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab9d95d7ed26ad8306352b0d5f05b593222b272790564589790d210aa15caa9e"
+checksum = "36ea0e100fadf81be85d7ff70f86cd805c7572601d4ab2946207f36540854b43"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
