@@ -155,6 +155,7 @@ impl RipvecServer {
             repo_graph: Arc::new(std::sync::RwLock::new(None)),
             root_indices: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             root_graphs: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            progress: Arc::new(crate::server::IndexProgress::default()),
         }
     }
 
@@ -291,10 +292,7 @@ impl RipvecServer {
             let idx_guard = self.index.read().await;
             if idx_guard.is_none() {
                 return Err(if self.indexing.load(Ordering::SeqCst) {
-                    rmcp::ErrorData::internal_error(
-                        "Index is still building. Try again shortly.".to_string(),
-                        None,
-                    )
+                    rmcp::ErrorData::internal_error(self.progress.format_message(), None)
                 } else {
                     rmcp::ErrorData::internal_error(
                         "No index available. Call reindex first.".to_string(),
@@ -794,10 +792,7 @@ impl RipvecServer {
                 .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
             default_guard.as_ref().ok_or_else(|| {
                 if self.indexing.load(std::sync::atomic::Ordering::SeqCst) {
-                    rmcp::ErrorData::internal_error(
-                        "Repository graph is still building. Try again shortly.".to_string(),
-                        None,
-                    )
+                    rmcp::ErrorData::internal_error(self.progress.format_message(), None)
                 } else {
                     rmcp::ErrorData::internal_error(
                         "No repository graph available. Call reindex first.".to_string(),

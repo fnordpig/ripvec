@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use rmcp::handler::server::tool::ToolRouter;
 use tokio::sync::{OnceCell, RwLock};
@@ -17,6 +17,74 @@ struct IndexingGuard(Arc<AtomicBool>);
 impl Drop for IndexingGuard {
     fn drop(&mut self) {
         self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Shared progress state for background indexing, readable by tool handlers.
+///
+/// All fields are atomics so they can be written from a blocking thread
+/// and read from async tool handlers without locks.
+#[derive(Default)]
+pub struct IndexProgress {
+    /// Current phase: 0=idle, 1=loading model, 2=walking, 3=embedding, 4=building index.
+    pub phase: AtomicU64,
+    /// Total files found during walk.
+    pub total_files: AtomicU64,
+    /// Files processed so far (cached + re-embedded).
+    pub done_files: AtomicU64,
+    /// Timestamp (epoch millis) when indexing started.
+    pub started_ms: AtomicU64,
+}
+
+impl IndexProgress {
+    /// Format a human-readable progress message for tool error responses.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "epoch millis and ETA seconds always fit in u64 in practice"
+    )]
+    pub fn format_message(&self) -> String {
+        let phase = self.phase.load(Ordering::Relaxed);
+        let total = self.total_files.load(Ordering::Relaxed);
+        let done = self.done_files.load(Ordering::Relaxed);
+        let started = self.started_ms.load(Ordering::Relaxed);
+
+        let elapsed = if started > 0 {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            (now.saturating_sub(started)) / 1000
+        } else {
+            0
+        };
+
+        match phase {
+            1 => "Index is building: loading embedding model... (first run downloads ~100MB)"
+                .to_string(),
+            2 => format!("Index is building: scanning files... ({elapsed}s elapsed)"),
+            3 if total > 0 => {
+                let pct = if total > 0 { done * 100 / total } else { 0 };
+                let eta = if done > 0 && elapsed > 0 {
+                    let remaining = total.saturating_sub(done);
+                    let rate = done as f64 / elapsed as f64;
+                    if rate > 0.0 {
+                        format!(", ~{}s remaining", (remaining as f64 / rate) as u64)
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+                format!(
+                    "Index is building: embedding {done}/{total} files ({pct}%, {elapsed}s elapsed{eta}). \
+                     Try again in a moment — subsequent calls will be instant once cached."
+                )
+            }
+            3 => format!("Index is building: embedding files... ({elapsed}s elapsed)"),
+            4 => format!("Index is building: finalizing search index... ({elapsed}s elapsed)"),
+            _ => "Index is still building. Try again shortly.".to_string(),
+        }
     }
 }
 
@@ -48,6 +116,8 @@ pub struct RipvecServer {
     pub root_graphs: Arc<
         std::sync::RwLock<std::collections::HashMap<PathBuf, ripvec_core::repo_map::RepoGraph>>,
     >,
+    /// Shared progress state for background indexing.
+    pub progress: Arc<IndexProgress>,
 }
 
 impl rmcp::ServerHandler for RipvecServer {
@@ -186,7 +256,7 @@ impl rmcp::ServerHandler for RipvecServer {
 
         let rendered = match graph_guard.as_ref() {
             Some(graph) => ripvec_core::repo_map::render(graph, 1500, None),
-            None => "Repository graph not yet available. Index is still building.".to_string(),
+            None => self.progress.format_message(),
         };
 
         Ok(rmcp::model::ReadResourceResult::new(vec![
@@ -200,6 +270,10 @@ impl rmcp::ServerHandler for RipvecServer {
 /// Sets `server.indexing` to `true` during the operation and `false` when done.
 /// The indexing flag is managed via an RAII guard so it resets even on panic.
 /// Errors are logged to stderr rather than propagated.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "epoch millis fit in u64 until year 584942"
+)]
 pub async fn run_background_index(server: &RipvecServer) {
     if server
         .indexing
@@ -215,11 +289,24 @@ pub async fn run_background_index(server: &RipvecServer) {
 
     let root = server.project_root.clone();
     let index_lock = Arc::clone(&server.index);
+    let progress = Arc::clone(&server.progress);
+
+    // Record start time
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    progress.started_ms.store(now_ms, Ordering::Relaxed);
+    progress.phase.store(1, Ordering::Relaxed); // loading model
 
     let result = tokio::task::spawn_blocking(move || {
         let model_repo = "nomic-ai/modernbert-embed-base";
+
+        progress.phase.store(1, Ordering::Relaxed);
         let backends = ripvec_core::backend::detect_backends(model_repo)?;
         let tokenizer = ripvec_core::tokenize::load_tokenizer(model_repo)?;
+
+        progress.phase.store(2, Ordering::Relaxed); // walking
         let cfg = ripvec_core::embed::SearchConfig::default();
         let profiler = ripvec_core::profile::Profiler::noop();
 
@@ -227,6 +314,7 @@ pub async fn run_background_index(server: &RipvecServer) {
             backends.iter().map(AsRef::as_ref).collect();
 
         // Use persistent cache for instant restarts
+        progress.phase.store(3, Ordering::Relaxed); // embedding
         let (index, stats) = ripvec_core::cache::reindex::incremental_index(
             &root,
             &backend_refs,
@@ -236,6 +324,14 @@ pub async fn run_background_index(server: &RipvecServer) {
             model_repo,
             None,
         )?;
+
+        progress.phase.store(4, Ordering::Relaxed); // building index
+        progress
+            .total_files
+            .store(stats.chunks_total as u64, Ordering::Relaxed);
+        progress
+            .done_files
+            .store(stats.chunks_total as u64, Ordering::Relaxed);
 
         Ok::<_, ripvec_core::Error>((index, stats))
     })
@@ -252,12 +348,15 @@ pub async fn run_background_index(server: &RipvecServer) {
             );
             let mut idx = index_lock.write().await;
             *idx = Some(new_index);
+            server.progress.phase.store(0, Ordering::Relaxed);
         }
         Ok(Err(e)) => {
+            server.progress.phase.store(0, Ordering::Relaxed);
             error!("background indexing failed: {e}");
             eprintln!("[ripvec-mcp] indexing error: {e}");
         }
         Err(e) => {
+            server.progress.phase.store(0, Ordering::Relaxed);
             error!("background indexing task panicked: {e}");
             eprintln!("[ripvec-mcp] indexing panic: {e}");
         }
