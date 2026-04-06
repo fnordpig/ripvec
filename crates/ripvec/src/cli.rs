@@ -130,6 +130,14 @@ pub struct Args {
     #[arg(long, requires = "index")]
     pub reindex: bool,
 
+    /// Store the index in `.ripvec/cache/` at the project root (repo-local).
+    ///
+    /// Creates `.ripvec/config.toml` on first use. The index can then be
+    /// committed to git so teammates get instant search without re-embedding.
+    /// Requires `--index`.
+    #[arg(long, requires = "index")]
+    pub repo_level: bool,
+
     /// Clear the persistent index cache for this project and exit.
     #[arg(long)]
     pub clear_cache: bool,

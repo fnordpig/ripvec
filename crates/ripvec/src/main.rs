@@ -257,6 +257,7 @@ fn run_interactive(
             &live_profiler,
             &model_repo,
             args.cache_dir.as_deref().map(std::path::Path::new),
+            args.repo_level,
         )
         .context("incremental index failed")?;
 
@@ -432,6 +433,7 @@ fn run_oneshot(
             profiler,
             &model_repo,
             args.cache_dir.as_deref().map(std::path::Path::new),
+            args.repo_level,
         )
         .context("incremental index failed")?;
 
