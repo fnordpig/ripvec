@@ -9,7 +9,9 @@ use crate::chunk::CodeChunk;
 ///
 /// Stored as an rkyv archive in the object store, keyed by the blake3
 /// hash of the source file content.
-#[derive(Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(
+    Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, bitcode::Encode, bitcode::Decode,
+)]
 pub struct FileCache {
     /// The semantic chunks extracted from this file.
     pub chunks: Vec<CodeChunk>,
