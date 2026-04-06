@@ -645,6 +645,12 @@ impl RipvecServer {
                 None => (false, 0, 0, HashMap::new()),
             };
 
+            let cache_dir = ripvec_core::cache::reindex::resolve_cache_dir(
+                &canonical,
+                "nomic-ai/modernbert-embed-base",
+                None,
+            );
+            let is_repo_local = cache_dir.components().any(|c| c.as_os_str() == ".ripvec");
             let response = serde_json::json!({
                 "ready": ready,
                 "indexing": false,
@@ -652,6 +658,8 @@ impl RipvecServer {
                 "files": files_count,
                 "extensions": ext_counts,
                 "project_root": canonical.display().to_string(),
+                "cache_location": cache_dir.display().to_string(),
+                "repo_local": is_repo_local,
             });
             let json = serde_json::to_string_pretty(&response)
                 .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
@@ -680,6 +688,12 @@ impl RipvecServer {
                 None => (0, 0, HashMap::new()),
             };
 
+            let cache_dir = ripvec_core::cache::reindex::resolve_cache_dir(
+                &self.project_root,
+                "nomic-ai/modernbert-embed-base",
+                None,
+            );
+            let is_repo_local = cache_dir.components().any(|c| c.as_os_str() == ".ripvec");
             let response = serde_json::json!({
                 "ready": ready,
                 "indexing": is_indexing,
@@ -687,6 +701,8 @@ impl RipvecServer {
                 "files": files_count,
                 "extensions": ext_counts,
                 "project_root": self.project_root.display().to_string(),
+                "cache_location": cache_dir.display().to_string(),
+                "repo_local": is_repo_local,
             });
             let json = serde_json::to_string_pretty(&response)
                 .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
