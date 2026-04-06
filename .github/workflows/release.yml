@@ -54,20 +54,60 @@ jobs:
           fi
 
   build:
-    name: Build (${{ matrix.target }})
+    name: Build (${{ matrix.name }})
     needs: [prepare]
     if: needs.prepare.outputs.should_release == 'true'
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          # CPU-only Linux x86_64
+          - name: linux-x86_64
+            target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            features: ""
+            suffix: ""
+            container: ""
             apt: libopenblas-dev
-          - target: aarch64-apple-darwin
-            os: macos-latest
+
+          # CUDA Linux x86_64
+          - name: linux-x86_64-cuda
+            target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            features: "--features cuda"
+            suffix: "-cuda"
+            container: "nvidia/cuda:13.1.0-devel-ubuntu24.04"
             apt: ""
+
+          # CPU-only Linux ARM64 (Graviton)
+          - name: linux-arm64
+            target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            features: ""
+            suffix: ""
+            container: ""
+            apt: libopenblas-dev
+
+          # CUDA Linux ARM64
+          - name: linux-arm64-cuda
+            target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            features: "--features cuda"
+            suffix: "-cuda"
+            container: "nvidia/cuda:13.1.0-devel-ubuntu24.04"
+            apt: ""
+
+          # macOS ARM64 (Apple Silicon — Metal + MLX auto-enabled)
+          - name: macos-arm64
+            target: aarch64-apple-darwin
+            os: macos-latest
+            features: ""
+            suffix: ""
+            container: ""
+            apt: ""
+
     runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container || null }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -77,19 +117,24 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.target }}
+          key: release-${{ matrix.name }}
 
       - name: Install system dependencies
         if: matrix.apt != ''
-        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
+        run: |
+          if command -v sudo &>/dev/null; then
+            sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
+          else
+            apt-get update && apt-get install -y ${{ matrix.apt }}
+          fi
 
       - name: Build release binaries
-        run: cargo build --release --workspace
+        run: cargo build --release --workspace ${{ matrix.features }}
 
       - name: Package binaries
         run: |
           tag="${{ needs.prepare.outputs.version }}"
-          staging="ripvec-${tag}-${{ matrix.target }}"
+          staging="ripvec-${tag}-${{ matrix.target }}${{ matrix.suffix }}"
           mkdir -p "$staging"
           cp target/release/ripvec "$staging/" 2>/dev/null || true
           cp target/release/ripvec-mcp "$staging/" 2>/dev/null || true
@@ -99,7 +144,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.target }}
+          name: ${{ matrix.name }}
           path: ${{ env.ASSET }}
 
   release:
