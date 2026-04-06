@@ -274,6 +274,10 @@ impl rmcp::ServerHandler for RipvecServer {
     clippy::cast_possible_truncation,
     reason = "epoch millis fit in u64 until year 584942"
 )]
+#[expect(
+    clippy::too_many_lines,
+    reason = "progress tracking + graph building in one function"
+)]
 pub async fn run_background_index(server: &RipvecServer, repo_level: bool) {
     if server
         .indexing
