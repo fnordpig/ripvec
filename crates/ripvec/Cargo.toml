@@ -46,6 +46,11 @@ ripvec-core = { path = "../ripvec-core", version = "0.10.0", features = ["metal"
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 ripvec-core = { path = "../ripvec-core", version = "0.10.0", features = ["cpu"] }
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/ripvec-v{ version }-{ target }.tar.gz"
+bin-dir = "ripvec-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
 [dev-dependencies]
 assert_cmd.workspace = true
 predicates.workspace = true
