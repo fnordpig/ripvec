@@ -117,6 +117,31 @@ else loads from zstd-compressed cache (~8x smaller than raw). The MCP server
 uses this with a file watcher for **live re-indexing** as you edit code (2-second
 debounce).
 
+### Repo-Level Indexing
+
+Share pre-built search indices with your team by storing them in the repo:
+
+```bash
+ripvec --index --repo-level "your query"
+```
+
+This creates `.ripvec/` at the project root — commit it to git:
+
+```bash
+git add .ripvec/
+git commit -m "chore: add ripvec search index"
+```
+
+Teammates who clone the repo get instant semantic search with zero embedding time.
+The index auto-validates on first use (content hashes are checked, not file timestamps).
+
+For large repos where the index is too big to commit, add to `.gitignore`:
+```
+.ripvec/cache/objects/
+```
+This keeps the config but skips the embedding data — teammates will re-embed on first use
+but benefit from incremental updates afterward.
+
 ## How fast?
 
 **Without an index** (one-shot search):

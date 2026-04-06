@@ -67,6 +67,15 @@ Cargo workspace with three crates:
 - `--mode keyword` — pure BM25 keyword matching
 - `--index` enables persistent cache with incremental re-embedding
 
+## Cache resolution
+1. `--cache-dir` override (highest priority)
+2. `.ripvec/config.toml` in directory tree → `.ripvec/cache/` (repo-local)
+3. `RIPVEC_CACHE` environment variable
+4. `~/.cache/ripvec/` (default)
+
+Use `--repo-level --index` to create a repo-local index. Subsequent runs
+auto-detect `.ripvec/` — no flag needed.
+
 ## Key invariants
 - Model weights (~33-100MB) must NOT be committed to git
 - Metal: `_mmap` field must outlive `weight_buffer` (drop order matters)
