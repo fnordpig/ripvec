@@ -337,7 +337,8 @@ fn full_index_path(
 }
 
 /// Check if the resolved cache directory is inside a `.ripvec/` directory.
-fn is_repo_local(cache_dir: &Path) -> bool {
+#[must_use]
+pub fn is_repo_local(cache_dir: &Path) -> bool {
     cache_dir.components().any(|c| c.as_os_str() == ".ripvec")
 }
 
@@ -413,9 +414,17 @@ pub fn resolve_cache_dir(root: &Path, model_repo: &str, override_dir: Option<&Pa
         return dir.join(&project_hash).join(version_dir);
     }
 
-    // Priority 2: repo-local .ripvec/config.toml
-    if let Some(ripvec_dir) = crate::cache::config::find_repo_config(root) {
-        return ripvec_dir.join("cache");
+    // Priority 2: repo-local .ripvec/config.toml (with model validation)
+    if let Some(ripvec_dir) = crate::cache::config::find_repo_config(root)
+        && let Ok(config) = crate::cache::config::RepoConfig::load(&ripvec_dir)
+    {
+        if config.cache.model == model_repo {
+            return ripvec_dir.join("cache");
+        }
+        eprintln!(
+            "[ripvec] repo-local index model mismatch: config has '{}', runtime wants '{}' — falling back to user cache",
+            config.cache.model, model_repo
+        );
     }
 
     // Priority 3+4: env var or XDG

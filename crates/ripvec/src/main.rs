@@ -18,21 +18,33 @@ fn main() -> Result<()> {
     }
 
     // Handle --clear-cache early (before loading anything).
-    // Clears ALL model variants for this project (removes the project hash dir).
+    // For repo-local caches, clears .ripvec/cache/ only (preserves config.toml).
+    // For user-level caches, clears ALL model variants (removes the project hash dir).
     if args.clear_cache {
         let root = std::path::Path::new(&args.path);
-        // Pass a dummy model — we want the parent (project hash) dir.
-        let version_dir = ripvec_core::cache::reindex::resolve_cache_dir(
-            root,
-            "dummy",
-            args.cache_dir.as_deref().map(std::path::Path::new),
-        );
-        let cache_dir = version_dir.parent().unwrap_or(&version_dir);
-        if cache_dir.exists() {
-            std::fs::remove_dir_all(cache_dir).context("failed to clear cache")?;
-            eprintln!("Cache cleared: {}", cache_dir.display());
+        // Check for repo-local config first
+        if let Some(ripvec_dir) = ripvec_core::cache::config::find_repo_config(root) {
+            let cache_dir = ripvec_dir.join("cache");
+            if cache_dir.exists() {
+                std::fs::remove_dir_all(&cache_dir).context("failed to clear repo-local cache")?;
+                eprintln!("Repo-local cache cleared: {}", cache_dir.display());
+            } else {
+                eprintln!("No repo-local cache found at {}", cache_dir.display());
+            }
         } else {
-            eprintln!("No cache found at {}", cache_dir.display());
+            // User-level cache: pass a dummy model to get parent dir
+            let version_dir = ripvec_core::cache::reindex::resolve_cache_dir(
+                root,
+                "dummy",
+                args.cache_dir.as_deref().map(std::path::Path::new),
+            );
+            let cache_dir = version_dir.parent().unwrap_or(&version_dir);
+            if cache_dir.exists() {
+                std::fs::remove_dir_all(cache_dir).context("failed to clear cache")?;
+                eprintln!("Cache cleared: {}", cache_dir.display());
+            } else {
+                eprintln!("No cache found at {}", cache_dir.display());
+            }
         }
         return Ok(());
     }

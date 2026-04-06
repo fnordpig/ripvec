@@ -650,7 +650,7 @@ impl RipvecServer {
                 "nomic-ai/modernbert-embed-base",
                 None,
             );
-            let is_repo_local = cache_dir.components().any(|c| c.as_os_str() == ".ripvec");
+            let is_repo_local = ripvec_core::cache::reindex::is_repo_local(&cache_dir);
             let response = serde_json::json!({
                 "ready": ready,
                 "indexing": false,
@@ -693,7 +693,7 @@ impl RipvecServer {
                 "nomic-ai/modernbert-embed-base",
                 None,
             );
-            let is_repo_local = cache_dir.components().any(|c| c.as_os_str() == ".ripvec");
+            let is_repo_local = ripvec_core::cache::reindex::is_repo_local(&cache_dir);
             let response = serde_json::json!({
                 "ready": ready,
                 "indexing": is_indexing,
