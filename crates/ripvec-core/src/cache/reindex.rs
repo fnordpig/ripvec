@@ -330,34 +330,35 @@ fn load_all_from_store(
 
 /// Resolve the cache directory for a project + model combination.
 ///
-/// Layout: `<base>/<project_hash>/v<VERSION>-<model_slug>/`
+/// Resolution priority:
+/// 1. `override_dir` parameter (highest)
+/// 2. `.ripvec/config.toml` in directory tree (repo-local)
+/// 3. `RIPVEC_CACHE` environment variable
+/// 4. XDG cache dir (`~/.cache/ripvec/`)
 ///
-/// Encoding the version and model into the directory name means switching
-/// models creates a new cache dir (no migration needed) and bumping
-/// [`MANIFEST_VERSION`](super::manifest::MANIFEST_VERSION) auto-invalidates
-/// old caches (they're just orphaned directories).
+/// For repo-local, the cache lives at `.ripvec/cache/` directly (no project hash
+/// or version subdirectory — the config.toml pins the model and version).
 ///
-/// Priority: override > `RIPVEC_CACHE` env > XDG cache dir.
+/// For user-level cache, layout is `<base>/<project_hash>/v<VERSION>-<model_slug>/`.
 #[must_use]
 pub fn resolve_cache_dir(root: &Path, model_repo: &str, override_dir: Option<&Path>) -> PathBuf {
-    let project_hash = {
-        let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-        blake3::hash(canonical.to_string_lossy().as_bytes())
-            .to_hex()
-            .to_string()
-    };
+    // Priority 1: explicit override
+    if let Some(dir) = override_dir {
+        let project_hash = hash_project_root(root);
+        let version_dir = format_version_dir(model_repo);
+        return dir.join(&project_hash).join(version_dir);
+    }
 
-    // e.g. "nomic-ai/modernbert-embed-base" → "modernbert-embed-base"
-    let model_slug = model_repo
-        .rsplit('/')
-        .next()
-        .unwrap_or(model_repo)
-        .to_lowercase();
-    let version_dir = format!("v{}-{model_slug}", crate::cache::manifest::MANIFEST_VERSION);
+    // Priority 2: repo-local .ripvec/config.toml
+    if let Some(ripvec_dir) = crate::cache::config::find_repo_config(root) {
+        return ripvec_dir.join("cache");
+    }
 
-    let base = if let Some(dir) = override_dir {
-        dir.join(&project_hash)
-    } else if let Ok(env_dir) = std::env::var("RIPVEC_CACHE") {
+    // Priority 3+4: env var or XDG
+    let project_hash = hash_project_root(root);
+    let version_dir = format_version_dir(model_repo);
+
+    let base = if let Ok(env_dir) = std::env::var("RIPVEC_CACHE") {
         PathBuf::from(env_dir).join(&project_hash)
     } else {
         dirs::cache_dir()
@@ -367,4 +368,70 @@ pub fn resolve_cache_dir(root: &Path, model_repo: &str, override_dir: Option<&Pa
     };
 
     base.join(version_dir)
+}
+
+/// Blake3 hash of the canonical project root path.
+fn hash_project_root(root: &Path) -> String {
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    blake3::hash(canonical.to_string_lossy().as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+/// Format the version subdirectory name from model repo.
+fn format_version_dir(model_repo: &str) -> String {
+    let model_slug = model_repo
+        .rsplit('/')
+        .next()
+        .unwrap_or(model_repo)
+        .to_lowercase();
+    format!("v{}-{model_slug}", crate::cache::manifest::MANIFEST_VERSION)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn resolve_uses_repo_local_when_present() {
+        let dir = TempDir::new().unwrap();
+        let cfg = crate::cache::config::RepoConfig::new("nomic-ai/modernbert-embed-base", "3");
+        cfg.save(&dir.path().join(".ripvec")).unwrap();
+
+        let result = resolve_cache_dir(dir.path(), "nomic-ai/modernbert-embed-base", None);
+        assert!(
+            result.starts_with(dir.path().join(".ripvec").join("cache")),
+            "expected repo-local cache dir, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_falls_back_to_user_cache_when_no_config() {
+        let dir = TempDir::new().unwrap();
+        let result = resolve_cache_dir(dir.path(), "nomic-ai/modernbert-embed-base", None);
+        assert!(
+            !result.to_string_lossy().contains(".ripvec"),
+            "should not use repo-local without config, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_override_takes_priority_over_repo_local() {
+        let dir = TempDir::new().unwrap();
+        let override_dir = TempDir::new().unwrap();
+
+        let cfg = crate::cache::config::RepoConfig::new("nomic-ai/modernbert-embed-base", "3");
+        cfg.save(&dir.path().join(".ripvec")).unwrap();
+
+        let result = resolve_cache_dir(
+            dir.path(),
+            "nomic-ai/modernbert-embed-base",
+            Some(override_dir.path()),
+        );
+        assert!(
+            !result.starts_with(dir.path().join(".ripvec")),
+            "override should win over repo-local, got: {result:?}"
+        );
+    }
 }
