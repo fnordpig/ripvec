@@ -124,7 +124,13 @@ fn import_query_for_extension(ext: &str) -> Option<(tree_sitter::Language, Query
         ),
         _ => return None,
     };
-    let query = Query::new(&lang, query_str).ok()?;
+    let query = match Query::new(&lang, query_str) {
+        Ok(q) => q,
+        Err(e) => {
+            tracing::warn!(ext, %e, "import query compilation failed — language may be ABI-incompatible");
+            return None;
+        }
+    };
     Some((lang, query))
 }
 

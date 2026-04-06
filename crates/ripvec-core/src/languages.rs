@@ -127,7 +127,13 @@ fn compile_config(ext: &str) -> Option<LangConfig> {
         ),
         _ => return None,
     };
-    let query = Query::new(&lang, query_str).ok()?;
+    let query = match Query::new(&lang, query_str) {
+        Ok(q) => q,
+        Err(e) => {
+            tracing::warn!(ext, %e, "tree-sitter query compilation failed — language may be ABI-incompatible");
+            return None;
+        }
+    };
     Some(LangConfig {
         language: lang,
         query,
