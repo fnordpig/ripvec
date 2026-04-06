@@ -77,7 +77,7 @@ jobs:
             features: "--features cuda"
             suffix: "-cuda"
             container: "nvidia/cuda:13.1.0-devel-ubuntu24.04"
-            apt: ""
+            apt: libopenblas-dev
 
           # CPU-only Linux ARM64 (Graviton)
           - name: linux-arm64
@@ -95,7 +95,7 @@ jobs:
             features: "--features cuda"
             suffix: "-cuda"
             container: "nvidia/cuda:13.1.0-devel-ubuntu24.04"
-            apt: ""
+            apt: libopenblas-dev
 
           # macOS ARM64 (Apple Silicon — Metal + MLX auto-enabled)
           - name: macos-arm64
