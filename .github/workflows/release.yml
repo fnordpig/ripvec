@@ -125,6 +125,7 @@ jobs:
 
       - name: Install system dependencies
         if: matrix.apt != ''
+        shell: bash
         run: |
           if command -v sudo &>/dev/null; then
             sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
