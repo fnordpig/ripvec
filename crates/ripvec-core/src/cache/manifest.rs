@@ -47,7 +47,7 @@ pub struct FileEntry {
 }
 
 /// Current cache format version. Bump to invalidate all existing caches.
-pub const MANIFEST_VERSION: u32 = 2;
+pub const MANIFEST_VERSION: u32 = 3;
 
 impl Manifest {
     /// Create a new empty manifest for the given model.
