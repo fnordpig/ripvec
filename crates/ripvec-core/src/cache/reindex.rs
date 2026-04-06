@@ -52,6 +52,7 @@ pub fn incremental_index(
     profiler: &Profiler,
     model_repo: &str,
     cache_dir_override: Option<&Path>,
+    repo_level: bool,
 ) -> crate::Result<(HybridIndex, ReindexStats)> {
     let start = Instant::now();
 
@@ -61,7 +62,22 @@ pub fn incremental_index(
         )));
     }
 
+    // When repo_level is requested, ensure .ripvec/config.toml exists
+    // so that resolve_cache_dir will find it and use the repo-local path.
+    if repo_level {
+        let ripvec_dir = root.join(".ripvec");
+        let config_path = ripvec_dir.join("config.toml");
+        if !config_path.exists() {
+            let config = crate::cache::config::RepoConfig::new(
+                model_repo,
+                crate::cache::manifest::MANIFEST_VERSION.to_string(),
+            );
+            config.save(&ripvec_dir)?;
+        }
+    }
+
     let cache_dir = resolve_cache_dir(root, model_repo, cache_dir_override);
+    let portable = is_repo_local(&cache_dir);
     let manifest_path = cache_dir.join("manifest.json");
     let objects_dir = cache_dir.join("objects");
     let store = ObjectStore::new(&objects_dir);
@@ -73,12 +89,13 @@ pub fn incremental_index(
         // Incremental path: diff → re-embed dirty → merge
         incremental_path(
             root, backends, tokenizer, cfg, profiler, model_repo, &cache_dir, &store, manifest,
-            start,
+            start, portable,
         )
     } else {
         // Cold path: full embed
         full_index_path(
             root, backends, tokenizer, cfg, profiler, model_repo, &cache_dir, &store, start,
+            portable,
         )
     }
 }
@@ -100,6 +117,7 @@ fn incremental_path(
     store: &ObjectStore,
     mut manifest: Manifest,
     start: Instant,
+    portable: bool,
 ) -> crate::Result<(HybridIndex, ReindexStats)> {
     let diff_result = diff::compute_diff(root, &manifest)?;
 
@@ -177,7 +195,12 @@ fn incremental_path(
             embeddings: good_embeddings.iter().flatten().copied().collect(),
             hidden_dim,
         };
-        store.write(&content_hash, &file_cache.to_bytes())?;
+        let bytes = if portable {
+            file_cache.to_portable_bytes()
+        } else {
+            file_cache.to_bytes()
+        };
+        store.write(&content_hash, &bytes)?;
 
         // Update manifest
         let mtime = diff::mtime_secs(dirty_path);
@@ -185,6 +208,11 @@ fn incremental_path(
         manifest.add_file(&relative, mtime, size, &content_hash, good_chunks.len());
         new_chunks_count += good_chunks.len();
     }
+
+    // Heal stale mtimes (e.g., after git clone where all mtimes are wrong
+    // but content hashes match). This ensures the fast-path mtime check
+    // works on subsequent runs.
+    heal_manifest_mtimes(root, &mut manifest);
 
     // Recompute Merkle hashes
     manifest.recompute_hashes();
@@ -230,6 +258,7 @@ fn full_index_path(
     cache_dir: &Path,
     store: &ObjectStore,
     start: Instant,
+    portable: bool,
 ) -> crate::Result<(HybridIndex, ReindexStats)> {
     let (chunks, embeddings) = crate::embed::embed_all(root, backends, tokenizer, cfg, profiler)?;
 
@@ -270,7 +299,12 @@ fn full_index_path(
             embeddings: flat_emb,
             hidden_dim,
         };
-        store.write(&content_hash, &fc.to_bytes())?;
+        let bytes = if portable {
+            fc.to_portable_bytes()
+        } else {
+            fc.to_bytes()
+        };
+        store.write(&content_hash, &bytes)?;
 
         let relative = file_path_buf
             .strip_prefix(root)
@@ -302,6 +336,36 @@ fn full_index_path(
     ))
 }
 
+/// Check if the resolved cache directory is inside a `.ripvec/` directory.
+fn is_repo_local(cache_dir: &Path) -> bool {
+    cache_dir.components().any(|c| c.as_os_str() == ".ripvec")
+}
+
+/// Update manifest file mtimes to match the current filesystem.
+///
+/// After a git clone, all file mtimes are set to clone time, making the
+/// fast-path mtime check miss on every file. This function updates the
+/// manifest mtimes so subsequent diffs use the fast path.
+pub fn heal_manifest_mtimes(root: &Path, manifest: &mut Manifest) {
+    for (relative, entry) in &mut manifest.files {
+        let file_path = root.join(relative);
+        let mtime = diff::mtime_secs(&file_path);
+        if mtime != entry.mtime_secs {
+            entry.mtime_secs = mtime;
+        }
+    }
+}
+
+/// Load a `FileCache` from bytes, auto-detecting the format.
+/// Checks for bitcode magic first (portable), then falls back to rkyv.
+fn load_file_cache(bytes: &[u8]) -> crate::Result<FileCache> {
+    if bytes.len() >= 2 && bytes[..2] == [0x42, 0x43] {
+        FileCache::from_portable_bytes(bytes)
+    } else {
+        FileCache::from_bytes(bytes)
+    }
+}
+
 /// Load all cached chunks and embeddings from the object store.
 fn load_all_from_store(
     store: &ObjectStore,
@@ -312,7 +376,7 @@ fn load_all_from_store(
 
     for entry in manifest.files.values() {
         let bytes = store.read(&entry.content_hash)?;
-        let fc = FileCache::from_bytes(&bytes)?;
+        let fc = load_file_cache(&bytes)?;
         let dim = fc.hidden_dim;
 
         for (i, chunk) in fc.chunks.into_iter().enumerate() {
@@ -392,6 +456,37 @@ fn format_version_dir(model_repo: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn heal_stale_mtimes() {
+        use crate::cache::diff;
+        use crate::cache::manifest::Manifest;
+        use std::io::Write;
+
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("test.rs");
+        let content = "fn main() {}";
+        {
+            let mut f = std::fs::File::create(&file_path).unwrap();
+            f.write_all(content.as_bytes()).unwrap();
+        }
+
+        // Create manifest with correct content hash but wrong mtime
+        let content_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
+        let mut manifest = Manifest::new("test-model");
+        manifest.add_file(
+            "test.rs",
+            9_999_999, // deliberately wrong mtime
+            content.len() as u64,
+            &content_hash,
+            1,
+        );
+
+        // After heal, the manifest mtime should match the filesystem
+        heal_manifest_mtimes(dir.path(), &mut manifest);
+        let actual_mtime = diff::mtime_secs(&file_path);
+        assert_eq!(manifest.files["test.rs"].mtime_secs, actual_mtime);
+    }
 
     #[test]
     fn resolve_uses_repo_local_when_present() {
