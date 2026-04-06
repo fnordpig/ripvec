@@ -274,7 +274,7 @@ impl rmcp::ServerHandler for RipvecServer {
     clippy::cast_possible_truncation,
     reason = "epoch millis fit in u64 until year 584942"
 )]
-pub async fn run_background_index(server: &RipvecServer) {
+pub async fn run_background_index(server: &RipvecServer, repo_level: bool) {
     if server
         .indexing
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -323,6 +323,7 @@ pub async fn run_background_index(server: &RipvecServer) {
             &profiler,
             model_repo,
             None,
+            repo_level,
         )?;
 
         progress.phase.store(4, Ordering::Relaxed); // building index
@@ -444,7 +445,7 @@ pub async fn run_file_watcher(server: &RipvecServer) {
         while rx.try_recv().is_ok() {}
 
         eprintln!("[ripvec-mcp] changes detected, re-indexing...");
-        run_background_index(server).await;
+        run_background_index(server, false).await;
     }
 }
 

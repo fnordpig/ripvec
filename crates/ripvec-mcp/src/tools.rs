@@ -125,6 +125,11 @@ pub struct RepoMapParams {
 pub struct ReindexParams {
     /// Project root directory to reindex. Uses the server's default project root if omitted.
     pub root: Option<String>,
+    /// Store the index in `.ripvec/cache/` at the project root (repo-local).
+    /// Creates `.ripvec/config.toml` on first use. Commit the `.ripvec/` directory
+    /// to git so teammates get instant search without re-embedding.
+    #[serde(default)]
+    pub repo_level: bool,
 }
 
 /// Parameters for the `index_status` tool.
@@ -204,6 +209,7 @@ impl RipvecServer {
     async fn ensure_root(
         &self,
         root: Option<&str>,
+        repo_level: bool,
     ) -> Result<Option<std::path::PathBuf>, rmcp::ErrorData> {
         let Some(root_str) = root else {
             return Ok(None);
@@ -242,6 +248,7 @@ impl RipvecServer {
                         &profiler,
                         "nomic-ai/modernbert-embed-base",
                         None,
+                        repo_level,
                     )
                 })
                 .await
@@ -286,7 +293,7 @@ impl RipvecServer {
         offset: usize,
         root: Option<&str>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let custom_root = self.ensure_root(root).await?;
+        let custom_root = self.ensure_root(root, false).await?;
 
         if custom_root.is_none() {
             let idx_guard = self.index.read().await;
@@ -429,7 +436,7 @@ impl RipvecServer {
         &self,
         Parameters(params): Parameters<FindSimilarParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let custom_root = self.ensure_root(params.root.as_deref()).await?;
+        let custom_root = self.ensure_root(params.root.as_deref(), false).await?;
 
         let root_cache_guard;
         let idx_guard;
@@ -537,7 +544,7 @@ impl RipvecServer {
             }
 
             let start = Instant::now();
-            self.ensure_root(Some(root_str)).await?;
+            self.ensure_root(Some(root_str), params.repo_level).await?;
             let duration_ms = start.elapsed().as_millis();
 
             let cache = self.root_indices.read().await;
@@ -571,7 +578,7 @@ impl RipvecServer {
             }
 
             let start = Instant::now();
-            run_background_index(self).await;
+            run_background_index(self, params.repo_level).await;
             let duration_ms = start.elapsed().as_millis();
 
             let idx_guard = self.index.read().await;
@@ -769,7 +776,7 @@ impl RipvecServer {
         &self,
         Parameters(params): Parameters<RepoMapParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let custom_root = self.ensure_root(params.root.as_deref()).await?;
+        let custom_root = self.ensure_root(params.root.as_deref(), false).await?;
 
         // Get the appropriate repo graph (custom root or default).
         let root_graphs_guard;

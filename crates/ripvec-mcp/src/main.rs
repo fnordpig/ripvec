@@ -43,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
     // Spawn background indexing (non-blocking)
     let bg_server = server.clone();
     tokio::spawn(async move {
-        server::run_background_index(&bg_server).await;
+        server::run_background_index(&bg_server, false).await;
     });
 
     // Spawn debounced file watcher (re-indexes on changes after 2s quiet)
