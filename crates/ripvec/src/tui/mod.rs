@@ -203,6 +203,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut A
                     &profiler,
                     &cfg.model_repo,
                     cfg.cache_dir.as_deref(),
+                    false,
                 ) {
                     Ok((new_index, stats)) => {
                         let msg = format!(
