@@ -26,6 +26,10 @@ pub struct FileCache {
 /// these bytes, so detection is unambiguous.
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
+/// Magic bytes to identify bitcode-encoded (portable) cache objects.
+/// 'B' 'C' for bitcode — distinct from zstd magic (0x28 0xB5) and rkyv data.
+const BITCODE_MAGIC: [u8; 2] = [0x42, 0x43];
+
 impl FileCache {
     /// Serialize to zstd-compressed rkyv bytes.
     ///
@@ -62,6 +66,48 @@ impl FileCache {
         };
         rkyv::from_bytes::<Self, rkyv::rancor::Error>(&raw)
             .map_err(|e| crate::Error::Other(anyhow::anyhow!("rkyv deserialization failed: {e}")))
+    }
+
+    /// Serialize to portable zstd-compressed bitcode bytes.
+    ///
+    /// Unlike `to_bytes` (rkyv, architecture-dependent), this format is safe
+    /// to share across different CPU architectures (e.g., x86_64 CI → aarch64 Mac).
+    ///
+    /// # Panics
+    ///
+    /// Panics if zstd compression fails (should not happen for valid data).
+    #[must_use]
+    pub fn to_portable_bytes(&self) -> Vec<u8> {
+        let raw = bitcode::encode(self);
+        let compressed = zstd::encode_all(raw.as_slice(), 1)
+            .expect("zstd compression should never fail on valid data");
+        let mut out = Vec::with_capacity(BITCODE_MAGIC.len() + compressed.len());
+        out.extend_from_slice(&BITCODE_MAGIC);
+        out.extend_from_slice(&compressed);
+        out
+    }
+
+    /// Deserialize from portable zstd-compressed bitcode bytes.
+    ///
+    /// Expects the `BITCODE_MAGIC` prefix. Returns an error if the bytes
+    /// are not a valid portable archive.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the magic prefix is missing, decompression fails,
+    /// or bitcode deserialization fails.
+    pub fn from_portable_bytes(bytes: &[u8]) -> crate::Result<Self> {
+        if bytes.len() < 2 || bytes[..2] != BITCODE_MAGIC {
+            return Err(crate::Error::Other(anyhow::anyhow!(
+                "not a portable bitcode cache object (missing magic)"
+            )));
+        }
+        let compressed = &bytes[2..];
+        let raw = zstd::decode_all(compressed)
+            .map_err(|e| crate::Error::Other(anyhow::anyhow!("zstd decompression failed: {e}")))?;
+        bitcode::decode(&raw).map_err(|e| {
+            crate::Error::Other(anyhow::anyhow!("bitcode deserialization failed: {e}"))
+        })
     }
 }
 
@@ -109,6 +155,49 @@ mod tests {
     #[test]
     fn invalid_bytes_returns_error() {
         let result = FileCache::from_bytes(b"garbage data");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn portable_round_trip() {
+        let fc = FileCache {
+            chunks: vec![CodeChunk {
+                file_path: "test.rs".into(),
+                name: "foo".into(),
+                kind: "function".into(),
+                start_line: 1,
+                end_line: 10,
+                enriched_content: "fn foo() {}".into(),
+                content: "fn foo() {}".into(),
+            }],
+            embeddings: vec![1.0, 2.0, 3.0, 4.0],
+            hidden_dim: 4,
+        };
+        let bytes = fc.to_portable_bytes();
+        let loaded = FileCache::from_portable_bytes(&bytes).unwrap();
+        assert_eq!(loaded.chunks.len(), 1);
+        assert_eq!(loaded.chunks[0].name, "foo");
+        assert_eq!(loaded.embeddings.len(), 4);
+        assert_eq!(loaded.hidden_dim, 4);
+    }
+
+    #[test]
+    fn portable_empty_cache() {
+        let fc = FileCache {
+            chunks: vec![],
+            embeddings: vec![],
+            hidden_dim: 384,
+        };
+        let bytes = fc.to_portable_bytes();
+        let loaded = FileCache::from_portable_bytes(&bytes).unwrap();
+        assert_eq!(loaded.chunks.len(), 0);
+        assert_eq!(loaded.embeddings.len(), 0);
+        assert_eq!(loaded.hidden_dim, 384);
+    }
+
+    #[test]
+    fn portable_invalid_bytes_returns_error() {
+        let result = FileCache::from_portable_bytes(b"garbage data");
         assert!(result.is_err());
     }
 }
