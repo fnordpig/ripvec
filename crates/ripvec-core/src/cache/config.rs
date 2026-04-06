@@ -109,14 +109,12 @@ pub fn find_repo_config(start: &Path) -> Option<PathBuf> {
     let mut current = start.to_path_buf();
     loop {
         let candidate = current.join(".ripvec");
-        if candidate.join("config.toml").exists() {
-            if let Ok(cfg) = RepoConfig::load(&candidate) {
-                if cfg.cache.local {
-                    return Some(candidate);
-                }
-            }
-            // Config exists but local == false (or unreadable) — stop searching.
-            return None;
+        let config_file = candidate.join("config.toml");
+        if config_file.exists() {
+            return RepoConfig::load(&candidate)
+                .ok()
+                .filter(|cfg| cfg.cache.local)
+                .map(|_| candidate);
         }
         match current.parent() {
             Some(parent) => current = parent.to_path_buf(),

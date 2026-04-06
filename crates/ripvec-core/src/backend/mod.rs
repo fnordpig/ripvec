@@ -169,7 +169,7 @@ pub fn load_backend(
         #[cfg(feature = "cuda")]
         BackendKind::Cuda => {
             if is_modernbert_model(model_repo) {
-                return load_modernbert_cuda(model_repo, max_layers);
+                return load_modernbert_cuda(model_repo);
             }
             let backend = cuda::CudaBackend::load(model_repo, &device_hint)?;
             Ok(Box::new(backend))
@@ -195,6 +195,10 @@ pub fn load_backend(
             #[cfg(feature = "cpu")]
             {
                 let backend = cpu::CpuBackend::load(model_repo, &device_hint)?;
+                #[expect(
+                    clippy::needless_return,
+                    reason = "return needed before cfg(not) fallback"
+                )]
                 return Ok(Box::new(backend));
             }
             #[cfg(not(feature = "cpu"))]
@@ -259,7 +263,7 @@ pub fn detect_backends(
     #[cfg(feature = "cuda")]
     {
         if is_modernbert_model(model_repo) {
-            if let Ok(b) = load_modernbert_cuda(model_repo, max_layers) {
+            if let Ok(b) = load_modernbert_cuda(model_repo) {
                 backends.push(b);
             }
         } else if let Ok(b) = cuda::CudaBackend::load(model_repo, &DeviceHint::Gpu) {
@@ -433,10 +437,7 @@ pub fn load_modernbert_cpu(model_repo: &str) -> crate::Result<Box<dyn EmbedBacke
 /// Returns an error if no CUDA device is available, the model cannot be
 /// downloaded, or weight loading fails.
 #[cfg(feature = "cuda")]
-pub fn load_modernbert_cuda(
-    model_repo: &str,
-    max_layers: Option<usize>,
-) -> crate::Result<Box<dyn EmbedBackend>> {
+pub fn load_modernbert_cuda(model_repo: &str) -> crate::Result<Box<dyn EmbedBackend>> {
     use driver::cuda::{CudaDriver, ModernBertConfig};
     use generic::GenericBackend;
     use hf_hub::api::sync::Api;
@@ -462,8 +463,7 @@ pub fn load_modernbert_cuda(
     let max_tokens = config.max_position_embeddings;
 
     let driver = CudaDriver::new()?;
-    let (mut arch, mmap) = driver.load_modern_bert_weights(&weights_path, &config)?;
-    arch.max_layers = max_layers;
+    let (arch, mmap) = driver.load_modern_bert_weights(&weights_path, &config)?;
 
     tracing::info!(
         model_repo,
