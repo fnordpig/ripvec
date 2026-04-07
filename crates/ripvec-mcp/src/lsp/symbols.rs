@@ -30,39 +30,61 @@ use ripvec_core::repo_map::RepoGraph;
 )]
 pub(crate) fn symbol_kind_for(kind: &str) -> SymbolKind {
     match kind {
-        // Functions (Rust, Python, JS/TS, Go, Scala, Bash, Kotlin, Swift, C/C++)
+        // ── Functions & methods ──────────────────────────────────────
         "function_item" | "function_definition" | "function_declaration" => SymbolKind::FUNCTION,
-
-        // Methods (JS/TS, Go, Java, Ruby)
         "method_definition" | "method_declaration" | "method" => SymbolKind::METHOD,
+        "constructor_declaration" => SymbolKind::CONSTRUCTOR,
 
-        // Structs (Rust)
-        "struct_item" => SymbolKind::STRUCT,
+        // ── Structs ─────────────────────────────────────────────────
+        "struct_item" | "struct_specifier" | "struct_declaration" => SymbolKind::STRUCT,
 
-        // Enums (Rust)
-        "enum_item" => SymbolKind::ENUM,
+        // ── Enums & variants ────────────────────────────────────────
+        "enum_item" | "enum_declaration" | "enum_specifier" => SymbolKind::ENUM,
+        "enum_variant" | "enum_constant" | "enum_entry" => SymbolKind::ENUM_MEMBER,
 
-        // Classes (Rust type alias, Python, JS/TS, Java, C++, Ruby)
-        "type_item" | "class_definition" | "class_declaration" | "class_specifier" | "class" => {
+        // ── Classes & type aliases ──────────────────────────────────
+        "type_item" | "type_definition" | "type_alias_declaration" | "typealias_declaration" => {
             SymbolKind::CLASS
         }
+        "class_definition" | "class_declaration" | "class_specifier" | "class" => SymbolKind::CLASS,
 
-        // Interfaces (TS, Java, Swift protocol, Scala trait)
-        "interface_declaration" | "protocol_declaration" | "trait_definition" => {
+        // ── Interfaces & traits ─────────────────────────────────────
+        "interface_declaration" | "protocol_declaration" | "trait_definition" | "trait_item" => {
             SymbolKind::INTERFACE
         }
 
-        // Objects (Kotlin, Scala)
+        // ── Impl blocks (Rust) ──────────────────────────────────────
+        "impl_item" => SymbolKind::CLASS,
+
+        // ── Objects (Kotlin, Scala) ─────────────────────────────────
         "object_declaration" | "object_definition" => SymbolKind::OBJECT,
 
-        // Modules (Ruby)
-        "module" => SymbolKind::MODULE,
+        // ── Modules & namespaces ────────────────────────────────────
+        "module" | "mod_item" | "namespace_definition" => SymbolKind::MODULE,
 
-        // HCL / TOML blocks
+        // ── Fields & properties ─────────────────────────────────────
+        "field_declaration" | "field_definition" | "property_declaration" => SymbolKind::FIELD,
+
+        // ── Constants & statics ─────────────────────────────────────
+        "const_item" | "const_spec" | "static_item" | "PAGERANK_BETA" => SymbolKind::CONSTANT,
+
+        // ── Variables & assignments ─────────────────────────────────
+        "variable_declarator"
+        | "variable_assignment"
+        | "assignment"
+        | "declaration"
+        | "val_definition"
+        | "var_definition" => SymbolKind::VARIABLE,
+
+        // ── HCL / TOML ─────────────────────────────────────────────
         "block" | "table" => SymbolKind::NAMESPACE,
+        "pair" => SymbolKind::KEY,
 
-        // Catch-all: default to FUNCTION for unknown node kinds
-        _ => SymbolKind::FUNCTION,
+        // ── Go type declarations ────────────────────────────────────
+        "type_declaration" => SymbolKind::CLASS,
+
+        // ── Catch-all ───────────────────────────────────────────────
+        _ => SymbolKind::VARIABLE,
     }
 }
 
