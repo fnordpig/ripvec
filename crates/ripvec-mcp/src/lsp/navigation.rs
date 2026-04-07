@@ -32,7 +32,12 @@ struct SymbolAtPosition {
 /// Parses the file, finds the smallest named node at the cursor, and returns
 /// its text plus structural context (node kind, parent kind). Falls back to
 /// text-based word extraction for unsupported extensions.
-fn symbol_at_position(source: &str, line: u32, character: u32, ext: &str) -> Option<SymbolAtPosition> {
+fn symbol_at_position(
+    source: &str,
+    line: u32,
+    character: u32,
+    ext: &str,
+) -> Option<SymbolAtPosition> {
     let config = ripvec_core::languages::config_for_extension(ext)?;
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&config.language).ok()?;
@@ -56,8 +61,15 @@ fn symbol_at_position(source: &str, line: u32, character: u32, ext: &str) -> Opt
     // Walk up to the nearest identifier-like node (skip operators, punctuation, keywords)
     loop {
         match node.kind() {
-            "identifier" | "type_identifier" | "field_identifier" | "property_identifier"
-            | "simple_identifier" | "word" | "constant" | "bare_key" | "command_name"
+            "identifier"
+            | "type_identifier"
+            | "field_identifier"
+            | "property_identifier"
+            | "simple_identifier"
+            | "word"
+            | "constant"
+            | "bare_key"
+            | "command_name"
             | "string_content" => break,
             _ => {
                 node = node.parent()?;
@@ -158,11 +170,37 @@ fn extract_symbol(source: &str, line: u32, character: u32, ext: &str) -> Option<
     word_at_position(source, line, character)
 }
 
+/// Find the chunk index at a given file path and line in the index.
+///
+/// Returns the index of the first chunk whose file path matches and whose
+/// line range contains the given 1-based line number.
+fn chunk_at_position(
+    hybrid: &HybridIndex,
+    file_path: &Path,
+    root: &Path,
+    line_1based: usize,
+) -> Option<usize> {
+    let abs_str = file_path.to_string_lossy();
+    let rel_path = file_path
+        .strip_prefix(root)
+        .unwrap_or(file_path)
+        .to_string_lossy();
+
+    hybrid.chunks().iter().enumerate().find_map(|(i, c)| {
+        let matches = c.file_path == *abs_str || c.file_path == *rel_path;
+        if matches && c.start_line <= line_1based && line_1based <= c.end_line {
+            Some(i)
+        } else {
+            None
+        }
+    })
+}
+
 /// Resolve the definition of the symbol at the given position.
 ///
-/// Uses tree-sitter to identify the symbol under the cursor, then searches
-/// the BM25 keyword index with PageRank boosting. Returns the best match
-/// where the chunk name exactly equals the symbol.
+/// Uses tree-sitter to identify the symbol, then performs hybrid search
+/// (semantic embedding + BM25 keyword) using the chunk at the cursor as
+/// the query vector. Falls back to keyword-only if no chunk covers the cursor.
 pub async fn goto_definition(
     params: GotoDefinitionParams,
     index: &Arc<tokio::sync::RwLock<Option<HybridIndex>>>,
@@ -179,12 +217,8 @@ pub async fn goto_definition(
         return Ok(None);
     };
 
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
-    let Some(word) = extract_symbol(&source, pos.position.line, pos.position.character, ext)
-    else {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let Some(word) = extract_symbol(&source, pos.position.line, pos.position.character, ext) else {
         return Ok(None);
     };
 
@@ -193,7 +227,19 @@ pub async fn goto_definition(
         return Ok(None);
     };
 
-    let mut results = hybrid.search(&[], &word, 20, 0.0, SearchMode::Keyword);
+    // Use the chunk at the cursor position as the semantic query vector.
+    // This gives hybrid search (BM25 keyword + embedding similarity) for free.
+    let line_1based = (pos.position.line as usize) + 1;
+    let query_embedding = chunk_at_position(hybrid, &path, root, line_1based)
+        .and_then(|idx| hybrid.semantic.embedding(idx))
+        .unwrap_or_default();
+
+    let mode = if query_embedding.is_empty() {
+        SearchMode::Keyword
+    } else {
+        SearchMode::Hybrid
+    };
+    let mut results = hybrid.search(&query_embedding, &word, 20, 0.0, mode);
 
     if let Ok(graph_guard) = repo_graph.read()
         && let Some(graph) = graph_guard.as_ref()
@@ -228,9 +274,9 @@ pub async fn goto_definition(
 
 /// Find all references to the symbol at the given position.
 ///
-/// Uses tree-sitter to identify the symbol under the cursor, then searches
-/// the BM25 keyword index with PageRank boosting. Returns all chunks whose
-/// name or content contains the symbol.
+/// Uses tree-sitter to identify the symbol, then performs hybrid search
+/// (semantic embedding + BM25) using the chunk at the cursor as the query
+/// vector. Returns all chunks whose name or content contains the symbol.
 pub async fn find_references(
     params: ReferenceParams,
     index: &Arc<tokio::sync::RwLock<Option<HybridIndex>>>,
@@ -247,12 +293,8 @@ pub async fn find_references(
         return Ok(None);
     };
 
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
-    let Some(word) = extract_symbol(&source, pos.position.line, pos.position.character, ext)
-    else {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let Some(word) = extract_symbol(&source, pos.position.line, pos.position.character, ext) else {
         return Ok(None);
     };
 
@@ -261,7 +303,18 @@ pub async fn find_references(
         return Ok(None);
     };
 
-    let mut results = hybrid.search(&[], &word, 50, 0.0, SearchMode::Keyword);
+    // Use the chunk at the cursor as the semantic query vector.
+    let line_1based = (pos.position.line as usize) + 1;
+    let query_embedding = chunk_at_position(hybrid, &path, root, line_1based)
+        .and_then(|idx| hybrid.semantic.embedding(idx))
+        .unwrap_or_default();
+
+    let mode = if query_embedding.is_empty() {
+        SearchMode::Keyword
+    } else {
+        SearchMode::Hybrid
+    };
+    let mut results = hybrid.search(&query_embedding, &word, 50, 0.0, mode);
 
     if let Ok(graph_guard) = repo_graph.read()
         && let Some(graph) = graph_guard.as_ref()
