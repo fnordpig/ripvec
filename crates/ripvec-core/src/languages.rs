@@ -33,7 +33,8 @@ pub fn config_for_extension(ext: &str) -> Option<Arc<LangConfig>> {
         let mut m = std::collections::HashMap::new();
         // Pre-compile all supported extensions
         for &ext in &[
-            "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "c", "h", "cpp", "cc", "cxx", "hpp",
+            "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "c", "h", "cpp", "cc", "cxx",
+            "hpp", "sh", "bash", "rb", "tf", "hcl", "kt", "kts", "swift", "scala", "toml",
         ] {
             if let Some(cfg) = compile_config(ext) {
                 m.insert(ext, Arc::new(cfg));
@@ -46,6 +47,10 @@ pub fn config_for_extension(ext: &str) -> Option<Arc<LangConfig>> {
 }
 
 /// Compile a [`LangConfig`] for the given extension (uncached).
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match arm per language — flat by design"
+)]
 fn compile_config(ext: &str) -> Option<LangConfig> {
     let (lang, query_str): (Language, &str) = match ext {
         // Rust: standalone functions, structs, and methods INSIDE impl/trait blocks.
@@ -125,6 +130,58 @@ fn compile_config(ext: &str) -> Option<LangConfig> {
                 "(class_specifier name: (type_identifier) @name) @def",
             ),
         ),
+        // Bash: function definitions.
+        "sh" | "bash" => (
+            tree_sitter_bash::LANGUAGE.into(),
+            "(function_definition name: (word) @name) @def",
+        ),
+        // Ruby: methods, classes, and modules.
+        "rb" => (
+            tree_sitter_ruby::LANGUAGE.into(),
+            concat!(
+                "(method name: (identifier) @name) @def\n",
+                "(class name: (constant) @name) @def\n",
+                "(module name: (constant) @name) @def",
+            ),
+        ),
+        // HCL (Terraform): resource, data, variable, and output blocks.
+        "tf" | "hcl" => (
+            tree_sitter_hcl::LANGUAGE.into(),
+            "(block (identifier) @name) @def",
+        ),
+        // Kotlin: functions, classes, and objects.
+        "kt" | "kts" => (
+            tree_sitter_kotlin_ng::LANGUAGE.into(),
+            concat!(
+                "(function_declaration name: (identifier) @name) @def\n",
+                "(class_declaration name: (identifier) @name) @def\n",
+                "(object_declaration name: (identifier) @name) @def",
+            ),
+        ),
+        // Swift: functions, classes, structs, enums, and protocols.
+        "swift" => (
+            tree_sitter_swift::LANGUAGE.into(),
+            concat!(
+                "(function_declaration name: (simple_identifier) @name) @def\n",
+                "(class_declaration name: (type_identifier) @name) @def\n",
+                "(protocol_declaration name: (type_identifier) @name) @def",
+            ),
+        ),
+        // Scala: functions, classes, traits, and objects.
+        "scala" => (
+            tree_sitter_scala::LANGUAGE.into(),
+            concat!(
+                "(function_definition name: (identifier) @name) @def\n",
+                "(class_definition name: (identifier) @name) @def\n",
+                "(trait_definition name: (identifier) @name) @def\n",
+                "(object_definition name: (identifier) @name) @def",
+            ),
+        ),
+        // TOML: table headers (sections).
+        "toml" => (
+            tree_sitter_toml_ng::LANGUAGE.into(),
+            "(table (bare_key) @name) @def",
+        ),
         _ => return None,
     };
     let query = match Query::new(&lang, query_str) {
@@ -162,7 +219,8 @@ mod tests {
     #[test]
     fn all_supported_extensions() {
         let exts = [
-            "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "c", "h", "cpp", "cc", "cxx", "hpp",
+            "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "c", "h", "cpp", "cc", "cxx",
+            "hpp", "sh", "bash", "rb", "tf", "hcl", "kt", "kts", "swift", "scala", "toml",
         ];
         for ext in &exts {
             assert!(config_for_extension(ext).is_some(), "failed for {ext}");

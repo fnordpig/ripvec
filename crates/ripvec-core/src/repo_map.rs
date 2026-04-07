@@ -122,6 +122,11 @@ fn import_query_for_extension(ext: &str) -> Option<(tree_sitter::Language, Query
             tree_sitter_go::LANGUAGE.into(),
             "(import_spec path: (interpreted_string_literal) @import_path) @import",
         ),
+        // Ruby: require statements.
+        "rb" => (
+            tree_sitter_ruby::LANGUAGE.into(),
+            "(call method: (identifier) @_method arguments: (argument_list (string (string_content) @import_path)) (#eq? @_method \"require\")) @import",
+        ),
         _ => return None,
     };
     let query = match Query::new(&lang, query_str) {
