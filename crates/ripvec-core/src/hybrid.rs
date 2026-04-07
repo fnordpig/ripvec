@@ -201,6 +201,57 @@ pub fn rrf_fuse(semantic: &[(usize, f32)], bm25: &[(usize, f32)], k: f32) -> Vec
     results
 }
 
+/// Apply a multiplicative PageRank boost to search results.
+///
+/// For each result, looks up the file's PageRank score and applies:
+///   `boosted_score = score * (1.0 + alpha * normalized_pagerank)`
+///
+/// This amplifies already-relevant results from structurally important files
+/// without promoting irrelevant results (multiplicative, not additive).
+/// Results are re-sorted after boosting.
+///
+/// `pagerank_by_file` maps relative file paths to their PageRank scores
+/// (pre-normalized to [0, 1] by dividing by max rank).
+/// `alpha` controls boost strength — 0.3 means the top-ranked file gets
+/// a 30% score boost. The `alpha` field from [`RepoGraph`] is recommended.
+pub fn boost_with_pagerank<S: std::hash::BuildHasher>(
+    results: &mut [(usize, f32)],
+    chunks: &[CodeChunk],
+    pagerank_by_file: &HashMap<String, f32, S>,
+    alpha: f32,
+) {
+    for (idx, score) in results.iter_mut() {
+        if let Some(chunk) = chunks.get(*idx) {
+            let rank = pagerank_by_file
+                .get(&chunk.file_path)
+                .copied()
+                .unwrap_or(0.0);
+            *score *= 1.0 + alpha * rank;
+        }
+    }
+    // Re-sort descending by boosted score
+    results.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+}
+
+/// Build a normalized PageRank lookup table from a [`RepoGraph`].
+///
+/// Returns a map from relative file path to PageRank score normalized
+/// to [0, 1] (divided by the maximum rank in the graph). Files with
+/// no PageRank score map to 0.0.
+#[must_use]
+pub fn pagerank_lookup(graph: &crate::repo_map::RepoGraph) -> HashMap<String, f32> {
+    let max_rank = graph.base_ranks.iter().copied().fold(0.0_f32, f32::max);
+    if max_rank <= f32::EPSILON {
+        return HashMap::new();
+    }
+    graph
+        .files
+        .iter()
+        .zip(graph.base_ranks.iter())
+        .map(|(file, &rank)| (file.path.clone(), rank / max_rank))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,5 +322,92 @@ mod tests {
         assert_eq!(SearchMode::Hybrid.to_string(), "hybrid");
         assert_eq!(SearchMode::Semantic.to_string(), "semantic");
         assert_eq!(SearchMode::Keyword.to_string(), "keyword");
+    }
+
+    #[test]
+    fn pagerank_boost_amplifies_relevant() {
+        let chunks = vec![
+            CodeChunk {
+                file_path: "important.rs".into(),
+                name: "a".into(),
+                kind: "function".into(),
+                start_line: 1,
+                end_line: 10,
+                content: String::new(),
+                enriched_content: String::new(),
+            },
+            CodeChunk {
+                file_path: "obscure.rs".into(),
+                name: "b".into(),
+                kind: "function".into(),
+                start_line: 1,
+                end_line: 10,
+                content: String::new(),
+                enriched_content: String::new(),
+            },
+        ];
+
+        // Both start with same score; important.rs has high PageRank
+        let mut results = vec![(0, 0.8_f32), (1, 0.8)];
+        let mut pr = HashMap::new();
+        pr.insert("important.rs".to_string(), 1.0); // max PageRank
+        pr.insert("obscure.rs".to_string(), 0.1); // low PageRank
+
+        boost_with_pagerank(&mut results, &chunks, &pr, 0.3);
+
+        // important.rs should now rank higher
+        assert_eq!(
+            results[0].0, 0,
+            "important.rs should rank first after boost"
+        );
+        assert!(results[0].1 > results[1].1);
+
+        // Verify the math: 0.8 * (1 + 0.3 * 1.0) = 1.04
+        assert!((results[0].1 - 1.04).abs() < 0.001);
+        // 0.8 * (1 + 0.3 * 0.1) = 0.824
+        assert!((results[1].1 - 0.824).abs() < 0.001);
+    }
+
+    #[test]
+    fn pagerank_boost_zero_relevance_stays_zero() {
+        let chunks = vec![CodeChunk {
+            file_path: "important.rs".into(),
+            name: "a".into(),
+            kind: "function".into(),
+            start_line: 1,
+            end_line: 10,
+            content: String::new(),
+            enriched_content: String::new(),
+        }];
+
+        let mut results = vec![(0, 0.0_f32)];
+        let mut pr = HashMap::new();
+        pr.insert("important.rs".to_string(), 1.0);
+
+        boost_with_pagerank(&mut results, &chunks, &pr, 0.3);
+
+        // Zero score stays zero regardless of PageRank
+        assert_eq!(results[0].1, 0.0);
+    }
+
+    #[test]
+    fn pagerank_boost_unknown_file_no_effect() {
+        let chunks = vec![CodeChunk {
+            file_path: "unknown.rs".into(),
+            name: "a".into(),
+            kind: "function".into(),
+            start_line: 1,
+            end_line: 10,
+            content: String::new(),
+            enriched_content: String::new(),
+        }];
+
+        let mut results = vec![(0, 0.5_f32)];
+        let pr = HashMap::new(); // empty — no PageRank data
+
+        boost_with_pagerank(&mut results, &chunks, &pr, 0.3);
+
+        // No PageRank data → no boost
+        assert_eq!(results[0].1, 0.5);
     }
 }

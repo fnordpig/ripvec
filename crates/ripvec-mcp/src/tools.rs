@@ -285,6 +285,7 @@ impl RipvecServer {
     }
 
     /// Shared search implementation used by both `search_code` and `search_text`.
+    #[expect(clippy::too_many_lines, reason = "PageRank boost adds graph lookup")]
     async fn run_search(
         &self,
         query: &str,
@@ -353,13 +354,46 @@ impl RipvecServer {
             })?
         };
 
-        let ranked = index.search(
+        let mut ranked = index.search(
             &query_embedding,
             query,
             top_k,
             threshold,
             ripvec_core::hybrid::SearchMode::Hybrid,
         );
+
+        // Apply PageRank boost if the repo graph is available.
+        // Multiplicative: amplifies relevant results from structurally important
+        // files without promoting irrelevant ones.
+        if let Some(ref canon) = custom_root {
+            let rg = self
+                .root_graphs
+                .read()
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+            if let Some(graph) = rg.get(canon) {
+                let pr = ripvec_core::hybrid::pagerank_lookup(graph);
+                ripvec_core::hybrid::boost_with_pagerank(
+                    &mut ranked,
+                    index.chunks(),
+                    &pr,
+                    graph.alpha,
+                );
+            }
+        } else {
+            let rg = self
+                .repo_graph
+                .read()
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+            if let Some(graph) = rg.as_ref() {
+                let pr = ripvec_core::hybrid::pagerank_lookup(graph);
+                ripvec_core::hybrid::boost_with_pagerank(
+                    &mut ranked,
+                    index.chunks(),
+                    &pr,
+                    graph.alpha,
+                );
+            }
+        }
 
         let results: Vec<SearchResultItem> = ranked
             .into_iter()
