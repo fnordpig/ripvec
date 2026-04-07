@@ -1,28 +1,36 @@
-//! MCP server binary for ripvec semantic search.
+//! MCP/LSP server binary for ripvec semantic search.
 //!
-//! Exposes seven tools over stdin/stdout using the MCP protocol:
+//! By default, exposes seven tools over stdin/stdout using the MCP protocol:
 //! `search_code`, `search_text`, `find_similar`, `reindex`, `index_status`,
 //! `get_repo_map`, and `up_to_date`.
 //!
-//! The search index is built in the background on startup. Set `RIPVEC_ROOT`
+//! With `--lsp`, starts a Language Server Protocol server over stdio instead,
+//! providing code intelligence (symbols, definitions, references, hover).
+//!
+//! Both modes share the same search index and file watcher. Set `RIPVEC_ROOT`
 //! to override the default project root (current directory).
 
+mod lsp;
 mod result;
 mod server;
 mod tools;
 
 use rmcp::ServiceExt;
 
-/// Start the MCP server: build the background index, then serve over stdio.
+/// Start the MCP or LSP server: build the background index, then serve over stdio.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+
     // Handle --version before anything else (no clap needed for MCP server)
-    if std::env::args().any(|a| a == "--version" || a == "-V") {
+    if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("ripvec-mcp {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 
-    // Initialize tracing to stderr (MCP uses stdin/stdout for transport)
+    let lsp_mode = args.iter().any(|a| a == "--lsp");
+
+    // Initialize tracing to stderr (both MCP and LSP use stdin/stdout for transport)
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -36,7 +44,11 @@ async fn main() -> anyhow::Result<()> {
         std::path::PathBuf::from,
     );
 
-    eprintln!("[ripvec-mcp] project root: {}", root.display());
+    let mode_label = if lsp_mode { "LSP" } else { "MCP" };
+    eprintln!(
+        "[ripvec-mcp] {mode_label} mode, project root: {}",
+        root.display()
+    );
 
     let server = server::RipvecServer::new(root);
 
@@ -52,10 +64,15 @@ async fn main() -> anyhow::Result<()> {
         server::run_file_watcher(&watcher_server).await;
     });
 
-    let service = server
-        .serve(rmcp::transport::stdio())
-        .await
-        .map_err(|e| anyhow::anyhow!("MCP serve error: {e}"))?;
-    service.waiting().await?;
-    Ok(())
+    if lsp_mode {
+        lsp::run(server).await;
+        Ok(())
+    } else {
+        let service = server
+            .serve(rmcp::transport::stdio())
+            .await
+            .map_err(|e| anyhow::anyhow!("MCP serve error: {e}"))?;
+        service.waiting().await?;
+        Ok(())
+    }
 }

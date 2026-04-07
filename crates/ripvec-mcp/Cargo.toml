@@ -26,6 +26,7 @@ tokenizers.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 notify = "8.2.0"
+tower-lsp-server.workspace = true
 
 [features]
 default = []

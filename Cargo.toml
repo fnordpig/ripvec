@@ -61,6 +61,9 @@ serde_json = "1.0"
 schemars = "1.0"
 toml = "0.8"
 
+# LSP server
+tower-lsp-server = "0.23"
+
 # Testing
 assert_cmd = "2.1"
 predicates = "3"
