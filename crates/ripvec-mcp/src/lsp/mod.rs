@@ -33,16 +33,8 @@ struct RipvecLsp {
     /// LSP client handle for sending notifications (diagnostics, logs).
     client: Client,
     /// Pre-built search index (shared with MCP server / file watcher).
-    #[expect(
-        dead_code,
-        reason = "stub — will be used once handlers are implemented"
-    )]
     index: Arc<tokio::sync::RwLock<Option<ripvec_core::hybrid::HybridIndex>>>,
     /// PageRank-weighted repository graph.
-    #[expect(
-        dead_code,
-        reason = "stub — will be used once handlers are implemented"
-    )]
     repo_graph: Arc<std::sync::RwLock<Option<ripvec_core::repo_map::RepoGraph>>>,
     /// Root directory of the indexed project.
     project_root: PathBuf,
@@ -118,14 +110,14 @@ impl LanguageServer for RipvecLsp {
         &self,
         params: WorkspaceSymbolParams,
     ) -> Result<Option<WorkspaceSymbolResponse>> {
-        symbols::workspace_symbol(params).await
+        symbols::workspace_symbol(params, &self.index, &self.repo_graph, &self.project_root).await
     }
 
     async fn goto_definition(
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
-        navigation::goto_definition(params).await
+        navigation::goto_definition(params, &self.index, &self.repo_graph, &self.project_root).await
     }
 
     async fn goto_implementation(
@@ -138,17 +130,23 @@ impl LanguageServer for RipvecLsp {
             work_done_progress_params: params.work_done_progress_params,
             partial_result_params: params.partial_result_params,
         };
-        let result = navigation::goto_definition(def_params).await?;
+        let result = navigation::goto_definition(
+            def_params,
+            &self.index,
+            &self.repo_graph,
+            &self.project_root,
+        )
+        .await?;
         // GotoDefinitionResponse and GotoImplementationResponse are the same type alias.
         Ok(result)
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
-        navigation::find_references(params).await
+        navigation::find_references(params, &self.index, &self.repo_graph, &self.project_root).await
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
-        hover::hover(params).await
+        hover::hover(params, &self.index, &self.project_root).await
     }
 }
 

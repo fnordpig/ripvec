@@ -2,15 +2,22 @@
 //!
 //! Uses tree-sitter via `ripvec_core::chunk::chunk_file` to extract
 //! semantic code chunks and maps them to LSP `DocumentSymbol` entries.
+//! Workspace symbol search uses the BM25 keyword index with PageRank
+//! boosting for ranked results across the entire project.
+
+use std::path::Path;
+use std::sync::Arc;
 
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
-    DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, Position, Range, SymbolKind,
-    WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, Location, Position, Range,
+    SymbolInformation, SymbolKind, Uri, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 
-use ripvec_core::chunk::{ChunkConfig, chunk_file};
+use ripvec_core::chunk::{ChunkConfig, CodeChunk, chunk_file};
+use ripvec_core::hybrid::{HybridIndex, SearchMode, boost_with_pagerank, pagerank_lookup};
 use ripvec_core::languages::config_for_extension;
+use ripvec_core::repo_map::RepoGraph;
 
 /// Map a tree-sitter node kind string to an LSP `SymbolKind`.
 ///
@@ -118,7 +125,7 @@ fn line_to_u32(n: usize) -> u32 {
     deprecated,
     reason = "DocumentSymbol has a deprecated `deprecated` field"
 )]
-fn chunk_to_symbol(chunk: &ripvec_core::chunk::CodeChunk) -> DocumentSymbol {
+fn chunk_to_symbol(chunk: &CodeChunk) -> DocumentSymbol {
     let start_line = line_to_u32(chunk.start_line.saturating_sub(1));
     let end_line = line_to_u32(chunk.end_line.saturating_sub(1));
 
@@ -157,11 +164,90 @@ fn chunk_to_symbol(chunk: &ripvec_core::chunk::CodeChunk) -> DocumentSymbol {
     }
 }
 
-/// Search for symbols across the entire workspace.
-/// Currently a stub that returns `Ok(None)`.
-#[expect(clippy::unused_async, reason = "will use async once implemented")]
+/// Build an LSP `Range` from a chunk's 1-based line numbers.
+///
+/// Converts to 0-based LSP positions with character offsets at column 0.
+fn chunk_range(chunk: &CodeChunk) -> Range {
+    Range {
+        start: Position {
+            line: line_to_u32(chunk.start_line.saturating_sub(1)),
+            character: 0,
+        },
+        end: Position {
+            line: line_to_u32(chunk.end_line.saturating_sub(1)),
+            character: 0,
+        },
+    }
+}
+
+/// Build a `Uri` from a chunk's file path, resolving against `root` if relative.
+fn uri_for_chunk(chunk: &CodeChunk, root: &Path) -> Option<Uri> {
+    let path = Path::new(&chunk.file_path);
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    Uri::from_file_path(abs)
+}
+
+/// Search for symbols across the entire workspace using the BM25 keyword index.
+///
+/// Results are boosted by PageRank so structurally important definitions
+/// float to the top. Returns up to 20 results as `SymbolInformation` entries.
+#[expect(
+    deprecated,
+    reason = "SymbolInformation has a deprecated `deprecated` field"
+)]
 pub async fn workspace_symbol(
-    _params: WorkspaceSymbolParams,
+    params: WorkspaceSymbolParams,
+    index: &Arc<tokio::sync::RwLock<Option<HybridIndex>>>,
+    repo_graph: &Arc<std::sync::RwLock<Option<RepoGraph>>>,
+    root: &Path,
 ) -> Result<Option<WorkspaceSymbolResponse>> {
-    Ok(None)
+    let query = params.query.trim();
+    if query.is_empty() {
+        return Ok(None);
+    }
+
+    let guard = index.read().await;
+    let Some(hybrid) = guard.as_ref() else {
+        return Ok(None);
+    };
+
+    let mut results = hybrid.search(&[], query, 20, 0.0, SearchMode::Keyword);
+
+    // Apply PageRank boost if the repo graph is available.
+    if let Ok(graph_guard) = repo_graph.read()
+        && let Some(graph) = graph_guard.as_ref()
+    {
+        let pr = pagerank_lookup(graph);
+        boost_with_pagerank(&mut results, hybrid.chunks(), &pr, 0.3);
+    }
+
+    let chunks = hybrid.chunks();
+    let symbols: Vec<SymbolInformation> = results
+        .into_iter()
+        .filter_map(|(idx, _score)| {
+            let chunk = chunks.get(idx)?;
+            let uri = uri_for_chunk(chunk, root)?;
+            Some(SymbolInformation {
+                name: chunk.name.clone(),
+                kind: symbol_kind_for(&chunk.kind),
+                tags: None,
+                deprecated: None,
+                location: Location {
+                    uri,
+                    range: chunk_range(chunk),
+                },
+                container_name: None,
+            })
+        })
+        .collect();
+
+    if symbols.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(WorkspaceSymbolResponse::Flat(symbols)))
+    }
 }
