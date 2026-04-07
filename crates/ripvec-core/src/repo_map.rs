@@ -20,16 +20,26 @@ use crate::walk;
 /// Persisted dependency graph with `PageRank` scores.
 #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
 pub struct RepoGraph {
-    /// Files in the repository with definitions and imports.
+    /// Files in the repository with definitions, imports, and calls.
     pub files: Vec<FileNode>,
-    /// Dependency edges: `(importer_idx, definer_idx, weight)`.
+    /// File-level edges (derived from def-level call edges).
     pub edges: Vec<(u32, u32, u32)>,
-    /// Standard `PageRank` scores (one per file).
+    /// File-level `PageRank` scores (aggregated from def-level).
     pub base_ranks: Vec<f32>,
-    /// Top callers per file (indices into `files`).
+    /// File-level callers (indices into `files`).
     pub callers: Vec<Vec<u32>>,
-    /// Top callees per file (indices into `files`).
+    /// File-level callees (indices into `files`).
     pub callees: Vec<Vec<u32>>,
+    /// Definition-level call edges: `(caller_def, callee_def, weight)`.
+    pub def_edges: Vec<(DefId, DefId, u32)>,
+    /// Definition-level `PageRank` scores (flattened: `offsets[file_idx] + def_idx`).
+    pub def_ranks: Vec<f32>,
+    /// Definition-level callers (flattened, parallel to `def_ranks`).
+    pub def_callers: Vec<Vec<DefId>>,
+    /// Definition-level callees (flattened, parallel to `def_ranks`).
+    pub def_callees: Vec<Vec<DefId>>,
+    /// Prefix-sum offsets for flattening `DefId` to linear index.
+    pub def_offsets: Vec<usize>,
     /// Auto-tuned alpha for search boost.
     pub alpha: f32,
 }
@@ -60,6 +70,12 @@ pub struct Definition {
     pub scope: String,
     /// Function/method signature, if available.
     pub signature: Option<String>,
+    /// Byte offset of this definition's start in the source file.
+    pub start_byte: u32,
+    /// Byte offset of this definition's end in the source file.
+    pub end_byte: u32,
+    /// Call sites within this definition's body.
+    pub calls: Vec<CallRef>,
 }
 
 /// An import reference extracted from a source file.
@@ -69,6 +85,20 @@ pub struct ImportRef {
     pub raw_path: String,
     /// Resolved file index in [`RepoGraph::files`], if resolution succeeded.
     pub resolved_idx: Option<u32>,
+}
+
+/// Unique identifier for a definition: (file index, definition index within file).
+pub type DefId = (u32, u16);
+
+/// A call site extracted from a definition body.
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
+pub struct CallRef {
+    /// Callee function/method name.
+    pub name: String,
+    /// Byte offset of the call in the source file (for scoping to definitions).
+    pub byte_offset: u32,
+    /// Resolved target definition, if resolution succeeded.
+    pub resolved: Option<DefId>,
 }
 
 // ── Constants ────────────────────────────────────────────────────────
@@ -375,6 +405,10 @@ fn extract_definitions(source: &str, config: &languages::LangConfig) -> Vec<Defi
             let start_line = node.start_position().row as u32 + 1;
             #[expect(clippy::cast_possible_truncation, reason = "line numbers fit in u32")]
             let end_line = node.end_position().row as u32 + 1;
+            #[expect(clippy::cast_possible_truncation, reason = "byte offsets fit in u32")]
+            let start_byte = node.start_byte() as u32;
+            #[expect(clippy::cast_possible_truncation, reason = "byte offsets fit in u32")]
+            let end_byte = node.end_byte() as u32;
             defs.push(Definition {
                 name,
                 kind: node.kind().to_string(),
@@ -382,11 +416,191 @@ fn extract_definitions(source: &str, config: &languages::LangConfig) -> Vec<Defi
                 end_line,
                 scope,
                 signature,
+                start_byte,
+                end_byte,
+                calls: vec![],
             });
         }
     }
 
     defs
+}
+
+// ── Call Extraction & Resolution ────────────────────────────────────
+
+/// Extract call sites from a source file and assign them to definitions.
+///
+/// Uses the language's call query to find all call expressions, then
+/// assigns each call to the definition whose byte range contains it.
+/// Calls outside any definition body (module-level) are ignored.
+fn extract_calls(source: &str, call_config: &languages::CallConfig, defs: &mut [Definition]) {
+    let mut parser = Parser::new();
+    if parser.set_language(&call_config.language).is_err() {
+        return;
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return;
+    };
+
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&call_config.query, tree.root_node(), source.as_bytes());
+
+    while let Some(m) = matches.next() {
+        let mut callee_name = None;
+        let mut call_byte = 0u32;
+
+        for cap in m.captures {
+            let cap_name = &call_config.query.capture_names()[cap.index as usize];
+            if *cap_name == "callee" {
+                callee_name = Some(source[cap.node.start_byte()..cap.node.end_byte()].to_string());
+                #[expect(clippy::cast_possible_truncation, reason = "byte offsets fit in u32")]
+                {
+                    call_byte = cap.node.start_byte() as u32;
+                }
+            }
+        }
+
+        if let Some(name) = callee_name {
+            // Assign to the enclosing definition by byte range
+            if let Some(def) = defs
+                .iter_mut()
+                .find(|d| d.start_byte <= call_byte && call_byte < d.end_byte)
+            {
+                // Skip self-recursive calls
+                if def.name != name {
+                    def.calls.push(CallRef {
+                        name,
+                        byte_offset: call_byte,
+                        resolved: None,
+                    });
+                }
+            }
+            // Calls outside any definition are ignored (module-level init)
+        }
+    }
+}
+
+/// Build an index from definition name to list of `DefId`s.
+fn build_def_index(files: &[FileNode]) -> HashMap<String, Vec<DefId>> {
+    let mut index: HashMap<String, Vec<DefId>> = HashMap::new();
+    for (file_idx, file) in files.iter().enumerate() {
+        for (def_idx, def) in file.defs.iter().enumerate() {
+            #[expect(clippy::cast_possible_truncation)]
+            let did: DefId = (file_idx as u32, def_idx as u16);
+            index.entry(def.name.clone()).or_default().push(did);
+        }
+    }
+    index
+}
+
+/// Resolve call references to target definitions.
+///
+/// Strategy:
+/// 1. Same-file: prefer definitions in the caller's own file.
+/// 2. Imported-file: check definitions in files this file imports.
+/// 3. Unresolved: leave `resolved` as `None`.
+fn resolve_calls(files: &mut [FileNode], def_index: &HashMap<String, Vec<DefId>>) {
+    // Pre-compute imported file sets for each file
+    let imported_files: Vec<std::collections::HashSet<u32>> = files
+        .iter()
+        .map(|f| {
+            f.imports
+                .iter()
+                .filter_map(|imp| imp.resolved_idx)
+                .collect()
+        })
+        .collect();
+
+    for file_idx in 0..files.len() {
+        for def_idx in 0..files[file_idx].defs.len() {
+            for call_idx in 0..files[file_idx].defs[def_idx].calls.len() {
+                let call_name = files[file_idx].defs[def_idx].calls[call_idx].name.clone();
+
+                let Some(candidates) = def_index.get(&call_name) else {
+                    continue;
+                };
+
+                // Priority 1: same file
+                #[expect(clippy::cast_possible_truncation)]
+                let file_idx_u32 = file_idx as u32;
+                if let Some(&did) = candidates.iter().find(|(f, _)| *f == file_idx_u32) {
+                    files[file_idx].defs[def_idx].calls[call_idx].resolved = Some(did);
+                    continue;
+                }
+
+                // Priority 2: imported file
+                if let Some(&did) = candidates
+                    .iter()
+                    .find(|(f, _)| imported_files[file_idx].contains(f))
+                {
+                    files[file_idx].defs[def_idx].calls[call_idx].resolved = Some(did);
+                }
+                // Priority 3: unresolved — leave as None
+            }
+        }
+    }
+}
+
+/// Compute a prefix-sum offset table for flattening `DefId`s to linear indices.
+fn def_offsets(files: &[FileNode]) -> Vec<usize> {
+    let mut offsets = Vec::with_capacity(files.len() + 1);
+    offsets.push(0);
+    for file in files {
+        offsets.push(offsets.last().unwrap() + file.defs.len());
+    }
+    offsets
+}
+
+/// Flatten a `DefId` to a linear index using the offset table.
+fn flatten_def_id(offsets: &[usize], did: DefId) -> usize {
+    offsets[did.0 as usize] + did.1 as usize
+}
+
+/// Build top-N caller and callee lists for each definition (flattened).
+fn build_def_neighbor_lists(
+    n: usize,
+    edges: &[(u32, u32, u32)],
+    offsets: &[usize],
+) -> (Vec<Vec<DefId>>, Vec<Vec<DefId>>) {
+    let mut incoming: Vec<Vec<(u32, u32)>> = vec![vec![]; n];
+    let mut outgoing: Vec<Vec<(u32, u32)>> = vec![vec![]; n];
+
+    for &(src, dst, w) in edges {
+        let (s, d) = (src as usize, dst as usize);
+        if s < n && d < n {
+            incoming[d].push((src, w));
+            outgoing[s].push((dst, w));
+        }
+    }
+
+    // Convert flat index back to DefId
+    let to_def_id = |flat: u32| -> DefId {
+        let flat_usize = flat as usize;
+        let file_idx = offsets.partition_point(|&o| o <= flat_usize) - 1;
+        let def_idx = flat_usize - offsets[file_idx];
+        #[expect(clippy::cast_possible_truncation)]
+        (file_idx as u32, def_idx as u16)
+    };
+
+    let callers = incoming
+        .into_iter()
+        .map(|mut v| {
+            v.sort_by(|a, b| b.1.cmp(&a.1));
+            v.truncate(MAX_NEIGHBORS);
+            v.into_iter().map(|(idx, _)| to_def_id(idx)).collect()
+        })
+        .collect();
+
+    let callees = outgoing
+        .into_iter()
+        .map(|mut v| {
+            v.sort_by(|a, b| b.1.cmp(&a.1));
+            v.truncate(MAX_NEIGHBORS);
+            v.into_iter().map(|(idx, _)| to_def_id(idx)).collect()
+        })
+        .collect();
+
+    (callers, callees)
 }
 
 // ── PageRank ─────────────────────────────────────────────────────────
@@ -486,6 +700,94 @@ fn pagerank(n: usize, edges: &[(u32, u32, u32)], focus: Option<usize>) -> Vec<f3
 
 // ── Graph Building ───────────────────────────────────────────────────
 
+/// Intermediate result from definition-level graph computation.
+struct DefGraphData {
+    def_edges: Vec<(DefId, DefId, u32)>,
+    def_ranks: Vec<f32>,
+    def_callers: Vec<Vec<DefId>>,
+    def_callees: Vec<Vec<DefId>>,
+    offsets: Vec<usize>,
+    base_ranks: Vec<f32>,
+    file_edges: Vec<(u32, u32, u32)>,
+}
+
+/// Build definition-level edges, compute `PageRank`, and derive file-level data.
+fn compute_def_graph(files: &[FileNode]) -> DefGraphData {
+    // Build definition-level edge list from resolved calls
+    let mut def_edge_map: HashMap<(DefId, DefId), u32> = HashMap::new();
+    for (file_idx, file) in files.iter().enumerate() {
+        for (def_idx, def) in file.defs.iter().enumerate() {
+            #[expect(clippy::cast_possible_truncation)]
+            let caller_id: DefId = (file_idx as u32, def_idx as u16);
+            for call in &def.calls {
+                if let Some(callee_id) = call.resolved {
+                    *def_edge_map.entry((caller_id, callee_id)).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    let def_edges: Vec<(DefId, DefId, u32)> = def_edge_map
+        .into_iter()
+        .map(|((src, dst), w)| (src, dst, w))
+        .collect();
+
+    // Compute def-level PageRank
+    let offsets = def_offsets(files);
+    let n_defs = *offsets.last().unwrap_or(&0);
+
+    let flat_def_edges: Vec<(u32, u32, u32)> = def_edges
+        .iter()
+        .map(|(src, dst, w)| {
+            #[expect(clippy::cast_possible_truncation)]
+            (
+                flatten_def_id(&offsets, *src) as u32,
+                flatten_def_id(&offsets, *dst) as u32,
+                *w,
+            )
+        })
+        .collect();
+
+    let def_ranks = pagerank(n_defs, &flat_def_edges, None);
+
+    // Aggregate def ranks to file level
+    let base_ranks: Vec<f32> = files
+        .iter()
+        .enumerate()
+        .map(|(i, file)| {
+            let start = offsets[i];
+            let end = start + file.defs.len();
+            def_ranks[start..end].iter().sum()
+        })
+        .collect();
+
+    // Derive file-level edges from def-level call edges
+    let mut file_edge_map: HashMap<(u32, u32), u32> = HashMap::new();
+    for &(src, dst, w) in &def_edges {
+        let src_file = src.0;
+        let dst_file = dst.0;
+        if src_file != dst_file {
+            *file_edge_map.entry((src_file, dst_file)).or_insert(0) += w;
+        }
+    }
+    let file_edges: Vec<(u32, u32, u32)> = file_edge_map
+        .into_iter()
+        .map(|((src, dst), w)| (src, dst, w))
+        .collect();
+
+    // Build def-level caller/callee lists
+    let (def_callers, def_callees) = build_def_neighbor_lists(n_defs, &flat_def_edges, &offsets);
+
+    DefGraphData {
+        def_edges,
+        def_ranks,
+        def_callers,
+        def_callees,
+        offsets,
+        base_ranks,
+        file_edges,
+    }
+}
+
 /// Build a dependency graph from a repository root.
 ///
 /// Walks the directory tree, parses each supported file with tree-sitter,
@@ -568,33 +870,28 @@ pub fn build_graph(root: &Path) -> crate::Result<RepoGraph> {
         }
     }
 
-    // Build edge list from resolved imports
-    let mut edge_map: HashMap<(u32, u32), u32> = HashMap::new();
-    for (importer_idx, file) in files.iter().enumerate() {
-        for import in &file.imports {
-            if let Some(definer_idx) = import.resolved_idx
-                && let Ok(src) = u32::try_from(importer_idx)
-            {
-                *edge_map.entry((src, definer_idx)).or_insert(0) += 1;
-            }
+    // Extract calls within definitions
+    for (idx, ext, source) in &raw_sources {
+        if let Some(call_config) = languages::call_query_for_extension(ext) {
+            extract_calls(source, &call_config, &mut files[*idx].defs);
         }
     }
-    let edges: Vec<(u32, u32, u32)> = edge_map
-        .into_iter()
-        .map(|((src, dst), w)| (src, dst, w))
-        .collect();
 
-    // Compute PageRank
+    // Resolve call references to target definitions
+    let def_index = build_def_index(&files);
+    resolve_calls(&mut files, &def_index);
+
+    // Build def-level graph, compute PageRank, and derive file-level data
+    let graph_data = compute_def_graph(&files);
+
+    // Build file-level caller/callee lists
     let n = files.len();
-    let base_ranks = pagerank(n, &edges, None);
-
-    // Build caller/callee lists
-    let (inbound, outbound) = build_neighbor_lists(n, &edges);
+    let (callers, callees) = build_neighbor_lists(n, &graph_data.file_edges);
 
     // Auto-tune alpha based on graph density
     #[expect(clippy::cast_precision_loss, reason = "graph sizes fit in f32")]
     let density = if n > 1 {
-        edges.len() as f32 / (n as f32 * (n as f32 - 1.0))
+        graph_data.file_edges.len() as f32 / (n as f32 * (n as f32 - 1.0))
     } else {
         0.0
     };
@@ -602,12 +899,42 @@ pub fn build_graph(root: &Path) -> crate::Result<RepoGraph> {
 
     Ok(RepoGraph {
         files,
-        edges,
-        base_ranks,
-        callers: inbound,
-        callees: outbound,
+        edges: graph_data.file_edges,
+        base_ranks: graph_data.base_ranks,
+        callers,
+        callees,
+        def_edges: graph_data.def_edges,
+        def_ranks: graph_data.def_ranks,
+        def_callers: graph_data.def_callers,
+        def_callees: graph_data.def_callees,
+        def_offsets: graph_data.offsets,
         alpha,
     })
+}
+
+impl RepoGraph {
+    /// Get the `PageRank` score for a specific definition.
+    #[must_use]
+    pub fn def_rank(&self, did: DefId) -> f32 {
+        let flat = self.def_offsets[did.0 as usize] + did.1 as usize;
+        self.def_ranks.get(flat).copied().unwrap_or(0.0)
+    }
+
+    /// Look up a definition by file path and name. Returns the first match.
+    #[must_use]
+    pub fn find_def(&self, file_path: &str, def_name: &str) -> Option<DefId> {
+        for (file_idx, file) in self.files.iter().enumerate() {
+            if file.path == file_path {
+                for (def_idx, def) in file.defs.iter().enumerate() {
+                    if def.name == def_name {
+                        #[expect(clippy::cast_possible_truncation)]
+                        return Some((file_idx as u32, def_idx as u16));
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
 /// Build top-N caller and callee lists for each file.
@@ -877,6 +1204,9 @@ mod tests {
                     end_line: 5,
                     scope: String::new(),
                     signature: Some(format!("func_{i}(x: i32) -> i32")),
+                    start_byte: 0,
+                    end_byte: 0,
+                    calls: vec![],
                 }],
                 imports: vec![],
             })
@@ -893,6 +1223,11 @@ mod tests {
             base_ranks,
             callers: top_callers,
             callees: top_callees,
+            def_edges: vec![],
+            def_ranks: vec![],
+            def_callers: vec![],
+            def_callees: vec![],
+            def_offsets: vec![0],
             alpha: 0.5,
         };
 
@@ -931,6 +1266,11 @@ mod tests {
             base_ranks: vec![],
             callers: vec![],
             callees: vec![],
+            def_edges: vec![],
+            def_ranks: vec![],
+            def_callers: vec![],
+            def_callees: vec![],
+            def_offsets: vec![0],
             alpha: 0.5,
         };
         let output = render(&graph, 1000, None);
