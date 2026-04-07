@@ -304,6 +304,11 @@ pub async fn run_background_index(server: &RipvecServer, repo_level: bool) {
     progress.phase.store(1, Ordering::Relaxed); // loading model
 
     let result = tokio::task::spawn_blocking(move || {
+        // Force single-threaded BLAS on this thread. Multi-threaded Accelerate/OpenBLAS
+        // inside tokio's blocking pool can deadlock (the BLAS worker threads contend
+        // with tokio's I/O threads for scheduling).
+        ripvec_core::backend::driver::cpu::force_single_threaded_blas();
+
         let model_repo = "nomic-ai/modernbert-embed-base";
 
         progress.phase.store(1, Ordering::Relaxed);
