@@ -18,7 +18,7 @@ and cosine similarity ranking. Rust 2024 edition.
 Cargo workspace with three crates:
 - `ripvec-core` — shared library (backends, chunking, embedding, search, repo map, cache)
 - `ripvec` — CLI binary (clap, TUI with ratatui)
-- `ripvec-mcp` — MCP server binary (rmcp, 7 tools + 1 resource)
+- `ripvec-mcp` — MCP server binary (rmcp, 7 tools + 1 resource) + LSP server (`--lsp` flag, tower-lsp-server)
 
 ### Backends (in detection priority order)
 - **Metal** (default on macOS) — custom MSL kernels + MPS GEMMs, 73.8/s on M2 Max
@@ -29,6 +29,22 @@ Cargo workspace with three crates:
 ### Models
 - **BGE-small-en-v1.5** (--fast) — ClassicBert, 384-dim, CLS pooling
 - **ModernBERT** (default) — 768-dim, mean pooling
+
+## LSP server
+
+`ripvec-mcp --lsp` serves Language Server Protocol over stdio, providing
+code intelligence for all 21 supported languages (26 file extensions):
+
+- `workspaceSymbol` — cross-language semantic search with PageRank boost
+- `documentSymbol` — file outline via tree-sitter for all languages
+- `goToDefinition` / `goToImplementation` — BM25 identifier match + PageRank
+- `findReferences` — keyword search with content filtering
+- `hover` — enriched content with scope chain
+- `publishDiagnostics` — tree-sitter syntax error detection
+
+Especially valuable for languages without dedicated LSPs (bash, HCL, TOML,
+Ruby, Kotlin, Swift, Scala). For languages with dedicated LSPs (Rust, Go,
+TypeScript), ripvec complements with cross-language semantic features.
 
 ## When to use ripvec vs LSP vs grep
 

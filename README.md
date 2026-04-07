@@ -172,10 +172,11 @@ Use both — ripvec for "find the retry logic", grep for "find `TODO`".
 **vs Sourcegraph / GitHub search** — ripvec runs locally on your machine. Your
 code never leaves your laptop. No servers, no subscriptions, no cloud.
 
-**vs Serena / LSP tools** — ripvec finds *what* code to look at. LSP tells you
-the *details* (definitions, references, types). They're complementary — ripvec
-answers "where is authentication handled?" and LSP answers "who calls
-`authenticate()` and what does it return?"
+**vs Serena / LSP tools** — ripvec *is also* an LSP server (`ripvec-mcp --lsp`).
+It provides cross-language code intelligence (symbols, definitions, references,
+hover, syntax diagnostics) for 21 languages — including bash, HCL, TOML, and
+others that have no dedicated language server. For languages with dedicated LSPs
+(Rust, Go, TypeScript), ripvec complements with semantic cross-language search.
 
 **vs grepai / mgrep / cloud tools** — ripvec is self-contained. No Ollama, no
 API keys, no Docker, no external embedding service. One binary, bundled model
