@@ -44,7 +44,7 @@ pub async fn hover(
     let chunk = chunks.iter().find(|c| {
         let chunk_path = Path::new(&c.file_path);
         let matches_abs = chunk_path == file_path;
-        let matches_rel = c.file_path == rel_path;
+        let matches_rel = c.file_path == *rel_path;
         (matches_abs || matches_rel) && c.start_line <= line_1based && line_1based <= c.end_line
     });
 
