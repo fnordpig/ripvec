@@ -37,7 +37,7 @@ thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 ndarray = "0.17"
-tantivy = "0.25"
+tantivy = "0.26"
 blas-src = { version = "0.14", optional = true, default-features = false, features = ["openblas"] }
 openblas-src = { version = "0.10", optional = true, default-features = false, features = ["system"] }
 accelerate-src = { version = "0.3", optional = true }
