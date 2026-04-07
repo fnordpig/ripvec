@@ -15,11 +15,75 @@ use ripvec_core::chunk::CodeChunk;
 use ripvec_core::hybrid::{HybridIndex, SearchMode, boost_with_pagerank, pagerank_lookup};
 use ripvec_core::repo_map::RepoGraph;
 
+/// Information about a symbol extracted from a cursor position via tree-sitter.
+struct SymbolAtPosition {
+    /// The symbol text (e.g., "boost_with_pagerank").
+    name: String,
+    /// The tree-sitter node kind (e.g., "identifier", "type_identifier").
+    #[expect(dead_code, reason = "will be used for smarter search routing")]
+    node_kind: String,
+    /// The kind of the parent node (e.g., "call_expression", "use_declaration").
+    #[expect(dead_code, reason = "will be used for smarter search routing")]
+    parent_kind: String,
+}
+
+/// Extract the symbol at the given position using tree-sitter.
+///
+/// Parses the file, finds the smallest named node at the cursor, and returns
+/// its text plus structural context (node kind, parent kind). Falls back to
+/// text-based word extraction for unsupported extensions.
+fn symbol_at_position(source: &str, line: u32, character: u32, ext: &str) -> Option<SymbolAtPosition> {
+    let config = ripvec_core::languages::config_for_extension(ext)?;
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&config.language).ok()?;
+    let tree = parser.parse(source, None)?;
+
+    // Convert line/character to byte offset
+    let mut byte_offset = 0;
+    for (i, line_str) in source.lines().enumerate() {
+        if i == line as usize {
+            byte_offset += (character as usize).min(line_str.len());
+            break;
+        }
+        byte_offset += line_str.len() + 1; // +1 for newline
+    }
+
+    // Find the smallest node at this position
+    let mut node = tree
+        .root_node()
+        .descendant_for_byte_range(byte_offset, byte_offset)?;
+
+    // Walk up to the nearest identifier-like node (skip operators, punctuation, keywords)
+    loop {
+        match node.kind() {
+            "identifier" | "type_identifier" | "field_identifier" | "property_identifier"
+            | "simple_identifier" | "word" | "constant" | "bare_key" | "command_name"
+            | "string_content" => break,
+            _ => {
+                node = node.parent()?;
+            }
+        }
+    }
+
+    let name = source[node.start_byte()..node.end_byte()].to_string();
+    let node_kind = node.kind().to_string();
+    let parent_kind = node
+        .parent()
+        .map(|p| p.kind().to_string())
+        .unwrap_or_default();
+
+    Some(SymbolAtPosition {
+        name,
+        node_kind,
+        parent_kind,
+    })
+}
+
 /// Extract the identifier (word) at the given 0-based line and character.
 ///
-/// Expands outward from the cursor position to include all contiguous
-/// identifier characters (`[a-zA-Z0-9_]`).  Returns `None` if the cursor
-/// is not on an identifier character or the line doesn't exist.
+/// Text-based fallback when tree-sitter parsing isn't available.
+/// Expands outward from the cursor to include all contiguous
+/// identifier characters (`[a-zA-Z0-9_]`).
 fn word_at_position(source: &str, line: u32, character: u32) -> Option<String> {
     let target_line = source.lines().nth(line as usize)?;
     let col = character as usize;
@@ -84,11 +148,21 @@ fn uri_for_chunk(chunk: &CodeChunk, root: &Path) -> Option<Uri> {
     Uri::from_file_path(abs)
 }
 
+/// Extract the symbol name at a cursor position, using tree-sitter with text fallback.
+fn extract_symbol(source: &str, line: u32, character: u32, ext: &str) -> Option<String> {
+    // Try tree-sitter first for precise symbol extraction
+    if let Some(sym) = symbol_at_position(source, line, character, ext) {
+        return Some(sym.name);
+    }
+    // Fall back to text-based word extraction
+    word_at_position(source, line, character)
+}
+
 /// Resolve the definition of the symbol at the given position.
 ///
-/// Reads the file to extract the word under the cursor, searches the
-/// BM25 keyword index, applies PageRank boosting, and returns the best
-/// match where the chunk name exactly equals the word.
+/// Uses tree-sitter to identify the symbol under the cursor, then searches
+/// the BM25 keyword index with PageRank boosting. Returns the best match
+/// where the chunk name exactly equals the symbol.
 pub async fn goto_definition(
     params: GotoDefinitionParams,
     index: &Arc<tokio::sync::RwLock<Option<HybridIndex>>>,
@@ -105,7 +179,12 @@ pub async fn goto_definition(
         return Ok(None);
     };
 
-    let Some(word) = word_at_position(&source, pos.position.line, pos.position.character) else {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let Some(word) = extract_symbol(&source, pos.position.line, pos.position.character, ext)
+    else {
         return Ok(None);
     };
 
@@ -149,9 +228,9 @@ pub async fn goto_definition(
 
 /// Find all references to the symbol at the given position.
 ///
-/// Extracts the word under the cursor, searches the BM25 keyword index
-/// with PageRank boosting, and returns all chunks whose name or content
-/// contains the word.
+/// Uses tree-sitter to identify the symbol under the cursor, then searches
+/// the BM25 keyword index with PageRank boosting. Returns all chunks whose
+/// name or content contains the symbol.
 pub async fn find_references(
     params: ReferenceParams,
     index: &Arc<tokio::sync::RwLock<Option<HybridIndex>>>,
@@ -168,7 +247,12 @@ pub async fn find_references(
         return Ok(None);
     };
 
-    let Some(word) = word_at_position(&source, pos.position.line, pos.position.character) else {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let Some(word) = extract_symbol(&source, pos.position.line, pos.position.character, ext)
+    else {
         return Ok(None);
     };
 
