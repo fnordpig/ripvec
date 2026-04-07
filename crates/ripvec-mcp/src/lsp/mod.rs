@@ -3,6 +3,7 @@
 //! Implements the Language Server Protocol over stdio, sharing the same
 //! search index and file watcher as the MCP server. Started with `--lsp`.
 
+mod call_hierarchy;
 mod diagnostics;
 mod hover;
 mod navigation;
@@ -14,12 +15,14 @@ use std::sync::Arc;
 
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
-    DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentSymbolParams,
-    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
-    HoverProviderCapability, ImplementationProviderCapability, InitializeParams, InitializeResult,
-    InitializedParams, Location, MessageType, OneOf, ReferenceParams, ServerCapabilities,
-    TextDocumentSyncCapability, TextDocumentSyncKind, WorkspaceSymbolParams,
-    WorkspaceSymbolResponse, request,
+    CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
+    CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
+    CallHierarchyServerCapability, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
+    DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
+    Hover, HoverParams, HoverProviderCapability, ImplementationProviderCapability,
+    InitializeParams, InitializeResult, InitializedParams, Location, MessageType, OneOf,
+    ReferenceParams, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
+    WorkspaceSymbolParams, WorkspaceSymbolResponse, request,
 };
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
@@ -67,6 +70,7 @@ impl LanguageServer for RipvecLsp {
                 implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
                 references_provider: Some(OneOf::Left(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
+                call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
                 ..Default::default()
             },
             ..Default::default()
@@ -147,6 +151,27 @@ impl LanguageServer for RipvecLsp {
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         hover::hover(params, &self.index, &self.project_root).await
+    }
+
+    async fn prepare_call_hierarchy(
+        &self,
+        params: CallHierarchyPrepareParams,
+    ) -> Result<Option<Vec<CallHierarchyItem>>> {
+        call_hierarchy::prepare(params, &self.repo_graph, &self.project_root).await
+    }
+
+    async fn incoming_calls(
+        &self,
+        params: CallHierarchyIncomingCallsParams,
+    ) -> Result<Option<Vec<CallHierarchyIncomingCall>>> {
+        call_hierarchy::incoming(params, &self.repo_graph, &self.project_root).await
+    }
+
+    async fn outgoing_calls(
+        &self,
+        params: CallHierarchyOutgoingCallsParams,
+    ) -> Result<Option<Vec<CallHierarchyOutgoingCall>>> {
+        call_hierarchy::outgoing(params, &self.repo_graph, &self.project_root).await
     }
 }
 

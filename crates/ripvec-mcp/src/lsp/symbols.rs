@@ -28,7 +28,7 @@ use ripvec_core::repo_map::RepoGraph;
     clippy::match_same_arms,
     reason = "explicit function kinds listed for documentation/auditability"
 )]
-fn symbol_kind_for(kind: &str) -> SymbolKind {
+pub(crate) fn symbol_kind_for(kind: &str) -> SymbolKind {
     match kind {
         // Functions (Rust, Python, JS/TS, Go, Scala, Bash, Kotlin, Swift, C/C++)
         "function_item" | "function_definition" | "function_declaration" => SymbolKind::FUNCTION,
