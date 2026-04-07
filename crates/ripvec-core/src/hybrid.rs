@@ -243,8 +243,11 @@ pub fn boost_with_pagerank<S: std::hash::BuildHasher>(
 
     for (idx, score) in results.iter_mut() {
         if let Some(chunk) = chunks.get(*idx) {
+            // Try definition-level lookup first, fall back to file-level
+            let def_key = format!("{}::{}", chunk.file_path, chunk.name);
             let rank = pagerank_by_file
-                .get(&chunk.file_path)
+                .get(&def_key)
+                .or_else(|| pagerank_by_file.get(&chunk.file_path))
                 .copied()
                 .unwrap_or(0.0);
             let saturated = (1.0 + PAGERANK_BETA * rank).ln() / log_denom;
@@ -257,21 +260,44 @@ pub fn boost_with_pagerank<S: std::hash::BuildHasher>(
 
 /// Build a normalized PageRank lookup table from a [`RepoGraph`].
 ///
-/// Returns a map from relative file path to PageRank score normalized
-/// to [0, 1] (divided by the maximum rank in the graph). Files with
-/// no PageRank score map to 0.0.
+/// Returns a map from `"file_path::def_name"` to definition-level PageRank
+/// normalized to `[0, 1]`. Also inserts file-level entries (`"file_path"`)
+/// as aggregated fallback for chunks that don't match a specific definition.
 #[must_use]
 pub fn pagerank_lookup(graph: &crate::repo_map::RepoGraph) -> HashMap<String, f32> {
-    let max_rank = graph.base_ranks.iter().copied().fold(0.0_f32, f32::max);
+    let max_rank = graph.def_ranks.iter().copied().fold(0.0_f32, f32::max);
     if max_rank <= f32::EPSILON {
-        return HashMap::new();
+        // Fall back to file-level ranks if no def-level data
+        let file_max = graph.base_ranks.iter().copied().fold(0.0_f32, f32::max);
+        if file_max <= f32::EPSILON {
+            return HashMap::new();
+        }
+        return graph
+            .files
+            .iter()
+            .zip(graph.base_ranks.iter())
+            .map(|(file, &rank)| (file.path.clone(), rank / file_max))
+            .collect();
     }
-    graph
-        .files
-        .iter()
-        .zip(graph.base_ranks.iter())
-        .map(|(file, &rank)| (file.path.clone(), rank / max_rank))
-        .collect()
+
+    let mut map = HashMap::new();
+
+    // Definition-level entries: "path::name" -> def_rank
+    for (file_idx, file) in graph.files.iter().enumerate() {
+        for (def_idx, def) in file.defs.iter().enumerate() {
+            let flat = graph.def_offsets[file_idx] + def_idx;
+            if let Some(&rank) = graph.def_ranks.get(flat) {
+                let key = format!("{}::{}", file.path, def.name);
+                map.insert(key, rank / max_rank);
+            }
+        }
+        // File-level aggregate for fallback
+        if file_idx < graph.base_ranks.len() {
+            map.insert(file.path.clone(), graph.base_ranks[file_idx] / max_rank);
+        }
+    }
+
+    map
 }
 
 #[cfg(test)]
