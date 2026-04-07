@@ -74,7 +74,14 @@ fn compile_config(ext: &str) -> Option<LangConfig> {
                 "(function_item name: (identifier) @name) @def\n",
                 "(struct_item name: (type_identifier) @name) @def\n",
                 "(enum_item name: (type_identifier) @name) @def\n",
-                "(type_item name: (type_identifier) @name) @def",
+                "(type_item name: (type_identifier) @name) @def\n",
+                "(field_declaration name: (field_identifier) @name) @def\n",
+                "(enum_variant name: (identifier) @name) @def\n",
+                "(impl_item type: (type_identifier) @name) @def\n",
+                "(trait_item name: (type_identifier) @name) @def\n",
+                "(const_item name: (identifier) @name) @def\n",
+                "(static_item name: (identifier) @name) @def\n",
+                "(mod_item name: (identifier) @name) @def",
             ),
         ),
         // Python: top-level functions AND methods inside classes (function_definition
@@ -83,7 +90,8 @@ fn compile_config(ext: &str) -> Option<LangConfig> {
             tree_sitter_python::LANGUAGE.into(),
             concat!(
                 "(function_definition name: (identifier) @name) @def\n",
-                "(class_definition name: (identifier) @name body: (block) @def)",
+                "(class_definition name: (identifier) @name body: (block) @def)\n",
+                "(assignment left: (identifier) @name) @def",
             ),
         ),
         // JS: functions, methods, and arrow functions assigned to variables.
@@ -92,7 +100,8 @@ fn compile_config(ext: &str) -> Option<LangConfig> {
             concat!(
                 "(function_declaration name: (identifier) @name) @def\n",
                 "(method_definition name: (property_identifier) @name) @def\n",
-                "(class_declaration name: (identifier) @name) @def",
+                "(class_declaration name: (identifier) @name) @def\n",
+                "(variable_declarator name: (identifier) @name) @def",
             ),
         ),
         "ts" => (
@@ -101,7 +110,10 @@ fn compile_config(ext: &str) -> Option<LangConfig> {
                 "(function_declaration name: (identifier) @name) @def\n",
                 "(method_definition name: (property_identifier) @name) @def\n",
                 "(class_declaration name: (type_identifier) @name) @def\n",
-                "(interface_declaration name: (type_identifier) @name) @def",
+                "(interface_declaration name: (type_identifier) @name) @def\n",
+                "(variable_declarator name: (identifier) @name) @def\n",
+                "(type_alias_declaration name: (type_identifier) @name) @def\n",
+                "(enum_declaration name: (identifier) @name) @def",
             ),
         ),
         "tsx" => (
@@ -110,14 +122,19 @@ fn compile_config(ext: &str) -> Option<LangConfig> {
                 "(function_declaration name: (identifier) @name) @def\n",
                 "(method_definition name: (property_identifier) @name) @def\n",
                 "(class_declaration name: (type_identifier) @name) @def\n",
-                "(interface_declaration name: (type_identifier) @name) @def",
+                "(interface_declaration name: (type_identifier) @name) @def\n",
+                "(variable_declarator name: (identifier) @name) @def\n",
+                "(type_alias_declaration name: (type_identifier) @name) @def\n",
+                "(enum_declaration name: (identifier) @name) @def",
             ),
         ),
         "go" => (
             tree_sitter_go::LANGUAGE.into(),
             concat!(
                 "(function_declaration name: (identifier) @name) @def\n",
-                "(method_declaration name: (field_identifier) @name) @def",
+                "(method_declaration name: (field_identifier) @name) @def\n",
+                "(type_declaration (type_spec name: (type_identifier) @name)) @def\n",
+                "(const_spec name: (identifier) @name) @def",
             ),
         ),
         // Java: methods are already captured individually (method_declaration
@@ -127,25 +144,44 @@ fn compile_config(ext: &str) -> Option<LangConfig> {
             concat!(
                 "(method_declaration name: (identifier) @name) @def\n",
                 "(class_declaration name: (identifier) @name) @def\n",
-                "(interface_declaration name: (identifier) @name) @def",
+                "(interface_declaration name: (identifier) @name) @def\n",
+                "(field_declaration declarator: (variable_declarator name: (identifier) @name)) @def\n",
+                "(enum_constant name: (identifier) @name) @def\n",
+                "(enum_declaration name: (identifier) @name) @def\n",
+                "(constructor_declaration name: (identifier) @name) @def",
             ),
         ),
         "c" | "h" => (
             tree_sitter_c::LANGUAGE.into(),
-            "(function_definition declarator: (function_declarator declarator: (identifier) @name)) @def",
+            concat!(
+                "(function_definition declarator: (function_declarator declarator: (identifier) @name)) @def\n",
+                "(declaration declarator: (init_declarator declarator: (identifier) @name)) @def\n",
+                "(struct_specifier name: (type_identifier) @name) @def\n",
+                "(enum_specifier name: (type_identifier) @name) @def\n",
+                "(type_definition declarator: (type_identifier) @name) @def",
+            ),
         ),
         // C++: functions at any level, plus class signatures.
         "cpp" | "cc" | "cxx" | "hpp" => (
             tree_sitter_cpp::LANGUAGE.into(),
             concat!(
                 "(function_definition declarator: (function_declarator declarator: (identifier) @name)) @def\n",
-                "(class_specifier name: (type_identifier) @name) @def",
+                "(class_specifier name: (type_identifier) @name) @def\n",
+                "(declaration declarator: (init_declarator declarator: (identifier) @name)) @def\n",
+                "(struct_specifier name: (type_identifier) @name) @def\n",
+                "(enum_specifier name: (type_identifier) @name) @def\n",
+                "(type_definition declarator: (type_identifier) @name) @def\n",
+                "(namespace_definition name: (namespace_identifier) @name) @def\n",
+                "(field_declaration declarator: (field_identifier) @name) @def",
             ),
         ),
         // Bash: function definitions (.bats = Bash Automated Testing System).
         "sh" | "bash" | "bats" => (
             tree_sitter_bash::LANGUAGE.into(),
-            "(function_definition name: (word) @name) @def",
+            concat!(
+                "(function_definition name: (word) @name) @def\n",
+                "(variable_assignment name: (variable_name) @name) @def",
+            ),
         ),
         // Ruby: methods, classes, and modules.
         "rb" => (
@@ -153,7 +189,9 @@ fn compile_config(ext: &str) -> Option<LangConfig> {
             concat!(
                 "(method name: (identifier) @name) @def\n",
                 "(class name: (constant) @name) @def\n",
-                "(module name: (constant) @name) @def",
+                "(module name: (constant) @name) @def\n",
+                "(assignment left: (identifier) @name) @def\n",
+                "(assignment left: (constant) @name) @def",
             ),
         ),
         // HCL (Terraform): resource, data, variable, and output blocks.
@@ -167,7 +205,9 @@ fn compile_config(ext: &str) -> Option<LangConfig> {
             concat!(
                 "(function_declaration name: (identifier) @name) @def\n",
                 "(class_declaration name: (identifier) @name) @def\n",
-                "(object_declaration name: (identifier) @name) @def",
+                "(object_declaration name: (identifier) @name) @def\n",
+                "(property_declaration (identifier) @name) @def\n",
+                "(enum_entry (identifier) @name) @def",
             ),
         ),
         // Swift: functions, classes, structs, enums, and protocols.
@@ -176,7 +216,9 @@ fn compile_config(ext: &str) -> Option<LangConfig> {
             concat!(
                 "(function_declaration name: (simple_identifier) @name) @def\n",
                 "(class_declaration name: (type_identifier) @name) @def\n",
-                "(protocol_declaration name: (type_identifier) @name) @def",
+                "(protocol_declaration name: (type_identifier) @name) @def\n",
+                "(property_declaration name: (pattern bound_identifier: (simple_identifier) @name)) @def\n",
+                "(typealias_declaration name: (type_identifier) @name) @def",
             ),
         ),
         // Scala: functions, classes, traits, and objects.
@@ -186,13 +228,19 @@ fn compile_config(ext: &str) -> Option<LangConfig> {
                 "(function_definition name: (identifier) @name) @def\n",
                 "(class_definition name: (identifier) @name) @def\n",
                 "(trait_definition name: (identifier) @name) @def\n",
-                "(object_definition name: (identifier) @name) @def",
+                "(object_definition name: (identifier) @name) @def\n",
+                "(val_definition pattern: (identifier) @name) @def\n",
+                "(var_definition pattern: (identifier) @name) @def\n",
+                "(type_definition name: (type_identifier) @name) @def",
             ),
         ),
         // TOML: table headers (sections).
         "toml" => (
             tree_sitter_toml_ng::LANGUAGE.into(),
-            "(table (bare_key) @name) @def",
+            concat!(
+                "(table (bare_key) @name) @def\n",
+                "(pair (bare_key) @name) @def",
+            ),
         ),
         _ => return None,
     };
