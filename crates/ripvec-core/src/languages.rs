@@ -34,7 +34,8 @@ pub fn config_for_extension(ext: &str) -> Option<Arc<LangConfig>> {
         // Pre-compile all supported extensions
         for &ext in &[
             "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "c", "h", "cpp", "cc", "cxx",
-            "hpp", "sh", "bash", "rb", "tf", "hcl", "kt", "kts", "swift", "scala", "toml",
+            "hpp", "sh", "bash", "bats", "rb", "tf", "tfvars", "hcl", "kt", "kts", "swift",
+            "scala", "toml",
         ] {
             if let Some(cfg) = compile_config(ext) {
                 m.insert(ext, Arc::new(cfg));
@@ -130,8 +131,8 @@ fn compile_config(ext: &str) -> Option<LangConfig> {
                 "(class_specifier name: (type_identifier) @name) @def",
             ),
         ),
-        // Bash: function definitions.
-        "sh" | "bash" => (
+        // Bash: function definitions (.bats = Bash Automated Testing System).
+        "sh" | "bash" | "bats" => (
             tree_sitter_bash::LANGUAGE.into(),
             "(function_definition name: (word) @name) @def",
         ),
@@ -145,7 +146,7 @@ fn compile_config(ext: &str) -> Option<LangConfig> {
             ),
         ),
         // HCL (Terraform): resource, data, variable, and output blocks.
-        "tf" | "hcl" => (
+        "tf" | "tfvars" | "hcl" => (
             tree_sitter_hcl::LANGUAGE.into(),
             "(block (identifier) @name) @def",
         ),
@@ -220,7 +221,8 @@ mod tests {
     fn all_supported_extensions() {
         let exts = [
             "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "c", "h", "cpp", "cc", "cxx",
-            "hpp", "sh", "bash", "rb", "tf", "hcl", "kt", "kts", "swift", "scala", "toml",
+            "hpp", "sh", "bash", "bats", "rb", "tf", "tfvars", "hcl", "kt", "kts", "swift",
+            "scala", "toml",
         ];
         for ext in &exts {
             assert!(config_for_extension(ext).is_some(), "failed for {ext}");
