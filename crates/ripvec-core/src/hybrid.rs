@@ -201,32 +201,54 @@ pub fn rrf_fuse(semantic: &[(usize, f32)], bm25: &[(usize, f32)], k: f32) -> Vec
     results
 }
 
+/// Logarithmic saturation steepness for PageRank boost.
+///
+/// Controls how quickly the boost curve flattens. With `PAGERANK_BETA=10`:
+/// - rank 0.01 → 4% of max boost (barely boosted)
+/// - rank 0.10 → 29% of max boost
+/// - rank 0.50 → 75% of max boost
+/// - rank 1.00 → 100% of max boost
+///
+/// This prevents the single highest-ranked definition from getting a
+/// disproportionate boost relative to the second-highest.
+const PAGERANK_BETA: f32 = 10.0;
+
 /// Apply a multiplicative PageRank boost to search results.
 ///
-/// For each result, looks up the file's PageRank score and applies:
-///   `boosted_score = score * (1.0 + alpha * normalized_pagerank)`
+/// For each result, looks up the chunk's PageRank score and applies a
+/// log-saturated boost:
 ///
-/// This amplifies already-relevant results from structurally important files
-/// without promoting irrelevant results (multiplicative, not additive).
+///   `boosted = score * (1 + alpha * log(1 + beta * rank) / log(1 + beta))`
+///
+/// The logarithmic saturation compresses high PageRank values so the
+/// top-ranked definition doesn't dominate. This models a Bayesian prior
+/// where structural importance multiplies with query relevance.
+///
 /// Results are re-sorted after boosting.
 ///
 /// `pagerank_by_file` maps relative file paths to their PageRank scores
 /// (pre-normalized to [0, 1] by dividing by max rank).
-/// `alpha` controls boost strength — 0.3 means the top-ranked file gets
-/// a 30% score boost. The `alpha` field from [`RepoGraph`] is recommended.
+/// `alpha` controls overall boost strength. The `alpha` field from
+/// [`RepoGraph`] is recommended (auto-tuned from graph density).
 pub fn boost_with_pagerank<S: std::hash::BuildHasher>(
     results: &mut [(usize, f32)],
     chunks: &[CodeChunk],
     pagerank_by_file: &HashMap<String, f32, S>,
     alpha: f32,
 ) {
+    let log_denom = (1.0 + PAGERANK_BETA).ln();
+    if log_denom <= f32::EPSILON {
+        return;
+    }
+
     for (idx, score) in results.iter_mut() {
         if let Some(chunk) = chunks.get(*idx) {
             let rank = pagerank_by_file
                 .get(&chunk.file_path)
                 .copied()
                 .unwrap_or(0.0);
-            *score *= 1.0 + alpha * rank;
+            let saturated = (1.0 + PAGERANK_BETA * rank).ln() / log_denom;
+            *score *= 1.0 + alpha * saturated;
         }
     }
     // Re-sort descending by boosted score
@@ -362,10 +384,19 @@ mod tests {
         );
         assert!(results[0].1 > results[1].1);
 
-        // Verify the math: 0.8 * (1 + 0.3 * 1.0) = 1.04
-        assert!((results[0].1 - 1.04).abs() < 0.001);
-        // 0.8 * (1 + 0.3 * 0.1) = 0.824
-        assert!((results[1].1 - 0.824).abs() < 0.001);
+        // Verify the math with log saturation (beta=10):
+        // rank=1.0: saturated = ln(11)/ln(11) = 1.0 → 0.8 * (1 + 0.3 * 1.0) = 1.04
+        assert!(
+            (results[0].1 - 1.04).abs() < 0.01,
+            "rank=1.0 boost: expected ~1.04, got {}",
+            results[0].1
+        );
+        // rank=0.1: saturated = ln(2)/ln(11) ≈ 0.289 → 0.8 * (1 + 0.3 * 0.289) ≈ 0.869
+        assert!(
+            (results[1].1 - 0.869).abs() < 0.01,
+            "rank=0.1 boost: expected ~0.869, got {}",
+            results[1].1
+        );
     }
 
     #[test]

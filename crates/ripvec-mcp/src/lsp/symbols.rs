@@ -222,7 +222,7 @@ pub async fn workspace_symbol(
         && let Some(graph) = graph_guard.as_ref()
     {
         let pr = pagerank_lookup(graph);
-        boost_with_pagerank(&mut results, hybrid.chunks(), &pr, 0.3);
+        boost_with_pagerank(&mut results, hybrid.chunks(), &pr, graph.alpha);
     }
 
     let chunks = hybrid.chunks();
