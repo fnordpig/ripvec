@@ -214,33 +214,138 @@ ripvec-mcp --lsp   # serves LSP over stdio
 
 Same binary, `--lsp` flag selects protocol.
 
-## Indexing
+## Index architecture
 
-### No index required
+ripvec works without an index (`ripvec "query" .` embeds on-the-fly), but
+persistent indexing makes subsequent searches instant.
 
-ripvec works out of the box — point it at a directory and search. No pre-indexing,
-no database, no config.
+### Cache layout
 
-### Persistent cache
-
-```sh
-ripvec "query" --index    # First run embeds; subsequent runs are instant
+```mermaid
+graph TD
+    subgraph "~/.cache/ripvec/&lt;project_hash&gt;/v3-modernbert/"
+        M["manifest.json<br/>file entries + Merkle hashes"]
+        L["manifest.lock<br/>advisory fd-lock"]
+        subgraph "objects/ (content-addressed)"
+            O1["ab/cdef12...<br/>(zstd-compressed FileCache)"]
+            O2["3f/a891bc...<br/>(zstd-compressed FileCache)"]
+        end
+    end
 ```
 
-Cache uses a Merkle-tree diff system: content-addressed chunks, per-directory
-hash trees, zstd compression (~8x smaller). Only changed files get re-embedded.
-The MCP server adds a file watcher for live re-indexing (2-second debounce).
+Each file's chunks and embeddings are serialized into a `FileCache` object,
+compressed with zstd (~8x), and stored by blake3 content hash in a git-style
+`xx/hash` sharded object store. The manifest tracks metadata: mtime, size,
+content hash, chunk count per file, plus Merkle directory hashes.
 
-### Team sharing
+### Change detection — two-level diff
+
+```mermaid
+graph TD
+    F["File on disk"] --> M{"mtime + size<br/>match manifest?"}
+    M -->|"yes"| SKIP["Unchanged<br/>(fast path, no I/O)"]
+    M -->|"no"| HASH{"blake3 content hash<br/>matches manifest?"}
+    HASH -->|"yes"| TOUCH["Touched but identical<br/>(heal mtime in manifest)"]
+    HASH -->|"no"| DIRTY["Dirty → re-embed"]
+```
+
+Level 1 (mtime+size) is a stat call — microseconds. Level 2 (blake3 hash)
+reads the file but avoids re-embedding if content hasn't changed. After
+`git clone` (where all mtimes are wrong), the first run hashes everything
+but re-embeds nothing — then heals the manifest mtimes for fast-path on
+subsequent runs.
+
+### Serialization — two formats
+
+| Format | Used for | Portable? |
+|--------|----------|-----------|
+| **rkyv** (zero-copy) | User-level cache (~/.cache) | No (architecture-dependent) |
+| **bitcode** | Repo-level cache (.ripvec/) | Yes (cross-architecture) |
+
+Auto-detected on read via magic bytes: `0x42 0x43` = bitcode, otherwise rkyv.
+Both are zstd-compressed. Repo-level indices use bitcode so they can be
+committed to git and shared between x86 CI and ARM developer machines.
+
+### Concurrency and locking
+
+```mermaid
+sequenceDiagram
+    participant MCP as MCP Server
+    participant Watcher as File Watcher
+    participant Lock as manifest.lock
+    participant Cache as Object Store
+
+    Note over MCP: Query arrives
+    MCP->>Lock: acquire read lock
+    MCP->>Cache: load objects
+    Lock-->>MCP: release
+
+    Note over Watcher: File change detected (2s debounce)
+    Watcher->>Lock: acquire write lock
+    Watcher->>Cache: re-embed dirty files
+    Watcher->>Cache: write new objects
+    Watcher->>Cache: save manifest + GC
+    Lock-->>Watcher: release
+```
+
+The file watcher debounces for 2 seconds of quiet before triggering
+re-indexing. Advisory `fd-lock` on `manifest.lock` prevents readers from
+seeing a half-written manifest. The MCP server holds a read lock during
+queries; the watcher holds a write lock during index updates. Multiple
+readers can proceed concurrently; writers block all readers.
+
+Garbage collection runs after each incremental update — unreferenced objects
+(from deleted or re-embedded files) are removed from the store.
+
+### Dual search index
+
+```mermaid
+graph LR
+    subgraph "HybridIndex"
+        subgraph "SearchIndex (dense vectors)"
+            EMB["768-dim embeddings<br/>(TurboQuant 4-bit compressed)"]
+            EMB --> CS["Cosine similarity scan"]
+        end
+        subgraph "Bm25Index (tantivy)"
+            TAN["Inverted index<br/>(code-aware tokenizer)"]
+            TAN --> BM["BM25 scoring<br/>(name 3× / path 1.5× / body 1×)"]
+        end
+        CS --> RRF["RRF fusion (k=60)"]
+        BM --> RRF
+    end
+```
+
+The BM25 index uses a code-aware tokenizer that splits `parseJsonConfig` into
+`[parse, json, config]` and `my_func_name` into `[my, func, name]` — so keyword
+search finds `json config parser` even if the function is named in camelCase.
+Function names are boosted 3x over body text.
+
+TurboQuant compresses 768-dim vectors from 3KB to ~380 bytes (4-bit) with a
+rotation matrix for better quantization. This enables ~5x faster scanning for
+large indices while maintaining ranking quality through exact re-ranking of
+the top candidates.
+
+### Repo-level indexing
 
 ```sh
 ripvec --index --repo-level "query"
 git add .ripvec/ && git commit -m "add search index"
 ```
 
-Teammates who clone get instant search — zero embedding time. Uses portable
-bitcode serialization (architecture-independent). File timestamps self-heal
-after clone.
+Creates `.ripvec/config.toml` (pins model + version) and `.ripvec/cache/`
+(manifest + objects). Teammates who clone get instant search. The config
+is validated on load — if the model doesn't match the runtime model, ripvec
+falls back to the user-level cache with a warning.
+
+### Cache resolution
+
+```mermaid
+graph TD
+    A["--cache-dir override"] -->|"highest priority"| R["Resolved cache dir"]
+    B[".ripvec/config.toml<br/>(repo-local)"] -->|"if model matches"| R
+    C["RIPVEC_CACHE env var"] --> R
+    D["~/.cache/ripvec/<br/>(XDG default)"] -->|"lowest priority"| R
+```
 
 ## Supported languages
 
