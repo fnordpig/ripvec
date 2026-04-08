@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{Hover, HoverContents, HoverParams, MarkupContent, MarkupKind};
 
+use ripvec_core::cache::reindex::load_cached_index;
 use ripvec_core::chunk::CodeChunk;
 use ripvec_core::hybrid::HybridIndex;
 
@@ -85,6 +86,20 @@ pub async fn hover(
         && let Some(chunk) = find_hover_chunk(hybrid.chunks(), &file_path, alt_root, line_1based)
     {
         return Ok(Some(hover_response(chunk)));
+    }
+    drop(ri_guard);
+
+    // Fall back to disk cache (cross-process).
+    let model_repo = "nomic-ai/modernbert-embed-base";
+    let mut candidate = file_path.parent();
+    while let Some(dir) = candidate {
+        if (dir.join(".git").exists() || dir.join(".ripvec").exists())
+            && let Some(cached) = load_cached_index(dir, model_repo)
+            && let Some(chunk) = find_hover_chunk(cached.chunks(), &file_path, dir, line_1based)
+        {
+            return Ok(Some(hover_response(chunk)));
+        }
+        candidate = dir.parent();
     }
 
     Ok(None)

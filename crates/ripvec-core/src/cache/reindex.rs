@@ -393,6 +393,47 @@ fn load_all_from_store(
     Ok((all_chunks, all_embeddings))
 }
 
+/// Load a pre-built index from the disk cache without re-embedding.
+///
+/// This is the lightweight read path for processes that don't own the index
+/// (e.g., the LSP process reading caches built by the MCP process).
+/// Returns `None` if no compatible cache exists for this root.
+///
+/// Uses an advisory file lock on `manifest.lock` to avoid reading
+/// a half-written cache.
+#[must_use]
+pub fn load_cached_index(root: &Path, model_repo: &str) -> Option<HybridIndex> {
+    let cache_dir = resolve_cache_dir(root, model_repo, None);
+    let manifest_path = cache_dir.join("manifest.json");
+    let objects_dir = cache_dir.join("objects");
+    let lock_path = cache_dir.join("manifest.lock");
+
+    // Ensure cache dir exists (it might not if no index has been built)
+    if !manifest_path.exists() {
+        return None;
+    }
+
+    // Acquire a shared (read) lock — blocks if a writer holds the exclusive lock
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .read(true)
+        .open(&lock_path)
+        .ok()?;
+    let lock = fd_lock::RwLock::new(lock_file);
+    let _guard = lock.read().ok()?;
+
+    let manifest = Manifest::load(&manifest_path).ok()?;
+    if !manifest.is_compatible(model_repo) {
+        return None;
+    }
+
+    let store = ObjectStore::new(&objects_dir);
+    let (chunks, embeddings) = load_all_from_store(&store, &manifest).ok()?;
+    HybridIndex::new(chunks, &embeddings, None).ok()
+}
+
 /// Resolve the cache directory for a project + model combination.
 ///
 /// Resolution priority:

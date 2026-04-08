@@ -12,9 +12,37 @@ use tower_lsp_server::ls_types::{
     GotoDefinitionParams, GotoDefinitionResponse, Location, Position, Range, ReferenceParams, Uri,
 };
 
+use ripvec_core::cache::reindex::load_cached_index;
 use ripvec_core::chunk::CodeChunk;
 use ripvec_core::hybrid::{HybridIndex, SearchMode, boost_with_pagerank, pagerank_lookup};
 use ripvec_core::repo_map::RepoGraph;
+
+/// A cached index loaded from disk for a non-default project root.
+struct CachedRoot {
+    root: PathBuf,
+    index: HybridIndex,
+}
+
+/// Walk up from a file path to find a directory with a cached ripvec index.
+///
+/// Checks each ancestor directory for a disk cache (built by MCP or CLI).
+/// Returns the index and root if found. This enables cross-process index
+/// sharing: the MCP builds the cache, the LSP reads it.
+fn find_cached_root_for_file(file_path: &Path, model_repo: &str) -> Option<CachedRoot> {
+    let mut candidate = file_path.parent()?;
+    loop {
+        // Check if this directory has a .git (likely project root)
+        if (candidate.join(".git").exists() || candidate.join(".ripvec").exists())
+            && let Some(index) = load_cached_index(candidate, model_repo)
+        {
+            return Some(CachedRoot {
+                root: candidate.to_path_buf(),
+                index,
+            });
+        }
+        candidate = candidate.parent()?;
+    }
+}
 
 /// Information about a symbol extracted from a cursor position via tree-sitter.
 struct SymbolAtPosition {
@@ -290,7 +318,7 @@ pub async fn goto_definition(
         return Ok(result);
     }
 
-    // Fall back to on-demand root indices.
+    // Fall back to on-demand root indices (in-memory, from MCP searches in same process).
     let ri_guard = root_indices.read().await;
     if let Some((alt_root, hybrid)) = ri_guard.iter().find(|(r, _)| path.starts_with(r)) {
         let rg_guard = root_graphs.read().ok();
@@ -303,6 +331,18 @@ pub async fn goto_definition(
             line_1based,
             graph,
         ));
+    }
+    drop(ri_guard);
+
+    // Fall back to disk cache (cross-process: index built by MCP in another process).
+    // Walk up from the file path to find a cached index root.
+    let model_repo = "nomic-ai/modernbert-embed-base";
+    if let Some(cached) = find_cached_root_for_file(&path, model_repo) {
+        let result =
+            search_definition(&cached.index, &word, &path, &cached.root, line_1based, None);
+        if result.is_some() {
+            return Ok(result);
+        }
     }
 
     Ok(None)
@@ -405,6 +445,17 @@ pub async fn find_references(
         let rg_guard = root_graphs.read().ok();
         let graph = rg_guard.as_ref().and_then(|g| g.get(alt_root));
         let locations = search_references(hybrid, &word, &path, alt_root, line_1based, graph);
+        if !locations.is_empty() {
+            return Ok(Some(locations));
+        }
+    }
+    drop(ri_guard);
+
+    // Fall back to disk cache (cross-process).
+    let model_repo = "nomic-ai/modernbert-embed-base";
+    if let Some(cached) = find_cached_root_for_file(&path, model_repo) {
+        let locations =
+            search_references(&cached.index, &word, &path, &cached.root, line_1based, None);
         if !locations.is_empty() {
             return Ok(Some(locations));
         }
