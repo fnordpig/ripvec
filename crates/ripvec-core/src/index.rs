@@ -289,6 +289,40 @@ impl SearchIndex {
         Some(self.embeddings.row(idx).to_vec())
     }
 
+    /// Find duplicate or near-duplicate chunks by pairwise cosine similarity.
+    ///
+    /// Computes `embeddings @ embeddings.T` (a single BLAS GEMM) to get all
+    /// pairwise similarities, then extracts pairs above `threshold` from the
+    /// upper triangle (avoiding self-matches and symmetric duplicates).
+    ///
+    /// Returns `(chunk_a, chunk_b, similarity)` sorted by descending similarity.
+    /// Each pair appears only once (a < b).
+    #[must_use]
+    pub fn find_duplicates(&self, threshold: f32, max_pairs: usize) -> Vec<(usize, usize, f32)> {
+        let n = self.chunks.len();
+        if n < 2 {
+            return vec![];
+        }
+
+        // Single GEMM: [n, dim] × [dim, n] = [n, n] pairwise similarity matrix
+        let sim_matrix = self.embeddings.dot(&self.embeddings.t());
+
+        // Scan upper triangle for pairs above threshold
+        let mut pairs: Vec<(usize, usize, f32)> = Vec::new();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let score = sim_matrix[[i, j]];
+                if score >= threshold {
+                    pairs.push((i, j, score));
+                }
+            }
+        }
+
+        pairs.sort_unstable_by(|a, b| b.2.total_cmp(&a.2));
+        pairs.truncate(max_pairs);
+        pairs
+    }
+
     /// Number of chunks in the index.
     #[must_use]
     pub fn len(&self) -> usize {

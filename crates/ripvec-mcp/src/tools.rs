@@ -120,6 +120,19 @@ pub struct RepoMapParams {
     pub root: Option<String>,
 }
 
+/// Parameters for the `find_duplicates` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindDuplicatesParams {
+    /// Project root directory to search. Uses the server's default project root if omitted.
+    pub root: Option<String>,
+    /// Minimum cosine similarity threshold for a pair to be considered a duplicate.
+    /// Default: 0.85. Higher values (0.90+) find near-exact copies; lower values
+    /// (0.75-0.85) find similar patterns that may be refactorable.
+    pub threshold: Option<f32>,
+    /// Maximum number of duplicate pairs to return. Default: 20.
+    pub max_pairs: Option<usize>,
+}
+
 /// Parameters for the `reindex` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReindexParams {
@@ -543,6 +556,72 @@ impl RipvecServer {
     ///
     /// Clears the current index, re-walks and re-embeds all files, then
     /// returns statistics about the new index. Blocks until indexing is done.
+    #[tool(
+        name = "find_duplicates",
+        description = "Find duplicate or near-duplicate code by pairwise embedding similarity. Returns pairs of chunks with cosine similarity above the threshold, sorted by similarity. Useful for detecting copy-paste code, refactoring candidates, and similar patterns across the codebase."
+    )]
+    async fn find_duplicates(
+        &self,
+        Parameters(params): Parameters<FindDuplicatesParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let threshold = params.threshold.unwrap_or(0.85);
+        let max_pairs = params.max_pairs.unwrap_or(20);
+
+        let custom_root = self.ensure_root(params.root.as_deref(), false).await?;
+
+        let root_cache_guard;
+        let idx_guard;
+        let index: &ripvec_core::hybrid::HybridIndex = if let Some(ref canon) = custom_root {
+            root_cache_guard = self.root_indices.read().await;
+            root_cache_guard.get(canon).ok_or_else(|| {
+                rmcp::ErrorData::internal_error(
+                    "Cached index disappeared. Try again.".to_string(),
+                    None,
+                )
+            })?
+        } else {
+            idx_guard = self.index.read().await;
+            idx_guard.as_ref().ok_or_else(|| {
+                let msg = self.progress.format_message();
+                rmcp::ErrorData::internal_error(msg, None)
+            })?
+        };
+
+        let pairs = index.semantic.find_duplicates(threshold, max_pairs);
+
+        let chunks = index.chunks();
+        let results: Vec<serde_json::Value> = pairs
+            .iter()
+            .map(|&(a, b, score)| {
+                let chunk_a = &chunks[a];
+                let chunk_b = &chunks[b];
+                serde_json::json!({
+                    "similarity": (score * 1000.0).round() / 1000.0,
+                    "a": {
+                        "file": &chunk_a.file_path,
+                        "name": &chunk_a.name,
+                        "kind": &chunk_a.kind,
+                        "lines": format!("{}-{}", chunk_a.start_line, chunk_a.end_line),
+                    },
+                    "b": {
+                        "file": &chunk_b.file_path,
+                        "name": &chunk_b.name,
+                        "kind": &chunk_b.kind,
+                        "lines": format!("{}-{}", chunk_b.start_line, chunk_b.end_line),
+                    },
+                })
+            })
+            .collect();
+
+        let response = serde_json::json!({
+            "pairs": results,
+            "total": pairs.len(),
+            "threshold": threshold,
+        });
+
+        Ok(CallToolResult::success(vec![Content::json(response)?]))
+    }
+
     #[tool(
         name = "reindex",
         description = "Rebuild the search index from scratch. Returns chunk and file counts when done."
