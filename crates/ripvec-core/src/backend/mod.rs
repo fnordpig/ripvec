@@ -418,10 +418,10 @@ pub fn load_modernbert_cpu(model_repo: &str) -> crate::Result<Box<dyn EmbedBacke
         layers = config.num_hidden_layers,
         heads = config.num_attention_heads,
         max_tokens,
-        "ModernBERT loaded on CPU (driver/arch)"
+        "ModernBERT loaded on CPU (driver/arch, zero-copy mmap)"
     );
 
-    Ok(Box::new(GenericBackend::new(
+    Ok(Box::new(GenericBackend::new_shared(
         driver, arch, max_tokens, false, mmap,
     )))
 }
@@ -478,7 +478,12 @@ pub fn load_modernbert_cuda(model_repo: &str) -> crate::Result<Box<dyn EmbedBack
     // CUDA benefits from larger batches to saturate GPU SMs (128 SMs on RTX 4090).
     // Metal uses 32 (AMX coprocessor-limited). CUDA can handle 128+ easily.
     Ok(Box::new(GenericBackend::with_max_batch(
-        driver, arch, max_tokens, true, mmap, 32,
+        driver,
+        arch,
+        max_tokens,
+        true,
+        generic::MmapHolder::Owned(mmap),
+        32,
     )))
 }
 
@@ -623,10 +628,10 @@ pub fn load_classic_cpu(model_repo: &str) -> crate::Result<Box<dyn EmbedBackend>
         heads = config.num_attention_heads,
         intermediate = config.intermediate_size,
         max_tokens,
-        "ClassicBert loaded on CPU (driver/arch)"
+        "ClassicBert loaded on CPU (driver/arch, zero-copy mmap)"
     );
 
-    Ok(Box::new(GenericBackend::new(
+    Ok(Box::new(GenericBackend::new_shared(
         driver, arch, max_tokens, false, mmap,
     )))
 }

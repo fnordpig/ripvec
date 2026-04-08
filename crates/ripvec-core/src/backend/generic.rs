@@ -7,7 +7,8 @@
 //! embedding backend.
 //!
 //! The `_mmap` field keeps the memory-mapped safetensors file alive as long
-//! as the backend exists, since Metal zero-copy buffers reference its pages.
+//! as the backend exists, since Metal zero-copy buffers and CPU `MmapTensor`
+//! slices reference its pages.
 
 use super::arch::ModelArch;
 use super::driver::Driver;
@@ -23,7 +24,8 @@ use super::{EmbedBackend, Encoding};
 ///
 /// `_mmap` **must** be declared after `arch` so it is dropped last. The
 /// architecture's weight tensors reference pages in the memory-mapped file
-/// via zero-copy Metal buffers; dropping the mmap first would invalidate them.
+/// via zero-copy Metal buffers or CPU `MmapTensor::Mapped` slices; dropping
+/// the mmap first would invalidate them.
 pub struct GenericBackend<D: Driver, A: ModelArch<D>> {
     /// Hardware compute driver (Metal, CUDA, CPU).
     driver: D,
@@ -40,7 +42,17 @@ pub struct GenericBackend<D: Driver, A: ModelArch<D>> {
     ///
     /// Must outlive the weight tensors in `arch` — declared last for correct
     /// drop order.
-    _mmap: memmap2::Mmap,
+    _mmap: MmapHolder,
+}
+
+/// Holds a memory-mapped file, accepting either an owned `Mmap` or an
+/// `Arc<Mmap>`. CPU backends share the `Arc` with `MmapTensor::Mapped`
+/// variants; GPU backends pass an owned `Mmap`.
+pub enum MmapHolder {
+    /// Owned mmap (GPU backends — tensors are device copies, not mmap refs).
+    Owned(memmap2::Mmap),
+    /// Shared mmap (CPU backend — `MmapTensor::Mapped` variants hold `Arc` clones).
+    Shared(std::sync::Arc<memmap2::Mmap>),
 }
 
 impl<D: Driver, A: ModelArch<D>> GenericBackend<D, A> {
@@ -48,18 +60,41 @@ impl<D: Driver, A: ModelArch<D>> GenericBackend<D, A> {
     ///
     /// The `mmap` must be the memory-mapped safetensors file whose pages back
     /// the weight tensors stored in `arch`.
-    /// Create a new generic backend.
     ///
     /// For GPU backends, runs a warm-up forward pass to prime the buffer pool.
     /// This is skipped for large models (max_tokens > 1024) where the warm-up
     /// cost exceeds the benefit.
-    /// Create a new generic backend.
     ///
     /// `max_batch` controls how many encodings are sent in each forward pass.
     /// Metal: 32 (optimal for M2 Max AMX). CUDA: 128+ (needs more work to
     /// saturate 128 SMs on RTX 4090).
     pub fn new(driver: D, arch: A, max_tokens: usize, is_gpu: bool, mmap: memmap2::Mmap) -> Self {
-        Self::with_max_batch(driver, arch, max_tokens, is_gpu, mmap, 32)
+        Self::with_max_batch(
+            driver,
+            arch,
+            max_tokens,
+            is_gpu,
+            MmapHolder::Owned(mmap),
+            32,
+        )
+    }
+
+    /// Create with an `Arc<Mmap>` shared with zero-copy tensors.
+    pub fn new_shared(
+        driver: D,
+        arch: A,
+        max_tokens: usize,
+        is_gpu: bool,
+        mmap: std::sync::Arc<memmap2::Mmap>,
+    ) -> Self {
+        Self::with_max_batch(
+            driver,
+            arch,
+            max_tokens,
+            is_gpu,
+            MmapHolder::Shared(mmap),
+            32,
+        )
     }
 
     /// Create with explicit max batch size.
@@ -69,7 +104,7 @@ impl<D: Driver, A: ModelArch<D>> GenericBackend<D, A> {
         arch: A,
         max_tokens: usize,
         is_gpu: bool,
-        mmap: memmap2::Mmap,
+        mmap: MmapHolder,
         max_batch: usize,
     ) -> Self {
         let backend = Self {

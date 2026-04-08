@@ -24,6 +24,7 @@ extern crate blas_src;
 extern crate openblas_src;
 
 use std::path::Path;
+use std::sync::Arc;
 
 use safetensors::SafeTensors;
 
@@ -35,6 +36,131 @@ use crate::backend::arch::classic_bert::{
 use crate::backend::arch::modern_bert::{
     ModernBertArch, ModernBertLayerWeights, ModernBertWeights, RopeCache,
 };
+
+// ---------------------------------------------------------------------------
+// MmapTensor — zero-copy weight storage
+// ---------------------------------------------------------------------------
+
+/// A tensor that can be either owned (`Vec<f32>`) or a zero-copy view into an mmap.
+///
+/// Implements [`Deref<Target=[f32]>`] so the forward pass code works unchanged.
+/// Mutable operations (used only on transient activation buffers from
+/// [`CpuDriver::alloc_zeros`]) go through the `Owned` variant.
+///
+/// Weight tensors loaded from safetensors use the `Mapped` variant, which
+/// references pages in the memory-mapped file directly. The OS pages in only
+/// the weights that are actually accessed and can evict under memory pressure.
+pub enum MmapTensor {
+    /// Owned data — used for activation buffers, fused tensors, synthetic
+    /// biases, and any weight whose mmap offset is not 4-byte aligned.
+    Owned(Vec<f32>),
+    /// Zero-copy view into an mmap'd safetensors file.
+    ///
+    /// The [`Arc<memmap2::Mmap>`] keeps the mapping alive as long as any
+    /// tensor references it.
+    Mapped {
+        /// Shared reference to the memory-mapped file.
+        mmap: Arc<memmap2::Mmap>,
+        /// Byte offset within the mmap where this tensor starts.
+        offset: usize,
+        /// Number of `f32` elements in this tensor.
+        len: usize,
+    },
+}
+
+impl std::ops::Deref for MmapTensor {
+    type Target = [f32];
+
+    fn deref(&self) -> &[f32] {
+        match self {
+            Self::Owned(v) => v,
+            #[expect(unsafe_code, reason = "reinterpret aligned mmap bytes as f32 slice")]
+            Self::Mapped { mmap, offset, len } => {
+                let bytes = &mmap[*offset..*offset + *len * 4];
+                // SAFETY: safetensors stores f32 as little-endian bytes. We
+                // verified 4-byte alignment at construction time (unaligned
+                // tensors fall back to the Owned/copy path). The Arc<Mmap>
+                // keeps the mapping alive for the lifetime of this tensor.
+                #[expect(
+                    clippy::cast_ptr_alignment,
+                    reason = "alignment verified in load_tensor_mmap before constructing Mapped"
+                )]
+                unsafe {
+                    std::slice::from_raw_parts(bytes.as_ptr().cast::<f32>(), *len)
+                }
+            }
+        }
+    }
+}
+
+impl std::ops::DerefMut for MmapTensor {
+    fn deref_mut(&mut self) -> &mut [f32] {
+        match self {
+            Self::Owned(v) => v,
+            Self::Mapped { .. } => {
+                panic!("cannot mutate a memory-mapped tensor — only Owned tensors are mutable")
+            }
+        }
+    }
+}
+
+// --- Vec-like mutation methods (only valid on Owned variant) ---
+//
+// These are used by Driver methods on *output* tensors, which are always
+// created via `alloc_zeros` and thus always `Owned`.
+
+impl MmapTensor {
+    /// Resize the owned buffer, filling new slots with `value`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on a `Mapped` tensor.
+    fn resize(&mut self, new_len: usize, value: f32) {
+        match self {
+            Self::Owned(v) => v.resize(new_len, value),
+            Self::Mapped { .. } => panic!("cannot resize a memory-mapped tensor"),
+        }
+    }
+
+    /// Clear the owned buffer (sets length to 0, keeps capacity).
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on a `Mapped` tensor.
+    fn clear(&mut self) {
+        match self {
+            Self::Owned(v) => v.clear(),
+            Self::Mapped { .. } => panic!("cannot clear a memory-mapped tensor"),
+        }
+    }
+
+    /// Extend the owned buffer from an iterator.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on a `Mapped` tensor.
+    fn extend<I: IntoIterator<Item = f32>>(&mut self, iter: I) {
+        match self {
+            Self::Owned(v) => v.extend(iter),
+            Self::Mapped { .. } => panic!("cannot extend a memory-mapped tensor"),
+        }
+    }
+}
+
+impl From<Vec<f32>> for MmapTensor {
+    fn from(v: Vec<f32>) -> Self {
+        Self::Owned(v)
+    }
+}
+
+// SAFETY: Both variants are Send + Sync:
+// - Owned(Vec<f32>): Vec<f32> is Send + Sync.
+// - Mapped { Arc<Mmap>, usize, usize }: Arc<Mmap> is Send + Sync, usize is Send + Sync.
+//   Mmap is Send + Sync (memmap2 documents this).
+#[expect(unsafe_code, reason = "MmapTensor components are all Send + Sync")]
+unsafe impl Send for MmapTensor {}
+#[expect(unsafe_code, reason = "MmapTensor components are all Send + Sync")]
+unsafe impl Sync for MmapTensor {}
 // ---------------------------------------------------------------------------
 // CpuDriver
 // ---------------------------------------------------------------------------
@@ -164,12 +290,13 @@ impl ClassicBertConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Safetensors -> Vec<f32> helpers
+// Safetensors -> tensor helpers
 // ---------------------------------------------------------------------------
 
-/// Load a named tensor from safetensors as flat `Vec<f32>`.
+/// Load a named tensor from safetensors as flat `Vec<f32>` (copy path).
 ///
-/// The tensor must be stored in `f32` (little-endian) format.
+/// The tensor must be stored in `f32` (little-endian) format. Used for
+/// ClassicBert QKV fusion where we need separate Q/K/V vecs to concatenate.
 fn load_tensor_flat(tensors: &SafeTensors<'_>, name: &str) -> crate::Result<Vec<f32>> {
     let tensor = tensors
         .tensor(name)
@@ -182,37 +309,86 @@ fn load_tensor_flat(tensors: &SafeTensors<'_>, name: &str) -> crate::Result<Vec<
     Ok(data)
 }
 
+/// Load a tensor as a zero-copy mmap view, falling back to copy if unaligned.
+///
+/// Checks that `tensor.data()` is 4-byte aligned within the mmap. If so,
+/// returns a `Mapped` variant that references the mmap directly. If not
+/// (rare — safetensors typically aligns tensors), falls back to a copy.
+fn load_tensor_mmap(
+    tensors: &SafeTensors<'_>,
+    name: &str,
+    mmap: &Arc<memmap2::Mmap>,
+) -> crate::Result<MmapTensor> {
+    let tensor = tensors
+        .tensor(name)
+        .map_err(|_| crate::Error::Cpu(format!("missing weight: {name}")))?;
+
+    let data = tensor.data();
+    let ptr = data.as_ptr();
+    let byte_len = data.len();
+    let float_len = byte_len / 4;
+
+    // Check 4-byte alignment for safe f32 reinterpretation.
+    if (ptr as usize).is_multiple_of(4) {
+        // Calculate byte offset within the mmap.
+        let mmap_start = mmap.as_ptr() as usize;
+        let tensor_start = ptr as usize;
+        let offset = tensor_start - mmap_start;
+
+        Ok(MmapTensor::Mapped {
+            mmap: Arc::clone(mmap),
+            offset,
+            len: float_len,
+        })
+    } else {
+        // Unaligned — fall back to copy.
+        let data: Vec<f32> = data
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        Ok(MmapTensor::Owned(data))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Weight loading
 // ---------------------------------------------------------------------------
 
 impl CpuDriver {
-    /// Load `ClassicBert` weights from a safetensors file into `Vec<f32>` tensors.
+    /// Load `ClassicBert` weights from a safetensors file into `MmapTensor` tensors.
     ///
     /// Fuses separate Q, K, V weight matrices into a single `[3*hidden, hidden]`
     /// tensor (and `[3*hidden]` bias) at load time for a single GEMM per layer.
+    /// Fused tensors are `MmapTensor::Owned` (must be copied for concatenation);
+    /// non-fused weights use `MmapTensor::Mapped` for zero-copy mmap access.
     ///
-    /// Returns `(arch, mmap)` -- the mmap is kept alive for API consistency with
-    /// the Metal driver, though CPU tensors are independent copies.
+    /// Returns `(arch, mmap)` -- the `Arc<Mmap>` is shared with `Mapped` tensors.
     ///
     /// # Errors
     ///
     /// Returns an error if the file cannot be opened, safetensors parsing fails,
     /// or any expected weight tensor is missing.
     #[expect(unsafe_code, reason = "memmap2::Mmap::map requires unsafe")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "weight loading with QKV fusion is inherently sequential"
+    )]
     pub fn load_classic_bert_weights(
         &self,
         weights_path: &Path,
         config: &ClassicBertConfig,
-    ) -> crate::Result<(ClassicBertArch<Vec<f32>>, memmap2::Mmap)> {
+    ) -> crate::Result<(ClassicBertArch<MmapTensor>, Arc<memmap2::Mmap>)> {
         let file = std::fs::File::open(weights_path).map_err(|e| crate::Error::Io {
             path: weights_path.display().to_string(),
             source: e,
         })?;
-        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| crate::Error::Io {
-            path: weights_path.display().to_string(),
-            source: e,
-        })?;
+        let mmap =
+            Arc::new(
+                unsafe { memmap2::Mmap::map(&file) }.map_err(|e| crate::Error::Io {
+                    path: weights_path.display().to_string(),
+                    source: e,
+                })?,
+            );
 
         let tensors = SafeTensors::deserialize(&mmap)
             .map_err(|e| crate::Error::Cpu(format!("safetensors parse: {e}")))?;
@@ -223,7 +399,9 @@ impl CpuDriver {
         let head_dim = hidden / num_heads;
         let intermediate = config.intermediate_size;
 
-        // Build per-layer weights with fused QKV
+        // Build per-layer weights with fused QKV.
+        // QKV fusion requires copying Q/K/V into a contiguous buffer, so
+        // these are always Owned. Non-fused weights use zero-copy mmap.
         let mut layers = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             let prefix = format!("encoder.layer.{i}");
@@ -247,61 +425,80 @@ impl CpuDriver {
             fused_qkv_b.extend_from_slice(&v_b);
 
             layers.push(ClassicBertLayerWeights {
-                qkv_weight: fused_qkv_w,
-                qkv_bias: fused_qkv_b,
-                output_weight: load_tensor_flat(
+                qkv_weight: MmapTensor::Owned(fused_qkv_w),
+                qkv_bias: MmapTensor::Owned(fused_qkv_b),
+                output_weight: load_tensor_mmap(
                     &tensors,
                     &format!("{prefix}.attention.output.dense.weight"),
+                    &mmap,
                 )?,
-                output_bias: load_tensor_flat(
+                output_bias: load_tensor_mmap(
                     &tensors,
                     &format!("{prefix}.attention.output.dense.bias"),
+                    &mmap,
                 )?,
-                output_ln_weight: load_tensor_flat(
+                output_ln_weight: load_tensor_mmap(
                     &tensors,
                     &format!("{prefix}.attention.output.LayerNorm.weight"),
+                    &mmap,
                 )?,
-                output_ln_bias: load_tensor_flat(
+                output_ln_bias: load_tensor_mmap(
                     &tensors,
                     &format!("{prefix}.attention.output.LayerNorm.bias"),
+                    &mmap,
                 )?,
-                ffn_inter_weight: load_tensor_flat(
+                ffn_inter_weight: load_tensor_mmap(
                     &tensors,
                     &format!("{prefix}.intermediate.dense.weight"),
+                    &mmap,
                 )?,
-                ffn_inter_bias: load_tensor_flat(
+                ffn_inter_bias: load_tensor_mmap(
                     &tensors,
                     &format!("{prefix}.intermediate.dense.bias"),
+                    &mmap,
                 )?,
-                ffn_out_weight: load_tensor_flat(
+                ffn_out_weight: load_tensor_mmap(
                     &tensors,
                     &format!("{prefix}.output.dense.weight"),
+                    &mmap,
                 )?,
-                ffn_out_bias: load_tensor_flat(&tensors, &format!("{prefix}.output.dense.bias"))?,
-                ffn_ln_weight: load_tensor_flat(
+                ffn_out_bias: load_tensor_mmap(
+                    &tensors,
+                    &format!("{prefix}.output.dense.bias"),
+                    &mmap,
+                )?,
+                ffn_ln_weight: load_tensor_mmap(
                     &tensors,
                     &format!("{prefix}.output.LayerNorm.weight"),
+                    &mmap,
                 )?,
-                ffn_ln_bias: load_tensor_flat(
+                ffn_ln_bias: load_tensor_mmap(
                     &tensors,
                     &format!("{prefix}.output.LayerNorm.bias"),
+                    &mmap,
                 )?,
             });
         }
 
-        // Embedding weights
+        // Embedding weights (zero-copy where aligned).
         let weights = ClassicBertWeights {
-            word_embeddings: load_tensor_flat(&tensors, "embeddings.word_embeddings.weight")?,
-            position_embeddings: load_tensor_flat(
+            word_embeddings: load_tensor_mmap(
+                &tensors,
+                "embeddings.word_embeddings.weight",
+                &mmap,
+            )?,
+            position_embeddings: load_tensor_mmap(
                 &tensors,
                 "embeddings.position_embeddings.weight",
+                &mmap,
             )?,
-            token_type_embeddings: load_tensor_flat(
+            token_type_embeddings: load_tensor_mmap(
                 &tensors,
                 "embeddings.token_type_embeddings.weight",
+                &mmap,
             )?,
-            emb_ln_weight: load_tensor_flat(&tensors, "embeddings.LayerNorm.weight")?,
-            emb_ln_bias: load_tensor_flat(&tensors, "embeddings.LayerNorm.bias")?,
+            emb_ln_weight: load_tensor_mmap(&tensors, "embeddings.LayerNorm.weight", &mmap)?,
+            emb_ln_bias: load_tensor_mmap(&tensors, "embeddings.LayerNorm.bias", &mmap)?,
             layers,
             num_heads,
             head_dim,
@@ -313,26 +510,31 @@ impl CpuDriver {
         Ok((ClassicBertArch { weights }, mmap))
     }
 
-    /// Load `ModernBERT` weights from a safetensors file into `Vec<f32>` tensors.
+    /// Load `ModernBERT` weights as zero-copy `MmapTensor` views into the mmap.
     ///
     /// Weight names follow the `nomic-ai/modernbert-embed-base` convention:
     /// `layers.{i}.attn.Wqkv.weight`, `layers.{i}.mlp.Wi.weight`, etc.
     ///
-    /// Returns `(arch, mmap)` where mmap is kept alive for API consistency.
+    /// Returns `(arch, mmap)` where the `Arc<Mmap>` is shared with all `Mapped`
+    /// tensors in the arch. The OS pages in only the weights that are actually
+    /// touched during inference and can reclaim pages under memory pressure.
     pub fn load_modern_bert_weights(
         &self,
         weights_path: &Path,
         config: &ModernBertConfig,
-    ) -> crate::Result<(ModernBertArch<Vec<f32>>, memmap2::Mmap)> {
+    ) -> crate::Result<(ModernBertArch<MmapTensor>, Arc<memmap2::Mmap>)> {
         let file = std::fs::File::open(weights_path).map_err(|e| crate::Error::Io {
             path: weights_path.display().to_string(),
             source: e,
         })?;
         #[expect(unsafe_code, reason = "memmap2 requires unsafe for mmap")]
-        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| crate::Error::Io {
-            path: weights_path.display().to_string(),
-            source: e,
-        })?;
+        let mmap =
+            Arc::new(
+                unsafe { memmap2::Mmap::map(&file) }.map_err(|e| crate::Error::Io {
+                    path: weights_path.display().to_string(),
+                    source: e,
+                })?,
+            );
 
         let tensors = SafeTensors::deserialize(&mmap)
             .map_err(|e| crate::Error::Cpu(format!("safetensors parse: {e}")))?;
@@ -346,20 +548,25 @@ impl CpuDriver {
 
         let mut layers = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
-            let qkv_weight = load_tensor_flat(&tensors, &format!("layers.{i}.attn.Wqkv.weight"))?;
-            let output_weight = load_tensor_flat(&tensors, &format!("layers.{i}.attn.Wo.weight"))?;
+            let qkv_weight =
+                load_tensor_mmap(&tensors, &format!("layers.{i}.attn.Wqkv.weight"), &mmap)?;
+            let output_weight =
+                load_tensor_mmap(&tensors, &format!("layers.{i}.attn.Wo.weight"), &mmap)?;
             let attn_norm_weight = if i == 0 {
                 None
             } else {
-                Some(load_tensor_flat(
+                Some(load_tensor_mmap(
                     &tensors,
                     &format!("layers.{i}.attn_norm.weight"),
+                    &mmap,
                 )?)
             };
-            let mlp_wi_weight = load_tensor_flat(&tensors, &format!("layers.{i}.mlp.Wi.weight"))?;
-            let mlp_wo_weight = load_tensor_flat(&tensors, &format!("layers.{i}.mlp.Wo.weight"))?;
+            let mlp_wi_weight =
+                load_tensor_mmap(&tensors, &format!("layers.{i}.mlp.Wi.weight"), &mmap)?;
+            let mlp_wo_weight =
+                load_tensor_mmap(&tensors, &format!("layers.{i}.mlp.Wo.weight"), &mmap)?;
             let mlp_norm_weight =
-                load_tensor_flat(&tensors, &format!("layers.{i}.mlp_norm.weight"))?;
+                load_tensor_mmap(&tensors, &format!("layers.{i}.mlp_norm.weight"), &mmap)?;
 
             let is_global = i % global_attn_every_n == 0;
 
@@ -374,10 +581,11 @@ impl CpuDriver {
             });
         }
 
-        let tok_embeddings = load_tensor_flat(&tensors, "embeddings.tok_embeddings.weight")?;
-        let emb_norm_weight = load_tensor_flat(&tensors, "embeddings.norm.weight")?;
-        let final_norm_weight = load_tensor_flat(&tensors, "final_norm.weight")?;
-        let zero_bias = vec![0.0f32; hidden];
+        let tok_embeddings = load_tensor_mmap(&tensors, "embeddings.tok_embeddings.weight", &mmap)?;
+        let emb_norm_weight = load_tensor_mmap(&tensors, "embeddings.norm.weight", &mmap)?;
+        let final_norm_weight = load_tensor_mmap(&tensors, "final_norm.weight", &mmap)?;
+        // zero_bias is synthetic (not in the file), always Owned.
+        let zero_bias = MmapTensor::Owned(vec![0.0f32; hidden]);
 
         let weights = ModernBertWeights {
             tok_embeddings,
@@ -393,7 +601,7 @@ impl CpuDriver {
             local_window: config.local_attention,
         };
 
-        // Build RoPE caches
+        // Build RoPE caches (computed, always Owned).
         let max_seq = config.max_position_embeddings;
         let global_rope = build_rope_cache_cpu(head_dim, max_seq, config.global_rope_theta);
         let local_rope = build_rope_cache_cpu(head_dim, max_seq, config.local_rope_theta);
@@ -458,8 +666,8 @@ impl ModernBertConfig {
     }
 }
 
-/// Build RoPE cos/sin tables as `Vec<f32>` for CPU.
-fn build_rope_cache_cpu(head_dim: usize, max_seq: usize, theta: f32) -> RopeCache<Vec<f32>> {
+/// Build RoPE cos/sin tables as `MmapTensor::Owned` for CPU.
+fn build_rope_cache_cpu(head_dim: usize, max_seq: usize, theta: f32) -> RopeCache<MmapTensor> {
     let half_dim = head_dim / 2;
     let n = max_seq * half_dim;
     let mut cos_data = Vec::with_capacity(n);
@@ -474,8 +682,8 @@ fn build_rope_cache_cpu(head_dim: usize, max_seq: usize, theta: f32) -> RopeCach
     }
 
     RopeCache {
-        cos: cos_data,
-        sin: sin_data,
+        cos: MmapTensor::Owned(cos_data),
+        sin: MmapTensor::Owned(sin_data),
     }
 }
 
@@ -516,7 +724,7 @@ fn softmax_inplace(vals: &mut [f32]) {
     reason = "dimension values and token IDs are small positive integers"
 )]
 impl Driver for CpuDriver {
-    type Tensor = Vec<f32>;
+    type Tensor = MmapTensor;
 
     // begin_batch / end_batch: no-ops for CPU.
 
@@ -524,19 +732,20 @@ impl Driver for CpuDriver {
         Ok(Self)
     }
 
-    fn alloc_zeros(&self, n: usize) -> crate::Result<Vec<f32>> {
-        Ok(vec![0.0; n])
+    fn alloc_zeros(&self, n: usize) -> crate::Result<MmapTensor> {
+        Ok(MmapTensor::Owned(vec![0.0; n]))
     }
 
-    fn clone_tensor(&self, tensor: &Vec<f32>, _n: usize) -> crate::Result<Vec<f32>> {
-        Ok(tensor.clone())
+    fn clone_tensor(&self, tensor: &MmapTensor, _n: usize) -> crate::Result<MmapTensor> {
+        // Both Owned and Mapped deref to &[f32]; copy into a new Owned vec.
+        Ok(MmapTensor::Owned(tensor.to_vec()))
     }
 
     fn prepare_batch(
         &self,
         encodings: &[Encoding],
         max_seq: usize,
-    ) -> crate::Result<BatchInputs<Vec<f32>>> {
+    ) -> crate::Result<BatchInputs<MmapTensor>> {
         let batch = encodings.len();
         let total = batch * max_seq;
 
@@ -580,12 +789,12 @@ impl Driver for CpuDriver {
         let total_tokens: usize = seq_lengths.iter().sum();
 
         Ok(BatchInputs {
-            input_ids,
-            attention_mask: attn_mask_int,
-            token_type_ids,
-            position_ids,
-            float_mask,
-            pooling_mask,
+            input_ids: MmapTensor::Owned(input_ids),
+            attention_mask: MmapTensor::Owned(attn_mask_int),
+            token_type_ids: MmapTensor::Owned(token_type_ids),
+            position_ids: MmapTensor::Owned(position_ids),
+            float_mask: MmapTensor::Owned(float_mask),
+            pooling_mask: MmapTensor::Owned(pooling_mask),
             batch,
             max_seq,
             total_tokens,
@@ -596,8 +805,8 @@ impl Driver for CpuDriver {
 
     fn pad_to_batch(
         &self,
-        flat: &Vec<f32>,
-        padded: &mut Vec<f32>,
+        flat: &MmapTensor,
+        padded: &mut MmapTensor,
         seq_lengths: &[usize],
         max_seq: usize,
         dim: usize,
@@ -619,8 +828,8 @@ impl Driver for CpuDriver {
 
     fn unpad_from_batch(
         &self,
-        padded: &Vec<f32>,
-        flat: &mut Vec<f32>,
+        padded: &MmapTensor,
+        flat: &mut MmapTensor,
         seq_lengths: &[usize],
         max_seq: usize,
         dim: usize,
@@ -641,11 +850,11 @@ impl Driver for CpuDriver {
 
     fn embedding_lookup(
         &self,
-        word_ids: &Vec<f32>,
-        embedding_table: &Vec<f32>,
+        word_ids: &MmapTensor,
+        embedding_table: &MmapTensor,
         seq_len: usize,
         hidden: usize,
-    ) -> crate::Result<Vec<f32>> {
+    ) -> crate::Result<MmapTensor> {
         let mut output = vec![0.0; seq_len * hidden];
         for (i, &wid) in word_ids.iter().enumerate().take(seq_len) {
             let id = wid as usize;
@@ -654,14 +863,14 @@ impl Driver for CpuDriver {
             output[dst_start..dst_start + hidden]
                 .copy_from_slice(&embedding_table[src_start..src_start + hidden]);
         }
-        Ok(output)
+        Ok(MmapTensor::Owned(output))
     }
 
     fn add_embeddings(
         &self,
-        hidden: &mut Vec<f32>,
-        table: &Vec<f32>,
-        ids: &Vec<f32>,
+        hidden: &mut MmapTensor,
+        table: &MmapTensor,
+        ids: &MmapTensor,
         seq_len: usize,
         hidden_dim: usize,
     ) -> crate::Result<()> {
@@ -678,10 +887,10 @@ impl Driver for CpuDriver {
 
     fn layer_norm(
         &self,
-        output: &mut Vec<f32>,
-        input: &Vec<f32>,
-        weight: &Vec<f32>,
-        bias: &Vec<f32>,
+        output: &mut MmapTensor,
+        input: &MmapTensor,
+        weight: &MmapTensor,
+        bias: &MmapTensor,
         rows: usize,
         cols: usize,
         eps: f32,
@@ -708,9 +917,9 @@ impl Driver for CpuDriver {
     )]
     fn gemm(
         &self,
-        a: &Vec<f32>,
-        b: &Vec<f32>,
-        output: &mut Vec<f32>,
+        a: &MmapTensor,
+        b: &MmapTensor,
+        output: &mut MmapTensor,
         m: usize,
         n: usize,
         k: usize,
@@ -729,7 +938,7 @@ impl Driver for CpuDriver {
             let mut c = ndarray::Array2::zeros((m, n));
             ndarray::linalg::general_mat_mul(1.0, &a_view, &bt, 0.0, &mut c);
             output.clear();
-            output.extend(c.iter());
+            output.extend(c.iter().copied());
         } else {
             // B is [k, n]
             let b_view = ndarray::ArrayView2::from_shape((k, n), b)
@@ -737,7 +946,7 @@ impl Driver for CpuDriver {
             let mut c = ndarray::Array2::zeros((m, n));
             ndarray::linalg::general_mat_mul(1.0, &a_view, &b_view, 0.0, &mut c);
             output.clear();
-            output.extend(c.iter());
+            output.extend(c.iter().copied());
         }
 
         Ok(())
@@ -749,9 +958,9 @@ impl Driver for CpuDriver {
     )]
     fn gemm_batched(
         &self,
-        a: &Vec<f32>,
-        b: &Vec<f32>,
-        output: &mut Vec<f32>,
+        a: &MmapTensor,
+        b: &MmapTensor,
+        output: &mut MmapTensor,
         m: usize,
         n: usize,
         k: usize,
@@ -798,8 +1007,8 @@ impl Driver for CpuDriver {
 
     fn fused_scale_mask_softmax(
         &self,
-        scores: &mut Vec<f32>,
-        mask: &Vec<f32>,
+        scores: &mut MmapTensor,
+        mask: &MmapTensor,
         batch: usize,
         num_heads: usize,
         seq_len: usize,
@@ -827,8 +1036,8 @@ impl Driver for CpuDriver {
 
     fn fused_scale_mask_softmax_windowed(
         &self,
-        scores: &mut Vec<f32>,
-        mask: &Vec<f32>,
+        scores: &mut MmapTensor,
+        mask: &MmapTensor,
         batch: usize,
         num_heads: usize,
         seq_len: usize,
@@ -858,8 +1067,8 @@ impl Driver for CpuDriver {
 
     fn build_attn_mask(
         &self,
-        output: &mut Vec<f32>,
-        int_mask: &Vec<f32>,
+        output: &mut MmapTensor,
+        int_mask: &MmapTensor,
         n: usize,
     ) -> crate::Result<()> {
         output.resize(n, 0.0);
@@ -871,10 +1080,10 @@ impl Driver for CpuDriver {
 
     fn qkv_split(
         &self,
-        q: &mut Vec<f32>,
-        k: &mut Vec<f32>,
-        v: &mut Vec<f32>,
-        qkv: &Vec<f32>,
+        q: &mut MmapTensor,
+        k: &mut MmapTensor,
+        v: &mut MmapTensor,
+        qkv: &MmapTensor,
         batch: usize,
         seq: usize,
         hidden: usize,
@@ -909,8 +1118,8 @@ impl Driver for CpuDriver {
 
     fn attn_reshape(
         &self,
-        output: &mut Vec<f32>,
-        input: &Vec<f32>,
+        output: &mut MmapTensor,
+        input: &MmapTensor,
         batch: usize,
         seq: usize,
         num_heads: usize,
@@ -937,9 +1146,9 @@ impl Driver for CpuDriver {
 
     fn apply_rope(
         &self,
-        qk: &mut Vec<f32>,
-        cos: &Vec<f32>,
-        sin: &Vec<f32>,
+        qk: &mut MmapTensor,
+        cos: &MmapTensor,
+        sin: &MmapTensor,
         num_rows: usize,
         seq_len: usize,
         head_dim: usize,
@@ -970,9 +1179,9 @@ impl Driver for CpuDriver {
 
     fn split_gate_value(
         &self,
-        first: &mut Vec<f32>,
-        second: &mut Vec<f32>,
-        input: &Vec<f32>,
+        first: &mut MmapTensor,
+        second: &mut MmapTensor,
+        input: &MmapTensor,
         rows: usize,
         cols: usize,
     ) -> crate::Result<()> {
@@ -989,7 +1198,7 @@ impl Driver for CpuDriver {
         Ok(())
     }
 
-    fn gelu(&self, x: &mut Vec<f32>, n: usize) -> crate::Result<()> {
+    fn gelu(&self, x: &mut MmapTensor, n: usize) -> crate::Result<()> {
         for v in x.iter_mut().take(n) {
             *v = gelu_scalar(*v);
         }
@@ -998,9 +1207,9 @@ impl Driver for CpuDriver {
 
     fn swiglu(
         &self,
-        value: &Vec<f32>,
-        gate: &Vec<f32>,
-        output: &mut Vec<f32>,
+        value: &MmapTensor,
+        gate: &MmapTensor,
+        output: &mut MmapTensor,
         n: usize,
     ) -> crate::Result<()> {
         output.resize(n, 0.0);
@@ -1015,9 +1224,9 @@ impl Driver for CpuDriver {
 
     fn geglu(
         &self,
-        value: &Vec<f32>,
-        gate: &Vec<f32>,
-        output: &mut Vec<f32>,
+        value: &MmapTensor,
+        gate: &MmapTensor,
+        output: &mut MmapTensor,
         n: usize,
     ) -> crate::Result<()> {
         output.resize(n, 0.0);
@@ -1030,8 +1239,8 @@ impl Driver for CpuDriver {
 
     fn fused_bias_gelu(
         &self,
-        x: &mut Vec<f32>,
-        bias: &Vec<f32>,
+        x: &mut MmapTensor,
+        bias: &MmapTensor,
         rows: usize,
         cols: usize,
     ) -> crate::Result<()> {
@@ -1046,10 +1255,10 @@ impl Driver for CpuDriver {
 
     fn fused_bias_residual(
         &self,
-        output: &mut Vec<f32>,
-        input: &Vec<f32>,
-        bias: &Vec<f32>,
-        residual: &Vec<f32>,
+        output: &mut MmapTensor,
+        input: &MmapTensor,
+        bias: &MmapTensor,
+        residual: &MmapTensor,
         n: usize,
         cols: usize,
     ) -> crate::Result<()> {
@@ -1062,11 +1271,11 @@ impl Driver for CpuDriver {
 
     fn fused_residual_layernorm(
         &self,
-        output: &mut Vec<f32>,
-        hidden: &Vec<f32>,
-        residual: &Vec<f32>,
-        weight: &Vec<f32>,
-        bias: &Vec<f32>,
+        output: &mut MmapTensor,
+        hidden: &MmapTensor,
+        residual: &MmapTensor,
+        weight: &MmapTensor,
+        bias: &MmapTensor,
         rows: usize,
         cols: usize,
         eps: f32,
@@ -1101,9 +1310,9 @@ impl Driver for CpuDriver {
 
     fn residual_add(
         &self,
-        output: &mut Vec<f32>,
-        hidden: &Vec<f32>,
-        residual: &Vec<f32>,
+        output: &mut MmapTensor,
+        hidden: &MmapTensor,
+        residual: &MmapTensor,
         n: usize,
     ) -> crate::Result<()> {
         output.resize(n, 0.0);
@@ -1115,8 +1324,8 @@ impl Driver for CpuDriver {
 
     fn add_bias(
         &self,
-        x: &mut Vec<f32>,
-        bias: &Vec<f32>,
+        x: &mut MmapTensor,
+        bias: &MmapTensor,
         rows: usize,
         cols: usize,
     ) -> crate::Result<()> {
@@ -1131,8 +1340,8 @@ impl Driver for CpuDriver {
 
     fn cls_pool(
         &self,
-        output: &mut Vec<f32>,
-        hidden: &Vec<f32>,
+        output: &mut MmapTensor,
+        hidden: &MmapTensor,
         batch: usize,
         seq: usize,
         hidden_dim: usize,
@@ -1148,9 +1357,9 @@ impl Driver for CpuDriver {
 
     fn mean_pool(
         &self,
-        output: &mut Vec<f32>,
-        hidden: &Vec<f32>,
-        mask: &Vec<f32>,
+        output: &mut MmapTensor,
+        hidden: &MmapTensor,
+        mask: &MmapTensor,
         batch: usize,
         seq: usize,
         hidden_dim: usize,
@@ -1172,7 +1381,7 @@ impl Driver for CpuDriver {
         Ok(())
     }
 
-    fn l2_normalize(&self, data: &mut Vec<f32>, rows: usize, cols: usize) -> crate::Result<()> {
+    fn l2_normalize(&self, data: &mut MmapTensor, rows: usize, cols: usize) -> crate::Result<()> {
         for r in 0..rows {
             let base = r * cols;
             let row = &data[base..base + cols];
@@ -1191,9 +1400,9 @@ impl Driver for CpuDriver {
     )]
     fn banded_qk(
         &self,
-        q: &Vec<f32>,
-        k: &Vec<f32>,
-        scores: &mut Vec<f32>,
+        q: &MmapTensor,
+        k: &MmapTensor,
+        scores: &mut MmapTensor,
         batch_heads: usize,
         seq: usize,
         head_dim: usize,
@@ -1228,9 +1437,9 @@ impl Driver for CpuDriver {
     )]
     fn banded_sv(
         &self,
-        scores: &Vec<f32>,
-        v: &Vec<f32>,
-        output: &mut Vec<f32>,
+        scores: &MmapTensor,
+        v: &MmapTensor,
+        output: &mut MmapTensor,
         batch_heads: usize,
         seq: usize,
         head_dim: usize,
@@ -1260,7 +1469,7 @@ impl Driver for CpuDriver {
 
     fn banded_softmax(
         &self,
-        scores: &mut Vec<f32>,
+        scores: &mut MmapTensor,
         total_rows: usize,
         window: usize,
         scale: f32,
@@ -1284,7 +1493,13 @@ impl Driver for CpuDriver {
         Ok(())
     }
 
-    fn to_host(&self, tensor: &Vec<f32>, batch: usize, dim: usize) -> crate::Result<Vec<Vec<f32>>> {
+    fn to_host(
+        &self,
+        tensor: &MmapTensor,
+        batch: usize,
+        dim: usize,
+    ) -> crate::Result<Vec<Vec<f32>>> {
+        // Deref to &[f32] works for both Owned and Mapped variants.
         let mut results = Vec::with_capacity(batch);
         for b in 0..batch {
             results.push(tensor[b * dim..(b + 1) * dim].to_vec());
@@ -1317,7 +1532,7 @@ mod tests {
     #[test]
     fn gelu_smoke_test() {
         let driver = CpuDriver::new().unwrap();
-        let mut tensor = vec![0.0_f32, 1.0, -1.0, 2.0];
+        let mut tensor: MmapTensor = vec![0.0_f32, 1.0, -1.0, 2.0].into();
         driver.gelu(&mut tensor, 4).unwrap();
 
         // GELU(0) = 0
@@ -1344,10 +1559,10 @@ mod tests {
     #[test]
     fn layer_norm_smoke_test() {
         let driver = CpuDriver::new().unwrap();
-        let input = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // 2 rows x 3 cols
-        let weight = vec![1.0, 1.0, 1.0];
-        let bias = vec![0.0, 0.0, 0.0];
-        let mut output = vec![];
+        let input: MmapTensor = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0].into(); // 2 rows x 3 cols
+        let weight: MmapTensor = vec![1.0, 1.0, 1.0].into();
+        let bias: MmapTensor = vec![0.0, 0.0, 0.0].into();
+        let mut output: MmapTensor = vec![].into();
 
         driver
             .layer_norm(&mut output, &input, &weight, &bias, 2, 3, 1e-5)
@@ -1368,9 +1583,9 @@ mod tests {
         // A = [[1, 2], [3, 4]] (2x2)
         // B = [[5, 6], [7, 8]] (2x2)
         // A @ B = [[19, 22], [43, 50]]
-        let a = vec![1.0, 2.0, 3.0, 4.0];
-        let b = vec![5.0, 6.0, 7.0, 8.0];
-        let mut output = vec![];
+        let a: MmapTensor = vec![1.0, 2.0, 3.0, 4.0].into();
+        let b: MmapTensor = vec![5.0, 6.0, 7.0, 8.0].into();
+        let mut output: MmapTensor = vec![].into();
 
         driver.gemm(&a, &b, &mut output, 2, 2, 2, false).unwrap();
 
@@ -1387,9 +1602,9 @@ mod tests {
         // A = [[1, 2], [3, 4]] (2x2)
         // B = [[5, 7], [6, 8]] (2x2, transposed form = [[5,6],[7,8]])
         // A @ B^T = [[19, 22], [43, 50]]
-        let a = vec![1.0, 2.0, 3.0, 4.0];
-        let b = vec![5.0, 6.0, 7.0, 8.0]; // [n=2, k=2] when transpose_b=true
-        let mut output = vec![];
+        let a: MmapTensor = vec![1.0, 2.0, 3.0, 4.0].into();
+        let b: MmapTensor = vec![5.0, 6.0, 7.0, 8.0].into(); // [n=2, k=2] when transpose_b=true
+        let mut output: MmapTensor = vec![].into();
 
         driver.gemm(&a, &b, &mut output, 2, 2, 2, true).unwrap();
 
@@ -1404,17 +1619,18 @@ mod tests {
     fn embedding_lookup_test() {
         let driver = CpuDriver::new().unwrap();
         // 3 tokens, hidden=2, table has 5 entries
-        let table = vec![
+        let table: MmapTensor = vec![
             0.1, 0.2, // id 0
             0.3, 0.4, // id 1
             0.5, 0.6, // id 2
             0.7, 0.8, // id 3
             0.9, 1.0, // id 4
-        ];
-        let ids = vec![2.0, 0.0, 4.0]; // look up ids 2, 0, 4
+        ]
+        .into();
+        let ids: MmapTensor = vec![2.0, 0.0, 4.0].into(); // look up ids 2, 0, 4
 
         let output = driver.embedding_lookup(&ids, &table, 3, 2).unwrap();
-        assert_eq!(output, vec![0.5, 0.6, 0.1, 0.2, 0.9, 1.0]);
+        assert_eq!(&*output, &[0.5, 0.6, 0.1, 0.2, 0.9, 1.0]);
     }
 
     /// CLS pooling test.
@@ -1422,16 +1638,17 @@ mod tests {
     fn cls_pool_test() {
         let driver = CpuDriver::new().unwrap();
         // batch=2, seq=3, hidden=2
-        let hidden = vec![
+        let hidden: MmapTensor = vec![
             1.0, 2.0, // batch 0, token 0 (CLS)
             3.0, 4.0, // batch 0, token 1
             5.0, 6.0, // batch 0, token 2
             7.0, 8.0, // batch 1, token 0 (CLS)
             9.0, 10.0, // batch 1, token 1
             11.0, 12.0, // batch 1, token 2
-        ];
-        let mut output = vec![];
+        ]
+        .into();
+        let mut output: MmapTensor = vec![].into();
         driver.cls_pool(&mut output, &hidden, 2, 3, 2).unwrap();
-        assert_eq!(output, vec![1.0, 2.0, 7.0, 8.0]);
+        assert_eq!(&*output, &[1.0, 2.0, 7.0, 8.0]);
     }
 }
