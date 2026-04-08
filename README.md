@@ -57,20 +57,25 @@ and the LSP for symbol navigation.
 
 ## Workflow: orient, search, navigate
 
-ripvec is most useful when you combine its three capabilities:
+```mermaid
+graph LR
+    A["🗺️ Orient<br/>get_repo_map"] --> B["🔍 Search<br/>search_code"]
+    B --> C["🧭 Navigate<br/>LSP operations"]
+    C -->|"need more context"| B
+    C -->|"found it"| D["✏️ Edit"]
+```
 
-**1. Orient** — `get_repo_map` returns a structural overview ranked by function-level
+**Orient** — `get_repo_map` returns a structural overview ranked by function-level
 importance. One tool call replaces 10+ sequential file reads. Start here when
 working on unfamiliar code.
 
-**2. Search** — `search_code "authentication middleware"` finds implementations by
+**Search** — `search_code "authentication middleware"` finds implementations by
 meaning across all 19 languages simultaneously. Results are ranked by relevance
 and structural importance.
 
-**3. Navigate** — LSP `documentSymbol` shows the file outline. `goToDefinition`
-jumps to the likely definition (name-matched + ranked by importance).
-`findReferences` shows usage sites. `incomingCalls`/`outgoingCalls` traces
-the call graph.
+**Navigate** — LSP `documentSymbol` shows the file outline. `goToDefinition`
+jumps to the likely definition. `findReferences` shows usage sites.
+`incomingCalls`/`outgoingCalls` traces the call graph.
 
 ## Semantic search
 
@@ -93,7 +98,7 @@ server installs. It provides:
 
 - **`documentSymbol`** — file outline: functions, fields, enum variants, constants, types, headings
 - **`workspaceSymbol`** — cross-language symbol search with PageRank boost
-- **`goToDefinition`** — best-effort name-based resolution, ranked by structural importance (not type-aware — use dedicated LSPs for precise resolution)
+- **`goToDefinition`** — name-based resolution ranked by structural importance
 - **`findReferences`** — usage sites via hybrid search + content filtering
 - **`hover`** — scope chain, signature, enriched context
 - **`publishDiagnostics`** — tree-sitter syntax error detection after every edit
@@ -110,19 +115,31 @@ to language-aware intelligence.
 
 ## Function-level PageRank
 
+```mermaid
+graph LR
+    subgraph "Call Graph"
+        A["main()"] --> B["handle_request()"]
+        A --> C["init_db()"]
+        B --> D["authenticate()"]
+        B --> E["dispatch()"]
+        D --> F["verify_token()"]
+        E --> D
+    end
+    subgraph "PageRank"
+        D2["authenticate() ★★★"]
+        B2["handle_request() ★★"]
+        E2["dispatch() ★"]
+    end
+```
+
 ripvec extracts call expressions from every function body using tree-sitter,
-resolves callee names to definitions (same-file first, then imported files),
-and computes PageRank on the resulting call graph.
+resolves callee names to definitions, and computes PageRank on the resulting
+call graph. Functions called by many others rank higher — `authenticate()` in
+the example above is more structurally important than `dispatch()` because
+more code depends on it.
 
-This is name-based resolution, not type-aware — a call to `render()` resolves
-to the first `render` definition found in scope. Precision is limited by
-dynamic dispatch and polymorphism. But even approximate call graphs produce
-meaningful structural importance signals, and the ranking improves search quality
-in practice.
-
-The boost is multiplicative and log-saturated so high-PageRank functions get
-amplified without dominating results. Zero-relevance stays at zero regardless
-of importance.
+This directly improves search: when two functions both match your query,
+the one that's more central to the codebase ranks first.
 
 ## Install
 
@@ -290,28 +307,35 @@ on your GPU, and combines search + LSP + structural ranking in one binary.
 
 ## Scoring pipeline
 
-```
-query → ModernBERT embedding (768-dim)
-     → cosine similarity ranking
-     → BM25 keyword ranking
-     → Reciprocal Rank Fusion (k=60)
-     → min-max normalization
-     → × function-level PageRank boost (log-saturated)
-     → threshold + top-k
+```mermaid
+graph TD
+    Q["query"] --> E["ModernBERT embedding<br/>(768-dim)"]
+    E --> S["Cosine similarity<br/>ranking"]
+    E --> K["BM25 keyword<br/>ranking"]
+    S --> F["Reciprocal Rank Fusion<br/>(k=60)"]
+    K --> F
+    F --> N["Normalize to [0, 1]"]
+    N --> P["× PageRank boost<br/>(log-saturated, per-function)"]
+    P --> T["Threshold + top-k"]
 ```
 
-The min-max normalization maps the best result to 1.0 within each query — this
-means the threshold is relative, not absolute. A weak result set can still pass
-threshold if it's the best available. This is a known tradeoff; future versions
-may switch to z-score normalization for better calibration.
+The RRF fusion follows Cormack et al. (2009) — rank-based combination that
+handles the scale mismatch between cosine similarity and BM25 without tuning.
+The PageRank boost is multiplicative: zero-relevance stays at zero regardless
+of structural importance.
+
+Min-max normalization maps the best result to 1.0 within each query, making
+the threshold relative rather than absolute. This is a known tradeoff; future
+versions may switch to z-score normalization for better calibration.
 
 ## Limitations
 
-- **goToDefinition is best-effort**: name-based, not type-aware. Use dedicated
-  LSPs (rust-analyzer, pyright, gopls) when you need precise type resolution.
-- **Call graph is approximate**: name-based resolution has false positives with
-  common function names (`new`, `run`, `render`). Cross-crate resolution is
-  limited to workspace members.
+- **goToDefinition is best-effort**: resolves by name matching and structural
+  importance, not by type system analysis. Use dedicated LSPs (rust-analyzer,
+  pyright, gopls) when you need exact resolution for overloaded symbols.
+- **Call graph is approximate**: common names like `new`, `run`, `render` may
+  resolve to the wrong definition. Cross-crate resolution limited to workspace
+  members.
 - **Cold start**: first search without an index embeds everything — 5s on CUDA,
   32s on Apple Silicon for a medium codebase. Use `--index` for repeated searches.
 - **English-centric**: ModernBERT was trained primarily on English text. Queries
