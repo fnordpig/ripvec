@@ -46,7 +46,7 @@ pub fn config_for_extension(ext: &str) -> Option<Arc<LangConfig>> {
         for &ext in &[
             "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "c", "h", "cpp", "cc", "cxx",
             "hpp", "sh", "bash", "bats", "rb", "tf", "tfvars", "hcl", "kt", "kts", "swift",
-            "scala", "toml",
+            "scala", "toml", "json", "yaml", "yml", "md",
         ] {
             if let Some(cfg) = compile_config(ext) {
                 m.insert(ext, Arc::new(cfg));
@@ -241,6 +241,21 @@ fn compile_config(ext: &str) -> Option<LangConfig> {
                 "(table (bare_key) @name) @def\n",
                 "(pair (bare_key) @name) @def",
             ),
+        ),
+        // JSON: key-value pairs, capturing the key string content.
+        "json" => (
+            tree_sitter_json::LANGUAGE.into(),
+            "(pair key: (string (string_content) @name)) @def",
+        ),
+        // YAML: block mapping pairs with plain scalar keys.
+        "yaml" | "yml" => (
+            tree_sitter_yaml::LANGUAGE.into(),
+            "(block_mapping_pair key: (flow_node (plain_scalar (string_scalar) @name))) @def",
+        ),
+        // Markdown: ATX headings (# through ######), capturing the heading text.
+        "md" => (
+            tree_sitter_md::LANGUAGE.into(),
+            "(atx_heading heading_content: (inline) @name) @def",
         ),
         _ => return None,
     };
@@ -439,7 +454,7 @@ mod tests {
         let exts = [
             "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "c", "h", "cpp", "cc", "cxx",
             "hpp", "sh", "bash", "bats", "rb", "tf", "tfvars", "hcl", "kt", "kts", "swift",
-            "scala", "toml",
+            "scala", "toml", "json", "yaml", "yml", "md",
         ];
         for ext in &exts {
             assert!(config_for_extension(ext).is_some(), "failed for {ext}");
