@@ -1,1 +1,40 @@
-{"rust":{"command":"rust-analyzer","args":[],"extensionToLanguage":{".rs":"rust"},"transport":"stdio"}}
+{
+  "rust": {
+    "command": "rust-analyzer",
+    "args": [],
+    "extensionToLanguage": { ".rs": "rust" },
+    "transport": "stdio"
+  },
+  "ripvec": {
+    "command": "./target/release/ripvec-mcp",
+    "args": ["--lsp"],
+    "extensionToLanguage": {
+      ".rs": "ripvec",
+      ".py": "ripvec",
+      ".js": "ripvec",
+      ".jsx": "ripvec",
+      ".ts": "ripvec",
+      ".tsx": "ripvec",
+      ".go": "ripvec",
+      ".java": "ripvec",
+      ".c": "ripvec",
+      ".h": "ripvec",
+      ".cpp": "ripvec",
+      ".cc": "ripvec",
+      ".cxx": "ripvec",
+      ".hpp": "ripvec",
+      ".sh": "ripvec",
+      ".bash": "ripvec",
+      ".bats": "ripvec",
+      ".rb": "ripvec",
+      ".tf": "ripvec",
+      ".tfvars": "ripvec",
+      ".hcl": "ripvec",
+      ".kt": "ripvec",
+      ".kts": "ripvec",
+      ".swift": "ripvec",
+      ".scala": "ripvec",
+      ".toml": "ripvec"
+    }
+  }
+}
