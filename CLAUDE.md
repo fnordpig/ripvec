@@ -51,6 +51,12 @@ ToolSearch("select:mcp__plugin_ripvec_ripvec__search_code")
 After `cargo build --release`, the project MCP picks up changes immediately
 (next tool call). No restart needed — the binary is replaced in place.
 
+**A/B testing**: Search the same query on both to compare local vs released behavior:
+```
+mcp__ripvec__search_code("query")                      # local build
+mcp__plugin_ripvec_ripvec__search_code("query")        # released version
+```
+
 ## LSP server
 
 `ripvec-mcp --lsp` serves Language Server Protocol over stdio, providing
