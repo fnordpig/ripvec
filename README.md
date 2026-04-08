@@ -351,23 +351,70 @@ Cargo workspace with three crates:
 | [`ripvec`](crates/ripvec) | CLI binary (clap + ratatui TUI) |
 | [`ripvec-mcp`](crates/ripvec-mcp) | MCP + LSP server binary (rmcp + tower-lsp-server) |
 
-### Backend detection and inference
+### Driver / Architecture split
+
+The core design insight: the forward pass is written ONCE as a generic
+`ModernBertArch<D: Driver>`, and each backend implements the `Driver` trait
+with platform-specific operations. Same model, same math, different hardware.
 
 ```mermaid
-graph TD
-    Start["ripvec starts"] --> Detect{"Detect platform"}
-    Detect -->|"macOS"| Metal{"Metal available?"}
-    Metal -->|"yes"| MetalBE["🔶 Metal Backend<br/>Custom MSL kernels<br/>+ MPS GEMMs via AMX"]
-    Metal -->|"no"| MLX{"MLX available?"}
-    MLX -->|"yes"| MLXBE["🟣 MLX Backend<br/>mlx-rs lazy eval<br/>graph fusion"]
-    MLX -->|"no"| CPUBE
-    Detect -->|"Linux + CUDA"| CUDABE["🟢 CUDA Backend<br/>cuBLAS FP16 tensor cores<br/>+ fused NVRTC kernels"]
-    Detect -->|"Linux / fallback"| CPUBE["🔵 CPU Backend<br/>ndarray + system BLAS<br/>(Accelerate / OpenBLAS)"]
+graph TB
+    subgraph "Architecture (written once)"
+        FP["ModernBertArch&lt;D: Driver&gt;<br/>forward()"]
+        FP --> L1["Layer 1: Attention + FFN"]
+        L1 --> L2["Layer 2: Attention + FFN"]
+        L2 --> LN["...22 layers..."]
+        LN --> Pool["Mean pool + L2 norm"]
+    end
+    subgraph "Driver trait implementations"
+        FP -.->|"D = Metal"| M["MetalDriver<br/>MPS GEMMs + custom MSL kernels"]
+        FP -.->|"D = CUDA"| CU["CudaDriver<br/>cuBLAS tensor cores + NVRTC kernels"]
+        FP -.->|"D = CPU"| CP["CpuDriver<br/>ndarray + Accelerate/OpenBLAS"]
+        FP -.->|"D = MLX"| ML["MlxDriver<br/>lazy eval → auto-fused Metal"]
+    end
 ```
 
-All four backends implement the same `EmbedBackend` trait — the forward pass
-is generic over `ModernBertArch<D: Driver>`. Same model weights, same output,
-different hardware paths.
+### What each backend actually does per layer
+
+Each of the 22 ModernBERT layers runs attention + FFN. Here's how the same
+operations map to different hardware:
+
+```mermaid
+graph LR
+    subgraph "Attention"
+        LN1["LayerNorm"] --> QKV["QKV projection<br/>(GEMM)"]
+        QKV --> PAD["Pad + Split"]
+        PAD --> ROPE["RoPE rotation"]
+        ROPE --> ATTN["Q @ K^T<br/>(batched GEMM)"]
+        ATTN --> SM["Scale + Mask<br/>+ Softmax"]
+        SM --> AV["Scores @ V<br/>(batched GEMM)"]
+        AV --> UNPAD["Reshape + Unpad"]
+        UNPAD --> OPROJ["Output proj<br/>(GEMM)"]
+        OPROJ --> RES1["Residual add"]
+    end
+    subgraph "FFN"
+        RES1 --> LN2["LayerNorm"]
+        LN2 --> WI["Wi projection<br/>(GEMM)"]
+        WI --> GEGLU["Split + GeGLU"]
+        GEGLU --> WO["Wo projection<br/>(GEMM)"]
+        WO --> RES2["Residual add"]
+    end
+```
+
+| Operation | Metal | CUDA | CPU | MLX |
+|-----------|-------|------|-----|-----|
+| **GEMM** | MPS (AMX) | cuBLAS FP16 tensor cores | Accelerate / OpenBLAS | Auto-fused |
+| **Softmax+Scale+Mask** | Fused MSL kernel | Fused NVRTC kernel | Scalar loop | Auto-fused |
+| **RoPE** | Custom MSL kernel | Custom NVRTC kernel | Scalar loop | Lazy ops |
+| **GeGLU (split+gelu+gate)** | Fused MSL kernel | Fused NVRTC kernel | Scalar loop | Auto-fused |
+| **Pad/Unpad/Reshape** | Custom MSL kernels | Custom NVRTC kernels | Rust loops | Free (metadata) |
+| **FP16 support** | Yes (all kernels) | Yes (all kernels) | No | No |
+
+Metal and CUDA have **hand-written fused kernels** for softmax, GeGLU, and
+attention reshape — these eliminate intermediate buffers and reduce memory
+bandwidth. MLX gets fusion automatically via lazy evaluation (the entire
+forward pass typically compiles to 2-3 Metal kernel dispatches). CPU uses
+explicit scalar loops for everything except GEMM.
 
 ### Embedding pipeline
 
