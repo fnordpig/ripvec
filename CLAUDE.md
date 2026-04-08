@@ -30,6 +30,27 @@ Cargo workspace with three crates:
 - **BGE-small-en-v1.5** (--fast) — ClassicBert, 384-dim, CLS pooling
 - **ModernBERT** (default) — 768-dim, mean pooling
 
+## MCP tool resolution
+
+Two ripvec MCP servers run simultaneously in this project:
+
+| Source | Command | Tool namespace |
+|--------|---------|---------------|
+| Project `.mcp.json` | `./target/release/ripvec-mcp` (local build) | `mcp__ripvec__*` |
+| Plugin `.mcp.json` | downloaded binary | `mcp__plugin_ripvec_ripvec__*` |
+
+**For development, prefer `mcp__ripvec__*`** — that's the local build with your latest changes.
+The plugin binary is the last released version.
+
+If tools don't appear in ToolSearch, try both namespaces:
+```
+ToolSearch("select:mcp__ripvec__search_code")
+ToolSearch("select:mcp__plugin_ripvec_ripvec__search_code")
+```
+
+After `cargo build --release`, the project MCP picks up changes immediately
+(next tool call). No restart needed — the binary is replaced in place.
+
 ## LSP server
 
 `ripvec-mcp --lsp` serves Language Server Protocol over stdio, providing
