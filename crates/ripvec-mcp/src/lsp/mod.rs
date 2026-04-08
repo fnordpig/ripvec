@@ -39,6 +39,14 @@ struct RipvecLsp {
     index: Arc<tokio::sync::RwLock<Option<ripvec_core::hybrid::HybridIndex>>>,
     /// PageRank-weighted repository graph.
     repo_graph: Arc<std::sync::RwLock<Option<ripvec_core::repo_map::RepoGraph>>>,
+    /// On-demand indices for non-default roots (populated by MCP search with `root` param).
+    root_indices: Arc<
+        tokio::sync::RwLock<std::collections::HashMap<PathBuf, ripvec_core::hybrid::HybridIndex>>,
+    >,
+    /// On-demand repo graphs for non-default roots.
+    root_graphs: Arc<
+        std::sync::RwLock<std::collections::HashMap<PathBuf, ripvec_core::repo_map::RepoGraph>>,
+    >,
     /// Root directory of the indexed project.
     project_root: PathBuf,
     /// Shared indexing progress state.
@@ -114,21 +122,36 @@ impl LanguageServer for RipvecLsp {
         &self,
         params: WorkspaceSymbolParams,
     ) -> Result<Option<WorkspaceSymbolResponse>> {
-        symbols::workspace_symbol(params, &self.index, &self.repo_graph, &self.project_root).await
+        symbols::workspace_symbol(
+            params,
+            &self.index,
+            &self.root_indices,
+            &self.repo_graph,
+            &self.root_graphs,
+            &self.project_root,
+        )
+        .await
     }
 
     async fn goto_definition(
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
-        navigation::goto_definition(params, &self.index, &self.repo_graph, &self.project_root).await
+        navigation::goto_definition(
+            params,
+            &self.index,
+            &self.root_indices,
+            &self.repo_graph,
+            &self.root_graphs,
+            &self.project_root,
+        )
+        .await
     }
 
     async fn goto_implementation(
         &self,
         params: request::GotoImplementationParams,
     ) -> Result<Option<request::GotoImplementationResponse>> {
-        // Reuse goto_definition for now — implementation will diverge later.
         let def_params = GotoDefinitionParams {
             text_document_position_params: params.text_document_position_params,
             work_done_progress_params: params.work_done_progress_params,
@@ -137,41 +160,68 @@ impl LanguageServer for RipvecLsp {
         let result = navigation::goto_definition(
             def_params,
             &self.index,
+            &self.root_indices,
             &self.repo_graph,
+            &self.root_graphs,
             &self.project_root,
         )
         .await?;
-        // GotoDefinitionResponse and GotoImplementationResponse are the same type alias.
         Ok(result)
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
-        navigation::find_references(params, &self.index, &self.repo_graph, &self.project_root).await
+        navigation::find_references(
+            params,
+            &self.index,
+            &self.root_indices,
+            &self.repo_graph,
+            &self.root_graphs,
+            &self.project_root,
+        )
+        .await
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
-        hover::hover(params, &self.index, &self.project_root).await
+        hover::hover(params, &self.index, &self.root_indices, &self.project_root).await
     }
 
     async fn prepare_call_hierarchy(
         &self,
         params: CallHierarchyPrepareParams,
     ) -> Result<Option<Vec<CallHierarchyItem>>> {
-        call_hierarchy::prepare(params, &self.repo_graph, &self.project_root).await
+        call_hierarchy::prepare(
+            params,
+            &self.repo_graph,
+            &self.root_graphs,
+            &self.project_root,
+        )
+        .await
     }
 
     async fn incoming_calls(
         &self,
         params: CallHierarchyIncomingCallsParams,
     ) -> Result<Option<Vec<CallHierarchyIncomingCall>>> {
-        call_hierarchy::incoming(params, &self.repo_graph, &self.project_root).await
+        call_hierarchy::incoming(
+            params,
+            &self.repo_graph,
+            &self.root_graphs,
+            &self.project_root,
+        )
+        .await
     }
 
     async fn outgoing_calls(
         &self,
         params: CallHierarchyOutgoingCallsParams,
     ) -> Result<Option<Vec<CallHierarchyOutgoingCall>>> {
-        call_hierarchy::outgoing(params, &self.repo_graph, &self.project_root).await
+        call_hierarchy::outgoing(
+            params,
+            &self.repo_graph,
+            &self.root_graphs,
+            &self.project_root,
+        )
+        .await
     }
 }
 
@@ -184,6 +234,8 @@ pub async fn run(mcp_server: RipvecServer) {
         client,
         index: Arc::clone(&mcp_server.index),
         repo_graph: Arc::clone(&mcp_server.repo_graph),
+        root_indices: Arc::clone(&mcp_server.root_indices),
+        root_graphs: Arc::clone(&mcp_server.root_graphs),
         project_root: mcp_server.project_root.clone(),
         progress: Arc::clone(&mcp_server.progress),
     });

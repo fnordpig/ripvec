@@ -5,7 +5,8 @@
 //! Workspace symbol search uses the BM25 keyword index with PageRank
 //! boosting for ranked results across the entire project.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tower_lsp_server::jsonrpc::Result;
@@ -213,18 +214,56 @@ fn uri_for_chunk(chunk: &CodeChunk, root: &Path) -> Option<Uri> {
     Uri::from_file_path(abs)
 }
 
-/// Search for symbols across the entire workspace using the BM25 keyword index.
-///
-/// Results are boosted by PageRank so structurally important definitions
-/// float to the top. Returns up to 20 results as `SymbolInformation` entries.
+/// Collect symbol results from a single index, appending to `out`.
 #[expect(
     deprecated,
     reason = "SymbolInformation has a deprecated `deprecated` field"
 )]
+fn collect_symbols(
+    hybrid: &HybridIndex,
+    query: &str,
+    search_root: &Path,
+    repo_graph: Option<&RepoGraph>,
+    limit: usize,
+    out: &mut Vec<SymbolInformation>,
+) {
+    let mut results = hybrid.search(&[], query, limit, 0.0, SearchMode::Keyword);
+
+    if let Some(graph) = repo_graph {
+        let pr = pagerank_lookup(graph);
+        boost_with_pagerank(&mut results, hybrid.chunks(), &pr, graph.alpha);
+    }
+
+    let chunks = hybrid.chunks();
+    out.extend(results.into_iter().filter_map(|(idx, _score)| {
+        let chunk = chunks.get(idx)?;
+        let uri = uri_for_chunk(chunk, search_root)?;
+        Some(SymbolInformation {
+            name: chunk.name.clone(),
+            kind: symbol_kind_for(&chunk.kind),
+            tags: None,
+            deprecated: None,
+            location: Location {
+                uri,
+                range: chunk_range(chunk),
+            },
+            container_name: None,
+        })
+    }));
+}
+
+/// Search for symbols across the entire workspace using the BM25 keyword index.
+///
+/// Results are boosted by PageRank so structurally important definitions
+/// float to the top. Returns up to 20 results as `SymbolInformation` entries.
+///
+/// Searches all indices (default + on-demand roots) and merges results.
 pub async fn workspace_symbol(
     params: WorkspaceSymbolParams,
     index: &Arc<tokio::sync::RwLock<Option<HybridIndex>>>,
+    root_indices: &Arc<tokio::sync::RwLock<HashMap<PathBuf, HybridIndex>>>,
     repo_graph: &Arc<std::sync::RwLock<Option<RepoGraph>>>,
+    root_graphs: &Arc<std::sync::RwLock<HashMap<PathBuf, RepoGraph>>>,
     root: &Path,
 ) -> Result<Option<WorkspaceSymbolResponse>> {
     let query = params.query.trim();
@@ -232,44 +271,34 @@ pub async fn workspace_symbol(
         return Ok(None);
     }
 
-    let guard = index.read().await;
-    let Some(hybrid) = guard.as_ref() else {
-        return Ok(None);
-    };
+    let mut symbols = Vec::new();
 
-    let mut results = hybrid.search(&[], query, 20, 0.0, SearchMode::Keyword);
-
-    // Apply PageRank boost if the repo graph is available.
-    if let Ok(graph_guard) = repo_graph.read()
-        && let Some(graph) = graph_guard.as_ref()
+    // Search the default index.
     {
-        let pr = pagerank_lookup(graph);
-        boost_with_pagerank(&mut results, hybrid.chunks(), &pr, graph.alpha);
+        let guard = index.read().await;
+        if let Some(hybrid) = guard.as_ref() {
+            let graph_ref = repo_graph.read().ok();
+            let graph = graph_ref.as_ref().and_then(|g| g.as_ref());
+            collect_symbols(hybrid, query, root, graph, 20, &mut symbols);
+        }
     }
 
-    let chunks = hybrid.chunks();
-    let symbols: Vec<SymbolInformation> = results
-        .into_iter()
-        .filter_map(|(idx, _score)| {
-            let chunk = chunks.get(idx)?;
-            let uri = uri_for_chunk(chunk, root)?;
-            Some(SymbolInformation {
-                name: chunk.name.clone(),
-                kind: symbol_kind_for(&chunk.kind),
-                tags: None,
-                deprecated: None,
-                location: Location {
-                    uri,
-                    range: chunk_range(chunk),
-                },
-                container_name: None,
-            })
-        })
-        .collect();
+    // Search all on-demand root indices.
+    {
+        let ri_guard = root_indices.read().await;
+        let rg_guard = root_graphs.read().ok();
+        for (alt_root, hybrid) in ri_guard.iter() {
+            let graph = rg_guard.as_ref().and_then(|g| g.get(alt_root));
+            collect_symbols(hybrid, query, alt_root, graph, 20, &mut symbols);
+        }
+    }
 
     if symbols.is_empty() {
         Ok(None)
     } else {
+        // Deduplicate by URI + range (same symbol from overlapping indices).
+        symbols.dedup_by(|a, b| a.location == b.location);
+        symbols.truncate(20);
         Ok(Some(WorkspaceSymbolResponse::Flat(symbols)))
     }
 }

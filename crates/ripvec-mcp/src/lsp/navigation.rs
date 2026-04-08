@@ -3,7 +3,8 @@
 //! Extracts the identifier under the cursor, searches the BM25 keyword
 //! index with PageRank boosting, and returns matching chunk locations.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tower_lsp_server::jsonrpc::Result;
@@ -196,15 +197,64 @@ fn chunk_at_position(
     })
 }
 
+/// Search a single index for the best definition match.
+///
+/// Returns the top-scoring chunk as a `GotoDefinitionResponse`, preferring
+/// exact name matches over fuzzy results.
+fn search_definition(
+    hybrid: &HybridIndex,
+    word: &str,
+    path: &Path,
+    search_root: &Path,
+    line_1based: usize,
+    repo_graph: Option<&RepoGraph>,
+) -> Option<GotoDefinitionResponse> {
+    let query_embedding = chunk_at_position(hybrid, path, search_root, line_1based)
+        .and_then(|idx| hybrid.semantic.embedding(idx))
+        .unwrap_or_default();
+
+    let mode = if query_embedding.is_empty() {
+        SearchMode::Keyword
+    } else {
+        SearchMode::Hybrid
+    };
+    let mut results = hybrid.search(&query_embedding, word, 20, 0.0, mode);
+
+    if let Some(graph) = repo_graph {
+        let pr = pagerank_lookup(graph);
+        boost_with_pagerank(&mut results, hybrid.chunks(), &pr, 0.3);
+    }
+
+    let chunks = hybrid.chunks();
+    let best = results
+        .iter()
+        .find(|(idx, _)| chunks.get(*idx).is_some_and(|c| c.name == word))
+        .or_else(|| results.first());
+
+    let &(idx, _) = best?;
+    let chunk = chunks.get(idx)?;
+    let uri = uri_for_chunk(chunk, search_root)?;
+
+    Some(GotoDefinitionResponse::Scalar(Location {
+        uri,
+        range: chunk_range(chunk),
+    }))
+}
+
 /// Resolve the definition of the symbol at the given position.
 ///
 /// Uses tree-sitter to identify the symbol, then performs hybrid search
 /// (semantic embedding + BM25 keyword) using the chunk at the cursor as
 /// the query vector. Falls back to keyword-only if no chunk covers the cursor.
+///
+/// Tries the default index first; if no result is found, checks on-demand
+/// root indices for a root that contains the queried file.
 pub async fn goto_definition(
     params: GotoDefinitionParams,
     index: &Arc<tokio::sync::RwLock<Option<HybridIndex>>>,
+    root_indices: &Arc<tokio::sync::RwLock<HashMap<PathBuf, HybridIndex>>>,
     repo_graph: &Arc<std::sync::RwLock<Option<RepoGraph>>>,
+    root_graphs: &Arc<std::sync::RwLock<HashMap<PathBuf, RepoGraph>>>,
     root: &Path,
 ) -> Result<Option<GotoDefinitionResponse>> {
     let pos = &params.text_document_position_params;
@@ -222,15 +272,52 @@ pub async fn goto_definition(
         return Ok(None);
     };
 
-    let guard = index.read().await;
-    let Some(hybrid) = guard.as_ref() else {
-        return Ok(None);
+    let line_1based = (pos.position.line as usize) + 1;
+
+    // Try the default index first.
+    let result = {
+        let guard = index.read().await;
+        if let Some(hybrid) = guard.as_ref() {
+            let graph_ref = repo_graph.read().ok();
+            let graph = graph_ref.as_ref().and_then(|g| g.as_ref());
+            search_definition(hybrid, &word, &path, root, line_1based, graph)
+        } else {
+            None
+        }
     };
 
-    // Use the chunk at the cursor position as the semantic query vector.
-    // This gives hybrid search (BM25 keyword + embedding similarity) for free.
-    let line_1based = (pos.position.line as usize) + 1;
-    let query_embedding = chunk_at_position(hybrid, &path, root, line_1based)
+    if result.is_some() {
+        return Ok(result);
+    }
+
+    // Fall back to on-demand root indices.
+    let ri_guard = root_indices.read().await;
+    if let Some((alt_root, hybrid)) = ri_guard.iter().find(|(r, _)| path.starts_with(r)) {
+        let rg_guard = root_graphs.read().ok();
+        let graph = rg_guard.as_ref().and_then(|g| g.get(alt_root));
+        return Ok(search_definition(
+            hybrid,
+            &word,
+            &path,
+            alt_root,
+            line_1based,
+            graph,
+        ));
+    }
+
+    Ok(None)
+}
+
+/// Search a single index for reference locations matching `word`.
+fn search_references(
+    hybrid: &HybridIndex,
+    word: &str,
+    path: &Path,
+    search_root: &Path,
+    line_1based: usize,
+    repo_graph: Option<&RepoGraph>,
+) -> Vec<Location> {
+    let query_embedding = chunk_at_position(hybrid, path, search_root, line_1based)
         .and_then(|idx| hybrid.semantic.embedding(idx))
         .unwrap_or_default();
 
@@ -239,37 +326,28 @@ pub async fn goto_definition(
     } else {
         SearchMode::Hybrid
     };
-    let mut results = hybrid.search(&query_embedding, &word, 20, 0.0, mode);
+    let mut results = hybrid.search(&query_embedding, word, 50, 0.0, mode);
 
-    if let Ok(graph_guard) = repo_graph.read()
-        && let Some(graph) = graph_guard.as_ref()
-    {
+    if let Some(graph) = repo_graph {
         let pr = pagerank_lookup(graph);
         boost_with_pagerank(&mut results, hybrid.chunks(), &pr, 0.3);
     }
 
     let chunks = hybrid.chunks();
-
-    // Prefer an exact name match; fall back to the top-ranked result.
-    let best = results
-        .iter()
-        .find(|(idx, _)| chunks.get(*idx).is_some_and(|c| c.name == word))
-        .or_else(|| results.first());
-
-    let Some(&(idx, _)) = best else {
-        return Ok(None);
-    };
-    let Some(chunk) = chunks.get(idx) else {
-        return Ok(None);
-    };
-    let Some(uri) = uri_for_chunk(chunk, root) else {
-        return Ok(None);
-    };
-
-    Ok(Some(GotoDefinitionResponse::Scalar(Location {
-        uri,
-        range: chunk_range(chunk),
-    })))
+    results
+        .into_iter()
+        .filter_map(|(idx, _score)| {
+            let chunk = chunks.get(idx)?;
+            if !chunk.name.contains(word) && !chunk.content.contains(word) {
+                return None;
+            }
+            let uri = uri_for_chunk(chunk, search_root)?;
+            Some(Location {
+                uri,
+                range: chunk_range(chunk),
+            })
+        })
+        .collect()
 }
 
 /// Find all references to the symbol at the given position.
@@ -277,10 +355,15 @@ pub async fn goto_definition(
 /// Uses tree-sitter to identify the symbol, then performs hybrid search
 /// (semantic embedding + BM25) using the chunk at the cursor as the query
 /// vector. Returns all chunks whose name or content contains the symbol.
+///
+/// Tries the default index first; if no results are found, checks on-demand
+/// root indices for a root that contains the queried file.
 pub async fn find_references(
     params: ReferenceParams,
     index: &Arc<tokio::sync::RwLock<Option<HybridIndex>>>,
+    root_indices: &Arc<tokio::sync::RwLock<HashMap<PathBuf, HybridIndex>>>,
     repo_graph: &Arc<std::sync::RwLock<Option<RepoGraph>>>,
+    root_graphs: &Arc<std::sync::RwLock<HashMap<PathBuf, RepoGraph>>>,
     root: &Path,
 ) -> Result<Option<Vec<Location>>> {
     let pos = &params.text_document_position;
@@ -298,52 +381,36 @@ pub async fn find_references(
         return Ok(None);
     };
 
-    let guard = index.read().await;
-    let Some(hybrid) = guard.as_ref() else {
-        return Ok(None);
-    };
-
-    // Use the chunk at the cursor as the semantic query vector.
     let line_1based = (pos.position.line as usize) + 1;
-    let query_embedding = chunk_at_position(hybrid, &path, root, line_1based)
-        .and_then(|idx| hybrid.semantic.embedding(idx))
-        .unwrap_or_default();
 
-    let mode = if query_embedding.is_empty() {
-        SearchMode::Keyword
-    } else {
-        SearchMode::Hybrid
+    // Try the default index first.
+    let locations = {
+        let guard = index.read().await;
+        if let Some(hybrid) = guard.as_ref() {
+            let graph_ref = repo_graph.read().ok();
+            let graph = graph_ref.as_ref().and_then(|g| g.as_ref());
+            search_references(hybrid, &word, &path, root, line_1based, graph)
+        } else {
+            Vec::new()
+        }
     };
-    let mut results = hybrid.search(&query_embedding, &word, 50, 0.0, mode);
 
-    if let Ok(graph_guard) = repo_graph.read()
-        && let Some(graph) = graph_guard.as_ref()
-    {
-        let pr = pagerank_lookup(graph);
-        boost_with_pagerank(&mut results, hybrid.chunks(), &pr, 0.3);
+    if !locations.is_empty() {
+        return Ok(Some(locations));
     }
 
-    let chunks = hybrid.chunks();
-    let locations: Vec<Location> = results
-        .into_iter()
-        .filter_map(|(idx, _score)| {
-            let chunk = chunks.get(idx)?;
-            if !chunk.name.contains(&word) && !chunk.content.contains(&word) {
-                return None;
-            }
-            let uri = uri_for_chunk(chunk, root)?;
-            Some(Location {
-                uri,
-                range: chunk_range(chunk),
-            })
-        })
-        .collect();
-
-    if locations.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(locations))
+    // Fall back to on-demand root indices.
+    let ri_guard = root_indices.read().await;
+    if let Some((alt_root, hybrid)) = ri_guard.iter().find(|(r, _)| path.starts_with(r)) {
+        let rg_guard = root_graphs.read().ok();
+        let graph = rg_guard.as_ref().and_then(|g| g.get(alt_root));
+        let locations = search_references(hybrid, &word, &path, alt_root, line_1based, graph);
+        if !locations.is_empty() {
+            return Ok(Some(locations));
+        }
     }
+
+    Ok(None)
 }
 
 #[cfg(test)]

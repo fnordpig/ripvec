@@ -4,7 +4,8 @@
 //! handler finds the definition at the cursor position; `incoming` and
 //! `outgoing` traverse `def_callers` / `def_callees` respectively.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::json;
@@ -90,48 +91,21 @@ fn def_to_item(
     })
 }
 
-/// Find the definition at the cursor position and return it as a
-/// [`CallHierarchyItem`].
-///
-/// Searches definitions in the file matching the cursor's URI for one
-/// whose line range contains the cursor line.
-#[expect(
-    clippy::unused_async,
-    reason = "LanguageServer trait requires async signature"
-)]
-pub async fn prepare(
-    params: CallHierarchyPrepareParams,
-    repo_graph: &Arc<std::sync::RwLock<Option<RepoGraph>>>,
-    root: &Path,
-) -> Result<Option<Vec<CallHierarchyItem>>> {
-    let pos = &params.text_document_position_params;
-    let Some(path_cow) = pos.text_document.uri.to_file_path() else {
-        return Ok(None);
-    };
-    let req_path = path_cow.into_owned();
-    let cursor_line = pos.position.line; // 0-based
-
-    let Ok(graph_guard) = repo_graph.read() else {
-        return Ok(None);
-    };
-    let Some(graph) = graph_guard.as_ref() else {
-        return Ok(None);
-    };
-
-    // Find the file in the graph.
-    let rel_path = make_relative(&req_path, root);
-    let Some(file_idx) = graph
+/// Find the definition at cursor in a single graph, returning the item if found.
+fn prepare_in_graph(
+    graph: &RepoGraph,
+    req_path: &Path,
+    search_root: &Path,
+    cursor_line: u32,
+) -> Option<CallHierarchyItem> {
+    let rel_path = make_relative(req_path, search_root);
+    let file_idx = graph
         .files
         .iter()
-        .position(|f| Path::new(&f.path) == rel_path)
-    else {
-        return Ok(None);
-    };
+        .position(|f| Path::new(&f.path) == rel_path)?;
 
-    // Find the innermost definition containing the cursor line.
-    // Definitions are sorted by start_line; prefer the narrowest span.
     let file = &graph.files[file_idx];
-    let mut best: Option<(usize, u32)> = None; // (def_idx, span_size)
+    let mut best: Option<(usize, u32)> = None;
     for (di, def) in file.defs.iter().enumerate() {
         let start = def_line_to_lsp(def.start_line);
         let end = def_line_to_lsp(def.end_line);
@@ -143,47 +117,67 @@ pub async fn prepare(
         }
     }
 
-    let Some((def_idx, _)) = best else {
-        return Ok(None);
-    };
-
-    match def_to_item(graph, file_idx, def_idx, root) {
-        Some(item) => Ok(Some(vec![item])),
-        None => Ok(None),
-    }
+    let (def_idx, _) = best?;
+    def_to_item(graph, file_idx, def_idx, search_root)
 }
 
-/// Return callers of the given definition.
+/// Find the definition at the cursor position and return it as a
+/// [`CallHierarchyItem`].
 ///
-/// Reads `file_idx` / `def_idx` from the item's `data` field, computes
-/// the flat index, and maps each entry in `graph.def_callers[flat]` to a
-/// [`CallHierarchyIncomingCall`].
+/// Searches definitions in the file matching the cursor's URI for one
+/// whose line range contains the cursor line. Tries the default repo
+/// graph first, then on-demand root graphs.
 #[expect(
     clippy::unused_async,
     reason = "LanguageServer trait requires async signature"
 )]
-pub async fn incoming(
-    params: CallHierarchyIncomingCallsParams,
+pub async fn prepare(
+    params: CallHierarchyPrepareParams,
     repo_graph: &Arc<std::sync::RwLock<Option<RepoGraph>>>,
+    root_graphs: &Arc<std::sync::RwLock<HashMap<PathBuf, RepoGraph>>>,
     root: &Path,
-) -> Result<Option<Vec<CallHierarchyIncomingCall>>> {
-    let Some((file_idx, def_idx)) = extract_ids(&params.item) else {
+) -> Result<Option<Vec<CallHierarchyItem>>> {
+    let pos = &params.text_document_position_params;
+    let Some(path_cow) = pos.text_document.uri.to_file_path() else {
         return Ok(None);
     };
+    let req_path = path_cow.into_owned();
+    let cursor_line = pos.position.line; // 0-based
 
-    let Ok(graph_guard) = repo_graph.read() else {
-        return Ok(None);
-    };
-    let Some(graph) = graph_guard.as_ref() else {
-        return Ok(None);
-    };
+    // Try the default repo graph first.
+    if let Ok(graph_guard) = repo_graph.read()
+        && let Some(graph) = graph_guard.as_ref()
+        && let Some(item) = prepare_in_graph(graph, &req_path, root, cursor_line)
+    {
+        return Ok(Some(vec![item]));
+    }
 
+    // Fall back to on-demand root graphs.
+    if let Ok(rg_guard) = root_graphs.read() {
+        for (alt_root, graph) in rg_guard.iter() {
+            if req_path.starts_with(alt_root)
+                && let Some(item) = prepare_in_graph(graph, &req_path, alt_root, cursor_line)
+            {
+                return Ok(Some(vec![item]));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Collect incoming calls from a single graph.
+fn incoming_from_graph(
+    graph: &RepoGraph,
+    file_idx: usize,
+    def_idx: usize,
+    search_root: &Path,
+) -> Vec<CallHierarchyIncomingCall> {
     let Some(flat) = flat_index(graph, file_idx, def_idx) else {
-        return Ok(None);
+        return Vec::new();
     };
-
     let Some(callers) = graph.def_callers.get(flat) else {
-        return Ok(None);
+        return Vec::new();
     };
 
     let mut results = Vec::with_capacity(callers.len());
@@ -191,56 +185,75 @@ pub async fn incoming(
         let caller_file = caller_file as usize;
         let caller_def = caller_def as usize;
 
-        let Some(item) = def_to_item(graph, caller_file, caller_def, root) else {
+        let Some(item) = def_to_item(graph, caller_file, caller_def, search_root) else {
             continue;
         };
 
-        // Find the call site range(s) within the caller that reference the target.
         let from_ranges = call_site_ranges(graph, caller_file, caller_def, file_idx, def_idx);
-
         results.push(CallHierarchyIncomingCall {
             from: item,
             from_ranges,
         });
     }
-
-    if results.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(results))
-    }
+    results
 }
 
-/// Return callees of the given definition.
+/// Return callers of the given definition.
 ///
-/// Same as `incoming` but traverses `graph.def_callees[flat]` and returns
-/// [`CallHierarchyOutgoingCall`] entries.
+/// Reads `file_idx` / `def_idx` from the item's `data` field, computes
+/// the flat index, and maps each entry in `graph.def_callers[flat]` to a
+/// [`CallHierarchyIncomingCall`].
+///
+/// Tries the default repo graph first; falls back to on-demand root graphs.
 #[expect(
     clippy::unused_async,
     reason = "LanguageServer trait requires async signature"
 )]
-pub async fn outgoing(
-    params: CallHierarchyOutgoingCallsParams,
+pub async fn incoming(
+    params: CallHierarchyIncomingCallsParams,
     repo_graph: &Arc<std::sync::RwLock<Option<RepoGraph>>>,
+    root_graphs: &Arc<std::sync::RwLock<HashMap<PathBuf, RepoGraph>>>,
     root: &Path,
-) -> Result<Option<Vec<CallHierarchyOutgoingCall>>> {
+) -> Result<Option<Vec<CallHierarchyIncomingCall>>> {
     let Some((file_idx, def_idx)) = extract_ids(&params.item) else {
         return Ok(None);
     };
 
-    let Ok(graph_guard) = repo_graph.read() else {
-        return Ok(None);
-    };
-    let Some(graph) = graph_guard.as_ref() else {
-        return Ok(None);
-    };
+    // Try the default repo graph first.
+    if let Ok(graph_guard) = repo_graph.read()
+        && let Some(graph) = graph_guard.as_ref()
+    {
+        let results = incoming_from_graph(graph, file_idx, def_idx, root);
+        if !results.is_empty() {
+            return Ok(Some(results));
+        }
+    }
 
+    // Fall back to on-demand root graphs.
+    if let Ok(rg_guard) = root_graphs.read() {
+        for (alt_root, graph) in rg_guard.iter() {
+            let results = incoming_from_graph(graph, file_idx, def_idx, alt_root);
+            if !results.is_empty() {
+                return Ok(Some(results));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Collect outgoing calls from a single graph.
+fn outgoing_from_graph(
+    graph: &RepoGraph,
+    file_idx: usize,
+    def_idx: usize,
+    search_root: &Path,
+) -> Vec<CallHierarchyOutgoingCall> {
     let Some(flat) = flat_index(graph, file_idx, def_idx) else {
-        return Ok(None);
+        return Vec::new();
     };
-
     let Some(callees) = graph.def_callees.get(flat) else {
-        return Ok(None);
+        return Vec::new();
     };
 
     let mut results = Vec::with_capacity(callees.len());
@@ -248,24 +261,60 @@ pub async fn outgoing(
         let callee_file = callee_file as usize;
         let callee_def = callee_def as usize;
 
-        let Some(item) = def_to_item(graph, callee_file, callee_def, root) else {
+        let Some(item) = def_to_item(graph, callee_file, callee_def, search_root) else {
             continue;
         };
 
-        // from_ranges: ranges in the *caller* (current def) where this callee is invoked.
         let from_ranges = call_site_ranges(graph, file_idx, def_idx, callee_file, callee_def);
-
         results.push(CallHierarchyOutgoingCall {
             to: item,
             from_ranges,
         });
     }
+    results
+}
 
-    if results.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(results))
+/// Return callees of the given definition.
+///
+/// Same as `incoming` but traverses `graph.def_callees[flat]` and returns
+/// [`CallHierarchyOutgoingCall`] entries.
+///
+/// Tries the default repo graph first; falls back to on-demand root graphs.
+#[expect(
+    clippy::unused_async,
+    reason = "LanguageServer trait requires async signature"
+)]
+pub async fn outgoing(
+    params: CallHierarchyOutgoingCallsParams,
+    repo_graph: &Arc<std::sync::RwLock<Option<RepoGraph>>>,
+    root_graphs: &Arc<std::sync::RwLock<HashMap<PathBuf, RepoGraph>>>,
+    root: &Path,
+) -> Result<Option<Vec<CallHierarchyOutgoingCall>>> {
+    let Some((file_idx, def_idx)) = extract_ids(&params.item) else {
+        return Ok(None);
+    };
+
+    // Try the default repo graph first.
+    if let Ok(graph_guard) = repo_graph.read()
+        && let Some(graph) = graph_guard.as_ref()
+    {
+        let results = outgoing_from_graph(graph, file_idx, def_idx, root);
+        if !results.is_empty() {
+            return Ok(Some(results));
+        }
     }
+
+    // Fall back to on-demand root graphs.
+    if let Ok(rg_guard) = root_graphs.read() {
+        for (alt_root, graph) in rg_guard.iter() {
+            let results = outgoing_from_graph(graph, file_idx, def_idx, alt_root);
+            if !results.is_empty() {
+                return Ok(Some(results));
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
