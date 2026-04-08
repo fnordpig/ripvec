@@ -15,4 +15,12 @@ design.md
 
 # Local config (machine-specific)
 .mcp.json
+.lsp.json
 .claude/
+.augment/
+bacon.toml
+
+# Tool artifacts
+.tracemeld/
+__pycache__/
+*.pyc
