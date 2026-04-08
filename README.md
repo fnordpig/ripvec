@@ -351,14 +351,48 @@ Cargo workspace with three crates:
 | [`ripvec`](crates/ripvec) | CLI binary (clap + ratatui TUI) |
 | [`ripvec-mcp`](crates/ripvec-mcp) | MCP + LSP server binary (rmcp + tower-lsp-server) |
 
-### GPU backends
+### Backend detection and inference
 
-| Backend | Platform | Approach |
-|---------|----------|----------|
-| Metal | macOS (default) | Custom MSL kernels + MPS GEMMs |
-| MLX | macOS (fallback) | mlx-rs, lazy eval graph fusion |
-| CUDA | Linux | cudarc + cuBLAS FP16 tensor cores + fused NVRTC kernels |
-| CPU | Everywhere | ndarray + system BLAS (Accelerate / OpenBLAS) |
+```mermaid
+graph TD
+    Start["ripvec starts"] --> Detect{"Detect platform"}
+    Detect -->|"macOS"| Metal{"Metal available?"}
+    Metal -->|"yes"| MetalBE["🔶 Metal Backend<br/>Custom MSL kernels<br/>+ MPS GEMMs via AMX"]
+    Metal -->|"no"| MLX{"MLX available?"}
+    MLX -->|"yes"| MLXBE["🟣 MLX Backend<br/>mlx-rs lazy eval<br/>graph fusion"]
+    MLX -->|"no"| CPUBE
+    Detect -->|"Linux + CUDA"| CUDABE["🟢 CUDA Backend<br/>cuBLAS FP16 tensor cores<br/>+ fused NVRTC kernels"]
+    Detect -->|"Linux / fallback"| CPUBE["🔵 CPU Backend<br/>ndarray + system BLAS<br/>(Accelerate / OpenBLAS)"]
+```
+
+All four backends implement the same `EmbedBackend` trait — the forward pass
+is generic over `ModernBertArch<D: Driver>`. Same model weights, same output,
+different hardware paths.
+
+### Embedding pipeline
+
+```mermaid
+graph LR
+    subgraph "Stage 1: Chunk (rayon)"
+        F["Files"] --> TS["Tree-sitter<br/>parse"]
+        TS --> C["Semantic<br/>chunks"]
+    end
+    subgraph "Stage 2: Tokenize"
+        C --> T["ModernBERT<br/>tokenizer"]
+        T --> B["Padded<br/>batches"]
+    end
+    subgraph "Stage 3: Embed (GPU)"
+        B --> FW["Forward pass<br/>(22 layers)"]
+        FW --> P["Mean pool<br/>+ L2 norm"]
+        P --> V["768-dim<br/>vectors"]
+    end
+    C -.->|"bounded channel<br/>backpressure"| T
+    T -.->|"bounded channel<br/>backpressure"| FW
+```
+
+For large corpora (1000+ files), stages run concurrently as a streaming
+pipeline with bounded channels for backpressure. The GPU starts embedding
+after the first batch (~50ms), not after all files are chunked.
 
 ### Embedding models
 
