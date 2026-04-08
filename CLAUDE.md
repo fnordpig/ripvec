@@ -61,6 +61,27 @@ mcp__ripvec__search_code("query")                      # local build
 mcp__plugin_ripvec_ripvec__search_code("query")        # released version
 ```
 
+## Plugin marketplace
+
+The ripvec plugin lives at `../my-claude-plugins/plugins/ripvec/`. When
+releasing a new version:
+
+1. Bump version in `../my-claude-plugins/plugins/ripvec/.claude-plugin/plugin.json`
+2. Bump version in `../my-claude-plugins/.claude-plugin/marketplace.json`
+3. Update description if features changed
+4. Commit and push `../my-claude-plugins/`
+
+The plugin's auto-updater (`ensure-ripvec-mcp.sh`) fetches the latest
+release from GitHub API — no manual version pinning needed for the binary.
+But the marketplace version must match to trigger Claude Code's plugin
+cache refresh.
+
+**A/B testing**: Search the same query on both to compare local vs released behavior:
+```
+mcp__ripvec__search_code("query")                      # local build
+mcp__plugin_ripvec_ripvec__search_code("query")        # released version
+```
+
 ## LSP server
 
 `ripvec-mcp --lsp` serves Language Server Protocol over stdio, providing
