@@ -51,6 +51,10 @@ ToolSearch("select:mcp__plugin_ripvec_ripvec__search_code")
 After `cargo build --release`, the project MCP picks up changes immediately
 (next tool call). No restart needed — the binary is replaced in place.
 
+Both servers running simultaneously is useful for A/B testing: call the same
+query on `mcp__ripvec__*` (local build) and `mcp__plugin_ripvec_ripvec__*`
+(released) to compare behavior before/after a change.
+
 **A/B testing**: Search the same query on both to compare local vs released behavior:
 ```
 mcp__ripvec__search_code("query")                      # local build
