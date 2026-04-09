@@ -405,11 +405,15 @@ pub async fn run_background_index(server: &RipvecServer, repo_level: bool) {
     // Guard drop resets indexing flag automatically
 }
 
-/// Watch the project directory for file changes and re-index after a 2-second quiet period.
+/// Watch a project directory for file changes and re-index after a 2-second quiet period.
 ///
 /// Uses the `notify` crate for OS-level file watching (`FSEvents` on macOS,
 /// inotify on Linux). After detecting changes, waits 2 seconds for quiet
 /// then runs `run_background_index` to incrementally update the index.
+///
+/// Not used in the default MCP startup (indices are on-demand), but available
+/// for future use when a persistent watch mode is needed.
+#[expect(dead_code, reason = "available for future persistent watch mode")]
 pub async fn run_file_watcher(server: &RipvecServer) {
     use notify::{RecursiveMode, Watcher};
 

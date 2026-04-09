@@ -39,30 +39,22 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    let mode_label = if lsp_mode { "LSP" } else { "MCP" };
+    eprintln!("[ripvec-mcp] {mode_label} mode — no auto-index, all tools require explicit root");
+
+    // No default project root. Every tool call must provide a root parameter.
+    // The on-demand index path (ensure_root) handles caching, disk cache
+    // discovery, and .ripvec/config.toml resolution per-call.
     let root = std::env::var("RIPVEC_ROOT").map_or_else(
         |_| std::env::current_dir().expect("cannot determine current directory"),
         std::path::PathBuf::from,
     );
 
-    let mode_label = if lsp_mode { "LSP" } else { "MCP" };
-    eprintln!(
-        "[ripvec-mcp] {mode_label} mode, project root: {}",
-        root.display()
-    );
-
     let server = server::RipvecServer::new(root);
 
-    // Spawn background indexing (non-blocking)
-    let bg_server = server.clone();
-    tokio::spawn(async move {
-        server::run_background_index(&bg_server, false).await;
-    });
-
-    // Spawn debounced file watcher (re-indexes on changes after 2s quiet)
-    let watcher_server = server.clone();
-    tokio::spawn(async move {
-        server::run_file_watcher(&watcher_server).await;
-    });
+    // No background indexing. No file watcher. Indices are built on-demand
+    // when tools are called with a root parameter, and cached in memory
+    // (root_indices) and on disk (~/.cache/ripvec/ or .ripvec/cache/).
 
     if lsp_mode {
         lsp::run(server).await;
