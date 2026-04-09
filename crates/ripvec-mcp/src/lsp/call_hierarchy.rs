@@ -67,7 +67,6 @@ fn def_to_item(
     let uri = uri_for_file(&file.path, root)?;
 
     let range = def_range(def);
-    // Selection range covers the first line (the name / signature).
     let selection_range = Range {
         start: range.start,
         end: Position {
@@ -87,6 +86,7 @@ fn def_to_item(
         data: Some(json!({
             "file_idx": file_idx,
             "def_idx": def_idx,
+            "root": root.to_string_lossy(),
         })),
     })
 }
@@ -161,6 +161,20 @@ pub async fn prepare(
                 return Ok(Some(vec![item]));
             }
         }
+    }
+
+    // Fall back: build graph on demand from disk for the file's project root.
+    let mut candidate = req_path.parent();
+    while let Some(dir) = candidate {
+        if dir.join(".git").exists() || dir.join(".ripvec").exists() {
+            if let Ok(graph) = ripvec_core::repo_map::build_graph(dir)
+                && let Some(item) = prepare_in_graph(&graph, &req_path, dir, cursor_line)
+            {
+                return Ok(Some(vec![item]));
+            }
+            break;
+        }
+        candidate = dir.parent();
     }
 
     Ok(None)
@@ -239,6 +253,15 @@ pub async fn incoming(
         }
     }
 
+    // Fall back: rebuild graph from disk using root stored in data.
+    if let Some(graph_root) = extract_root(&params.item)
+        && let Ok(graph) = ripvec_core::repo_map::build_graph(&graph_root) {
+            let results = incoming_from_graph(&graph, file_idx, def_idx, &graph_root);
+            if !results.is_empty() {
+                return Ok(Some(results));
+            }
+        }
+
     Ok(None)
 }
 
@@ -314,6 +337,15 @@ pub async fn outgoing(
         }
     }
 
+    // Fall back: rebuild graph from disk using root stored in data.
+    if let Some(graph_root) = extract_root(&params.item)
+        && let Ok(graph) = ripvec_core::repo_map::build_graph(&graph_root) {
+            let results = outgoing_from_graph(&graph, file_idx, def_idx, &graph_root);
+            if !results.is_empty() {
+                return Ok(Some(results));
+            }
+        }
+
     Ok(None)
 }
 
@@ -325,6 +357,13 @@ fn extract_ids(item: &CallHierarchyItem) -> Option<(usize, usize)> {
     let file_idx = usize::try_from(data.get("file_idx")?.as_u64()?).ok()?;
     let def_idx = usize::try_from(data.get("def_idx")?.as_u64()?).ok()?;
     Some((file_idx, def_idx))
+}
+
+/// Extract the project root from the item's `data` field.
+fn extract_root(item: &CallHierarchyItem) -> Option<PathBuf> {
+    let data = item.data.as_ref()?;
+    let root_str = data.get("root")?.as_str()?;
+    Some(PathBuf::from(root_str))
 }
 
 /// Compute the flat index from `(file_idx, def_idx)`.
