@@ -74,6 +74,12 @@ pub fn incremental_index(
             );
             config.save(&ripvec_dir)?;
         }
+        // Prevent merge conflicts: always keep "ours" for manifest.json.
+        // After merge, next `ripvec --index` reconciles from the filesystem.
+        let gitattributes_path = ripvec_dir.join(".gitattributes");
+        if !gitattributes_path.exists() {
+            let _ = std::fs::write(&gitattributes_path, "cache/manifest.json merge=ours\n");
+        }
     }
 
     let cache_dir = resolve_cache_dir(root, model_repo, cache_dir_override);
