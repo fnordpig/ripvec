@@ -1,6 +1,6 @@
 {
   "name": "ripvec",
-  "version": "0.1.0",
+  "version": "0.13.3",
   "description": "Semantic code search and structural analysis — find code by meaning, understand architecture through dependency graphs",
   "author": {
     "name": "fnordpig",
