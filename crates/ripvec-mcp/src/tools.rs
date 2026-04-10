@@ -750,22 +750,43 @@ impl RipvecServer {
                 .unwrap_or_else(|_| root_path.clone());
 
             let cache = self.root_indices.read().await;
-            let (ready, chunk_count, files_count, ext_counts) = match cache.get(&canonical) {
-                Some(index) => {
-                    let mut files_set = HashSet::new();
+            let (ready, chunk_count, files_count, ext_counts) = if let Some(index) = cache.get(&canonical) {
+                let mut files_set = HashSet::new();
+                let mut exts: HashMap<String, usize> = HashMap::new();
+                for chunk in index.chunks() {
+                    files_set.insert(chunk.file_path.as_str());
+                    let ext = std::path::Path::new(&chunk.file_path)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("(none)")
+                        .to_string();
+                    *exts.entry(ext).or_insert(0) += 1;
+                }
+                (true, index.chunks().len(), files_set.len(), exts)
+            } else {
+                // Check disk cache — the index may exist on disk even if not loaded in memory.
+                let cache_dir = ripvec_core::cache::reindex::resolve_cache_dir(
+                    &canonical,
+                    "nomic-ai/modernbert-embed-base",
+                    None,
+                );
+                let manifest_path = cache_dir.join("manifest.json");
+                if let Ok(manifest) = ripvec_core::cache::manifest::Manifest::load(&manifest_path) {
+                    let file_count = manifest.files.len();
+                    let chunk_count: usize = manifest.files.values().map(|f| f.chunk_count).sum();
                     let mut exts: HashMap<String, usize> = HashMap::new();
-                    for chunk in index.chunks() {
-                        files_set.insert(chunk.file_path.as_str());
-                        let ext = std::path::Path::new(&chunk.file_path)
+                    for key in manifest.files.keys() {
+                        let ext = std::path::Path::new(key)
                             .extension()
                             .and_then(|e| e.to_str())
                             .unwrap_or("(none)")
                             .to_string();
-                        *exts.entry(ext).or_insert(0) += 1;
+                        *exts.entry(ext).or_insert(0) += chunk_count / file_count.max(1);
                     }
-                    (true, index.chunks().len(), files_set.len(), exts)
+                    (true, chunk_count, file_count, exts)
+                } else {
+                    (false, 0, 0, HashMap::new())
                 }
-                None => (false, 0, 0, HashMap::new()),
             };
 
             let cache_dir = ripvec_core::cache::reindex::resolve_cache_dir(
@@ -793,22 +814,43 @@ impl RipvecServer {
             let idx_guard = self.index.read().await;
             let ready = idx_guard.is_some();
 
-            let (chunk_count, files_count, ext_counts) = match idx_guard.as_ref() {
-                Some(index) => {
-                    let mut files_set = HashSet::new();
+            let (chunk_count, files_count, ext_counts) = if let Some(index) = idx_guard.as_ref() {
+                let mut files_set = HashSet::new();
+                let mut exts: HashMap<String, usize> = HashMap::new();
+                for chunk in index.chunks() {
+                    files_set.insert(chunk.file_path.as_str());
+                    let ext = std::path::Path::new(&chunk.file_path)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("(none)")
+                        .to_string();
+                    *exts.entry(ext).or_insert(0) += 1;
+                }
+                (index.chunks().len(), files_set.len(), exts)
+            } else {
+                // Check disk cache
+                let cache_dir = ripvec_core::cache::reindex::resolve_cache_dir(
+                    &self.project_root,
+                    "nomic-ai/modernbert-embed-base",
+                    None,
+                );
+                let manifest_path = cache_dir.join("manifest.json");
+                if let Ok(manifest) = ripvec_core::cache::manifest::Manifest::load(&manifest_path) {
+                    let file_count = manifest.files.len();
+                    let chunk_count: usize = manifest.files.values().map(|f| f.chunk_count).sum();
                     let mut exts: HashMap<String, usize> = HashMap::new();
-                    for chunk in index.chunks() {
-                        files_set.insert(chunk.file_path.as_str());
-                        let ext = std::path::Path::new(&chunk.file_path)
+                    for key in manifest.files.keys() {
+                        let ext = std::path::Path::new(key)
                             .extension()
                             .and_then(|e| e.to_str())
                             .unwrap_or("(none)")
                             .to_string();
                         *exts.entry(ext).or_insert(0) += 1;
                     }
-                    (index.chunks().len(), files_set.len(), exts)
+                    (chunk_count, file_count, exts)
+                } else {
+                    (0, 0, HashMap::new())
                 }
-                None => (0, 0, HashMap::new()),
             };
 
             let cache_dir = ripvec_core::cache::reindex::resolve_cache_dir(
