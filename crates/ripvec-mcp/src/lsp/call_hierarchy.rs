@@ -255,12 +255,13 @@ pub async fn incoming(
 
     // Fall back: rebuild graph from disk using root stored in data.
     if let Some(graph_root) = extract_root(&params.item)
-        && let Ok(graph) = ripvec_core::repo_map::build_graph(&graph_root) {
-            let results = incoming_from_graph(&graph, file_idx, def_idx, &graph_root);
-            if !results.is_empty() {
-                return Ok(Some(results));
-            }
+        && let Ok(graph) = ripvec_core::repo_map::build_graph(&graph_root)
+    {
+        let results = incoming_from_graph(&graph, file_idx, def_idx, &graph_root);
+        if !results.is_empty() {
+            return Ok(Some(results));
         }
+    }
 
     Ok(None)
 }
@@ -339,12 +340,13 @@ pub async fn outgoing(
 
     // Fall back: rebuild graph from disk using root stored in data.
     if let Some(graph_root) = extract_root(&params.item)
-        && let Ok(graph) = ripvec_core::repo_map::build_graph(&graph_root) {
-            let results = outgoing_from_graph(&graph, file_idx, def_idx, &graph_root);
-            if !results.is_empty() {
-                return Ok(Some(results));
-            }
+        && let Ok(graph) = ripvec_core::repo_map::build_graph(&graph_root)
+    {
+        let results = outgoing_from_graph(&graph, file_idx, def_idx, &graph_root);
+        if !results.is_empty() {
+            return Ok(Some(results));
         }
+    }
 
     Ok(None)
 }

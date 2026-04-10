@@ -136,6 +136,30 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Prompt the user to enable `pull.autoStash` for a repo-local cache.
+///
+/// Only prompts if the setting hasn't been configured yet. Reads a single
+/// line from stdin (default: yes).
+fn prompt_auto_stash(root: &std::path::Path) {
+    if let Some(msg) = ripvec_core::cache::reindex::check_auto_stash(root) {
+        eprintln!("{msg}");
+        eprint!("[Y/n] ");
+        let mut input = String::new();
+        let enable = if std::io::stdin().read_line(&mut input).is_ok() {
+            !input.trim().eq_ignore_ascii_case("n")
+        } else {
+            true
+        };
+        if let Err(e) = ripvec_core::cache::reindex::apply_auto_stash(root, enable) {
+            eprintln!("ripvec: failed to save auto_stash preference: {e}");
+        } else if enable {
+            eprintln!("ripvec: pull.autoStash enabled for this repo.");
+        } else {
+            eprintln!("ripvec: pull.autoStash declined. You can enable it later in .ripvec/config.toml.");
+        }
+    }
+}
+
 /// Load the embedding backend(s), tokenizer, and build the search config.
 ///
 /// When `--backend auto` (the default), probes for all available backends
@@ -272,6 +296,10 @@ fn run_interactive(
             args.repo_level,
         )
         .context("incremental index failed")?;
+
+        if args.repo_level {
+            prompt_auto_stash(std::path::Path::new(&args.path));
+        }
 
         // Extract chunks and embeddings from the HybridIndex for the TUI
         let n = index.chunks().len();
@@ -448,6 +476,10 @@ fn run_oneshot(
             args.repo_level,
         )
         .context("incremental index failed")?;
+
+        if args.repo_level {
+            prompt_auto_stash(std::path::Path::new(&args.path));
+        }
 
         if let Some(pb) = &pb {
             if stats.chunks_reembedded > 0 {

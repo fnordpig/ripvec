@@ -25,6 +25,10 @@ pub struct CacheConfig {
     pub model: String,
     /// Manifest format version string (e.g. `"3"`).
     pub version: String,
+    /// Whether ripvec has configured `pull.autoStash` for this repo.
+    /// `None` = not yet asked, `Some(true)` = enabled, `Some(false)` = declined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_stash: Option<bool>,
 }
 
 impl RepoConfig {
@@ -36,6 +40,7 @@ impl RepoConfig {
                 local: true,
                 model: model.into(),
                 version: version.into(),
+                auto_stash: None,
             },
         }
     }

@@ -674,12 +674,17 @@ impl RipvecServer {
                 None => (0, 0),
             };
 
-            let response = serde_json::json!({
+            let mut response = serde_json::json!({
                 "chunks": chunk_count,
                 "files": file_count,
                 "duration_ms": duration_ms,
                 "root": canonical.display().to_string(),
             });
+            if let Some(msg) =
+                ripvec_core::cache::reindex::check_auto_stash(&canonical)
+            {
+                response["auto_stash_hint"] = serde_json::Value::String(msg);
+            }
             let json = serde_json::to_string_pretty(&response)
                 .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
             Ok(CallToolResult::success(vec![Content::text(json)]))
@@ -708,12 +713,17 @@ impl RipvecServer {
                 None => (0, 0),
             };
 
-            let response = serde_json::json!({
+            let mut response = serde_json::json!({
                 "chunks": chunk_count,
                 "files": file_count,
                 "duration_ms": duration_ms,
                 "root": self.project_root.display().to_string(),
             });
+            if let Some(msg) =
+                ripvec_core::cache::reindex::check_auto_stash(&self.project_root)
+            {
+                response["auto_stash_hint"] = serde_json::Value::String(msg);
+            }
             let json = serde_json::to_string_pretty(&response)
                 .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
             Ok(CallToolResult::success(vec![Content::text(json)]))

@@ -78,7 +78,10 @@ pub fn incremental_index(
         // After merge, next `ripvec --index` reconciles from the filesystem.
         let gitattributes_path = ripvec_dir.join(".gitattributes");
         if !gitattributes_path.exists() {
-            let _ = std::fs::write(&gitattributes_path, "cache/manifest.json merge=ours\n");
+            let _ = std::fs::write(
+                &gitattributes_path,
+                "cache/manifest.json merge=ours\ncache/objects/** binary\n",
+            );
         }
     }
 
@@ -361,6 +364,78 @@ pub fn heal_manifest_mtimes(root: &Path, manifest: &mut Manifest) {
             entry.mtime_secs = mtime;
         }
     }
+}
+
+/// Check whether `pull.autoStash` needs to be configured for a repo-local cache.
+///
+/// Returns `Some(message)` with a human-readable prompt if the setting has not
+/// been configured yet. Returns `None` if already configured (in git config or
+/// `.ripvec/config.toml`) or if the cache is not repo-local.
+#[must_use]
+pub fn check_auto_stash(root: &Path) -> Option<String> {
+    use std::process::Command;
+
+    let ripvec_dir = root.join(".ripvec");
+    let config = crate::cache::config::RepoConfig::load(&ripvec_dir).ok()?;
+    if !config.cache.local {
+        return None;
+    }
+
+    // Already decided via config.toml
+    if config.cache.auto_stash.is_some() {
+        return None;
+    }
+
+    // Already set in git config (by user or previous run)
+    let git_check = Command::new("git")
+        .args(["config", "--local", "pull.autoStash"])
+        .current_dir(root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if git_check.status.success() {
+        // Sync the existing git setting into config.toml so we don't check again
+        let val = String::from_utf8_lossy(&git_check.stdout)
+            .trim()
+            .eq_ignore_ascii_case("true");
+        let _ = apply_auto_stash(root, val);
+        return None;
+    }
+
+    Some(
+        "ripvec: Repo-local cache can dirty the worktree and block `git pull`.\n\
+         Enable `pull.autoStash` for this repo? (git stashes dirty files before pull, pops after)"
+            .to_string(),
+    )
+}
+
+/// Apply the user's `auto_stash` choice: set git config and save to `config.toml`.
+///
+/// When `enable` is true, runs `git config --local pull.autoStash true`.
+/// The choice is persisted to `.ripvec/config.toml` so the prompt is not repeated.
+///
+/// # Errors
+///
+/// Returns an error if `config.toml` cannot be read or written.
+pub fn apply_auto_stash(root: &Path, enable: bool) -> crate::Result<()> {
+    use std::process::Command;
+
+    let ripvec_dir = root.join(".ripvec");
+    let mut config = crate::cache::config::RepoConfig::load(&ripvec_dir)?;
+    config.cache.auto_stash = Some(enable);
+    config.save(&ripvec_dir)?;
+
+    if enable {
+        let _ = Command::new("git")
+            .args(["config", "--local", "pull.autoStash", "true"])
+            .current_dir(root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    Ok(())
 }
 
 /// Load a `FileCache` from bytes, auto-detecting the format.
