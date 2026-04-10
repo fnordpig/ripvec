@@ -155,7 +155,9 @@ fn prompt_auto_stash(root: &std::path::Path) {
         } else if enable {
             eprintln!("ripvec: pull.autoStash enabled for this repo.");
         } else {
-            eprintln!("ripvec: pull.autoStash declined. You can enable it later in .ripvec/config.toml.");
+            eprintln!(
+                "ripvec: pull.autoStash declined. You can enable it later in .ripvec/config.toml."
+            );
         }
     }
 }
