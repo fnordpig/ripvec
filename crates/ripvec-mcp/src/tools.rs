@@ -762,14 +762,23 @@ impl RipvecServer {
                 }
                 (true, index.chunks().len(), files_set.len(), exts)
             } else {
-                // Check disk cache — the index may exist on disk even if not loaded in memory.
+                // Check disk cache, or rebuild manifest from objects if gitignored.
                 let cache_dir = ripvec_core::cache::reindex::resolve_cache_dir(
                     &canonical,
                     "nomic-ai/modernbert-embed-base",
                     None,
                 );
                 let manifest_path = cache_dir.join("manifest.json");
-                if let Ok(manifest) = ripvec_core::cache::manifest::Manifest::load(&manifest_path) {
+                if let Some(manifest) = ripvec_core::cache::manifest::Manifest::load(&manifest_path)
+                    .ok()
+                    .or_else(|| {
+                        ripvec_core::cache::reindex::rebuild_manifest_from_objects(
+                            &cache_dir,
+                            &canonical,
+                            "nomic-ai/modernbert-embed-base",
+                        )
+                    })
+                {
                     let file_count = manifest.files.len();
                     let chunk_count: usize = manifest.files.values().map(|f| f.chunk_count).sum();
                     let mut exts: HashMap<String, usize> = HashMap::new();
@@ -836,14 +845,24 @@ impl RipvecServer {
                     exts,
                 )
             } else {
-                // Check disk cache — index may exist on disk even if not loaded
+                // Check disk cache — index may exist on disk even if not loaded.
+                // Also try rebuilding from objects if manifest is gitignored.
                 let cache_dir = ripvec_core::cache::reindex::resolve_cache_dir(
                     &self.project_root,
                     "nomic-ai/modernbert-embed-base",
                     None,
                 );
                 let manifest_path = cache_dir.join("manifest.json");
-                if let Ok(manifest) = ripvec_core::cache::manifest::Manifest::load(&manifest_path) {
+                if let Some(manifest) = ripvec_core::cache::manifest::Manifest::load(&manifest_path)
+                    .ok()
+                    .or_else(|| {
+                        ripvec_core::cache::reindex::rebuild_manifest_from_objects(
+                            &cache_dir,
+                            &self.project_root,
+                            "nomic-ai/modernbert-embed-base",
+                        )
+                    })
+                {
                     let file_count = manifest.files.len();
                     let chunk_count: usize = manifest.files.values().map(|f| f.chunk_count).sum();
                     let mut exts: HashMap<String, usize> = HashMap::new();

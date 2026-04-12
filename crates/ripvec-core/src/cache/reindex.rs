@@ -74,14 +74,11 @@ pub fn incremental_index(
             );
             config.save(&ripvec_dir)?;
         }
-        // Prevent merge conflicts: always keep "ours" for manifest.json.
-        // After merge, next `ripvec --index` reconciles from the filesystem.
-        let gitattributes_path = ripvec_dir.join(".gitattributes");
-        if !gitattributes_path.exists() {
-            let _ = std::fs::write(
-                &gitattributes_path,
-                "cache/manifest.json merge=ours\ncache/objects/** binary\n",
-            );
+        // Gitignore the manifest — it's rebuilt from objects on first use.
+        // Objects are content-addressed and never cause merge conflicts.
+        let gitignore_path = ripvec_dir.join(".gitignore");
+        if !gitignore_path.exists() {
+            let _ = std::fs::write(&gitignore_path, "cache/manifest.json\n");
         }
     }
 
@@ -91,8 +88,10 @@ pub fn incremental_index(
     let objects_dir = cache_dir.join("objects");
     let store = ObjectStore::new(&objects_dir);
 
-    // Try loading existing manifest
-    let existing_manifest = Manifest::load(&manifest_path).ok();
+    // Try loading existing manifest, or rebuild from objects if missing.
+    let existing_manifest = Manifest::load(&manifest_path)
+        .ok()
+        .or_else(|| rebuild_manifest_from_objects(&cache_dir, root, model_repo));
 
     if let Some(manifest) = existing_manifest.filter(|m| m.is_compatible(model_repo)) {
         // Incremental path: diff → re-embed dirty → merge
@@ -505,7 +504,9 @@ pub fn load_cached_index(root: &Path, model_repo: &str) -> Option<HybridIndex> {
     let lock = fd_lock::RwLock::new(lock_file);
     let _guard = lock.read().ok()?;
 
-    let manifest = Manifest::load(&manifest_path).ok()?;
+    let manifest = Manifest::load(&manifest_path)
+        .ok()
+        .or_else(|| rebuild_manifest_from_objects(&cache_dir, root, model_repo))?;
     if !manifest.is_compatible(model_repo) {
         return None;
     }
@@ -660,4 +661,97 @@ mod tests {
             "override should win over repo-local, got: {result:?}"
         );
     }
+}
+
+/// Rebuild a manifest by scanning the object store and deserializing each object.
+///
+/// Used when `manifest.json` is gitignored and only the objects directory is
+/// committed. Scans every object, extracts the file path from the chunks,
+/// stats the source file for mtime/size, and constructs a valid manifest.
+///
+/// Returns `None` if the objects directory doesn't exist or is empty.
+#[must_use]
+pub fn rebuild_manifest_from_objects(
+    cache_dir: &std::path::Path,
+    root: &std::path::Path,
+    model_repo: &str,
+) -> Option<super::manifest::Manifest> {
+    use super::file_cache::FileCache;
+    use super::manifest::{FileEntry, MANIFEST_VERSION, Manifest};
+    use super::store::ObjectStore;
+    use std::collections::BTreeMap;
+
+    let store = ObjectStore::new(&cache_dir.join("objects"));
+    let hashes = store.list_hashes();
+    if hashes.is_empty() {
+        return None;
+    }
+
+    let mut files = BTreeMap::new();
+
+    for hash in &hashes {
+        let Ok(bytes) = store.read(hash) else {
+            continue;
+        };
+        let Ok(fc) =
+            FileCache::from_portable_bytes(&bytes).or_else(|_| FileCache::from_bytes(&bytes))
+        else {
+            continue;
+        };
+        let Some(first_chunk) = fc.chunks.first() else {
+            continue;
+        };
+
+        // The chunk's file_path may be absolute or relative.
+        // Try to make it relative to root for the manifest key.
+        let chunk_path = std::path::Path::new(&first_chunk.file_path);
+        let rel_path = chunk_path
+            .strip_prefix(root)
+            .unwrap_or(chunk_path)
+            .to_string_lossy()
+            .to_string();
+
+        // Stat the actual file for mtime/size.
+        let abs_path = root.join(&rel_path);
+        let (mtime_secs, size) = if let Ok(meta) = std::fs::metadata(&abs_path) {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs());
+            (mtime, meta.len())
+        } else {
+            (0, 0) // file may not exist on this machine yet
+        };
+
+        files.insert(
+            rel_path,
+            FileEntry {
+                mtime_secs,
+                size,
+                content_hash: hash.clone(),
+                chunk_count: fc.chunks.len(),
+            },
+        );
+    }
+
+    if files.is_empty() {
+        return None;
+    }
+
+    let manifest = Manifest {
+        version: MANIFEST_VERSION,
+        model_repo: model_repo.to_string(),
+        root_hash: String::new(), // will be recomputed on next incremental_index
+        directories: BTreeMap::new(), // will be recomputed on next incremental_index
+        files,
+    };
+
+    // Write the rebuilt manifest to disk so subsequent runs use it.
+    let manifest_path = cache_dir.join("manifest.json");
+    if let Ok(json) = serde_json::to_string_pretty(&manifest) {
+        let _ = std::fs::write(&manifest_path, json);
+    }
+
+    Some(manifest)
 }

@@ -106,6 +106,33 @@ impl ObjectStore {
         Ok(removed)
     }
 
+    /// List all object hashes in the store.
+    ///
+    /// Scans all `xx/` prefix directories and reconstructs the full hash
+    /// from `prefix + filename`.
+    #[must_use]
+    pub fn list_hashes(&self) -> Vec<String> {
+        let mut hashes = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&self.root) else {
+            return hashes;
+        };
+        for prefix_entry in entries.flatten() {
+            let prefix_path = prefix_entry.path();
+            if !prefix_path.is_dir() {
+                continue;
+            }
+            let prefix = prefix_entry.file_name();
+            let prefix_str = prefix.to_string_lossy();
+            if let Ok(files) = std::fs::read_dir(&prefix_path) {
+                for file_entry in files.flatten() {
+                    let file_name = file_entry.file_name();
+                    hashes.push(format!("{}{}", prefix_str, file_name.to_string_lossy()));
+                }
+            }
+        }
+        hashes
+    }
+
     /// Resolve the filesystem path for an object hash.
     fn object_path(&self, hash: &str) -> PathBuf {
         debug_assert!(
