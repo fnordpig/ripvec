@@ -152,6 +152,26 @@ pub struct IndexStatusParams {
     pub root: Option<String>,
 }
 
+/// Parameters for the `debug_log` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DebugLogParams {
+    /// Maximum number of recent log lines to return. Default: 50.
+    #[serde(default = "default_debug_log_lines")]
+    pub lines: usize,
+}
+
+/// Default number of log lines to return.
+fn default_debug_log_lines() -> usize {
+    50
+}
+
+/// Parameters for the `log_level` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LogLevelParams {
+    /// Filter directive. Examples: "debug", "warn", "ripvec_mcp=debug,ripvec_core=trace".
+    pub level: String,
+}
+
 /// Default token budget for repo map rendering.
 fn default_repo_map_tokens() -> usize {
     2000
@@ -162,7 +182,11 @@ impl RipvecServer {
     /// Create a new server for the given project root.
     ///
     /// The search index starts empty; call [`run_background_index`] to populate it.
-    pub fn new(project_root: std::path::PathBuf) -> Self {
+    pub fn new(
+        project_root: std::path::PathBuf,
+        log_buffer: crate::server::LogBuffer,
+        reload_handle: crate::server::FilterReloadHandle,
+    ) -> Self {
         Self {
             index: Arc::new(tokio::sync::RwLock::new(None)),
             text_backend: Arc::new(tokio::sync::OnceCell::new()),
@@ -174,6 +198,8 @@ impl RipvecServer {
             root_indices: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             root_graphs: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             progress: Arc::new(crate::server::IndexProgress::default()),
+            log_buffer,
+            reload_handle: Arc::new(reload_handle),
         }
     }
 
@@ -243,6 +269,7 @@ impl RipvecServer {
             let cache = self.root_indices.read().await;
             if !cache.contains_key(&canonical) {
                 drop(cache);
+                tracing::info!(root = %canonical.display(), "ensure_root: building index");
                 let text_backend = self.load_text_backend().await?;
                 let text_tokenizer = self.load_text_tokenizer().await?;
                 let backend = Arc::clone(text_backend);
@@ -439,6 +466,7 @@ impl RipvecServer {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        tracing::debug!(query = %params.query, top_k = params.top_k, "tool: search_code");
         self.run_search(
             &params.query,
             params.top_k,
@@ -461,6 +489,7 @@ impl RipvecServer {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        tracing::debug!(query = %params.query, top_k = params.top_k, "tool: search_text");
         self.run_search(
             &params.query,
             params.top_k,
@@ -483,6 +512,7 @@ impl RipvecServer {
         &self,
         Parameters(params): Parameters<FindSimilarParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        tracing::debug!(file = %params.file_path, line = params.line, "tool: find_similar");
         let custom_root = self.ensure_root(params.root.as_deref(), false).await?;
 
         let root_cache_guard;
@@ -564,6 +594,7 @@ impl RipvecServer {
         &self,
         Parameters(params): Parameters<FindDuplicatesParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        tracing::debug!(threshold = ?params.threshold, max_pairs = ?params.max_pairs, "tool: find_duplicates");
         let threshold = params.threshold.unwrap_or(0.85);
         let max_pairs = params.max_pairs.unwrap_or(20);
 
@@ -630,6 +661,7 @@ impl RipvecServer {
         &self,
         Parameters(params): Parameters<ReindexParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        tracing::debug!(root = ?params.root, repo_level = params.repo_level, "tool: reindex");
         if let Some(root_str) = params.root.as_deref() {
             // Reindex a custom root: evict from cache, then re-ensure.
             let root_path = std::path::PathBuf::from(root_str);
@@ -738,6 +770,7 @@ impl RipvecServer {
         &self,
         Parameters(params): Parameters<IndexStatusParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        tracing::debug!(root = ?params.root, "tool: index_status");
         if let Some(root_str) = params.root.as_deref() {
             // Status for a custom root.
             let root_path = std::path::PathBuf::from(root_str);
@@ -1001,6 +1034,7 @@ impl RipvecServer {
         &self,
         Parameters(params): Parameters<RepoMapParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        tracing::debug!(max_tokens = params.max_tokens, focus_file = ?params.focus_file, "tool: get_repo_map");
         let custom_root = self.ensure_root(params.root.as_deref(), false).await?;
 
         // Get the appropriate repo graph (custom root or default).
@@ -1045,6 +1079,70 @@ impl RipvecServer {
         let rendered = ripvec_core::repo_map::render(graph, params.max_tokens, focus_idx);
 
         Ok(CallToolResult::success(vec![Content::text(rendered)]))
+    }
+
+    /// Get recent log messages from the ripvec-mcp server.
+    ///
+    /// Useful for diagnosing why operations are slow or failing.
+    /// Returns the most recent log lines captured since server start.
+    #[tool(
+        name = "debug_log",
+        description = "Get recent log messages from the ripvec-mcp server. Useful for diagnosing why operations are slow or failing."
+    )]
+    async fn debug_log(
+        &self,
+        Parameters(params): Parameters<DebugLogParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let lines = self.log_buffer.snapshot();
+        let total = lines.len();
+        let output: Vec<&str> = lines
+            .iter()
+            .rev()
+            .take(params.lines)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(String::as_str)
+            .collect();
+        let response = serde_json::json!({
+            "lines": output,
+            "total_buffered": total,
+            "returned": output.len(),
+        });
+        let json = serde_json::to_string_pretty(&response)
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Change the log verbosity at runtime.
+    ///
+    /// Accepts standard tracing filter directives like "debug", "warn",
+    /// or fine-grained per-module filters like "ripvec_mcp=debug,ripvec_core=trace".
+    #[tool(
+        name = "log_level",
+        description = "Change the log verbosity at runtime. Levels: error, warn, info, debug, trace. Also accepts module-level filters like 'ripvec_mcp=debug,ripvec_core=trace'."
+    )]
+    async fn log_level(
+        &self,
+        Parameters(params): Parameters<LogLevelParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let new_filter = tracing_subscriber::EnvFilter::try_new(&params.level).map_err(|e| {
+            rmcp::ErrorData::internal_error(
+                format!("invalid filter '{0}': {e}", params.level),
+                None,
+            )
+        })?;
+        self.reload_handle.reload(new_filter).map_err(|e| {
+            rmcp::ErrorData::internal_error(format!("failed to reload filter: {e}"), None)
+        })?;
+        tracing::info!(filter = %params.level, "log level changed");
+        let response = serde_json::json!({
+            "filter": params.level,
+            "status": "applied",
+        });
+        let json = serde_json::to_string_pretty(&response)
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 }
 

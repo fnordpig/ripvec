@@ -3,13 +3,103 @@
 //! [`RipvecServer`] holds the shared search index, embedding backends,
 //! and tokenizers. Background indexing runs on startup and on `reindex`.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use rmcp::handler::server::tool::ToolRouter;
 use tokio::sync::{OnceCell, RwLock};
-use tracing::error;
+use tracing::{error, info, warn};
+
+/// Thread-safe ring buffer that captures the last N log lines for the `debug_log` tool.
+#[derive(Clone)]
+pub struct LogBuffer {
+    inner: Arc<std::sync::Mutex<VecDeque<String>>>,
+    capacity: usize,
+}
+
+impl LogBuffer {
+    /// Create a new buffer that retains the last `capacity` log lines.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(capacity))),
+            capacity,
+        }
+    }
+
+    /// Push a formatted log line into the buffer, evicting the oldest if full.
+    pub fn push(&self, line: String) {
+        if let Ok(mut buf) = self.inner.lock() {
+            if buf.len() >= self.capacity {
+                buf.pop_front();
+            }
+            buf.push_back(line);
+        }
+    }
+
+    /// Read all buffered lines without consuming them.
+    pub fn snapshot(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .map(|buf| buf.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
+/// A tracing [`Layer`](tracing_subscriber::Layer) that writes formatted events
+/// into a [`LogBuffer`] so they can be retrieved via the `debug_log` MCP tool.
+pub struct BufferLayer {
+    buffer: LogBuffer,
+}
+
+impl BufferLayer {
+    /// Wrap a [`LogBuffer`] in a tracing layer.
+    pub fn new(buffer: LogBuffer) -> Self {
+        Self { buffer }
+    }
+}
+
+/// Visitor that extracts fields from a tracing event into a string buffer.
+struct MessageVisitor<'a>(&'a mut String);
+
+impl tracing::field::Visit for MessageVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write;
+        if field.name() == "message" {
+            let _ = write!(self.0, "{value:?}");
+        } else {
+            let _ = write!(self.0, " {field}={value:?}");
+        }
+    }
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        use std::fmt::Write;
+        if field.name() == "message" {
+            let _ = write!(self.0, "{value}");
+        } else {
+            let _ = write!(self.0, " {field}={value}");
+        }
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for BufferLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        use std::fmt::Write;
+        let meta = event.metadata();
+        let mut message = String::new();
+        let _ = write!(message, "{} ", meta.level());
+        event.record(&mut MessageVisitor(&mut message));
+        self.buffer.push(message);
+    }
+}
+
+/// Type alias for the reload handle used to change log filters at runtime.
+pub type FilterReloadHandle =
+    tracing_subscriber::reload::Handle<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>;
 
 /// RAII guard that resets the indexing flag on drop (including panics).
 struct IndexingGuard(Arc<AtomicBool>);
@@ -118,6 +208,10 @@ pub struct RipvecServer {
     >,
     /// Shared progress state for background indexing.
     pub progress: Arc<IndexProgress>,
+    /// Ring buffer capturing recent log lines for the `debug_log` tool.
+    pub log_buffer: LogBuffer,
+    /// Handle to reload the tracing filter at runtime via `log_level` tool.
+    pub reload_handle: Arc<FilterReloadHandle>,
 }
 
 impl rmcp::ServerHandler for RipvecServer {
@@ -274,10 +368,6 @@ impl rmcp::ServerHandler for RipvecServer {
     clippy::cast_possible_truncation,
     reason = "epoch millis fit in u64 until year 584942"
 )]
-#[expect(
-    clippy::too_many_lines,
-    reason = "progress tracking + graph building in one function"
-)]
 pub async fn run_background_index(server: &RipvecServer, repo_level: bool) {
     if server
         .indexing
@@ -349,12 +439,12 @@ pub async fn run_background_index(server: &RipvecServer, repo_level: bool) {
 
     match result {
         Ok(Ok((new_index, stats))) => {
-            eprintln!(
-                "[ripvec-mcp] indexed {} chunks ({} cached, {} re-embedded, {}ms)",
-                stats.chunks_total,
-                stats.files_unchanged,
-                stats.chunks_reembedded,
-                stats.duration_ms,
+            info!(
+                chunks = stats.chunks_total,
+                cached = stats.files_unchanged,
+                reembedded = stats.chunks_reembedded,
+                duration_ms = stats.duration_ms,
+                "indexing complete"
             );
             let mut idx = index_lock.write().await;
             *idx = Some(new_index);
@@ -363,12 +453,10 @@ pub async fn run_background_index(server: &RipvecServer, repo_level: bool) {
         Ok(Err(e)) => {
             server.progress.phase.store(0, Ordering::Relaxed);
             error!("background indexing failed: {e}");
-            eprintln!("[ripvec-mcp] indexing error: {e}");
         }
         Err(e) => {
             server.progress.phase.store(0, Ordering::Relaxed);
             error!("background indexing task panicked: {e}");
-            eprintln!("[ripvec-mcp] indexing panic: {e}");
         }
     }
 
@@ -384,21 +472,18 @@ pub async fn run_background_index(server: &RipvecServer, repo_level: bool) {
             match graph_lock.write() {
                 Ok(mut g) => {
                     *g = Some(graph);
-                    eprintln!("[ripvec-mcp] repo graph built ({file_count} files)");
+                    info!(files = file_count, "repo graph built");
                 }
                 Err(e) => {
-                    error!("repo graph lock poisoned: {e}");
-                    eprintln!("[ripvec-mcp] repo graph lock error: {e}");
+                    warn!("repo graph lock poisoned: {e}");
                 }
             }
         }
         Ok(Err(e)) => {
             error!("repo graph build failed: {e}");
-            eprintln!("[ripvec-mcp] repo graph error: {e}");
         }
         Err(e) => {
             error!("repo graph task panicked: {e}");
-            eprintln!("[ripvec-mcp] repo graph panic: {e}");
         }
     }
 
@@ -432,20 +517,14 @@ pub async fn run_file_watcher(server: &RipvecServer) {
     }) {
         Ok(mut w) => {
             if let Err(e) = w.watch(&server.project_root, RecursiveMode::Recursive) {
-                eprintln!(
-                    "[ripvec-mcp] file watcher failed to watch {}: {e}",
-                    server.project_root.display()
-                );
+                warn!(root = %server.project_root.display(), "file watcher failed to watch: {e}");
                 return;
             }
-            eprintln!(
-                "[ripvec-mcp] file watcher active on {}",
-                server.project_root.display()
-            );
+            info!(root = %server.project_root.display(), "file watcher active");
             w
         }
         Err(e) => {
-            eprintln!("[ripvec-mcp] file watcher failed to start: {e}");
+            warn!("file watcher failed to start: {e}");
             return;
         }
     };
@@ -457,7 +536,7 @@ pub async fn run_file_watcher(server: &RipvecServer) {
         // Drain any events that arrived during the debounce window
         while rx.try_recv().is_ok() {}
 
-        eprintln!("[ripvec-mcp] changes detected, re-indexing...");
+        info!("changes detected, re-indexing...");
         run_background_index(server, false).await;
     }
 }

@@ -55,6 +55,7 @@ pub fn incremental_index(
     repo_level: bool,
 ) -> crate::Result<(HybridIndex, ReindexStats)> {
     let start = Instant::now();
+    tracing::info!(root = %root.display(), model = model_repo, "incremental_index starting");
 
     if backends.is_empty() {
         return Err(crate::Error::Other(anyhow::anyhow!(
@@ -94,6 +95,10 @@ pub fn incremental_index(
         .or_else(|| rebuild_manifest_from_objects(&cache_dir, root, model_repo));
 
     if let Some(manifest) = existing_manifest.filter(|m| m.is_compatible(model_repo)) {
+        tracing::info!(
+            files = manifest.files.len(),
+            "manifest loaded, running incremental diff"
+        );
         // Incremental path: diff → re-embed dirty → merge
         incremental_path(
             root, backends, tokenizer, cfg, profiler, model_repo, &cache_dir, &store, manifest,
@@ -132,6 +137,13 @@ fn incremental_path(
     let files_changed = diff_result.dirty.len();
     let files_deleted = diff_result.deleted.len();
     let files_unchanged = diff_result.unchanged;
+
+    tracing::info!(
+        changed = files_changed,
+        deleted = files_deleted,
+        unchanged = files_unchanged,
+        "diff complete"
+    );
 
     // Remove deleted files from manifest
     for deleted in &diff_result.deleted {
@@ -233,9 +245,15 @@ fn incremental_path(
     manifest.save(&cache_dir.join("manifest.json"))?;
 
     // Rebuild HybridIndex (semantic + BM25) from all cached objects
+    tracing::info!("loading cached objects from store");
     let (all_chunks, all_embeddings) = load_all_from_store(store, &manifest)?;
     let chunks_total = all_chunks.len();
+    tracing::info!(
+        chunks = chunks_total,
+        "building HybridIndex (BM25 + PolarQuant)"
+    );
     let hybrid = HybridIndex::new(all_chunks, &all_embeddings, None)?;
+    tracing::info!("HybridIndex ready");
 
     Ok((
         hybrid,
@@ -687,6 +705,11 @@ pub fn rebuild_manifest_from_objects(
         return None;
     }
 
+    tracing::info!(
+        objects = hashes.len(),
+        "rebuilding manifest from object store"
+    );
+
     let mut files = BTreeMap::new();
 
     for hash in &hashes {
@@ -746,6 +769,11 @@ pub fn rebuild_manifest_from_objects(
         directories: BTreeMap::new(), // will be recomputed on next incremental_index
         files,
     };
+
+    tracing::info!(
+        files = manifest.files.len(),
+        "manifest rebuilt from objects"
+    );
 
     // Write the rebuilt manifest to disk so subsequent runs use it.
     let manifest_path = cache_dir.join("manifest.json");

@@ -16,6 +16,7 @@ mod server;
 mod tools;
 
 use rmcp::ServiceExt;
+use tracing_subscriber::prelude::*;
 
 /// Start the MCP or LSP server: build the background index, then serve over stdio.
 #[tokio::main]
@@ -30,17 +31,32 @@ async fn main() -> anyhow::Result<()> {
 
     let lsp_mode = args.iter().any(|a| a == "--lsp");
 
-    // Initialize tracing to stderr (both MCP and LSP use stdin/stdout for transport)
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+    // Initialize tracing to stderr (both MCP and LSP use stdin/stdout for transport).
+    // Uses a reload handle so the filter can be changed at runtime via the log_level tool.
+    // Default: RIPVEC_LOG env var, or info for ripvec crates + warn for everything else.
+    let env_filter =
+        tracing_subscriber::EnvFilter::try_from_env("RIPVEC_LOG").unwrap_or_else(|_| {
+            tracing_subscriber::EnvFilter::new("ripvec_mcp=info,ripvec_core=info,warn")
+        });
+
+    let (filter_layer, reload_handle) = tracing_subscriber::reload::Layer::new(env_filter);
+
+    let log_buffer = server::LogBuffer::new(100);
+    let buffer_layer = server::BufferLayer::new(log_buffer.clone());
+
+    tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_target(false)
+                .compact(),
         )
+        .with(buffer_layer)
         .init();
 
     let mode_label = if lsp_mode { "LSP" } else { "MCP" };
-    eprintln!("[ripvec-mcp] {mode_label} mode — no auto-index, all tools require explicit root");
+    tracing::info!("{mode_label} mode — on-demand indexing, all tools require explicit root");
 
     // No default project root. Every tool call must provide a root parameter.
     // The on-demand index path (ensure_root) handles caching, disk cache
@@ -50,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
         std::path::PathBuf::from,
     );
 
-    let server = server::RipvecServer::new(root);
+    let server = server::RipvecServer::new(root, log_buffer, reload_handle);
 
     // No background indexing. No file watcher. Indices are built on-demand
     // when tools are called with a root parameter, and cached in memory
