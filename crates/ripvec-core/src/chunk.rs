@@ -472,7 +472,9 @@ mod tests {
 
     #[test]
     fn fallback_small_file_single_chunk() {
-        let source = "let x = 42;\nconsole.log(x);\n";
+        // With enriched queries, `let x = 42` matches variable_declarator.
+        // Use a source with NO tree-sitter captures to test the plaintext fallback.
+        let source = "// just a comment\n// and another\n";
         let config = crate::languages::config_for_extension("js").unwrap();
         let chunks = chunk_file(
             Path::new("script.js"),
