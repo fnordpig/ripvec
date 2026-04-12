@@ -368,6 +368,7 @@ impl rmcp::ServerHandler for RipvecServer {
     clippy::cast_possible_truncation,
     reason = "epoch millis fit in u64 until year 584942"
 )]
+#[expect(clippy::too_many_lines, reason = "orchestration function with logging")]
 pub async fn run_background_index(server: &RipvecServer, repo_level: bool) {
     if server
         .indexing
@@ -402,8 +403,14 @@ pub async fn run_background_index(server: &RipvecServer, repo_level: bool) {
         let model_repo = "nomic-ai/modernbert-embed-base";
 
         progress.phase.store(1, Ordering::Relaxed);
+        info!("loading embedding model: {model_repo}");
         let backends = ripvec_core::backend::detect_backends(model_repo)?;
+        info!(
+            backends = backends.len(),
+            "backends loaded, loading tokenizer"
+        );
         let tokenizer = ripvec_core::tokenize::load_tokenizer(model_repo)?;
+        info!("tokenizer loaded");
 
         progress.phase.store(2, Ordering::Relaxed); // walking
         let cfg = ripvec_core::embed::SearchConfig::default();
