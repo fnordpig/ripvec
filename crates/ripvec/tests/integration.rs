@@ -21,13 +21,21 @@ fn prints_help() {
         .stdout(predicate::str::contains("Semantic code search"));
 }
 
-/// Requires model download — run with `cargo test -- --ignored`
+/// Requires model download — run with `cargo test -- --ignored`.
+/// Uses `--fast` (BGE-small, 384-dim) to match the CI HuggingFace cache
+/// and keep download time under the 2-minute nextest slow timeout.
 #[test]
 #[ignore = "requires model download; run with `cargo test -- --ignored`"]
 fn searches_fixture_directory() {
     Command::cargo_bin("ripvec")
         .unwrap()
-        .args(["find the main entry point", "tests/fixtures/", "-n", "3"])
+        .args([
+            "--fast",
+            "find the main entry point",
+            "tests/fixtures/",
+            "-n",
+            "3",
+        ])
         .assert()
         .success();
 }
