@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::layer::SubscriberExt;
 
+#[expect(clippy::too_many_lines, reason = "orchestration entry point")]
 fn main() -> Result<()> {
     let mut args = cli::Args::parse();
 
@@ -64,17 +65,56 @@ fn main() -> Result<()> {
         args.threshold = 0.5;
     }
 
-    // Set up Chrome tracing if `--trace <file>` is specified.
-    // The guard must be held until the end of main — dropping it flushes the trace file.
+    // Set up tracing: stderr (or --log-file), optional Chrome trace, level filter.
+    // Priority: --log-level > --debug > RIPVEC_LOG env var > warn.
+    let level = args
+        .log_level
+        .clone()
+        .or_else(|| args.debug.then(|| "debug".to_string()))
+        .or_else(|| std::env::var("RIPVEC_LOG").ok())
+        .unwrap_or_else(|| "warn".to_string());
+    let make_filter = || {
+        tracing_subscriber::EnvFilter::try_new(&level)
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"))
+    };
+
     let trace_guard = args.trace.as_ref().map(|trace_path| {
         let (chrome_layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
             .file(trace_path)
             .include_args(true)
             .build();
-        tracing::subscriber::set_global_default(tracing_subscriber::registry().with(chrome_layer))
-            .expect("failed to set tracing subscriber");
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::registry()
+                .with(make_filter())
+                .with(chrome_layer),
+        )
+        .expect("failed to set tracing subscriber");
         guard
     });
+
+    if trace_guard.is_none() {
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_target(false)
+            .compact();
+        if let Some(log_path) = args.log_file.as_ref() {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_path)
+                .expect("failed to open log file");
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::registry()
+                    .with(make_filter())
+                    .with(fmt_layer.with_writer(std::sync::Mutex::new(file))),
+            );
+        } else {
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::registry()
+                    .with(make_filter())
+                    .with(fmt_layer.with_writer(std::io::stderr)),
+            );
+        }
+    }
 
     // Create profiler
     let profiler = ripvec_core::profile::Profiler::new(

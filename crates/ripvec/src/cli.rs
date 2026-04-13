@@ -119,6 +119,20 @@ pub struct Args {
     #[arg(long, value_name = "FILE")]
     pub trace: Option<String>,
 
+    /// Log level: error, warn, info, debug, trace. Overrides `RIPVEC_LOG` env var.
+    ///
+    /// `--debug` is a shortcut for `--log-level debug`.
+    #[arg(long, value_name = "LEVEL")]
+    pub log_level: Option<String>,
+
+    /// Shortcut for `--log-level debug`. Useful for diagnosing indexing/verify hangs.
+    #[arg(long)]
+    pub debug: bool,
+
+    /// Write logs to a file instead of stderr (one line per event).
+    #[arg(long, value_name = "FILE")]
+    pub log_file: Option<String>,
+
     /// Use persistent index: cache embeddings to disk, re-embed only changed files.
     ///
     /// First run builds the full index. Subsequent runs load from cache and
