@@ -911,7 +911,11 @@ impl RipvecServer {
                     // Kick off background load — the disk cache will be validated
                     // (mtime heal) and loaded into memory. Next index_status call
                     // will return ready: true.
-                    if !is_indexing && !self.indexing.swap(true, Ordering::SeqCst) {
+                    //
+                    // run_background_index does its own atomic compare_exchange
+                    // on the indexing flag — don't pre-set it here or we'd deadlock
+                    // the task into an early return.
+                    if !is_indexing {
                         drop(idx_guard); // release read lock before spawning writer
                         let bg_server = self.clone();
                         tokio::spawn(async move {
