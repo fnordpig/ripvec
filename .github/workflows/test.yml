@@ -46,10 +46,11 @@ jobs:
           path: ${{ env.HF_HOME }}
           key: hf-models-${{ runner.os }}-bge-small-coderank-v1
 
-      # Unit tests (no model download required)
-      # --test-timeout prevents hangs from BLAS deadlocks or parser init races.
+      # Unit tests (no model download required).
+      # Timeout/retry configured in .config/nextest.toml to prevent hangs
+      # from BLAS deadlocks or parser init races.
       - name: Unit tests
-        run: cargo nextest run --workspace --test-timeout 120s --retries 1
+        run: cargo nextest run --workspace
 
       # Integration tests that need model downloads (marked #[ignore])
       - name: Integration tests (with models)
