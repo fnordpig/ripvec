@@ -2,7 +2,13 @@
 # https://nexte.st/docs/configuration/
 
 [profile.default]
-# Fail fast on hangs: 2 minutes is way beyond any legitimate unit test.
+# Fail fast on hangs: unit tests should complete quickly.
 slow-timeout = { period = "60s", terminate-after = 2 }
 # Retry transient failures once (e.g., tree-sitter parser init races).
 retries = 1
+
+# Integration tests that embed large source trees on CPU (BGE-small).
+# Per-test override: give these up to 10 minutes before termination.
+[[profile.default.overrides]]
+filter = "test(mrl_retrieval_recall) | test(search_with_backend_trait) | test(searches_fixture_directory)"
+slow-timeout = { period = "120s", terminate-after = 5 }
