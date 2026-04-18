@@ -2671,15 +2671,16 @@ impl Driver for MetalDriver {
             set_u32_param(enc, k as u32, 5);
             set_u32_param(enc, u32::from(transpose_b), 6);
             set_u32_param(enc, (m * k) as u32, 7);
-            set_u32_param(
-                enc,
-                if transpose_b {
-                    (n * k) as u32
-                } else {
-                    (k * n) as u32
-                },
-                8,
-            );
+            #[expect(
+                clippy::if_same_then_else,
+                reason = "n*k and k*n compute to the same value but preserve shape semantics"
+            )]
+            let b_stride = if transpose_b {
+                (n * k) as u32
+            } else {
+                (k * n) as u32
+            };
+            set_u32_param(enc, b_stride, 8);
             set_u32_param(enc, (m * n) as u32, 9);
             let grid = MTLSize {
                 width: n.div_ceil(64),
@@ -2792,15 +2793,16 @@ impl Driver for MetalDriver {
                 set_u32_param(enc, k as u32, 5);
                 set_u32_param(enc, u32::from(transpose_b), 6);
                 set_u32_param(enc, (m * k) as u32, 7);
-                set_u32_param(
-                    enc,
-                    if transpose_b {
-                        (n * k) as u32
-                    } else {
-                        (k * n) as u32
-                    },
-                    8,
-                );
+                #[expect(
+                    clippy::if_same_then_else,
+                    reason = "n*k and k*n compute to the same value but preserve shape semantics"
+                )]
+                let b_stride = if transpose_b {
+                    (n * k) as u32
+                } else {
+                    (k * n) as u32
+                };
+                set_u32_param(enc, b_stride, 8);
                 set_u32_param(enc, (m * n) as u32, 9);
                 let grid = MTLSize {
                     width: n.div_ceil(64),

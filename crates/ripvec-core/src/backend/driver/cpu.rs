@@ -978,6 +978,10 @@ impl Driver for CpuDriver {
             let c_off = batch * stride_c;
 
             let a_slice = &a[a_off..a_off + m * k];
+            #[expect(
+                clippy::if_same_then_else,
+                reason = "n*k and k*n are the same multiplication but preserve the shape semantics"
+            )]
             let b_slice = if transpose_b {
                 &b[b_off..b_off + n * k]
             } else {

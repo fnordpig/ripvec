@@ -390,7 +390,7 @@ fn run_interactive(
             *ext_counts.entry(ext.to_string()).or_default() += 1;
         }
         let mut pairs: Vec<_> = ext_counts.into_iter().collect();
-        pairs.sort_by(|a, b| b.1.cmp(&a.1)); // most-common extension first
+        pairs.sort_by_key(|b| std::cmp::Reverse(b.1)); // most-common extension first
         let breakdown: Vec<String> = pairs
             .into_iter()
             .map(|(ext, count)| format!("{count} .{ext}"))

@@ -341,7 +341,8 @@ impl Bm25Index {
 
         let combined = BooleanQuery::new(sub_queries);
 
-        let Ok(top_docs) = searcher.search(&combined, &TopDocs::with_limit(top_k)) else {
+        let Ok(top_docs) = searcher.search(&combined, &TopDocs::with_limit(top_k).order_by_score())
+        else {
             return vec![];
         };
 

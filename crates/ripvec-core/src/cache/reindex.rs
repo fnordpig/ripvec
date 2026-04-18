@@ -202,7 +202,7 @@ fn incremental_path(
         // Filter out failed tokenizations
         let (good_chunks, good_embeddings): (Vec<_>, Vec<_>) = chunks
             .into_iter()
-            .zip(embeddings.into_iter())
+            .zip(embeddings)
             .filter(|(_, emb)| !emb.is_empty())
             .unzip();
 
