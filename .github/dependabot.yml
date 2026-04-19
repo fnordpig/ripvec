@@ -20,3 +20,10 @@ updates:
       interval: weekly
       day: monday
     labels: [dependencies, ci]
+    ignore:
+      # dtolnay/rust-toolchain uses Rust version tags (e.g. @1.88.0) as
+      # its action version tags. Dependabot misinterprets the MSRV pin
+      # as an action version and tries to bump it to non-existent Rust
+      # versions (e.g. @1.100.0). Manage MSRV via Cargo.toml's
+      # rust-version field instead.
+      - dependency-name: "dtolnay/rust-toolchain"
