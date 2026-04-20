@@ -143,6 +143,17 @@ jobs:
           mkdir -p "$staging"
           cp target/release/ripvec "$staging/" 2>/dev/null || true
           cp target/release/ripvec-mcp "$staging/" 2>/dev/null || true
+          # macOS: re-ad-hoc-sign so Gatekeeper doesn't SIGKILL the binary
+          # when it's launched under a non-TTY parent (e.g. Claude Code MCP
+          # stdio child). cargo produces a linker-signed Mach-O that spctl
+          # rejects; a fresh `codesign --force --sign -` makes the signature
+          # valid under the downloader's own trust scope.
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            for f in "$staging"/*; do
+              [[ -f "$f" ]] || continue
+              codesign --force --sign - "$f" 2>/dev/null || true
+            done
+          fi
           tar czf "${staging}.tar.gz" "$staging"
           echo "ASSET=${staging}.tar.gz" >> "$GITHUB_ENV"
 
