@@ -187,7 +187,10 @@ impl SearchIndex {
         }
 
         // Phase 1: SoA corpus scan — sequential streaming, centroid table in L1.
-        let pre_filter_k = (top_k * 10).min(comp.corpus.n);
+        // `saturating_mul` guards against overflow when a caller passes a huge
+        // top_k as a "no limit" sentinel; `.min(corpus.n)` caps to the corpus
+        // size either way.
+        let pre_filter_k = top_k.saturating_mul(10).min(comp.corpus.n);
         let query_state = comp.codec.prepare_query(query_embedding);
         let scores = comp.codec.scan_corpus(&comp.corpus, &query_state);
         let mut approx_scores: Vec<(usize, f32)> = scores.into_iter().enumerate().collect();

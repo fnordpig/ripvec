@@ -16,6 +16,8 @@ pub mod generic;
 pub mod metal_kernels;
 #[cfg(feature = "mlx")]
 pub mod mlx;
+#[cfg(feature = "cuda")]
+pub mod nvrtc_cubin;
 
 /// Pre-tokenized encoding ready for inference.
 ///
