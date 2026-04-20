@@ -154,7 +154,7 @@ impl IndexProgress {
                 .to_string(),
             2 => format!("Index is building: scanning files... ({elapsed}s elapsed)"),
             3 if total > 0 => {
-                let pct = if total > 0 { done * 100 / total } else { 0 };
+                let pct = (done * 100).checked_div(total).unwrap_or(0);
                 let eta = if done > 0 && elapsed > 0 {
                     let remaining = total.saturating_sub(done);
                     let rate = done as f64 / elapsed as f64;

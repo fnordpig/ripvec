@@ -242,3 +242,15 @@ Designed and benchmarked 4 optimization candidates against quality budgets (<=10
 - **Layer skipping**: +22% at skip-4, but 60% semantic loss. Per-layer ablation proved no single layer safely skippable.
 
 **Key finding**: MPS at 95%+ GPU utilization via AMX is at the hardware ceiling. Further throughput gains require model distillation or hardware, not inference tricks.
+
+### 27. Dependabot misbumps `dtolnay/rust-toolchain` MSRV pin
+
+`dtolnay/rust-toolchain` uses Rust version tags (e.g., `@1.88.0`) as its action
+version tags. Dependabot's github-actions ecosystem parser sees the `@1.88.0`
+and thinks "this action has a version that should be bumped" — so it auto-bumps
+to non-existent Rust versions like `@1.100.0`, and CI fails with a 404 from
+`static.rust-lang.org`.
+
+**Fix**: Ignore `dtolnay/rust-toolchain` in `.github/dependabot.yml`. Manage
+MSRV via `Cargo.toml`'s `rust-version` field instead. Never let Dependabot
+touch that particular action's version tag.

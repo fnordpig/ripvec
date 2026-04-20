@@ -585,7 +585,7 @@ fn build_def_neighbor_lists(
     let callers = incoming
         .into_iter()
         .map(|mut v| {
-            v.sort_by(|a, b| b.1.cmp(&a.1));
+            v.sort_by_key(|b| std::cmp::Reverse(b.1));
             v.truncate(MAX_NEIGHBORS);
             v.into_iter().map(|(idx, _)| to_def_id(idx)).collect()
         })
@@ -594,7 +594,7 @@ fn build_def_neighbor_lists(
     let callees = outgoing
         .into_iter()
         .map(|mut v| {
-            v.sort_by(|a, b| b.1.cmp(&a.1));
+            v.sort_by_key(|b| std::cmp::Reverse(b.1));
             v.truncate(MAX_NEIGHBORS);
             v.into_iter().map(|(idx, _)| to_def_id(idx)).collect()
         })
@@ -955,7 +955,7 @@ fn build_neighbor_lists(n: usize, edges: &[(u32, u32, u32)]) -> (Vec<Vec<u32>>, 
         lists
             .iter_mut()
             .map(|list| {
-                list.sort_by(|a, b| b.1.cmp(&a.1));
+                list.sort_by_key(|b| std::cmp::Reverse(b.1));
                 list.iter()
                     .take(MAX_NEIGHBORS)
                     .map(|(idx, _)| *idx)

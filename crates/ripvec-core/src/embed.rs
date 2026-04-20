@@ -374,7 +374,7 @@ fn embed_all_streaming(
                         buffer.push((encoding, chunk));
                         if buffer.len() >= bs {
                             // Sort within batch by descending token count.
-                            buffer.sort_by(|a, b| b.0.input_ids.len().cmp(&a.0.input_ids.len()));
+                            buffer.sort_by_key(|b| std::cmp::Reverse(b.0.input_ids.len()));
                             let batch = std::mem::replace(&mut buffer, Vec::with_capacity(bs));
                             if batch_tx.send(batch).is_err() {
                                 // Embed consumer dropped; stop tokenizing.
@@ -393,7 +393,7 @@ fn embed_all_streaming(
 
             // Flush remaining partial batch.
             if !buffer.is_empty() {
-                buffer.sort_by(|a, b| b.0.input_ids.len().cmp(&a.0.input_ids.len()));
+                buffer.sort_by_key(|b| std::cmp::Reverse(b.0.input_ids.len()));
                 let _ = batch_tx.send(buffer);
             }
             // batch_tx drops here, closing the embed channel.

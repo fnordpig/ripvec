@@ -202,7 +202,7 @@ fn incremental_path(
         // Filter out failed tokenizations
         let (good_chunks, good_embeddings): (Vec<_>, Vec<_>) = chunks
             .into_iter()
-            .zip(embeddings.into_iter())
+            .zip(embeddings)
             .filter(|(_, emb)| !emb.is_empty())
             .unzip();
 
@@ -237,16 +237,17 @@ fn incremental_path(
     // Recompute Merkle hashes
     manifest.recompute_hashes();
 
-    // GC unreferenced objects
+    // Rebuild HybridIndex (semantic + BM25) from all cached objects.
+    // This prunes any manifest entries whose objects are missing/corrupt.
+    tracing::info!("loading cached objects from store");
+    let (all_chunks, all_embeddings) = load_all_from_store(store, &mut manifest);
+
+    // GC unreferenced objects (after pruning so dangling hashes are dropped)
     let referenced = manifest.referenced_hashes();
     store.gc(&referenced)?;
 
-    // Save manifest
+    // Save manifest (after pruning so the on-disk manifest is clean)
     manifest.save(&cache_dir.join("manifest.json"))?;
-
-    // Rebuild HybridIndex (semantic + BM25) from all cached objects
-    tracing::info!("loading cached objects from store");
-    let (all_chunks, all_embeddings) = load_all_from_store(store, &manifest)?;
     let chunks_total = all_chunks.len();
     tracing::info!(
         chunks = chunks_total,
@@ -466,16 +467,46 @@ fn load_file_cache(bytes: &[u8]) -> crate::Result<FileCache> {
 }
 
 /// Load all cached chunks and embeddings from the object store.
+///
+/// Skips any manifest entry whose object is missing or corrupt, and prunes
+/// those entries from the manifest in place. This makes incremental indexing
+/// self-healing: an interrupted previous run or manually deleted cache file
+/// is treated as "file needs re-embedding" rather than a fatal error.
 fn load_all_from_store(
     store: &ObjectStore,
-    manifest: &Manifest,
-) -> crate::Result<(Vec<CodeChunk>, Vec<Vec<f32>>)> {
+    manifest: &mut Manifest,
+) -> (Vec<CodeChunk>, Vec<Vec<f32>>) {
     let mut all_chunks = Vec::new();
     let mut all_embeddings = Vec::new();
+    let mut dangling: Vec<String> = Vec::new();
 
-    for entry in manifest.files.values() {
-        let bytes = store.read(&entry.content_hash)?;
-        let fc = load_file_cache(&bytes)?;
+    for (path, entry) in &manifest.files {
+        let bytes = match store.read(&entry.content_hash) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path,
+                    hash = %entry.content_hash,
+                    error = %e,
+                    "cache object missing or unreadable — will re-embed"
+                );
+                dangling.push(path.clone());
+                continue;
+            }
+        };
+        let fc = match load_file_cache(&bytes) {
+            Ok(fc) => fc,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path,
+                    hash = %entry.content_hash,
+                    error = %e,
+                    "cache object corrupt — will re-embed"
+                );
+                dangling.push(path.clone());
+                continue;
+            }
+        };
         let dim = fc.hidden_dim;
 
         for (i, chunk) in fc.chunks.into_iter().enumerate() {
@@ -488,7 +519,19 @@ fn load_all_from_store(
         }
     }
 
-    Ok((all_chunks, all_embeddings))
+    // Prune dangling manifest entries so the next diff pass treats these
+    // files as new and re-embeds them.
+    for path in &dangling {
+        manifest.files.remove(path);
+    }
+    if !dangling.is_empty() {
+        tracing::warn!(
+            count = dangling.len(),
+            "pruned dangling manifest entries; these files will be re-embedded on next run"
+        );
+    }
+
+    (all_chunks, all_embeddings)
 }
 
 /// Load a pre-built index from the disk cache without re-embedding.
@@ -522,7 +565,7 @@ pub fn load_cached_index(root: &Path, model_repo: &str) -> Option<HybridIndex> {
     let lock = fd_lock::RwLock::new(lock_file);
     let _guard = lock.read().ok()?;
 
-    let manifest = Manifest::load(&manifest_path)
+    let mut manifest = Manifest::load(&manifest_path)
         .ok()
         .or_else(|| rebuild_manifest_from_objects(&cache_dir, root, model_repo))?;
     if !manifest.is_compatible(model_repo) {
@@ -530,7 +573,7 @@ pub fn load_cached_index(root: &Path, model_repo: &str) -> Option<HybridIndex> {
     }
 
     let store = ObjectStore::new(&objects_dir);
-    let (chunks, embeddings) = load_all_from_store(&store, &manifest).ok()?;
+    let (chunks, embeddings) = load_all_from_store(&store, &mut manifest);
     HybridIndex::new(chunks, &embeddings, None).ok()
 }
 
