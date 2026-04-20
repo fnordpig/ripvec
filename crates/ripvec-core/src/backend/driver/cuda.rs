@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::backend::nvrtc_cubin::compile_cubin;
-use cudarc::cublas::{sys, CudaBlas};
+use cudarc::cublas::{CudaBlas, sys};
 use cudarc::cublaslt::{self, CudaBlasLT, MatmulShared};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut,
@@ -21,10 +21,10 @@ use cudarc::driver::{
 use safetensors::SafeTensors;
 
 use super::{BatchInputs, Driver};
+use crate::backend::Encoding;
 use crate::backend::arch::modern_bert::{
     ModernBertArch, ModernBertLayerWeights, ModernBertWeights, RopeCache,
 };
-use crate::backend::Encoding;
 
 // ---------------------------------------------------------------------------
 // Error helper

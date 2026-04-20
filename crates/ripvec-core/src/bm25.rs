@@ -6,15 +6,15 @@
 //! `parseJsonConfig`) are matched correctly.
 
 use tantivy::schema::{
-    Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, INDEXED, STORED,
+    Field, INDEXED, IndexRecordOption, STORED, Schema, TextFieldIndexing, TextOptions, Value,
 };
 use tantivy::tokenizer::{
     LowerCaser, SimpleTokenizer, TextAnalyzer, Token, TokenFilter, TokenStream, Tokenizer,
 };
 use tantivy::{
+    Index, IndexReader, ReloadPolicy, TantivyDocument,
     collector::TopDocs,
     query::{BooleanQuery, BoostQuery, Occur, QueryParser},
-    Index, IndexReader, ReloadPolicy, TantivyDocument,
 };
 
 use crate::chunk::CodeChunk;
@@ -348,7 +348,10 @@ impl Bm25Index {
 
         let combined = BooleanQuery::new(sub_queries);
 
-        let Ok(top_docs) = searcher.search(&combined, &TopDocs::with_limit(effective_limit)) else {
+        let Ok(top_docs) = searcher.search(
+            &combined,
+            &TopDocs::with_limit(effective_limit).order_by_score(),
+        ) else {
             return vec![];
         };
 

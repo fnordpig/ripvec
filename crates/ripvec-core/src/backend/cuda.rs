@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use crate::backend::nvrtc_cubin::compile_cubin;
-use cudarc::cublas::{sys, CudaBlas};
+use cudarc::cublas::{CudaBlas, sys};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut,
     LaunchConfig, PushKernelArg,

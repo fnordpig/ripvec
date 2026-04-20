@@ -254,3 +254,23 @@ to non-existent Rust versions like `@1.100.0`, and CI fails with a 404 from
 **Fix**: Ignore `dtolnay/rust-toolchain` in `.github/dependabot.yml`. Manage
 MSRV via `Cargo.toml`'s `rust-version` field instead. Never let Dependabot
 touch that particular action's version tag.
+
+### 28. `cargo test --workspace --lib` SIGSEGVs at teardown (MLX/Metal drop race)
+
+Running ripvec-core's libtests in-process in parallel mode (`cargo test
+--workspace --lib`) reliably SIGSEGVs after all tests pass. The last test
+visible is usually in `backend::mlx::tests::*` or `backend::driver::metal::*`.
+
+Root cause: MLX's C++ global-destructor runtime tears down an autorelease
+pool / MPS device while another test thread still holds a Metal driver
+reference. This is a classic cross-library `atexit` race.
+
+Workaround: **use nextest** (`cargo nextest run --workspace --lib`) — it
+launches each test in its own process, so destructors run against isolated
+state. CI uses nextest exclusively. Single-threaded libtest
+(`-- --test-threads=1`) also avoids the race. Reproduces on main — pre-
+existing, not a PR regression.
+
+Not yet fixed because: (a) nextest-based CI is the canonical test runner,
+(b) investigating cross-library drop order requires non-trivial MLX/Metal
+instrumentation.

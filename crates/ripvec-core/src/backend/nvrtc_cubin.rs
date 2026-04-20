@@ -18,7 +18,7 @@
 
 use std::ffi::CString;
 
-use cudarc::nvrtc::{sys, Ptx};
+use cudarc::nvrtc::{Ptx, sys};
 
 /// Compile `src` to a CUBIN image for `arch` (e.g. `"sm_75"`).
 ///
