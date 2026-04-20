@@ -8,7 +8,9 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 retries = 1
 
 # Integration tests that embed large source trees on CPU (BGE-small).
-# Per-test override: give these up to 10 minutes before termination.
+# On ubuntu CI runners without a GPU, a full-corpus embed of the ripvec tree
+# (~5k chunks × ~400 tokens) takes ≈1900s at ~1000 tokens/sec via OpenBLAS.
+# Give these tests 30 minutes before termination to accommodate slow runners.
 [[profile.default.overrides]]
 filter = "test(mrl_retrieval_recall) | test(search_with_backend_trait) | test(searches_fixture_directory)"
-slow-timeout = { period = "120s", terminate-after = 5 }
+slow-timeout = { period = "120s", terminate-after = 15 }

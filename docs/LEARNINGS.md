@@ -274,3 +274,20 @@ existing, not a PR regression.
 Not yet fixed because: (a) nextest-based CI is the canonical test runner,
 (b) investigating cross-library drop order requires non-trivial MLX/Metal
 instrumentation.
+
+### 29. Ubuntu CI Test timeout on full-corpus CPU embedding
+
+`mrl_retrieval_recall` and `search_with_backend_trait` embed the entire
+ripvec workspace tree (~5k chunks) with BGE-small. On ubuntu-latest CI
+runners (CPU-only, OpenBLAS), this takes ~1900s at ~1000 tokens/sec —
+far exceeding the original 600s nextest timeout. Result: tests time out
+on every ubuntu commit since April 13, unrelated to any specific change.
+
+Distinct from LEARNINGS #28, which is about a macOS-local libtest
+teardown race (MLX/Metal drop order). This #29 is purely a CI-runner
+throughput envelope: the hardware takes that long, period.
+
+**Fix**: bump `terminate-after` to 15 (→ 30 minutes) in
+`.config/nextest.toml` for these three integration tests. Either
+re-scope the tests to a smaller corpus or move them to a macOS-only
+job (where Metal gives ~100x throughput) if 30 min proves insufficient.
