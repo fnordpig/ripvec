@@ -11,6 +11,8 @@ pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 pub mod driver;
+#[cfg(feature = "cuda")]
+pub mod nvrtc_cubin;
 pub mod generic;
 #[cfg(feature = "metal")]
 pub mod metal_kernels;

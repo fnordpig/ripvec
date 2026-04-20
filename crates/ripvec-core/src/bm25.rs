@@ -6,15 +6,15 @@
 //! `parseJsonConfig`) are matched correctly.
 
 use tantivy::schema::{
-    Field, INDEXED, IndexRecordOption, STORED, Schema, TextFieldIndexing, TextOptions, Value,
+    Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, INDEXED, STORED,
 };
 use tantivy::tokenizer::{
     LowerCaser, SimpleTokenizer, TextAnalyzer, Token, TokenFilter, TokenStream, Tokenizer,
 };
 use tantivy::{
-    Index, IndexReader, ReloadPolicy, TantivyDocument,
     collector::TopDocs,
     query::{BooleanQuery, BoostQuery, Occur, QueryParser},
+    Index, IndexReader, ReloadPolicy, TantivyDocument,
 };
 
 use crate::chunk::CodeChunk;
@@ -322,6 +322,13 @@ impl Bm25Index {
     pub fn search(&self, query_text: &str, top_k: usize) -> Vec<(usize, f32)> {
         let searcher = self.reader.searcher();
 
+        // Tantivy's `TopDocs::with_limit` panics on 0 and allocates the limit
+        // as heap capacity — pass `usize::MAX` and it tries to allocate the
+        // entire address space. Clamp to `num_docs` (the largest meaningful
+        // limit — no more documents can match than exist) with a floor of 1.
+        let doc_count = usize::try_from(searcher.num_docs()).unwrap_or(usize::MAX);
+        let effective_limit = top_k.min(doc_count).max(1);
+
         // Build per-field boosted sub-queries and combine with BooleanQuery.
         let make_sub = |field: Field, boost: f32| -> Box<dyn tantivy::query::Query> {
             let mut parser = QueryParser::for_index(&self.index, vec![field]);
@@ -341,7 +348,7 @@ impl Bm25Index {
 
         let combined = BooleanQuery::new(sub_queries);
 
-        let Ok(top_docs) = searcher.search(&combined, &TopDocs::with_limit(top_k)) else {
+        let Ok(top_docs) = searcher.search(&combined, &TopDocs::with_limit(effective_limit)) else {
             return vec![];
         };
 

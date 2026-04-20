@@ -9,12 +9,12 @@
 
 use std::sync::Arc;
 
-use cudarc::cublas::{CudaBlas, sys};
+use crate::backend::nvrtc_cubin::compile_cubin;
+use cudarc::cublas::{sys, CudaBlas};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut,
     LaunchConfig, PushKernelArg,
 };
-use cudarc::nvrtc::{CompileOptions, compile_ptx_with_opts};
 use hf_hub::api::sync::Api;
 use safetensors::SafeTensors;
 
@@ -782,12 +782,20 @@ struct KernelHandles {
 impl KernelHandles {
     /// Compile CUDA kernels and load function handles.
     fn compile(ctx: &Arc<CudaContext>) -> crate::Result<(Arc<CudaModule>, Self)> {
-        let opts = CompileOptions {
-            arch: Some("sm_70"),
-            ..Default::default()
-        };
-        let ptx = compile_ptx_with_opts(KERNELS, opts).map_err(cuda_err)?;
-        let module = ctx.load_module(ptx).map_err(cuda_err)?;
+        // Emit SASS directly for the live GPU's compute capability. See
+        // `backend::nvrtc_cubin` for why we skip PTX. Runtime detection also
+        // lets us run on CUDA 13+ NVRTCs that dropped the hardcoded sm_70
+        // support this file used to rely on.
+        use cudarc::driver::sys::CUdevice_attribute;
+        let major = ctx
+            .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+            .map_err(cuda_err)?;
+        let minor = ctx
+            .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
+            .map_err(cuda_err)?;
+        let arch = format!("sm_{major}{minor}");
+        let cubin = compile_cubin(KERNELS, &arch).map_err(cuda_err)?;
+        let module = ctx.load_module(cubin).map_err(cuda_err)?;
         let module = Arc::new(module);
 
         let load = |name: &str| -> crate::Result<CudaFunction> {

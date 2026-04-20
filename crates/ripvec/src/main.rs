@@ -221,7 +221,18 @@ fn load_pipeline(
     let backends = {
         let _guard = profiler.phase("model_load");
         let pb = use_progress.then(|| progress::spinner("Loading model\u{2026}"));
-        let result = match args.backend {
+
+        // An explicit --device cuda/metal pins the backend to that GPU family
+        // when --backend is left at auto. Without this, auto would silently
+        // fall back to CPU on GPU-load failure even though the user asked for
+        // a GPU — pinning surfaces the real error instead.
+        let effective_backend = match (&args.backend, &args.device) {
+            (cli::BackendArg::Auto, cli::DeviceArg::Cuda) => cli::BackendArg::Cuda,
+            (cli::BackendArg::Auto, cli::DeviceArg::Metal) => cli::BackendArg::Metal,
+            (b, _) => b.clone(),
+        };
+
+        let result = match effective_backend {
             cli::BackendArg::Auto => ripvec_core::backend::detect_backends(model_repo)
                 .context("failed to detect available backends")?,
             ref specific => {
@@ -555,10 +566,16 @@ fn run_oneshot(
                 .ok_or_else(|| anyhow::anyhow!("backend returned no embedding"))?
         };
 
+        // `top_k = 0` on the CLI means "all matches above threshold". Earlier
+        // revisions passed `usize::MAX` here, which later overflowed inside
+        // tantivy's TopDocs and in the semantic `pre_filter_k = top_k * 10`
+        // math. Clamp to the actual corpus size — every chunk could match and
+        // no more, so anything beyond that is wasted capacity and overflow bait.
+        let corpus_size = hybrid.chunks().len().max(1);
         let effective_top_k = if args.top_k > 0 {
-            args.top_k
+            args.top_k.min(corpus_size)
         } else {
-            usize::MAX
+            corpus_size
         };
         let ranked = hybrid.search(
             &query_embedding,

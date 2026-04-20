@@ -11,20 +11,20 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use cudarc::cublas::{CudaBlas, sys};
+use crate::backend::nvrtc_cubin::compile_cubin;
+use cudarc::cublas::{sys, CudaBlas};
 use cudarc::cublaslt::{self, CudaBlasLT, MatmulShared};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut,
     LaunchConfig, PushKernelArg,
 };
-use cudarc::nvrtc::{CompileOptions, compile_ptx_with_opts};
 use safetensors::SafeTensors;
 
 use super::{BatchInputs, Driver};
-use crate::backend::Encoding;
 use crate::backend::arch::modern_bert::{
     ModernBertArch, ModernBertLayerWeights, ModernBertWeights, RopeCache,
 };
+use crate::backend::Encoding;
 
 // ---------------------------------------------------------------------------
 // Error helper
@@ -1416,8 +1416,11 @@ struct KernelPipelines {
 impl KernelPipelines {
     /// Compile all CUDA kernels and load function handles.
     fn compile(ctx: &Arc<CudaContext>) -> crate::Result<(Arc<CudaModule>, Self)> {
-        // Detect GPU compute capability at runtime instead of hardcoding.
-        // CUDA 13+ dropped support for sm_70; the 4090 is sm_89.
+        // Detect GPU compute capability at runtime and emit SASS directly.
+        // Targeting `sm_XX` (real arch) with CUBIN output via NVRTC bypasses
+        // the PTX-version gate that caused "unsupported PTX version" failures
+        // with newer NVRTC toolkits (e.g. CUDA 13.2) on older drivers (590 /
+        // CUDA 13.1). See `backend::nvrtc_cubin` for the lifecycle.
         use cudarc::driver::sys::CUdevice_attribute;
         let major = ctx
             .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
@@ -1425,19 +1428,9 @@ impl KernelPipelines {
         let minor = ctx
             .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
             .map_err(cuda_err)?;
-        // Leak the arch string — compiled once at startup, lives forever.
-        // Use `compute_XX` (virtual arch) not `sm_XX` (real arch) to generate
-        // forward-compatible PTX. This avoids "unsupported PTX version" errors
-        // when the NVRTC toolkit is newer than the driver (e.g. toolkit 13.2,
-        // driver 13.1).
-        let arch_string: &'static str =
-            Box::leak(format!("compute_{major}{minor}").into_boxed_str());
-        let opts = CompileOptions {
-            arch: Some(arch_string),
-            ..Default::default()
-        };
-        let ptx = compile_ptx_with_opts(MODERN_KERNELS, opts).map_err(cuda_err)?;
-        let module = ctx.load_module(ptx).map_err(cuda_err)?;
+        let arch = format!("sm_{major}{minor}");
+        let cubin = compile_cubin(MODERN_KERNELS, &arch).map_err(cuda_err)?;
+        let module = ctx.load_module(cubin).map_err(cuda_err)?;
         let module = Arc::new(module);
 
         let load = |name: &str| -> crate::Result<CudaFunction> {
