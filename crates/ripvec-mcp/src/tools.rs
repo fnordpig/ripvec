@@ -1006,6 +1006,33 @@ impl RipvecServer {
         let binary_age = binary_mtime.elapsed().unwrap_or_default();
         let source_age = newest_source.elapsed().unwrap_or_default();
 
+        // Report the active backend/device if the embedding backend has been
+        // loaded. Skip the `get_or_try_init` path — we don't want to download
+        // a 100MB model just to answer "what version am I?".
+        let (backend_name, is_gpu, backend_loaded) = if let Some(b) = self.text_backend.get() {
+            (b.name().to_string(), b.is_gpu(), true)
+        } else {
+            // Fall back to compile-time feature detection so the user still
+            // sees what backends *would* be available on first search. CPU is
+            // always available (cpu-accelerate on macOS, cpu on Linux).
+            let available: Vec<&str> = [
+                #[cfg(feature = "cuda")]
+                "CUDA",
+                #[cfg(feature = "metal")]
+                "Metal",
+                #[cfg(feature = "mlx")]
+                "MLX",
+                "CPU",
+            ]
+            .into_iter()
+            .collect();
+            (
+                format!("not-yet-loaded (available: {})", available.join(", ")),
+                false,
+                false,
+            )
+        };
+
         let response = serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
             "stale": stale,
@@ -1014,6 +1041,9 @@ impl RipvecServer {
             "newest_source_file": newest_file,
             "binary_path": binary_path.display().to_string(),
             "rebuild_command": if stale { "cargo build --release" } else { "" },
+            "backend": backend_name,
+            "is_gpu": is_gpu,
+            "backend_loaded": backend_loaded,
         });
 
         let json = serde_json::to_string_pretty(&response)

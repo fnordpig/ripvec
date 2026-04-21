@@ -726,6 +726,10 @@ fn softmax_inplace(vals: &mut [f32]) {
 impl Driver for CpuDriver {
     type Tensor = MmapTensor;
 
+    fn name(&self) -> &'static str {
+        crate::backend::blas_info::cpu_driver_name()
+    }
+
     // begin_batch / end_batch: no-ops for CPU.
 
     fn new_for_clone() -> crate::Result<Self> {

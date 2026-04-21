@@ -766,6 +766,10 @@ impl EmbedBackend for CpuBackend {
         false
     }
 
+    fn name(&self) -> &'static str {
+        crate::backend::blas_info::cpu_driver_name()
+    }
+
     /// Maximum tokens from model config (512 for `ClassicBert`).
     #[expect(
         clippy::cast_sign_loss,

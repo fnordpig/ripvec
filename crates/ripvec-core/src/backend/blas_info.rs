@@ -179,3 +179,17 @@ pub fn recommend_blas() -> Option<String> {
         _ => None,
     }
 }
+
+/// Short name for the CPU driver including the detected BLAS backend
+/// (e.g. "CPU (Accelerate)", "CPU (OpenBLAS)", "CPU"). Used in the
+/// `up_to_date` MCP tool and other diagnostics.
+#[must_use]
+pub fn cpu_driver_name() -> &'static str {
+    match detect_blas() {
+        BlasKind::Accelerate => "CPU (Accelerate)",
+        BlasKind::OpenBlas => "CPU (OpenBLAS)",
+        BlasKind::IntelMkl => "CPU (Intel MKL)",
+        BlasKind::Blis => "CPU (BLIS/AOCL)",
+        BlasKind::Unknown => "CPU",
+    }
+}

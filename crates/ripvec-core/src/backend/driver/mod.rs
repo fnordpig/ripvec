@@ -34,6 +34,10 @@ pub trait Driver: Send + Sync {
     /// Metal: `MTLBuffer` + byte offset. CUDA: `CUdeviceptr`. CPU: `Array2<f32>`.
     type Tensor;
 
+    /// Short human-readable label for diagnostics (e.g. "Metal", "CUDA", "CPU").
+    /// Surfaced via [`super::EmbedBackend::name`].
+    fn name(&self) -> &'static str;
+
     /// Create a new driver instance for a cloned worker thread.
     ///
     /// CPU drivers are zero-size and always succeed. GPU drivers typically

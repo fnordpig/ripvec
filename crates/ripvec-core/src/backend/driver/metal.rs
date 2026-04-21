@@ -1683,6 +1683,10 @@ unsafe impl Sync for MetalDriver {}
 impl Driver for MetalDriver {
     type Tensor = MetalTensor;
 
+    fn name(&self) -> &'static str {
+        "Metal"
+    }
+
     fn begin_batch(&self) -> crate::Result<()> {
         self.begin_batch()
     }

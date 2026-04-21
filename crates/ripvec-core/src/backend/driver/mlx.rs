@@ -82,6 +82,10 @@ impl MlxDriver {
 impl Driver for MlxDriver {
     type Tensor = MlxTensor;
 
+    fn name(&self) -> &'static str {
+        "MLX"
+    }
+
     // begin_batch / end_batch: no-ops. MLX is always lazy.
 
     #[expect(

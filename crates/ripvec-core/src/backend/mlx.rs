@@ -703,6 +703,10 @@ impl EmbedBackend for MlxBackend {
         true
     }
 
+    fn name(&self) -> &'static str {
+        "MLX"
+    }
+
     /// Maximum tokens from model config (512 for `ClassicBert`).
     fn max_tokens(&self) -> usize {
         usize::try_from(self.max_position_embeddings).expect("max_position_embeddings is positive")

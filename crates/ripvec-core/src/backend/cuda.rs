@@ -2145,6 +2145,10 @@ impl EmbedBackend for CudaBackend {
         true
     }
 
+    fn name(&self) -> &'static str {
+        "CUDA"
+    }
+
     /// Maximum tokens from model config (512 for `ClassicBert`).
     #[expect(
         clippy::cast_sign_loss,

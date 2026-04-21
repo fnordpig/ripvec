@@ -2065,6 +2065,10 @@ fn build_rope_cache(
 impl Driver for CudaDriver {
     type Tensor = CudaTensor;
 
+    fn name(&self) -> &'static str {
+        "CUDA"
+    }
+
     // --- Batching ---
 
     fn begin_batch(&self) -> crate::Result<()> {

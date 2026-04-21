@@ -177,4 +177,8 @@ where
     fn max_tokens(&self) -> usize {
         self.max_tokens
     }
+
+    fn name(&self) -> &'static str {
+        self.driver.name()
+    }
 }

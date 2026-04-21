@@ -84,6 +84,13 @@ pub trait EmbedBackend: Send + Sync {
     fn max_tokens(&self) -> usize {
         512 // default for classic BERT models
     }
+
+    /// Short human-readable label for this backend (e.g. "Metal", "CUDA",
+    /// "CPU (Accelerate)", "MLX"). Used by diagnostics and the `up_to_date`
+    /// MCP tool. Defaults to "GPU" or "CPU" based on [`is_gpu`].
+    fn name(&self) -> &'static str {
+        if self.is_gpu() { "GPU" } else { "CPU" }
+    }
 }
 
 /// Available embedding backend implementations.
