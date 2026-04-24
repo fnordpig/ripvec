@@ -50,7 +50,7 @@ pub struct SearchResponse {
 fn ext_to_lang(ext: &str) -> &str {
     match ext {
         "rs" => "rust",
-        "py" => "python",
+        "py" | "pyi" => "python",
         "js" | "jsx" => "javascript",
         "ts" | "tsx" => "typescript",
         "go" => "go",
@@ -175,6 +175,21 @@ mod tests {
     }
 
     #[test]
+    fn test_from_chunk_content_python_stub_extension() {
+        let chunk = CodeChunk {
+            file_path: "app/views.pyi".to_string(),
+            name: "index".to_string(),
+            kind: "function_definition".to_string(),
+            start_line: 1,
+            end_line: 1,
+            enriched_content: "def index() -> str: ...".to_string(),
+            content: "def index() -> str: ...".to_string(),
+        };
+        let item = SearchResultItem::from_chunk(&chunk, 0.8);
+        assert_eq!(item.content, "```python\ndef index() -> str: ...\n```");
+    }
+
+    #[test]
     fn test_from_chunk_content_unknown_extension() {
         let chunk = CodeChunk {
             file_path: "data.xyz".to_string(),
@@ -211,6 +226,7 @@ mod tests {
     fn test_ext_to_lang_mappings() {
         assert_eq!(ext_to_lang("rs"), "rust");
         assert_eq!(ext_to_lang("py"), "python");
+        assert_eq!(ext_to_lang("pyi"), "python");
         assert_eq!(ext_to_lang("js"), "javascript");
         assert_eq!(ext_to_lang("jsx"), "javascript");
         assert_eq!(ext_to_lang("ts"), "typescript");

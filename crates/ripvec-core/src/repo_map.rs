@@ -129,7 +129,7 @@ fn import_query_for_extension(ext: &str) -> Option<(tree_sitter::Language, Query
             tree_sitter_rust::LANGUAGE.into(),
             "(use_declaration) @import",
         ),
-        "py" => (
+        "py" | "pyi" => (
             tree_sitter_python::LANGUAGE.into(),
             concat!(
                 "(import_statement) @import\n",
@@ -304,7 +304,7 @@ fn resolve_import(
 ) -> Option<usize> {
     match ext {
         "rs" => resolve_rust_import(raw, file_path, root, file_index),
-        "py" => resolve_python_import(raw, root, file_index),
+        "py" | "pyi" => resolve_python_import(raw, root, file_index),
         "js" | "jsx" | "ts" | "tsx" => resolve_js_import(raw, file_path, file_index),
         // Go imports use full package paths — skip local resolution
         _ => None,
@@ -328,13 +328,21 @@ fn resolve_python_import(
     };
 
     let rel_path: PathBuf = module_path.split('.').collect();
-    let as_file = root.join(&rel_path).with_extension("py");
-    if let Some(&idx) = file_index.get(&as_file) {
-        return Some(idx);
+    for ext in ["py", "pyi"] {
+        let as_file = root.join(&rel_path).with_extension(ext);
+        if let Some(&idx) = file_index.get(&as_file) {
+            return Some(idx);
+        }
     }
 
-    let as_init = root.join(&rel_path).join("__init__.py");
-    file_index.get(&as_init).copied()
+    for init_name in ["__init__.py", "__init__.pyi"] {
+        let as_init = root.join(&rel_path).join(init_name);
+        if let Some(&idx) = file_index.get(&as_init) {
+            return Some(idx);
+        }
+    }
+
+    None
 }
 
 /// Resolve a JS/TS import to a file index.
@@ -1337,6 +1345,26 @@ mod tests {
         let imports = extract_imports(source, &lang, &query);
         assert_eq!(imports.len(), 2);
         assert!(imports[0].contains("crate::foo::bar"));
+    }
+
+    #[test]
+    fn test_extract_imports_python_stub() {
+        let source = "from typing import Protocol\nimport pkg.types\n";
+        let (lang, query) = import_query_for_extension("pyi").unwrap();
+        let imports = extract_imports(source, &lang, &query);
+        assert_eq!(imports.len(), 2);
+        assert!(imports[0].contains("from typing import Protocol"));
+        assert!(imports[1].contains("import pkg.types"));
+    }
+
+    #[test]
+    fn test_resolve_python_import_to_stub_file() {
+        let root = PathBuf::from("/project");
+        let mut file_index = HashMap::new();
+        file_index.insert(PathBuf::from("/project/pkg/types.pyi"), 1);
+
+        let result = resolve_python_import("import pkg.types", &root, &file_index);
+        assert_eq!(result, Some(1));
     }
 
     #[test]

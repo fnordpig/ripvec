@@ -44,8 +44,8 @@ pub fn config_for_extension(ext: &str) -> Option<Arc<LangConfig>> {
         let mut m = std::collections::HashMap::new();
         // Pre-compile all supported extensions
         for &ext in &[
-            "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "c", "h", "cpp", "cc", "cxx",
-            "hpp", "sh", "bash", "bats", "rb", "tf", "tfvars", "hcl", "kt", "kts", "swift",
+            "rs", "py", "pyi", "js", "jsx", "ts", "tsx", "go", "java", "c", "h", "cpp", "cc",
+            "cxx", "hpp", "sh", "bash", "bats", "rb", "tf", "tfvars", "hcl", "kt", "kts", "swift",
             "scala", "toml", "json", "yaml", "yml", "md",
         ] {
             if let Some(cfg) = compile_config(ext) {
@@ -86,7 +86,7 @@ fn compile_config(ext: &str) -> Option<LangConfig> {
         ),
         // Python: top-level functions AND methods inside classes (function_definition
         // matches at any nesting depth, so methods are captured individually).
-        "py" => (
+        "py" | "pyi" => (
             tree_sitter_python::LANGUAGE.into(),
             concat!(
                 "(function_definition name: (identifier) @name) @def\n",
@@ -287,8 +287,8 @@ pub fn call_query_for_extension(ext: &str) -> Option<Arc<CallConfig>> {
         // Pre-compile for all extensions that have callable constructs.
         // TOML is deliberately excluded — it has no function calls.
         for &ext in &[
-            "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "c", "h", "cpp", "cc", "cxx",
-            "hpp", "sh", "bash", "bats", "rb", "tf", "tfvars", "hcl", "kt", "kts", "swift",
+            "rs", "py", "pyi", "js", "jsx", "ts", "tsx", "go", "java", "c", "h", "cpp", "cc",
+            "cxx", "hpp", "sh", "bash", "bats", "rb", "tf", "tfvars", "hcl", "kt", "kts", "swift",
             "scala",
         ] {
             if let Some(cfg) = compile_call_config(ext) {
@@ -321,7 +321,7 @@ fn compile_call_config(ext: &str) -> Option<CallConfig> {
             ),
         ),
         // Python: simple calls and attribute (method) calls.
-        "py" => (
+        "py" | "pyi" => (
             tree_sitter_python::LANGUAGE.into(),
             concat!(
                 "(call function: (identifier) @callee) @call\n",
@@ -445,6 +445,11 @@ mod tests {
     }
 
     #[test]
+    fn python_stub_extension_resolves() {
+        assert!(config_for_extension("pyi").is_some());
+    }
+
+    #[test]
     fn unknown_extension_returns_none() {
         assert!(config_for_extension("xyz").is_none());
     }
@@ -452,8 +457,8 @@ mod tests {
     #[test]
     fn all_supported_extensions() {
         let exts = [
-            "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "c", "h", "cpp", "cc", "cxx",
-            "hpp", "sh", "bash", "bats", "rb", "tf", "tfvars", "hcl", "kt", "kts", "swift",
+            "rs", "py", "pyi", "js", "jsx", "ts", "tsx", "go", "java", "c", "h", "cpp", "cc",
+            "cxx", "hpp", "sh", "bash", "bats", "rb", "tf", "tfvars", "hcl", "kt", "kts", "swift",
             "scala", "toml", "json", "yaml", "yml", "md",
         ];
         for ext in &exts {
@@ -464,8 +469,8 @@ mod tests {
     #[test]
     fn all_call_query_extensions() {
         let exts = [
-            "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "c", "h", "cpp", "cc", "cxx",
-            "hpp", "sh", "bash", "bats", "rb", "tf", "tfvars", "hcl", "kt", "kts", "swift",
+            "rs", "py", "pyi", "js", "jsx", "ts", "tsx", "go", "java", "c", "h", "cpp", "cc",
+            "cxx", "hpp", "sh", "bash", "bats", "rb", "tf", "tfvars", "hcl", "kt", "kts", "swift",
             "scala",
         ];
         for ext in &exts {

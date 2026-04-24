@@ -471,6 +471,21 @@ mod tests {
     }
 
     #[test]
+    fn chunks_python_stub_functions_and_classes() {
+        let source = "from typing import Protocol\n\ndef greet(name: str) -> str: ...\n\nclass Foo(Protocol):\n    value: int\n";
+        let config = crate::languages::config_for_extension("pyi").unwrap();
+        let chunks = chunk_file(
+            Path::new("test.pyi"),
+            source,
+            &config,
+            &ChunkConfig::default(),
+        );
+        assert!(chunks.len() >= 2);
+        assert!(chunks.iter().any(|c| c.name == "greet"));
+        assert!(chunks.iter().any(|c| c.name == "Foo"));
+    }
+
+    #[test]
     fn fallback_small_file_single_chunk() {
         // With enriched queries, `let x = 42` matches variable_declarator.
         // Use a source with NO tree-sitter captures to test the plaintext fallback.
