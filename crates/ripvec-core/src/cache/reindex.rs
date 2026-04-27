@@ -63,24 +63,28 @@ pub fn incremental_index(
         )));
     }
 
-    // When repo_level is requested, ensure .ripvec/config.toml exists
-    // so that resolve_cache_dir will find it and use the repo-local path.
-    if repo_level {
-        let ripvec_dir = root.join(".ripvec");
-        let config_path = ripvec_dir.join("config.toml");
-        if !config_path.exists() {
-            let config = crate::cache::config::RepoConfig::new(
-                model_repo,
-                crate::cache::manifest::MANIFEST_VERSION.to_string(),
-            );
-            config.save(&ripvec_dir)?;
+    {
+        let guard = profiler.phase("cache_prepare");
+        // When repo_level is requested, ensure .ripvec/config.toml exists
+        // so that resolve_cache_dir will find it and use the repo-local path.
+        if repo_level {
+            let ripvec_dir = root.join(".ripvec");
+            let config_path = ripvec_dir.join("config.toml");
+            if !config_path.exists() {
+                let config = crate::cache::config::RepoConfig::new(
+                    model_repo,
+                    crate::cache::manifest::MANIFEST_VERSION.to_string(),
+                );
+                config.save(&ripvec_dir)?;
+            }
+            // Gitignore the manifest — it's rebuilt from objects on first use.
+            // Objects are content-addressed and never cause merge conflicts.
+            let gitignore_path = ripvec_dir.join(".gitignore");
+            if !gitignore_path.exists() {
+                let _ = std::fs::write(&gitignore_path, "cache/manifest.json\n");
+            }
         }
-        // Gitignore the manifest — it's rebuilt from objects on first use.
-        // Objects are content-addressed and never cause merge conflicts.
-        let gitignore_path = ripvec_dir.join(".gitignore");
-        if !gitignore_path.exists() {
-            let _ = std::fs::write(&gitignore_path, "cache/manifest.json\n");
-        }
+        guard.set_detail(format!("repo_level={repo_level}"));
     }
 
     let cache_dir = resolve_cache_dir(root, model_repo, cache_dir_override);
@@ -89,10 +93,25 @@ pub fn incremental_index(
     let objects_dir = cache_dir.join("objects");
     let store = ObjectStore::new(&objects_dir);
 
+    tracing::info!(
+        cache_dir = %cache_dir.display(),
+        portable,
+        manifest = %manifest_path.display(),
+        "cache resolved"
+    );
+
     // Try loading existing manifest, or rebuild from objects if missing.
-    let existing_manifest = Manifest::load(&manifest_path)
-        .ok()
-        .or_else(|| rebuild_manifest_from_objects(&cache_dir, root, model_repo));
+    let existing_manifest = {
+        let guard = profiler.phase("cache_manifest");
+        let manifest = Manifest::load(&manifest_path)
+            .ok()
+            .or_else(|| rebuild_manifest_from_objects(&cache_dir, root, model_repo));
+        guard.set_detail(match &manifest {
+            Some(m) => format!("{} files", m.files.len()),
+            None => "none".to_string(),
+        });
+        manifest
+    };
 
     if let Some(manifest) = existing_manifest.filter(|m| m.is_compatible(model_repo)) {
         tracing::info!(
@@ -116,6 +135,10 @@ pub fn incremental_index(
 /// Incremental reindex: diff, re-embed dirty files, merge with cached.
 #[expect(clippy::too_many_arguments, reason = "pipeline state passed through")]
 #[expect(
+    clippy::too_many_lines,
+    reason = "incremental cache pipeline orchestration with diagnostic phase boundaries"
+)]
+#[expect(
     clippy::cast_possible_truncation,
     reason = "duration in ms won't exceed u64"
 )]
@@ -132,7 +155,17 @@ fn incremental_path(
     start: Instant,
     portable: bool,
 ) -> crate::Result<(HybridIndex, ReindexStats)> {
-    let diff_result = diff::compute_diff(root, &manifest)?;
+    let diff_result = {
+        let guard = profiler.phase("cache_diff");
+        let diff_result = diff::compute_diff(root, &manifest)?;
+        guard.set_detail(format!(
+            "{} changed, {} deleted, {} unchanged",
+            diff_result.dirty.len(),
+            diff_result.deleted.len(),
+            diff_result.unchanged,
+        ));
+        diff_result
+    };
 
     let files_changed = diff_result.dirty.len();
     let files_deleted = diff_result.deleted.len();
@@ -152,81 +185,89 @@ fn incremental_path(
 
     // Re-embed dirty files
     let mut new_chunks_count = 0;
-    for dirty_path in &diff_result.dirty {
-        let relative = dirty_path
-            .strip_prefix(root)
-            .unwrap_or(dirty_path)
-            .to_string_lossy()
-            .to_string();
+    {
+        let guard = profiler.phase("reembed_dirty_files");
+        tracing::info!(files = files_changed, "re-embedding changed files");
+        for dirty_path in &diff_result.dirty {
+            let relative = dirty_path
+                .strip_prefix(root)
+                .unwrap_or(dirty_path)
+                .to_string_lossy()
+                .to_string();
 
-        // Remove old entry if it exists
-        manifest.remove_file(&relative);
+            // Remove old entry if it exists
+            manifest.remove_file(&relative);
 
-        // Chunk this file
-        let Some(source) = crate::embed::read_source(dirty_path) else {
-            continue;
-        };
+            // Chunk this file
+            let Some(source) = crate::embed::read_source(dirty_path) else {
+                continue;
+            };
 
-        let ext = dirty_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-        let chunks = if cfg.text_mode {
-            crate::chunk::chunk_text(dirty_path, &source, &cfg.chunk)
-        } else {
-            match crate::languages::config_for_extension(ext) {
-                Some(lang_config) => {
-                    crate::chunk::chunk_file(dirty_path, &source, &lang_config, &cfg.chunk)
+            let ext = dirty_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            let chunks = if cfg.text_mode {
+                crate::chunk::chunk_text(dirty_path, &source, &cfg.chunk)
+            } else {
+                match crate::languages::config_for_extension(ext) {
+                    Some(lang_config) => {
+                        crate::chunk::chunk_file(dirty_path, &source, &lang_config, &cfg.chunk)
+                    }
+                    None => crate::chunk::chunk_text(dirty_path, &source, &cfg.chunk),
                 }
-                None => crate::chunk::chunk_text(dirty_path, &source, &cfg.chunk),
+            };
+
+            if chunks.is_empty() {
+                tracing::debug!(file = %relative, "dirty file produced no chunks");
+                continue;
             }
-        };
+            tracing::debug!(file = %relative, chunks = chunks.len(), "embedding dirty file");
 
-        if chunks.is_empty() {
-            continue;
+            // Tokenize
+            let model_max = backends[0].max_tokens();
+            let encodings: Vec<Option<crate::backend::Encoding>> = chunks
+                .iter()
+                .map(|chunk| {
+                    crate::tokenize::tokenize_query(&chunk.enriched_content, tokenizer, model_max)
+                        .ok()
+                })
+                .collect();
+
+            // Embed
+            let embeddings =
+                crate::embed::embed_distributed(&encodings, backends, cfg.batch_size, profiler)?;
+
+            // Filter out failed tokenizations
+            let (good_chunks, good_embeddings): (Vec<_>, Vec<_>) = chunks
+                .into_iter()
+                .zip(embeddings)
+                .filter(|(_, emb)| !emb.is_empty())
+                .unzip();
+
+            let hidden_dim = good_embeddings.first().map_or(384, Vec::len);
+
+            // Save to object store
+            let content_hash = diff::hash_file(dirty_path)?;
+            let file_cache = FileCache {
+                chunks: good_chunks.clone(),
+                embeddings: good_embeddings.iter().flatten().copied().collect(),
+                hidden_dim,
+            };
+            let bytes = if portable {
+                file_cache.to_portable_bytes()
+            } else {
+                file_cache.to_bytes()
+            };
+            store.write(&content_hash, &bytes)?;
+
+            // Update manifest
+            let mtime = diff::mtime_secs(dirty_path);
+            let size = std::fs::metadata(dirty_path).map_or(0, |m| m.len());
+            manifest.add_file(&relative, mtime, size, &content_hash, good_chunks.len());
+            new_chunks_count += good_chunks.len();
         }
-
-        // Tokenize
-        let model_max = backends[0].max_tokens();
-        let encodings: Vec<Option<crate::backend::Encoding>> = chunks
-            .iter()
-            .map(|chunk| {
-                crate::tokenize::tokenize_query(&chunk.enriched_content, tokenizer, model_max).ok()
-            })
-            .collect();
-
-        // Embed
-        let embeddings =
-            crate::embed::embed_distributed(&encodings, backends, cfg.batch_size, profiler)?;
-
-        // Filter out failed tokenizations
-        let (good_chunks, good_embeddings): (Vec<_>, Vec<_>) = chunks
-            .into_iter()
-            .zip(embeddings)
-            .filter(|(_, emb)| !emb.is_empty())
-            .unzip();
-
-        let hidden_dim = good_embeddings.first().map_or(384, Vec::len);
-
-        // Save to object store
-        let content_hash = diff::hash_file(dirty_path)?;
-        let file_cache = FileCache {
-            chunks: good_chunks.clone(),
-            embeddings: good_embeddings.iter().flatten().copied().collect(),
-            hidden_dim,
-        };
-        let bytes = if portable {
-            file_cache.to_portable_bytes()
-        } else {
-            file_cache.to_bytes()
-        };
-        store.write(&content_hash, &bytes)?;
-
-        // Update manifest
-        let mtime = diff::mtime_secs(dirty_path);
-        let size = std::fs::metadata(dirty_path).map_or(0, |m| m.len());
-        manifest.add_file(&relative, mtime, size, &content_hash, good_chunks.len());
-        new_chunks_count += good_chunks.len();
+        guard.set_detail(format!("{files_changed} files, {new_chunks_count} chunks"));
     }
 
     // Heal stale mtimes (e.g., after git clone where all mtimes are wrong
@@ -240,20 +281,38 @@ fn incremental_path(
     // Rebuild HybridIndex (semantic + BM25) from all cached objects.
     // This prunes any manifest entries whose objects are missing/corrupt.
     tracing::info!("loading cached objects from store");
-    let (all_chunks, all_embeddings) = load_all_from_store(store, &mut manifest);
+    let (all_chunks, all_embeddings) = {
+        let guard = profiler.phase("cache_load_objects");
+        let result = load_all_from_store(store, &mut manifest);
+        guard.set_detail(format!("{} chunks", result.0.len()));
+        result
+    };
 
     // GC unreferenced objects (after pruning so dangling hashes are dropped)
-    let referenced = manifest.referenced_hashes();
-    store.gc(&referenced)?;
+    {
+        let guard = profiler.phase("cache_gc");
+        let referenced = manifest.referenced_hashes();
+        store.gc(&referenced)?;
+        guard.set_detail(format!("{} referenced objects", referenced.len()));
+    }
 
     // Save manifest (after pruning so the on-disk manifest is clean)
-    manifest.save(&cache_dir.join("manifest.json"))?;
+    {
+        let guard = profiler.phase("cache_manifest_save");
+        manifest.save(&cache_dir.join("manifest.json"))?;
+        guard.set_detail(format!("{} files", manifest.files.len()));
+    }
     let chunks_total = all_chunks.len();
     tracing::info!(
         chunks = chunks_total,
         "building HybridIndex (BM25 + PolarQuant)"
     );
-    let hybrid = HybridIndex::new(all_chunks, &all_embeddings, None)?;
+    let hybrid = {
+        let guard = profiler.phase("build_hybrid_index");
+        let hybrid = HybridIndex::new(all_chunks, &all_embeddings, None)?;
+        guard.set_detail(format!("{chunks_total} chunks"));
+        hybrid
+    };
     tracing::info!("HybridIndex ready");
 
     Ok((
@@ -287,6 +346,7 @@ fn full_index_path(
     start: Instant,
     portable: bool,
 ) -> crate::Result<(HybridIndex, ReindexStats)> {
+    tracing::info!("no compatible manifest; building full index from source");
     let (chunks, embeddings) = crate::embed::embed_all(root, backends, tokenizer, cfg, profiler)?;
 
     let hidden_dim = embeddings.first().map_or(384, Vec::len);
@@ -309,46 +369,59 @@ fn full_index_path(
             .push(emb.clone());
     }
 
-    for (file_path, (file_chunks, file_embeddings)) in &file_groups {
-        // file_path from CodeChunk is already an absolute or cwd-relative path
-        let file_path_buf = PathBuf::from(file_path);
+    {
+        let guard = profiler.phase("cache_write_objects");
+        for (file_path, (file_chunks, file_embeddings)) in &file_groups {
+            // file_path from CodeChunk is already an absolute or cwd-relative path
+            let file_path_buf = PathBuf::from(file_path);
 
-        let content_hash = diff::hash_file(&file_path_buf).unwrap_or_else(|_| {
-            // File might not exist (e.g., generated content) — use chunk content hash
-            blake3::hash(file_chunks[0].content.as_bytes())
-                .to_hex()
-                .to_string()
-        });
+            let content_hash = diff::hash_file(&file_path_buf).unwrap_or_else(|_| {
+                // File might not exist (e.g., generated content) — use chunk content hash
+                blake3::hash(file_chunks[0].content.as_bytes())
+                    .to_hex()
+                    .to_string()
+            });
 
-        let flat_emb: Vec<f32> = file_embeddings.iter().flatten().copied().collect();
-        let fc = FileCache {
-            chunks: file_chunks.clone(),
-            embeddings: flat_emb,
-            hidden_dim,
-        };
-        let bytes = if portable {
-            fc.to_portable_bytes()
-        } else {
-            fc.to_bytes()
-        };
-        store.write(&content_hash, &bytes)?;
+            let flat_emb: Vec<f32> = file_embeddings.iter().flatten().copied().collect();
+            let fc = FileCache {
+                chunks: file_chunks.clone(),
+                embeddings: flat_emb,
+                hidden_dim,
+            };
+            let bytes = if portable {
+                fc.to_portable_bytes()
+            } else {
+                fc.to_bytes()
+            };
+            store.write(&content_hash, &bytes)?;
 
-        let relative = file_path_buf
-            .strip_prefix(root)
-            .unwrap_or(&file_path_buf)
-            .to_string_lossy()
-            .to_string();
-        let mtime = diff::mtime_secs(&file_path_buf);
-        let size = std::fs::metadata(&file_path_buf).map_or(0, |m| m.len());
-        manifest.add_file(&relative, mtime, size, &content_hash, file_chunks.len());
+            let relative = file_path_buf
+                .strip_prefix(root)
+                .unwrap_or(&file_path_buf)
+                .to_string_lossy()
+                .to_string();
+            let mtime = diff::mtime_secs(&file_path_buf);
+            let size = std::fs::metadata(&file_path_buf).map_or(0, |m| m.len());
+            manifest.add_file(&relative, mtime, size, &content_hash, file_chunks.len());
+        }
+        guard.set_detail(format!("{} files", file_groups.len()));
     }
 
-    manifest.recompute_hashes();
-    manifest.save(&cache_dir.join("manifest.json"))?;
+    {
+        let guard = profiler.phase("cache_manifest_save");
+        manifest.recompute_hashes();
+        manifest.save(&cache_dir.join("manifest.json"))?;
+        guard.set_detail(format!("{} files", manifest.files.len()));
+    }
 
     let chunks_total = chunks.len();
     let files_changed = file_groups.len();
-    let hybrid = HybridIndex::new(chunks, &embeddings, None)?;
+    let hybrid = {
+        let guard = profiler.phase("build_hybrid_index");
+        let hybrid = HybridIndex::new(chunks, &embeddings, None)?;
+        guard.set_detail(format!("{chunks_total} chunks"));
+        hybrid
+    };
 
     Ok((
         hybrid,
@@ -480,7 +553,13 @@ fn load_all_from_store(
     let mut all_embeddings = Vec::new();
     let mut dangling: Vec<String> = Vec::new();
 
-    for (path, entry) in &manifest.files {
+    let total = manifest.files.len();
+    tracing::info!(objects = total, "reading cached objects");
+    for (idx, (path, entry)) in manifest.files.iter().enumerate() {
+        let current = idx + 1;
+        if current == 1 || current % 1000 == 0 || current == total {
+            tracing::debug!(current, total, path = %path, "reading cached object");
+        }
         let bytes = match store.read(&entry.content_hash) {
             Ok(b) => b,
             Err(e) => {
@@ -645,85 +724,6 @@ fn format_version_dir(model_repo: &str) -> String {
     format!("v{}-{model_slug}", crate::cache::manifest::MANIFEST_VERSION)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    #[test]
-    fn heal_stale_mtimes() {
-        use crate::cache::diff;
-        use crate::cache::manifest::Manifest;
-        use std::io::Write;
-
-        let dir = TempDir::new().unwrap();
-        let file_path = dir.path().join("test.rs");
-        let content = "fn main() {}";
-        {
-            let mut f = std::fs::File::create(&file_path).unwrap();
-            f.write_all(content.as_bytes()).unwrap();
-        }
-
-        // Create manifest with correct content hash but wrong mtime
-        let content_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
-        let mut manifest = Manifest::new("test-model");
-        manifest.add_file(
-            "test.rs",
-            9_999_999, // deliberately wrong mtime
-            content.len() as u64,
-            &content_hash,
-            1,
-        );
-
-        // After heal, the manifest mtime should match the filesystem
-        heal_manifest_mtimes(dir.path(), &mut manifest);
-        let actual_mtime = diff::mtime_secs(&file_path);
-        assert_eq!(manifest.files["test.rs"].mtime_secs, actual_mtime);
-    }
-
-    #[test]
-    fn resolve_uses_repo_local_when_present() {
-        let dir = TempDir::new().unwrap();
-        let cfg = crate::cache::config::RepoConfig::new("nomic-ai/modernbert-embed-base", "3");
-        cfg.save(&dir.path().join(".ripvec")).unwrap();
-
-        let result = resolve_cache_dir(dir.path(), "nomic-ai/modernbert-embed-base", None);
-        assert!(
-            result.starts_with(dir.path().join(".ripvec").join("cache")),
-            "expected repo-local cache dir, got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn resolve_falls_back_to_user_cache_when_no_config() {
-        let dir = TempDir::new().unwrap();
-        let result = resolve_cache_dir(dir.path(), "nomic-ai/modernbert-embed-base", None);
-        assert!(
-            !result.to_string_lossy().contains(".ripvec"),
-            "should not use repo-local without config, got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn resolve_override_takes_priority_over_repo_local() {
-        let dir = TempDir::new().unwrap();
-        let override_dir = TempDir::new().unwrap();
-
-        let cfg = crate::cache::config::RepoConfig::new("nomic-ai/modernbert-embed-base", "3");
-        cfg.save(&dir.path().join(".ripvec")).unwrap();
-
-        let result = resolve_cache_dir(
-            dir.path(),
-            "nomic-ai/modernbert-embed-base",
-            Some(override_dir.path()),
-        );
-        assert!(
-            !result.starts_with(dir.path().join(".ripvec")),
-            "override should win over repo-local, got: {result:?}"
-        );
-    }
-}
-
 /// Rebuild a manifest by scanning the object store and deserializing each object.
 ///
 /// Used when `manifest.json` is gitignored and only the objects directory is
@@ -825,4 +825,83 @@ pub fn rebuild_manifest_from_objects(
     }
 
     Some(manifest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn heal_stale_mtimes() {
+        use crate::cache::diff;
+        use crate::cache::manifest::Manifest;
+        use std::io::Write;
+
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("test.rs");
+        let content = "fn main() {}";
+        {
+            let mut f = std::fs::File::create(&file_path).unwrap();
+            f.write_all(content.as_bytes()).unwrap();
+        }
+
+        // Create manifest with correct content hash but wrong mtime
+        let content_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
+        let mut manifest = Manifest::new("test-model");
+        manifest.add_file(
+            "test.rs",
+            9_999_999, // deliberately wrong mtime
+            content.len() as u64,
+            &content_hash,
+            1,
+        );
+
+        // After heal, the manifest mtime should match the filesystem
+        heal_manifest_mtimes(dir.path(), &mut manifest);
+        let actual_mtime = diff::mtime_secs(&file_path);
+        assert_eq!(manifest.files["test.rs"].mtime_secs, actual_mtime);
+    }
+
+    #[test]
+    fn resolve_uses_repo_local_when_present() {
+        let dir = TempDir::new().unwrap();
+        let cfg = crate::cache::config::RepoConfig::new("nomic-ai/modernbert-embed-base", "3");
+        cfg.save(&dir.path().join(".ripvec")).unwrap();
+
+        let result = resolve_cache_dir(dir.path(), "nomic-ai/modernbert-embed-base", None);
+        assert!(
+            result.starts_with(dir.path().join(".ripvec").join("cache")),
+            "expected repo-local cache dir, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_falls_back_to_user_cache_when_no_config() {
+        let dir = TempDir::new().unwrap();
+        let result = resolve_cache_dir(dir.path(), "nomic-ai/modernbert-embed-base", None);
+        assert!(
+            !result.to_string_lossy().contains(".ripvec"),
+            "should not use repo-local without config, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_override_takes_priority_over_repo_local() {
+        let dir = TempDir::new().unwrap();
+        let override_dir = TempDir::new().unwrap();
+
+        let cfg = crate::cache::config::RepoConfig::new("nomic-ai/modernbert-embed-base", "3");
+        cfg.save(&dir.path().join(".ripvec")).unwrap();
+
+        let result = resolve_cache_dir(
+            dir.path(),
+            "nomic-ai/modernbert-embed-base",
+            Some(override_dir.path()),
+        );
+        assert!(
+            !result.starts_with(dir.path().join(".ripvec")),
+            "override should win over repo-local, got: {result:?}"
+        );
+    }
 }

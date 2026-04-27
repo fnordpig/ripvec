@@ -726,6 +726,7 @@ mod tests {
     const BGE_SMALL: &str = "BAAI/bge-small-en-v1.5";
 
     #[test]
+    #[ignore = "requires MLX/Metal runtime"]
     fn mlx_supports_fp16() {
         let arr = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
         let half = arr.as_dtype(mlx_rs::Dtype::Float16);
@@ -737,12 +738,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires MLX/Metal runtime and model download"]
     fn mlx_backend_loads_model() {
         // Isolate: does model loading segfault?
         let _backend = MlxBackend::load(BGE_SMALL, &DeviceHint::Auto).unwrap();
     }
 
     #[test]
+    #[ignore = "requires MLX/Metal runtime and model download"]
     fn mlx_backend_loads_and_embeds() {
         let backend = MlxBackend::load(BGE_SMALL, &DeviceHint::Auto).unwrap();
         let enc = Encoding {
@@ -761,6 +764,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires MLX/Metal runtime and model download"]
     fn mlx_backend_empty_batch() {
         let backend = MlxBackend::load(BGE_SMALL, &DeviceHint::Auto).unwrap();
         let results = backend.embed_batch(&[]).unwrap();
@@ -768,6 +772,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires MLX/Metal runtime and model download"]
     fn mlx_backend_is_gpu() {
         let backend = MlxBackend::load(BGE_SMALL, &DeviceHint::Auto).unwrap();
         assert!(backend.is_gpu());
@@ -775,6 +780,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires MLX/Metal runtime and model download"]
     fn mlx_backend_batch_of_two() {
         let backend = MlxBackend::load(BGE_SMALL, &DeviceHint::Auto).unwrap();
         let enc1 = Encoding {
@@ -814,6 +820,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires MLX/Metal runtime and model download"]
     fn detect_variant_classic_bert() {
         // BGE model should detect as ClassicBert
         let backend = MlxBackend::load(BGE_SMALL, &DeviceHint::Auto).unwrap();

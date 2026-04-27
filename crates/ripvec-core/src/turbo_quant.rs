@@ -436,8 +436,8 @@ mod tests {
 
         // Query
         let mut query = vec![0.0f32; dim];
-        for d in 0..dim {
-            query[d] = ((42 * 7 + d * 13) as f32).sin();
+        for (d, value) in query.iter_mut().enumerate() {
+            *value = ((42 * 7 + d * 13) as f32).sin();
         }
         l2_normalize(&mut query);
 
@@ -483,6 +483,7 @@ mod tests {
     /// GPU vs CPU scan benchmark (Metal only).
     #[test]
     #[cfg(feature = "metal")]
+    #[ignore = "requires Metal hardware"]
     fn metal_turboquant_scan() {
         let dim = 768;
         let n = 10_000;
@@ -502,8 +503,8 @@ mod tests {
 
         let corpus = codec.encode_batch(&vecs);
         let mut query = vec![0.0f32; dim];
-        for d in 0..dim {
-            query[d] = ((42 * 7 + d * 13) as f32).sin();
+        for (d, value) in query.iter_mut().enumerate() {
+            *value = ((42 * 7 + d * 13) as f32).sin();
         }
         l2_normalize(&mut query);
         let qs = codec.prepare_query(&query);

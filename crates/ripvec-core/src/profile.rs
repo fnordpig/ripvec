@@ -173,6 +173,12 @@ impl Profiler {
     /// Start timing a named phase. Returns a guard that prints on drop.
     #[must_use]
     pub fn phase(&self, name: &'static str) -> PhaseGuard<'_> {
+        if let Self::Active { start, .. } = self {
+            self.report(&format!(
+                "[{:.3}s] {name}: starting",
+                start.elapsed().as_secs_f64(),
+            ));
+        }
         PhaseGuard {
             profiler: self,
             name,

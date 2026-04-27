@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use rayon::prelude::*;
-use tracing::{debug, info_span, instrument, warn};
+use tracing::{info_span, instrument, trace, warn};
 
 use crate::backend::{EmbedBackend, Encoding};
 use crate::chunk::{ChunkConfig, CodeChunk};
@@ -802,26 +802,26 @@ pub(crate) fn embed_distributed(
 ///
 /// Reads the file as raw bytes first, checks for NUL bytes in the first 8 KB
 /// to detect binary files, then converts to UTF-8. Returns `None` (with a
-/// debug log) when the file cannot be read, is binary, or is not valid UTF-8.
+/// trace log) when the file cannot be read, is binary, or is not valid UTF-8.
 pub(crate) fn read_source(path: &Path) -> Option<String> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
-            debug!(path = %path.display(), err = %e, "skipping file: read failed");
+            trace!(path = %path.display(), err = %e, "skipping file: read failed");
             return None;
         }
     };
 
     // Skip binary files: NUL byte anywhere in the first 8 KB is a reliable signal.
     if memchr::memchr(0, &bytes[..bytes.len().min(8192)]).is_some() {
-        debug!(path = %path.display(), "skipping binary file");
+        trace!(path = %path.display(), "skipping binary file");
         return None;
     }
 
     match std::str::from_utf8(&bytes) {
         Ok(s) => Some(s.to_string()),
         Err(e) => {
-            debug!(path = %path.display(), err = %e, "skipping file: not valid UTF-8");
+            trace!(path = %path.display(), err = %e, "skipping file: not valid UTF-8");
             None
         }
     }

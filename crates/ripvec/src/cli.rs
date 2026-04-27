@@ -119,7 +119,7 @@ pub struct Args {
     #[arg(long, value_name = "FILE")]
     pub trace: Option<String>,
 
-    /// Log level: error, warn, info, debug, trace. Overrides `RIPVEC_LOG` env var.
+    /// Log level: error, warn, info, debug, trace. Overrides `-v`, `--debug`, and `RIPVEC_LOG`.
     ///
     /// `--debug` is a shortcut for `--log-level debug`.
     #[arg(long, value_name = "LEVEL")]
@@ -128,6 +128,12 @@ pub struct Args {
     /// Shortcut for `--log-level debug`. Useful for diagnosing indexing/verify hangs.
     #[arg(long)]
     pub debug: bool,
+
+    /// Increase diagnostic verbosity: -v=info, -vv=debug, -vvv=trace.
+    ///
+    /// Verbose modes print line-oriented phase diagnostics instead of spinners.
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    pub verbose: u8,
 
     /// Write logs to a file instead of stderr (one line per event).
     #[arg(long, value_name = "FILE")]
@@ -159,6 +165,17 @@ pub struct Args {
     /// Override the cache directory (default: `~/.cache/ripvec/`).
     #[arg(long, value_name = "DIR")]
     pub cache_dir: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verbose_flag_counts_repeated_occurrences() {
+        let args = Args::try_parse_from(["ripvec", "-vvv", "query"]).unwrap();
+        assert_eq!(args.verbose, 3);
+    }
 }
 
 /// Output format for search results.

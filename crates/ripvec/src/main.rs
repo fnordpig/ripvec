@@ -7,6 +7,33 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::layer::SubscriberExt;
 
+/// Map `-v` count to a tracing level.
+fn log_level_from_verbosity(verbose: u8) -> Option<&'static str> {
+    match verbose {
+        0 => None,
+        1 => Some("info"),
+        2 => Some("debug"),
+        _ => Some("trace"),
+    }
+}
+
+/// Resolve the effective tracing level.
+///
+/// Priority: explicit `--log-level`, `--debug`, `-v`, `RIPVEC_LOG`, then warn.
+fn resolve_log_level(args: &cli::Args) -> String {
+    args.log_level
+        .clone()
+        .or_else(|| args.debug.then(|| "debug".to_string()))
+        .or_else(|| log_level_from_verbosity(args.verbose).map(str::to_string))
+        .or_else(|| std::env::var("RIPVEC_LOG").ok())
+        .unwrap_or_else(|| "warn".to_string())
+}
+
+/// Whether stderr should be line-oriented diagnostics instead of a spinner.
+fn diagnostics_mode(args: &cli::Args) -> bool {
+    args.profile || args.debug || args.verbose > 0
+}
+
 #[expect(clippy::too_many_lines, reason = "orchestration entry point")]
 fn main() -> Result<()> {
     let mut args = cli::Args::parse();
@@ -66,13 +93,7 @@ fn main() -> Result<()> {
     }
 
     // Set up tracing: stderr (or --log-file), optional Chrome trace, level filter.
-    // Priority: --log-level > --debug > RIPVEC_LOG env var > warn.
-    let level = args
-        .log_level
-        .clone()
-        .or_else(|| args.debug.then(|| "debug".to_string()))
-        .or_else(|| std::env::var("RIPVEC_LOG").ok())
-        .unwrap_or_else(|| "warn".to_string());
+    let level = resolve_log_level(&args);
     let make_filter = || {
         tracing_subscriber::EnvFilter::try_new(&level)
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"))
@@ -116,9 +137,24 @@ fn main() -> Result<()> {
         }
     }
 
-    // Create profiler
+    tracing::info!(
+        path = %args.path,
+        model = %model_repo,
+        mode = %args.mode,
+        index = args.index,
+        repo_level = args.repo_level,
+        reindex = args.reindex,
+        backend = ?args.backend,
+        device = ?args.device,
+        threads = args.threads,
+        verbose = args.verbose,
+        "ripvec starting"
+    );
+
+    // Create profiler. --debug and -v modes enable phase diagnostics because
+    // tracing alone does not show which long-running pipeline step is active.
     let profiler = ripvec_core::profile::Profiler::new(
-        args.profile,
+        diagnostics_mode(&args),
         std::time::Duration::from_secs_f64(args.profile_interval),
     );
 
@@ -136,8 +172,10 @@ fn main() -> Result<()> {
         .build_global()
         .context("failed to configure thread pool")?;
 
-    // Whether to show indicatif progress bars: TTY stderr and no --profile flag.
-    let use_progress = !args.profile && std::io::IsTerminal::is_terminal(&std::io::stderr());
+    // Whether to show indicatif progress bars. Diagnostic modes deliberately
+    // use line-oriented output because spinners and logs share stderr.
+    let use_progress =
+        !diagnostics_mode(&args) && std::io::IsTerminal::is_terminal(&std::io::stderr());
 
     // Print profiler header
     profiler.header(
@@ -232,6 +270,13 @@ fn load_pipeline(
             (b, _) => b.clone(),
         };
 
+        tracing::info!(
+            model = model_repo,
+            requested_backend = ?args.backend,
+            effective_backend = ?effective_backend,
+            device = ?args.device,
+            "loading embedding backend"
+        );
         let result = match effective_backend {
             cli::BackendArg::Auto => ripvec_core::backend::detect_backends(model_repo)
                 .context("failed to detect available backends")?,
@@ -258,10 +303,13 @@ fn load_pipeline(
         if let Some(pb) = pb {
             pb.finish_and_clear();
         }
+        tracing::info!(backends = result.len(), "embedding backend loaded");
         result
     };
+    tracing::info!(model = model_repo, "loading tokenizer");
     let tokenizer =
         ripvec_core::tokenize::load_tokenizer(model_repo).context("failed to load tokenizer")?;
+    tracing::info!("tokenizer loaded");
 
     let mode: ripvec_core::hybrid::SearchMode = args.mode.parse().unwrap_or_default();
 
@@ -513,8 +561,21 @@ fn run_oneshot(
                 &model_repo,
                 args.cache_dir.as_deref().map(std::path::Path::new),
             );
+            tracing::info!(cache_dir = %cache_dir.display(), "reindex requested; clearing cache");
             let _ = std::fs::remove_dir_all(&cache_dir);
         }
+
+        let cache_dir = ripvec_core::cache::reindex::resolve_cache_dir(
+            std::path::Path::new(&args.path),
+            &model_repo,
+            args.cache_dir.as_deref().map(std::path::Path::new),
+        );
+        tracing::info!(
+            root = %args.path,
+            cache_dir = %cache_dir.display(),
+            repo_level = args.repo_level,
+            "loading persistent index"
+        );
 
         let pb = use_progress.then(|| progress::spinner("Loading index\u{2026}"));
 
@@ -553,8 +614,10 @@ fn run_oneshot(
 
         // Embed query (skip for keyword-only mode)
         let query_embedding = if search_cfg.mode == ripvec_core::hybrid::SearchMode::Keyword {
+            tracing::info!("keyword mode selected; skipping query embedding");
             vec![0.0f32; hybrid.semantic.hidden_dim]
         } else {
+            tracing::info!("embedding query");
             let enc = ripvec_core::tokenize::tokenize_query(
                 &args.query,
                 tokenizer,
@@ -577,6 +640,14 @@ fn run_oneshot(
         } else {
             corpus_size
         };
+        tracing::info!(
+            corpus_size,
+            requested_top_k = args.top_k,
+            effective_top_k,
+            threshold = args.threshold,
+            mode = ?search_cfg.mode,
+            "ranking search results"
+        );
         let ranked = hybrid.search(
             &query_embedding,
             &args.query,
@@ -652,4 +723,18 @@ fn run_oneshot(
     output::print_results(&results, &args.format);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::log_level_from_verbosity;
+
+    #[test]
+    fn verbosity_maps_to_increasing_log_levels() {
+        assert_eq!(log_level_from_verbosity(0), None);
+        assert_eq!(log_level_from_verbosity(1), Some("info"));
+        assert_eq!(log_level_from_verbosity(2), Some("debug"));
+        assert_eq!(log_level_from_verbosity(3), Some("trace"));
+        assert_eq!(log_level_from_verbosity(9), Some("trace"));
+    }
 }

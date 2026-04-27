@@ -11,11 +11,12 @@
 
 use std::path::Path;
 
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use ripvec_core::backend::{BackendKind, DeviceHint, EmbedBackend, Encoding};
 use ripvec_core::chunk::ChunkConfig;
 use ripvec_core::embed::{DEFAULT_BATCH_SIZE, SearchConfig};
 use ripvec_core::profile::Profiler;
+use std::hint::black_box;
 
 const MODEL_REPO: &str = "BAAI/bge-small-en-v1.5";
 

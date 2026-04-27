@@ -740,7 +740,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     #[ignore = "requires model download (~570MB)"]
+    #[expect(clippy::too_many_lines, reason = "end-to-end backend diagnostic test")]
     fn modernbert_loads_and_embeds() {
+        use crate::backend::arch::ModelArch;
         use crate::backend::driver::Driver;
 
         let backend = load_modernbert_metal("nomic-ai/modernbert-embed-base").expect("load failed");
@@ -754,7 +756,7 @@ mod tests {
 
         // Stage-by-stage diagnostic using the driver directly
         let driver = crate::backend::driver::metal::MetalDriver::new().unwrap();
-        let inputs = driver.prepare_batch(&[enc.clone()], 8).unwrap();
+        let inputs = driver.prepare_batch(std::slice::from_ref(&enc), 8).unwrap();
 
         // Check: can we read back input_ids?
         let ids_host = driver.to_host(&inputs.input_ids, 1, 8).unwrap();
@@ -839,7 +841,7 @@ mod tests {
         eprintln!("STAGE 3 - Q after split: {nz}/{} nonzero", total * hd);
 
         // Attention scores
-        let mut scores = driver.alloc_zeros(1 * nh * 8 * 8).unwrap();
+        let mut scores = driver.alloc_zeros(nh * 8 * 8).unwrap();
         driver
             .gemm_batched(
                 &q,
@@ -860,14 +862,13 @@ mod tests {
         eprintln!("STAGE 4 - scores: {nz}/{} nonzero", nh * 8 * 8);
 
         // Full forward pass
-        use crate::backend::arch::ModelArch;
         let enc2 = Encoding {
             input_ids: vec![1, 100, 200, 300, 2],
             attention_mask: vec![1; 5],
             token_type_ids: vec![0; 5],
         };
 
-        let quick = arch.forward(&driver, &[enc2.clone()]).unwrap();
+        let quick = arch.forward(&driver, std::slice::from_ref(&enc2)).unwrap();
         let l2: f32 = quick[0].iter().map(|x| x * x).sum::<f32>().sqrt();
         let nz = quick[0].iter().filter(|&&v| v.abs() > 1e-10).count();
         eprintln!(
@@ -877,7 +878,7 @@ mod tests {
 
         // MRL truncation
         eprintln!("\n=== ModernBERT MRL Truncation ===");
-        let full = arch.forward(&driver, &[enc2.clone()]).unwrap();
+        let full = arch.forward(&driver, std::slice::from_ref(&enc2)).unwrap();
         let full_emb = &full[0];
         for dims in [64, 128, 256, 384, 512, 768] {
             let t: Vec<f32> = full_emb[..dims].to_vec();
@@ -905,7 +906,7 @@ mod tests {
             let len = 16 + (i * 4); // 16 to 140 tokens
             let mut ids = vec![1_i64]; // CLS
             for j in 1..len - 1 {
-                ids.push(100 + j as i64);
+                ids.push(100 + i64::from(j));
             }
             ids.push(2); // SEP
             encs.push(Encoding {
@@ -1024,7 +1025,7 @@ mod tests {
             let len = 16 + (i * 4); // 16 to 140 tokens
             let mut ids = vec![101_i64]; // [CLS]
             for j in 1..len - 1 {
-                ids.push(100 + j as i64);
+                ids.push(100 + i64::from(j));
             }
             ids.push(102); // [SEP]
             encs.push(Encoding {

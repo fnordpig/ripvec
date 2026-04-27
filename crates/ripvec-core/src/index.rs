@@ -13,6 +13,14 @@ use ndarray::{Array1, Array2};
 use crate::chunk::CodeChunk;
 use crate::turbo_quant::{CompressedCorpus, PolarCodec};
 
+/// Minimum corpus size before building TurboQuant compression.
+///
+/// TurboQuant pays a fixed setup cost to generate a 768×768 rotation matrix and
+/// encode the corpus. That cost is only worthwhile at larger corpus sizes; for
+/// small projects exact BLAS ranking is faster and avoids long index-build
+/// pauses.
+const TURBOQUANT_MIN_CHUNKS: usize = 4096;
+
 /// Pre-computed embedding matrix for fast re-ranking.
 ///
 /// Stores all chunk embeddings as a contiguous `[num_chunks, hidden_dim]`
@@ -123,15 +131,28 @@ impl SearchIndex {
             trunc
         });
 
-        // Compress embeddings with PolarQuant (4-bit).
+        // Compress embeddings with PolarQuant (4-bit) only when the corpus is
+        // large enough to amortize the fixed rotation/encoding setup cost.
         // At 768-dim: ~1920 bytes/vector vs 3072 FP32. 8× compression with bit-packing.
-        let compressed = if hidden_dim >= 64 && hidden_dim.is_multiple_of(2) {
-            let codec = PolarCodec::new(hidden_dim, 4, 42);
-            let corpus = codec.encode_batch(&embeddings);
-            Some(CompressedIndex { codec, corpus })
-        } else {
-            None
-        };
+        let compressed =
+            if n >= TURBOQUANT_MIN_CHUNKS && hidden_dim >= 64 && hidden_dim.is_multiple_of(2) {
+                tracing::info!(
+                    chunks = n,
+                    hidden_dim,
+                    "building TurboQuant compressed index"
+                );
+                let codec = PolarCodec::new(hidden_dim, 4, 42);
+                let corpus = codec.encode_batch(&embeddings);
+                Some(CompressedIndex { codec, corpus })
+            } else {
+                tracing::debug!(
+                    chunks = n,
+                    hidden_dim,
+                    min_chunks = TURBOQUANT_MIN_CHUNKS,
+                    "skipping TurboQuant compression for small corpus"
+                );
+                None
+            };
 
         Self {
             chunks,
@@ -377,6 +398,16 @@ mod tests {
         assert_eq!(index.len(), 3);
         assert_eq!(index.hidden_dim, 3);
         assert!(!index.is_empty());
+    }
+
+    #[test]
+    fn small_corpus_skips_turboquant_compression() {
+        let chunks = vec![dummy_chunk("a"), dummy_chunk("b")];
+        let embeddings = vec![vec![0.0; 768], vec![1.0; 768]];
+
+        let index = SearchIndex::new(chunks, &embeddings, None);
+
+        assert!(index.compressed.is_none());
     }
 
     #[test]

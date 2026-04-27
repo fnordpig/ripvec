@@ -444,7 +444,7 @@ mod tests {
         boost_with_pagerank(&mut results, &chunks, &pr, 0.3);
 
         // Zero score stays zero regardless of PageRank
-        assert_eq!(results[0].1, 0.0);
+        assert!(results[0].1.abs() < f32::EPSILON);
     }
 
     #[test]
@@ -465,6 +465,6 @@ mod tests {
         boost_with_pagerank(&mut results, &chunks, &pr, 0.3);
 
         // No PageRank data → no boost
-        assert_eq!(results[0].1, 0.5);
+        assert!((results[0].1 - 0.5).abs() < f32::EPSILON);
     }
 }

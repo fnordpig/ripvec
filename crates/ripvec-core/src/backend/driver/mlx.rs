@@ -1150,6 +1150,7 @@ mod tests {
 
     /// Verify that the MlxDriver can be constructed.
     #[test]
+    #[ignore = "requires MLX/Metal runtime"]
     fn mlx_driver_creates() {
         let driver = MlxDriver::new().unwrap();
         let zeros = driver.alloc_zeros(16).unwrap();
@@ -1195,8 +1196,12 @@ mod tests {
             token_type_ids: vec![0, 0, 0, 0, 0, 0],
         };
 
-        let driver_result = driver_backend.embed_batch(&[enc.clone()]).unwrap();
-        let mono_result = mono_backend.embed_batch(&[enc]).unwrap();
+        let driver_result = driver_backend
+            .embed_batch(std::slice::from_ref(&enc))
+            .unwrap();
+        let mono_result = mono_backend
+            .embed_batch(std::slice::from_ref(&enc))
+            .unwrap();
 
         let cosine: f32 = driver_result[0]
             .iter()
