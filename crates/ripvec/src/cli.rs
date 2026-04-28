@@ -3,7 +3,7 @@
 use clap::Parser;
 
 /// Semantic code search — like ripgrep but for meaning.
-#[derive(Parser, Debug)]
+#[derive(Parser, Clone, Debug)]
 #[command(name = "ripvec", version, about)]
 #[expect(
     clippy::struct_excessive_bools,

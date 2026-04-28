@@ -427,6 +427,7 @@ fn embed_all_streaming(
             let noop = crate::profile::Profiler::noop();
             match embed_distributed(&opt_encodings, backends, bs, &noop) {
                 Ok(batch_embeddings) => {
+                    profiler.embedding_batch(&batch_embeddings);
                     cumulative_done += batch_len;
                     // Byte-based progress: total_bytes known from walk, bytes_chunked
                     // tracks how much source data has been processed through the pipeline.
@@ -637,6 +638,7 @@ impl DistributedState<'_> {
 
             match backend.embed_batch(&valid) {
                 Ok(batch_embeddings) => {
+                    self.profiler.embedding_batch(&batch_embeddings);
                     for (idx, emb) in valid_indices.into_iter().zip(batch_embeddings) {
                         results.push((idx, emb));
                     }

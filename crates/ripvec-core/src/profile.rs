@@ -38,6 +38,9 @@ pub struct EmbedProgress {
 /// Callback for per-batch embed progress.
 type EmbedTickCallback = Box<dyn Fn(&EmbedProgress) + Send + Sync>;
 
+/// Callback for observing completed embedding vectors.
+type EmbeddingBatchCallback = Box<dyn Fn(&[Vec<f32>]) + Send + Sync>;
+
 #[expect(
     clippy::large_enum_variant,
     reason = "Active is the common case; Noop is only for --profile=false"
@@ -61,6 +64,8 @@ pub enum Profiler {
         on_progress: Option<ProgressCallback>,
         /// Optional callback for per-chunk embed progress (drives progress bars).
         on_embed_tick: Option<EmbedTickCallback>,
+        /// Optional callback for completed embedding vectors.
+        on_embedding_batch: Option<EmbeddingBatchCallback>,
     },
     /// No-op profiler. All methods are empty.
     Noop,
@@ -107,6 +112,7 @@ impl Profiler {
                 chunk_counts: Mutex::new(Vec::new()),
                 on_progress: None,
                 on_embed_tick: None,
+                on_embedding_batch: None,
             }
         } else {
             Self::Noop
@@ -125,6 +131,7 @@ impl Profiler {
             chunk_counts: Mutex::new(Vec::new()),
             on_progress: Some(Box::new(cb)),
             on_embed_tick: None,
+            on_embedding_batch: None,
         }
     }
 
@@ -142,6 +149,36 @@ impl Profiler {
             *on_embed_tick = Some(Box::new(cb));
         }
         self
+    }
+
+    /// Set a callback that receives each completed embedding batch.
+    #[must_use]
+    pub fn with_embedding_batch(
+        mut self,
+        cb: impl Fn(&[Vec<f32>]) + Send + Sync + 'static,
+    ) -> Self {
+        if let Self::Active {
+            ref mut on_embedding_batch,
+            ..
+        } = self
+        {
+            *on_embedding_batch = Some(Box::new(cb));
+        }
+        self
+    }
+
+    /// Notify observers that a batch of embeddings is available.
+    pub fn embedding_batch(&self, embeddings: &[Vec<f32>]) {
+        if embeddings.is_empty() {
+            return;
+        }
+        if let Self::Active {
+            on_embedding_batch, ..
+        } = self
+            && let Some(cb) = on_embedding_batch
+        {
+            cb(embeddings);
+        }
     }
 
     /// Create a no-op profiler.
@@ -582,5 +619,20 @@ mod tests {
         p.embed_begin(0);
         p.embed_done();
         // Should print "skipped" line, not divide by zero
+    }
+
+    #[test]
+    fn embedding_batch_callback_receives_embeddings() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let seen_for_cb = seen.clone();
+        let p = Profiler::with_callback(Duration::from_secs(10), |_| {}).with_embedding_batch(
+            move |batch| {
+                *seen_for_cb.lock().unwrap() += batch.len();
+            },
+        );
+
+        p.embedding_batch(&[vec![1.0, 0.0], vec![0.0, 1.0]]);
+
+        assert_eq!(*seen.lock().unwrap(), 2);
     }
 }
