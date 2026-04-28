@@ -33,6 +33,7 @@ tree-sitter-toml-ng.workspace = true
 tree-sitter-json.workspace = true
 tree-sitter-yaml.workspace = true
 tree-sitter-md.workspace = true
+tree-sitter-xml.workspace = true
 rayon.workspace = true
 ignore.workspace = true
 fd-lock.workspace = true

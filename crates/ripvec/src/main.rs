@@ -448,11 +448,13 @@ fn build_index_for_dashboard(
     let profiler_sink = (*sink).clone();
     let tick_sink = (*sink).clone();
     let embedding_sink = (*sink).clone();
+    let chunk_sink = (*sink).clone();
     let profiler = ripvec_core::profile::Profiler::with_callback(
         std::time::Duration::from_secs_f64(args.profile_interval),
         move |msg| profiler_sink.profiler_message(msg),
     )
     .with_embed_tick(move |progress| tick_sink.embed_tick(progress))
+    .with_chunk_batch(move |chunks| chunk_sink.chunks(chunks))
     .with_embedding_batch(move |embeddings| embedding_sink.embeddings(embeddings));
 
     profiler.header(env!("CARGO_PKG_VERSION"), &model_repo, threads, cores);
@@ -486,6 +488,7 @@ fn build_index_for_dashboard(
     .context("incremental index failed")?;
     profiler.finish();
 
+    sink.chunk_snapshot(index.chunks());
     let index_summary = build_index_summary(index.chunks());
 
     Ok(index_tui::IndexBuild {

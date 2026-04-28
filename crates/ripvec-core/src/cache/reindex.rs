@@ -203,20 +203,10 @@ fn incremental_path(
                 continue;
             };
 
-            let ext = dirty_path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
-            let chunks = if cfg.text_mode {
-                crate::chunk::chunk_text(dirty_path, &source, &cfg.chunk)
-            } else {
-                match crate::languages::config_for_extension(ext) {
-                    Some(lang_config) => {
-                        crate::chunk::chunk_file(dirty_path, &source, &lang_config, &cfg.chunk)
-                    }
-                    None => crate::chunk::chunk_text(dirty_path, &source, &cfg.chunk),
-                }
-            };
+            let chunks =
+                crate::chunk::chunk_source_for_path(dirty_path, &source, cfg.text_mode, &cfg.chunk);
+            profiler.chunk_thread_report(chunks.len());
+            profiler.chunk_batch(&chunks);
 
             if chunks.is_empty() {
                 tracing::debug!(file = %relative, "dirty file produced no chunks");

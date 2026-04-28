@@ -4,7 +4,7 @@
 //! the indexing pipeline in a worker thread and renders live progress, cached
 //! tracing events, and profiler status in the alternate screen.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -22,12 +22,13 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::symbols;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    BarChart, Block, Borders, Gauge, LineGauge, List, ListItem, Paragraph, Scrollbar,
-    ScrollbarOrientation, ScrollbarState, Sparkline, Wrap,
+    Block, Borders, Gauge, LineGauge, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Sparkline, Wrap,
 };
 use ratatui::{Frame, Terminal};
 use ripvec_core::backend::EmbedBackend;
 use ripvec_core::cache::reindex::ReindexStats;
+use ripvec_core::chunk::CodeChunk;
 use ripvec_core::hybrid::HybridIndex;
 use ripvec_core::profile::EmbedProgress;
 
@@ -113,6 +114,19 @@ pub struct EmbeddingPoint {
     pub y: f64,
     /// Projected third axis in `[0, 1]`, used as color temperature.
     pub z: f64,
+}
+
+/// Aggregated classification for chunks discovered during indexing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChunkClassDelta {
+    /// Language or document family.
+    pub family: String,
+    /// Source of the chunk boundary.
+    pub kind: String,
+    /// Whether the chunk came from a structured parser instead of raw text windows.
+    pub semantic: bool,
+    /// Number of chunks in this class.
+    pub count: usize,
 }
 
 impl LogLine {
@@ -237,6 +251,10 @@ pub enum DashboardEvent {
     Phase(String),
     /// Per-batch embedding progress.
     EmbedTick(EmbedProgress),
+    /// Chunk classifications observed live while files are parsed.
+    ChunkClasses(Vec<ChunkClassDelta>),
+    /// Final chunk classifications replacing live observations.
+    ChunkClassSnapshot(Vec<ChunkClassDelta>),
     /// Newly embedded vectors projected into atlas space.
     Embeddings(Vec<EmbeddingPoint>),
     /// Indexing finished or failed.
@@ -281,6 +299,20 @@ impl EventSink {
             .send(DashboardEvent::EmbedTick(progress.clone()));
     }
 
+    /// Send source chunk classification deltas.
+    pub fn chunks(&self, chunks: &[CodeChunk]) {
+        let deltas = chunk_class_deltas(chunks);
+        if !deltas.is_empty() {
+            let _ = self.sender.send(DashboardEvent::ChunkClasses(deltas));
+        }
+    }
+
+    /// Replace live classification observations with the final index corpus.
+    pub fn chunk_snapshot(&self, chunks: &[CodeChunk]) {
+        let deltas = chunk_class_deltas(chunks);
+        let _ = self.sender.send(DashboardEvent::ChunkClassSnapshot(deltas));
+    }
+
     /// Project and send completed embedding vectors.
     pub fn embeddings(&self, embeddings: &[Vec<f32>]) {
         let points: Vec<_> = embeddings
@@ -319,12 +351,80 @@ pub enum DashboardOutcome {
     Search(IndexBuild),
 }
 
+#[derive(Default)]
+struct CorpusMix {
+    counts: BTreeMap<(String, String, bool), usize>,
+}
+
+impl CorpusMix {
+    fn apply(&mut self, deltas: Vec<ChunkClassDelta>) {
+        for delta in deltas {
+            *self
+                .counts
+                .entry((delta.family, delta.kind, delta.semantic))
+                .or_default() += delta.count;
+        }
+    }
+
+    fn replace(&mut self, deltas: Vec<ChunkClassDelta>) {
+        self.counts.clear();
+        self.apply(deltas);
+    }
+
+    fn total_chunks(&self) -> usize {
+        self.counts.values().sum()
+    }
+
+    fn render_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let total = self.total_chunks();
+        if total == 0 {
+            return vec![
+                Line::from("waiting for tree-sitter classifications...".light_cyan()),
+                Line::from(""),
+                Line::from("The left pane updates as source files are parsed."),
+                Line::from("Text fallback chunks are counted alongside semantic chunks."),
+            ];
+        }
+
+        let mut entries: Vec<_> = self
+            .counts
+            .iter()
+            .map(|((family, kind, semantic), count)| {
+                (family.as_str(), kind.as_str(), *semantic, *count)
+            })
+            .collect();
+        entries.sort_by_key(|(_, _, _, count)| std::cmp::Reverse(*count));
+
+        let bar_width = usize::from(width).saturating_sub(30).clamp(6, 28);
+        let mut lines = vec![Line::from(vec![
+            Span::styled("corpus mix ", Style::default().fg(Color::LightCyan)),
+            Span::raw(format!("{total} chunks observed")),
+        ])];
+
+        for (family, kind, semantic, count) in entries.into_iter().take(10) {
+            let filled = ((count * bar_width) + (total / 2)) / total;
+            let empty = bar_width.saturating_sub(filled);
+            let color = family_color(family, semantic);
+            lines.push(Line::from(vec![
+                Span::styled(format!("{family:<10}"), Style::default().fg(color)),
+                Span::raw(" "),
+                Span::styled("█".repeat(filled.max(1)), Style::default().fg(color)),
+                Span::styled("░".repeat(empty), Style::default().fg(Color::DarkGray)),
+                Span::raw(format!(" {count:>5} {kind}")),
+            ]));
+        }
+
+        lines
+    }
+}
+
 struct App {
     config: DashboardConfig,
     phase: String,
     started: Instant,
     embed: Option<EmbedProgress>,
     rates: Vec<u64>,
+    corpus_mix: CorpusMix,
     embedding_points: Vec<EmbeddingPoint>,
     log_level: LogLevel,
     log_scroll: usize,
@@ -344,6 +444,7 @@ impl App {
             started: Instant::now(),
             embed: None,
             rates: Vec::new(),
+            corpus_mix: CorpusMix::default(),
             embedding_points: Vec::new(),
             log_level: LogLevel::Info,
             log_scroll: 0,
@@ -367,6 +468,8 @@ impl App {
                 }
                 self.embed = Some(progress);
             }
+            DashboardEvent::ChunkClasses(deltas) => self.corpus_mix.apply(deltas),
+            DashboardEvent::ChunkClassSnapshot(deltas) => self.corpus_mix.replace(deltas),
             DashboardEvent::Embeddings(mut points) => {
                 self.embedding_points.append(&mut points);
                 let excess = self.embedding_points.len().saturating_sub(MAX_ATLAS_POINTS);
@@ -588,40 +691,94 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_stats(frame: &mut Frame, app: &App, area: Rect) {
-    let Some(build) = app.done.as_ref() else {
-        let text = vec![
-            Line::from("waiting for cache topology...".light_cyan()),
-            Line::from(""),
-            Line::from(
-                "The dashboard is live before model load, cache diff, chunking, embedding, and index finalization.",
-            ),
-        ];
-        frame.render_widget(
-            Paragraph::new(text)
-                .wrap(Wrap { trim: true })
-                .block(Block::bordered().title("corpus")),
-            area,
-        );
-        return;
-    };
+    let mut text = app.corpus_mix.render_lines(area.width);
+    if let Some(build) = app.done.as_ref() {
+        text.push(Line::from(""));
+        text.push(Line::from(format!(
+            "cache: {} changed │ {} cached │ {} deleted",
+            build.stats.files_changed, build.stats.files_unchanged, build.stats.files_deleted
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: true })
+            .block(Block::bordered().title("tree-sitter corpus")),
+        area,
+    );
+}
 
-    let stats = &build.stats;
-    let data = [
-        ("dirty", stats.files_changed as u64),
-        ("cached", stats.files_unchanged as u64),
-        ("gone", stats.files_deleted as u64),
-        ("chunks", stats.chunks_reembedded as u64),
-    ];
-    let chart = BarChart::default()
-        .block(Block::bordered().title("cache delta"))
-        .data(&data)
-        .bar_width(7)
-        .bar_gap(1)
-        .bar_set(symbols::bar::NINE_LEVELS)
-        .value_style(Style::default().fg(Color::Black).bg(Color::LightGreen))
-        .bar_style(Style::default().fg(Color::LightCyan))
-        .label_style(Style::default().fg(Color::Gray));
-    frame.render_widget(chart, area);
+fn chunk_class_deltas(chunks: &[CodeChunk]) -> Vec<ChunkClassDelta> {
+    let mut counts: BTreeMap<(&'static str, &'static str, bool), usize> = BTreeMap::new();
+    for chunk in chunks {
+        let family = chunk_family(&chunk.file_path);
+        let (kind, semantic) = chunk_boundary_kind(&chunk.kind);
+        *counts.entry((family, kind, semantic)).or_default() += 1;
+    }
+
+    counts
+        .into_iter()
+        .map(|((family, kind, semantic), count)| ChunkClassDelta {
+            family: family.to_string(),
+            kind: kind.to_string(),
+            semantic,
+            count,
+        })
+        .collect()
+}
+
+fn chunk_family(path: &str) -> &'static str {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "rs" => "Rust",
+        "py" | "pyi" => "Python",
+        "js" | "jsx" => "JavaScript",
+        "ts" | "tsx" => "TypeScript",
+        "go" => "Go",
+        "java" => "Java",
+        "c" | "h" => "C",
+        "cpp" | "cc" | "cxx" | "hpp" => "C++",
+        "sh" | "bash" | "bats" => "Shell",
+        "rb" => "Ruby",
+        "tf" | "tfvars" | "hcl" => "HCL",
+        "kt" | "kts" => "Kotlin",
+        "swift" => "Swift",
+        "scala" => "Scala",
+        "toml" => "TOML",
+        "json" => "JSON",
+        "yaml" | "yml" => "YAML",
+        "md" => "Markdown",
+        "rdf" | "owl" => "RDF/OWL",
+        "xml" => "XML",
+        "ttl" | "nt" | "n3" | "trig" | "nq" => "RDF Text",
+        _ => "Text",
+    }
+}
+
+fn chunk_boundary_kind(kind: &str) -> (&'static str, bool) {
+    match kind {
+        "file" | "window" => ("text windows", false),
+        "rdf_statements" => ("rdf statements", true),
+        _ => ("tree-sitter", true),
+    }
+}
+
+fn family_color(family: &str, semantic: bool) -> Color {
+    if !semantic {
+        return Color::Gray;
+    }
+    match family {
+        "Rust" => Color::LightRed,
+        "Python" => Color::LightYellow,
+        "JavaScript" | "TypeScript" => Color::Yellow,
+        "RDF/OWL" | "RDF Text" | "XML" => Color::LightMagenta,
+        "Markdown" | "Text" => Color::LightBlue,
+        "JSON" | "YAML" | "TOML" | "HCL" => Color::LightGreen,
+        _ => Color::LightCyan,
+    }
 }
 
 fn draw_field(frame: &mut Frame, app: &App, area: Rect) {
@@ -981,10 +1138,12 @@ pub fn phase_from_profile_message(message: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        EmbeddingPoint, LogLevel, LogLine, heatmap_cell_char, heatmap_color, heatmap_lines,
+        ChunkClassDelta, CorpusMix, DashboardEvent, EmbeddingPoint, EventSink, LogBuffer, LogLevel,
+        LogLine, chunk_class_deltas, heatmap_cell_char, heatmap_color, heatmap_lines,
         phase_from_profile_message, project_embedding, visible_log_lines,
     };
     use ratatui::style::Color;
+    use ripvec_core::chunk::CodeChunk;
 
     #[test]
     fn verbosity_cycles_through_all_levels() {
@@ -1087,5 +1246,68 @@ mod tests {
         assert_ne!(heatmap_color(0.5), Color::LightRed);
         assert_ne!(heatmap_color(1.0), Color::Red);
         assert_ne!(heatmap_color(1.0), Color::LightRed);
+    }
+
+    fn make_chunk(path: &str, kind: &str) -> CodeChunk {
+        CodeChunk {
+            file_path: path.to_string(),
+            name: "sample".to_string(),
+            kind: kind.to_string(),
+            start_line: 1,
+            end_line: 1,
+            content: String::new(),
+            enriched_content: String::new(),
+        }
+    }
+
+    #[test]
+    fn chunk_classification_groups_tree_sitter_and_text_chunks() {
+        let chunks = vec![
+            make_chunk("src/lib.rs", "function_item"),
+            make_chunk("ontology/schema.owl", "element"),
+            make_chunk("README.txt", "window"),
+        ];
+
+        let mut mix = CorpusMix::default();
+        mix.apply(chunk_class_deltas(&chunks));
+        let rendered = mix
+            .render_lines(48)
+            .into_iter()
+            .flat_map(|line| line.spans.into_iter())
+            .map(|span| span.content.into_owned())
+            .fold(String::new(), |mut rendered, span| {
+                rendered.push_str(&span);
+                rendered
+            });
+
+        assert_eq!(mix.total_chunks(), 3);
+        assert!(rendered.contains("Rust"));
+        assert!(rendered.contains("RDF/OWL"));
+        assert!(rendered.contains("Text"));
+        assert!(rendered.contains("tree-sitter"));
+        assert!(rendered.contains("text windows"));
+    }
+
+    #[test]
+    fn event_sink_sends_chunk_class_deltas() {
+        let logs = LogBuffer::new(8);
+        let (sink, receiver) = EventSink::channel(logs);
+
+        sink.chunks(&[make_chunk("ontology/schema.rdf", "element")]);
+
+        match receiver.try_recv().expect("chunk event should be sent") {
+            DashboardEvent::ChunkClasses(deltas) => {
+                assert_eq!(
+                    deltas,
+                    vec![ChunkClassDelta {
+                        family: "RDF/OWL".to_string(),
+                        kind: "tree-sitter".to_string(),
+                        semantic: true,
+                        count: 1,
+                    }]
+                );
+            }
+            _ => panic!("expected ChunkClasses event"),
+        }
     }
 }

@@ -323,6 +323,200 @@ pub fn chunk_text(path: &Path, source: &str, chunk_config: &ChunkConfig) -> Vec<
     sliding_windows(path, source, chunk_config)
 }
 
+/// Return true for RDF-family text formats without a stable Rust tree-sitter grammar.
+#[must_use]
+pub fn is_rdf_text_extension(ext: &str) -> bool {
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "ttl" | "nt" | "n3" | "trig" | "nq"
+    )
+}
+
+/// Chunk Turtle/N-Triples/TriG/N-Quads style RDF by statement blocks.
+///
+/// RDF text formats are denser than prose but often lack a mature packaged
+/// tree-sitter grammar. This keeps prefixes together and groups multi-line
+/// subject statements ending in `.` so ontology classes and predicates remain
+/// intact for embedding.
+#[must_use]
+pub fn chunk_rdf_text(path: &Path, source: &str, chunk_config: &ChunkConfig) -> Vec<CodeChunk> {
+    if source.trim().is_empty() {
+        return vec![];
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_start_line = 1usize;
+    let mut current_is_directive = false;
+
+    for (line_idx, line) in source.lines().enumerate() {
+        let line_no = line_idx + 1;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            flush_rdf_block(
+                path,
+                &current,
+                current_start_line,
+                chunk_config,
+                &mut chunks,
+            );
+            current.clear();
+            current_is_directive = false;
+            continue;
+        }
+
+        let line_is_directive = is_rdf_directive(trimmed);
+        if !current.is_empty() && current_is_directive && !line_is_directive {
+            flush_rdf_block(
+                path,
+                &current,
+                current_start_line,
+                chunk_config,
+                &mut chunks,
+            );
+            current.clear();
+            current_is_directive = false;
+        }
+
+        if current.is_empty() {
+            current_start_line = line_no;
+            current_is_directive = line_is_directive;
+        }
+        current.push_str(line);
+        current.push('\n');
+
+        if !current_is_directive && trimmed.ends_with('.') {
+            flush_rdf_block(
+                path,
+                &current,
+                current_start_line,
+                chunk_config,
+                &mut chunks,
+            );
+            current.clear();
+            current_is_directive = false;
+        }
+    }
+
+    flush_rdf_block(
+        path,
+        &current,
+        current_start_line,
+        chunk_config,
+        &mut chunks,
+    );
+    if chunks.is_empty() {
+        sliding_windows(path, source, chunk_config)
+    } else {
+        chunks
+    }
+}
+
+/// Chunk a source file according to its path extension.
+#[must_use]
+pub fn chunk_source_for_path(
+    path: &Path,
+    source: &str,
+    text_mode: bool,
+    chunk_config: &ChunkConfig,
+) -> Vec<CodeChunk> {
+    if text_mode {
+        return chunk_text(path, source, chunk_config);
+    }
+
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if let Some(lang_config) = crate::languages::config_for_extension(ext) {
+        chunk_file(path, source, &lang_config, chunk_config)
+    } else if is_rdf_text_extension(ext) {
+        chunk_rdf_text(path, source, chunk_config)
+    } else {
+        chunk_text(path, source, chunk_config)
+    }
+}
+
+fn is_rdf_directive(trimmed: &str) -> bool {
+    trimmed.starts_with("@prefix")
+        || trimmed.starts_with("@base")
+        || trimmed.starts_with("PREFIX")
+        || trimmed.starts_with("BASE")
+}
+
+fn flush_rdf_block(
+    path: &Path,
+    content: &str,
+    start_line: usize,
+    chunk_config: &ChunkConfig,
+    chunks: &mut Vec<CodeChunk>,
+) {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let name = rdf_block_name(trimmed, path);
+    let content = format!("{trimmed}\n");
+    if content.len() > chunk_config.max_chunk_bytes {
+        chunks.extend(sliding_window_chunks(
+            &content,
+            path,
+            &name,
+            start_line,
+            chunk_config,
+        ));
+        return;
+    }
+    let header = format!("# {} | rdf: {name}\n", path.display());
+    let enriched_content = if header.len() + content.len() <= chunk_config.max_chunk_bytes {
+        format!("{header}{content}")
+    } else {
+        content.clone()
+    };
+    let line_count = content.lines().count().max(1);
+    chunks.push(CodeChunk {
+        file_path: path.display().to_string(),
+        name,
+        kind: "rdf_statements".to_string(),
+        start_line,
+        end_line: start_line + line_count - 1,
+        enriched_content,
+        content,
+    });
+}
+
+fn rdf_block_name(content: &str, path: &Path) -> String {
+    let first = content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'));
+    let Some(first) = first else {
+        return path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+    };
+
+    if first.starts_with("@prefix") || first.starts_with("PREFIX") {
+        return "@prefix".to_string();
+    }
+    if first.starts_with("@base") || first.starts_with("BASE") {
+        return "@base".to_string();
+    }
+
+    let token = first
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_end_matches([';', ',', '.']);
+    if token.is_empty() {
+        path.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string()
+    } else {
+        token.to_string()
+    }
+}
+
 /// Internal sliding-window implementation.
 fn sliding_windows(path: &Path, source: &str, chunk_config: &ChunkConfig) -> Vec<CodeChunk> {
     if source.trim().is_empty() {
@@ -693,6 +887,64 @@ mod tests {
                 "sliding window chunks should have enriched_content == content"
             );
         }
+    }
+
+    #[test]
+    fn chunks_rdf_xml_and_owl_elements_with_tree_sitter() {
+        let source = r#"<?xml version="1.0"?>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+         xmlns:owl="http://www.w3.org/2002/07/owl#">
+  <owl:Class rdf:about="http://example.com/Person"/>
+  <owl:ObjectProperty rdf:about="http://example.com/knows"/>
+</rdf:RDF>"#;
+        let rdf_config = crate::languages::config_for_extension("rdf").unwrap();
+        let owl_config = crate::languages::config_for_extension("owl").unwrap();
+
+        let rdf_chunks = chunk_file(
+            Path::new("ontology.rdf"),
+            source,
+            &rdf_config,
+            &ChunkConfig::default(),
+        );
+        let owl_chunks = chunk_file(
+            Path::new("ontology.owl"),
+            source,
+            &owl_config,
+            &ChunkConfig::default(),
+        );
+
+        assert!(rdf_chunks.iter().any(|chunk| chunk.name == "owl:Class"));
+        assert!(
+            rdf_chunks
+                .iter()
+                .any(|chunk| chunk.name == "owl:ObjectProperty")
+        );
+        assert!(rdf_chunks.iter().all(|chunk| chunk.kind == "element"));
+        assert!(owl_chunks.iter().any(|chunk| chunk.name == "owl:Class"));
+    }
+
+    #[test]
+    fn chunks_turtle_by_rdf_statement_blocks() {
+        let source = r#"@prefix ex: <http://example.com/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+
+ex:Person
+  a owl:Class ;
+  ex:label "Person" .
+
+ex:knows
+  a owl:ObjectProperty ;
+  ex:domain ex:Person ;
+  ex:range ex:Person .
+"#;
+
+        let chunks = chunk_rdf_text(Path::new("ontology.ttl"), source, &ChunkConfig::default());
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].kind, "rdf_statements");
+        assert_eq!(chunks[0].name, "@prefix");
+        assert_eq!(chunks[1].name, "ex:Person");
+        assert_eq!(chunks[2].name, "ex:knows");
     }
 
     #[test]

@@ -8,6 +8,8 @@ use std::cell::Cell;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::chunk::CodeChunk;
+
 /// Pipeline profiler that prints phase timing to stderr.
 ///
 /// Use [`Profiler::new`] to create an active or noop profiler based on
@@ -41,6 +43,9 @@ type EmbedTickCallback = Box<dyn Fn(&EmbedProgress) + Send + Sync>;
 /// Callback for observing completed embedding vectors.
 type EmbeddingBatchCallback = Box<dyn Fn(&[Vec<f32>]) + Send + Sync>;
 
+/// Callback for observing source chunks as they are discovered.
+type ChunkBatchCallback = Box<dyn Fn(&[CodeChunk]) + Send + Sync>;
+
 #[expect(
     clippy::large_enum_variant,
     reason = "Active is the common case; Noop is only for --profile=false"
@@ -66,6 +71,8 @@ pub enum Profiler {
         on_embed_tick: Option<EmbedTickCallback>,
         /// Optional callback for completed embedding vectors.
         on_embedding_batch: Option<EmbeddingBatchCallback>,
+        /// Optional callback for chunks discovered by the chunking stage.
+        on_chunk_batch: Option<ChunkBatchCallback>,
     },
     /// No-op profiler. All methods are empty.
     Noop,
@@ -113,6 +120,7 @@ impl Profiler {
                 on_progress: None,
                 on_embed_tick: None,
                 on_embedding_batch: None,
+                on_chunk_batch: None,
             }
         } else {
             Self::Noop
@@ -132,6 +140,7 @@ impl Profiler {
             on_progress: Some(Box::new(cb)),
             on_embed_tick: None,
             on_embedding_batch: None,
+            on_chunk_batch: None,
         }
     }
 
@@ -167,6 +176,19 @@ impl Profiler {
         self
     }
 
+    /// Set a callback that receives chunks as source files are parsed.
+    #[must_use]
+    pub fn with_chunk_batch(mut self, cb: impl Fn(&[CodeChunk]) + Send + Sync + 'static) -> Self {
+        if let Self::Active {
+            ref mut on_chunk_batch,
+            ..
+        } = self
+        {
+            *on_chunk_batch = Some(Box::new(cb));
+        }
+        self
+    }
+
     /// Notify observers that a batch of embeddings is available.
     pub fn embedding_batch(&self, embeddings: &[Vec<f32>]) {
         if embeddings.is_empty() {
@@ -178,6 +200,18 @@ impl Profiler {
             && let Some(cb) = on_embedding_batch
         {
             cb(embeddings);
+        }
+    }
+
+    /// Notify observers that a batch of source chunks is available.
+    pub fn chunk_batch(&self, chunks: &[CodeChunk]) {
+        if chunks.is_empty() {
+            return;
+        }
+        if let Self::Active { on_chunk_batch, .. } = self
+            && let Some(cb) = on_chunk_batch
+        {
+            cb(chunks);
         }
     }
 
@@ -558,6 +592,7 @@ impl Drop for PhaseGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chunk::CodeChunk;
     use std::time::Duration;
 
     #[test]
@@ -634,5 +669,32 @@ mod tests {
         p.embedding_batch(&[vec![1.0, 0.0], vec![0.0, 1.0]]);
 
         assert_eq!(*seen.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn chunk_batch_callback_receives_chunks() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_for_cb = seen.clone();
+        let p = Profiler::with_callback(Duration::from_secs(10), |_| {}).with_chunk_batch(
+            move |chunks| {
+                seen_for_cb
+                    .lock()
+                    .unwrap()
+                    .extend(chunks.iter().map(|chunk| chunk.kind.clone()));
+            },
+        );
+        let chunks = vec![CodeChunk {
+            file_path: "ontology/schema.owl".to_string(),
+            name: "owl:Class".to_string(),
+            kind: "element".to_string(),
+            start_line: 1,
+            end_line: 1,
+            content: String::new(),
+            enriched_content: String::new(),
+        }];
+
+        p.chunk_batch(&chunks);
+
+        assert_eq!(*seen.lock().unwrap(), vec!["element".to_string()]);
     }
 }

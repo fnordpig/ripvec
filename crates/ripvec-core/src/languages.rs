@@ -46,7 +46,7 @@ pub fn config_for_extension(ext: &str) -> Option<Arc<LangConfig>> {
         for &ext in &[
             "rs", "py", "pyi", "js", "jsx", "ts", "tsx", "go", "java", "c", "h", "cpp", "cc",
             "cxx", "hpp", "sh", "bash", "bats", "rb", "tf", "tfvars", "hcl", "kt", "kts", "swift",
-            "scala", "toml", "json", "yaml", "yml", "md",
+            "scala", "toml", "json", "yaml", "yml", "md", "xml", "rdf", "owl",
         ] {
             if let Some(cfg) = compile_config(ext) {
                 m.insert(ext, Arc::new(cfg));
@@ -257,6 +257,15 @@ fn compile_config(ext: &str) -> Option<LangConfig> {
             tree_sitter_md::LANGUAGE.into(),
             "(atx_heading heading_content: (inline) @name) @def",
         ),
+        // RDF/XML and OWL/XML are XML documents; capture each element so
+        // ontology classes/properties become searchable semantic chunks.
+        "xml" | "rdf" | "owl" => (
+            tree_sitter_xml::LANGUAGE_XML.into(),
+            concat!(
+                "(element (STag (Name) @name)) @def\n",
+                "(element (EmptyElemTag (Name) @name)) @def",
+            ),
+        ),
         _ => return None,
     };
     let query = match Query::new(&lang, query_str) {
@@ -459,10 +468,21 @@ mod tests {
         let exts = [
             "rs", "py", "pyi", "js", "jsx", "ts", "tsx", "go", "java", "c", "h", "cpp", "cc",
             "cxx", "hpp", "sh", "bash", "bats", "rb", "tf", "tfvars", "hcl", "kt", "kts", "swift",
-            "scala", "toml", "json", "yaml", "yml", "md",
+            "scala", "toml", "json", "yaml", "yml", "md", "xml", "rdf", "owl",
         ];
         for ext in &exts {
             assert!(config_for_extension(ext).is_some(), "failed for {ext}");
+        }
+    }
+
+    #[test]
+    fn turtle_family_uses_rdf_text_chunking_not_tree_sitter() {
+        for ext in ["ttl", "nt", "n3", "trig", "nq"] {
+            assert!(
+                config_for_extension(ext).is_none(),
+                "{ext} should be handled by RDF text chunking"
+            );
+            assert!(crate::chunk::is_rdf_text_extension(ext));
         }
     }
 

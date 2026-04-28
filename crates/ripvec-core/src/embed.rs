@@ -187,18 +187,10 @@ fn embed_all_batch(
                 let Some(source) = read_source(path) else {
                     return vec![];
                 };
-                let chunks = if text_mode {
-                    crate::chunk::chunk_text(path, &source, &cfg.chunk)
-                } else {
-                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                    match crate::languages::config_for_extension(ext) {
-                        Some(lang_config) => {
-                            crate::chunk::chunk_file(path, &source, &lang_config, &cfg.chunk)
-                        }
-                        None => crate::chunk::chunk_text(path, &source, &cfg.chunk),
-                    }
-                };
+                let chunks =
+                    crate::chunk::chunk_source_for_path(path, &source, text_mode, &cfg.chunk);
                 profiler.chunk_thread_report(chunks.len());
+                profiler.chunk_batch(&chunks);
                 chunks
             })
             .collect();
@@ -324,19 +316,11 @@ fn embed_all_streaming(
                 let Some(source) = read_source(path) else {
                     return;
                 };
-                let chunks = if text_mode {
-                    crate::chunk::chunk_text(path, &source, &chunk_config)
-                } else {
-                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                    match crate::languages::config_for_extension(ext) {
-                        Some(lang_config) => {
-                            crate::chunk::chunk_file(path, &source, &lang_config, &chunk_config)
-                        }
-                        None => crate::chunk::chunk_text(path, &source, &chunk_config),
-                    }
-                };
+                let chunks =
+                    crate::chunk::chunk_source_for_path(path, &source, text_mode, &chunk_config);
                 let n = chunks.len();
                 let file_bytes = source.len();
+                profiler.chunk_batch(&chunks);
                 for chunk in chunks {
                     // Channel disconnected means downstream errored; stop.
                     if chunk_tx.send(chunk).is_err() {
