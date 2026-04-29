@@ -1,0 +1,5 @@
+[cache]
+local = true
+model = "nomic-ai/modernbert-embed-base"
+version = "3"
+auto_stash = true
