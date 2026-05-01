@@ -35,8 +35,6 @@ use ripvec_core::profile::EmbedProgress;
 const MAX_ATLAS_POINTS: usize = 20_000;
 const ATLAS_MARGIN_RATIO: f64 = 0.08;
 const ATLAS_MIN_SPAN: f64 = 0.02;
-const ATLAS_LOWER_PERCENTILE: f64 = 0.02;
-const ATLAS_UPPER_PERCENTILE: f64 = 0.98;
 
 /// Verbosity level used by the dashboard log pane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -426,6 +424,7 @@ struct App {
     rates: Vec<u64>,
     corpus_mix: CorpusMix,
     embedding_points: Vec<EmbeddingPoint>,
+    atlas_viewport: AtlasViewport,
     log_level: LogLevel,
     log_scroll: usize,
     log_focus: bool,
@@ -446,6 +445,7 @@ impl App {
             rates: Vec::new(),
             corpus_mix: CorpusMix::default(),
             embedding_points: Vec::new(),
+            atlas_viewport: AtlasViewport::default(),
             log_level: LogLevel::Info,
             log_scroll: 0,
             log_focus: false,
@@ -471,6 +471,7 @@ impl App {
             DashboardEvent::ChunkClasses(deltas) => self.corpus_mix.apply(deltas),
             DashboardEvent::ChunkClassSnapshot(deltas) => self.corpus_mix.replace(deltas),
             DashboardEvent::Embeddings(mut points) => {
+                self.atlas_viewport.observe(&points);
                 self.embedding_points.append(&mut points);
                 let excess = self.embedding_points.len().saturating_sub(MAX_ATLAS_POINTS);
                 if excess > 0 {
@@ -768,17 +769,45 @@ fn chunk_boundary_kind(kind: &str) -> (&'static str, bool) {
 
 fn family_color(family: &str, semantic: bool) -> Color {
     if !semantic {
-        return Color::Gray;
+        return Color::Indexed(244);
     }
     match family {
-        "Rust" => Color::LightRed,
-        "Python" => Color::LightYellow,
-        "JavaScript" | "TypeScript" => Color::Yellow,
-        "RDF/OWL" | "RDF Text" | "XML" => Color::LightMagenta,
-        "Markdown" | "Text" => Color::LightBlue,
-        "JSON" | "YAML" | "TOML" | "HCL" => Color::LightGreen,
-        _ => Color::LightCyan,
+        "Rust" => Color::Indexed(166),
+        "Python" => Color::Indexed(220),
+        "JavaScript" => Color::Indexed(226),
+        "TypeScript" => Color::Indexed(33),
+        "Go" => Color::Indexed(51),
+        "Java" => Color::Indexed(160),
+        "C" => Color::Indexed(27),
+        "C++" => Color::Indexed(39),
+        "Shell" => Color::Indexed(118),
+        "Ruby" => Color::Indexed(161),
+        "HCL" => Color::Indexed(99),
+        "Kotlin" => Color::Indexed(208),
+        "Swift" => Color::Indexed(202),
+        "Scala" => Color::Indexed(196),
+        "TOML" => Color::Indexed(149),
+        "JSON" => Color::Indexed(47),
+        "YAML" => Color::Indexed(191),
+        "Markdown" => Color::Indexed(75),
+        "RDF/OWL" => Color::Indexed(135),
+        "XML" => Color::Indexed(177),
+        "RDF Text" => Color::Indexed(141),
+        "Text" => Color::Indexed(250),
+        _ => stable_family_color(family),
     }
+}
+
+fn stable_family_color(family: &str) -> Color {
+    const PALETTE: [u8; 16] = [
+        30, 35, 43, 49, 69, 81, 105, 111, 129, 147, 171, 183, 203, 211, 215, 229,
+    ];
+    const PALETTE_LEN: u64 = 16;
+    let hash = family.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x1000_0000_01b3)
+    });
+    let index = usize::try_from(hash % PALETTE_LEN).expect("palette index fits in usize");
+    Color::Indexed(PALETTE[index])
 }
 
 fn draw_field(frame: &mut Frame, app: &App, area: Rect) {
@@ -800,10 +829,15 @@ fn draw_field(frame: &mut Frame, app: &App, area: Rect) {
             Line::from("brightness: chunk density per cell"),
         ]
     } else {
-        heatmap_lines(
+        let bounds = app
+            .atlas_viewport
+            .bounds()
+            .unwrap_or_else(|| AtlasBounds::from_points(&app.embedding_points));
+        heatmap_lines_in_bounds(
             &app.embedding_points,
             heatmap_area.width,
             heatmap_area.height,
+            bounds,
         )
     };
     frame.render_widget(
@@ -934,11 +968,20 @@ fn random_axis_weight(index: usize, seed: u64) -> f64 {
     unit.mul_add(2.0, -1.0)
 }
 
+#[cfg(test)]
 fn heatmap_lines(points: &[EmbeddingPoint], width: u16, height: u16) -> Vec<Line<'static>> {
+    heatmap_lines_in_bounds(points, width, height, AtlasBounds::from_points(points))
+}
+
+fn heatmap_lines_in_bounds(
+    points: &[EmbeddingPoint],
+    width: u16,
+    height: u16,
+    bounds: AtlasBounds,
+) -> Vec<Line<'static>> {
     let width = usize::from(width).max(1);
     let height = usize::from(height).max(1);
     let mut cells = vec![HeatCell::default(); width * height];
-    let bounds = AtlasBounds::from_points(points);
 
     for point in points {
         let x = coordinate_to_index(bounds.normalize_x(point.x), width);
@@ -968,7 +1011,30 @@ fn heatmap_lines(points: &[EmbeddingPoint], width: u16, height: u16) -> Vec<Line
         .collect()
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct AtlasViewport {
+    bounds: Option<AtlasBounds>,
+}
+
+impl AtlasViewport {
+    fn observe(&mut self, points: &[EmbeddingPoint]) {
+        let Some(extents) = AtlasExtents::from_points(points) else {
+            return;
+        };
+
+        self.bounds = Some(match self.bounds {
+            Some(bounds) if bounds.contains_extents(extents) => bounds,
+            Some(bounds) => bounds.expand_to_include(extents),
+            None => AtlasBounds::from_extents(extents),
+        });
+    }
+
+    const fn bounds(self) -> Option<AtlasBounds> {
+        self.bounds
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct AtlasBounds {
     x_min: f64,
     x_max: f64,
@@ -978,10 +1044,20 @@ struct AtlasBounds {
 
 impl AtlasBounds {
     fn from_points(points: &[EmbeddingPoint]) -> Self {
-        let xs = points.iter().map(|point| point.x).collect();
-        let ys = points.iter().map(|point| point.y).collect();
-        let (x_min, x_max) = axis_bounds(xs);
-        let (y_min, y_max) = axis_bounds(ys);
+        AtlasExtents::from_points(points).map_or(
+            Self {
+                x_min: 0.0,
+                x_max: 1.0,
+                y_min: 0.0,
+                y_max: 1.0,
+            },
+            Self::from_extents,
+        )
+    }
+
+    fn from_extents(extents: AtlasExtents) -> Self {
+        let (x_min, x_max) = expand_axis_bounds(extents.x_min, extents.x_max);
+        let (y_min, y_max) = expand_axis_bounds(extents.y_min, extents.y_max);
         Self {
             x_min,
             x_max,
@@ -997,29 +1073,56 @@ impl AtlasBounds {
     fn normalize_y(self, value: f64) -> f64 {
         normalize_axis(value, self.y_min, self.y_max)
     }
-}
 
-fn axis_bounds(mut values: Vec<f64>) -> (f64, f64) {
-    values.retain(|value| value.is_finite());
-    if values.is_empty() {
-        return (0.0, 1.0);
+    fn contains_extents(self, extents: AtlasExtents) -> bool {
+        extents.x_min >= self.x_min
+            && extents.x_max <= self.x_max
+            && extents.y_min >= self.y_min
+            && extents.y_max <= self.y_max
     }
-    values.sort_by(f64::total_cmp);
-    let lower = percentile(&values, ATLAS_LOWER_PERCENTILE);
-    let upper = percentile(&values, ATLAS_UPPER_PERCENTILE);
-    expand_axis_bounds(lower, upper)
+
+    fn expand_to_include(self, extents: AtlasExtents) -> Self {
+        Self::from_extents(AtlasExtents {
+            x_min: self.x_min.min(extents.x_min),
+            x_max: self.x_max.max(extents.x_max),
+            y_min: self.y_min.min(extents.y_min),
+            y_max: self.y_max.max(extents.y_max),
+        })
+    }
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "percentile positions are clamped to valid vector indices before conversion"
-)]
-fn percentile(sorted: &[f64], percentile: f64) -> f64 {
-    let max_index = sorted.len().saturating_sub(1);
-    let position = percentile.clamp(0.0, 1.0) * max_index as f64;
-    let index = position.round() as usize;
-    sorted[index.min(max_index)]
+#[derive(Clone, Copy, Debug)]
+struct AtlasExtents {
+    x_min: f64,
+    x_max: f64,
+    y_min: f64,
+    y_max: f64,
+}
+
+impl AtlasExtents {
+    fn from_points(points: &[EmbeddingPoint]) -> Option<Self> {
+        let mut extents: Option<Self> = None;
+        for point in points {
+            if !(point.x.is_finite() && point.y.is_finite()) {
+                continue;
+            }
+            extents = Some(match extents {
+                Some(existing) => Self {
+                    x_min: existing.x_min.min(point.x),
+                    x_max: existing.x_max.max(point.x),
+                    y_min: existing.y_min.min(point.y),
+                    y_max: existing.y_max.max(point.y),
+                },
+                None => Self {
+                    x_min: point.x,
+                    x_max: point.x,
+                    y_min: point.y,
+                    y_max: point.y,
+                },
+            });
+        }
+        extents
+    }
 }
 
 fn expand_axis_bounds(lower: f64, upper: f64) -> (f64, f64) {
@@ -1029,17 +1132,9 @@ fn expand_axis_bounds(lower: f64, upper: f64) -> (f64, f64) {
         .max(ATLAS_MIN_SPAN)
         .mul_add(ATLAS_MARGIN_RATIO * 2.0, observed_span.max(ATLAS_MIN_SPAN));
     let half = padded_span * 0.5;
-    let mut min = center - half;
-    let mut max = center + half;
+    let min = center - half;
+    let max = center + half;
 
-    if min < 0.0 {
-        max = (max - min).min(1.0);
-        min = 0.0;
-    }
-    if max > 1.0 {
-        min = (min - (max - 1.0)).max(0.0);
-        max = 1.0;
-    }
     if (max - min).abs() <= f64::EPSILON {
         (0.0, 1.0)
     } else {
@@ -1138,9 +1233,10 @@ pub fn phase_from_profile_message(message: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChunkClassDelta, CorpusMix, DashboardEvent, EmbeddingPoint, EventSink, LogBuffer, LogLevel,
-        LogLine, chunk_class_deltas, heatmap_cell_char, heatmap_color, heatmap_lines,
-        phase_from_profile_message, project_embedding, visible_log_lines,
+        AtlasBounds, AtlasViewport, ChunkClassDelta, CorpusMix, DashboardEvent, EmbeddingPoint,
+        EventSink, LogBuffer, LogLevel, LogLine, chunk_class_deltas, family_color,
+        heatmap_cell_char, heatmap_color, heatmap_lines, phase_from_profile_message,
+        project_embedding, visible_log_lines,
     };
     use ratatui::style::Color;
     use ripvec_core::chunk::CodeChunk;
@@ -1239,6 +1335,49 @@ mod tests {
     }
 
     #[test]
+    fn atlas_viewport_does_not_shrink_for_points_inside_existing_view() {
+        let mut viewport = AtlasViewport::default();
+        viewport.observe(&[
+            point(0.490, 0.490),
+            point(0.510, 0.510),
+            point(0.500, 0.500),
+        ]);
+        let before = viewport.bounds().unwrap();
+
+        viewport.observe(&[point(0.499, 0.499), point(0.501, 0.501)]);
+
+        assert_eq!(viewport.bounds(), Some(before));
+    }
+
+    #[test]
+    fn atlas_viewport_expands_only_when_points_leave_view() {
+        let mut viewport = AtlasViewport::default();
+        viewport.observe(&[
+            point(0.490, 0.490),
+            point(0.510, 0.510),
+            point(0.500, 0.500),
+        ]);
+        let before = viewport.bounds().unwrap();
+        let outside = point(before.x_max + 0.001, before.y_max + 0.001);
+
+        viewport.observe(&[outside]);
+        let after = viewport.bounds().unwrap();
+
+        assert!(after.x_min <= before.x_min);
+        assert!(after.y_min <= before.y_min);
+        assert!(after.x_max > before.x_max);
+        assert!(after.y_max > before.y_max);
+    }
+
+    #[test]
+    fn atlas_bounds_center_single_point_near_projection_edge() {
+        let bounds = AtlasBounds::from_points(&[point(0.0, 0.0)]);
+
+        assert!((bounds.normalize_x(0.0) - 0.5).abs() < 0.001);
+        assert!((bounds.normalize_y(0.0) - 0.5).abs() < 0.001);
+    }
+
+    #[test]
     fn heatmap_color_scale_avoids_alarm_red() {
         assert_ne!(heatmap_color(0.0), Color::Red);
         assert_ne!(heatmap_color(0.0), Color::LightRed);
@@ -1246,6 +1385,57 @@ mod tests {
         assert_ne!(heatmap_color(0.5), Color::LightRed);
         assert_ne!(heatmap_color(1.0), Color::Red);
         assert_ne!(heatmap_color(1.0), Color::LightRed);
+    }
+
+    #[test]
+    fn corpus_mix_palette_uses_distinct_256_colors() {
+        assert_eq!(family_color("Rust", true), Color::Indexed(166));
+        assert_eq!(family_color("Python", true), Color::Indexed(220));
+
+        let families = [
+            "Rust",
+            "Python",
+            "JavaScript",
+            "TypeScript",
+            "Go",
+            "Java",
+            "C",
+            "C++",
+            "Shell",
+            "Ruby",
+            "HCL",
+            "Kotlin",
+            "Swift",
+            "Scala",
+            "TOML",
+            "JSON",
+            "YAML",
+            "Markdown",
+            "RDF/OWL",
+            "XML",
+            "RDF Text",
+        ];
+        let mut colors = Vec::new();
+        for family in families {
+            let color = family_color(family, true);
+            if !colors.contains(&color) {
+                colors.push(color);
+            }
+        }
+
+        assert!(
+            colors.len() >= 18,
+            "palette collapsed {} families to only {} colors",
+            families.len(),
+            colors.len()
+        );
+        assert_ne!(family_color("TOML", true), family_color("JSON", true));
+        assert_ne!(family_color("C", true), family_color("Markdown", true));
+        assert_ne!(family_color("XML", true), family_color("RDF/OWL", true));
+    }
+
+    fn point(x: f64, y: f64) -> EmbeddingPoint {
+        EmbeddingPoint { x, y, z: 0.5 }
     }
 
     fn make_chunk(path: &str, kind: &str) -> CodeChunk {

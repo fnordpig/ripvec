@@ -15,7 +15,7 @@ name = "ripvec"
 path = "src/main.rs"
 
 [dependencies]
-ripvec-core = { path = "../ripvec-core", version = "0.13.20" }
+ripvec-core = { path = "../ripvec-core", version = "0.13.21" }
 clap.workspace = true
 anyhow.workspace = true
 rayon.workspace = true
@@ -41,10 +41,10 @@ cpu = ["ripvec-core/cpu"]
 
 # Auto-enable platform-appropriate backends
 [target.'cfg(target_os = "macos")'.dependencies]
-ripvec-core = { path = "../ripvec-core", version = "0.13.20", features = ["metal", "mlx", "cpu-accelerate"] }
+ripvec-core = { path = "../ripvec-core", version = "0.13.21", features = ["metal", "mlx", "cpu-accelerate"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-ripvec-core = { path = "../ripvec-core", version = "0.13.20", features = ["cpu"] }
+ripvec-core = { path = "../ripvec-core", version = "0.13.21", features = ["cpu"] }
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/ripvec-v{ version }-{ target }.tar.gz"
