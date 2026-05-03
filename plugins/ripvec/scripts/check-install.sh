@@ -1,8 +1,8 @@
 #!/bin/bash
-# Check if ripvec-mcp is installed and available in PATH.
-# Runs on SessionStart — prints a hint if the binary is missing.
+# Compatibility shim for older local plugin installs.
 
-if ! command -v ripvec-mcp &>/dev/null; then
-	echo "ripvec-mcp not found. Install with: cargo install --git https://github.com/fnordpig/ripvec ripvec-mcp"
-	exit 1
-fi
+set -eo pipefail
+
+root="${CLAUDE_PLUGIN_ROOT}"
+case "$root" in ''|*'$'*) root="$(cd "$(dirname "$0")/.." && pwd)" ;; esac
+exec bash "$root/hooks/scripts/check-install.sh"

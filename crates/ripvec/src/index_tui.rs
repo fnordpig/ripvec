@@ -32,7 +32,7 @@ use ripvec_core::chunk::CodeChunk;
 use ripvec_core::hybrid::HybridIndex;
 use ripvec_core::profile::EmbedProgress;
 
-const MAX_ATLAS_POINTS: usize = 20_000;
+const MAX_ATLAS_POINTS: usize = 100_000;
 const ATLAS_MARGIN_RATIO: f64 = 0.08;
 const ATLAS_MIN_SPAN: f64 = 0.02;
 
@@ -313,11 +313,21 @@ impl EventSink {
 
     /// Project and send completed embedding vectors.
     pub fn embeddings(&self, embeddings: &[Vec<f32>]) {
-        let points: Vec<_> = embeddings
-            .iter()
-            .filter(|embedding| !embedding.is_empty())
-            .map(|embedding| project_embedding(embedding))
-            .collect();
+        let mut stats = EmbeddingBatchStats::default();
+        let mut points = Vec::new();
+        for embedding in embeddings {
+            stats.observe_raw(embedding);
+            if !embedding.is_empty() {
+                let point = project_embedding(embedding);
+                stats.observe_projected(point);
+                points.push(point);
+            }
+        }
+        if stats.should_log() {
+            let message = stats.message();
+            tracing::warn!("{message}");
+            self.logs.push(LogLine::new(LogLevel::Warn, message));
+        }
         if !points.is_empty() {
             let _ = self.sender.send(DashboardEvent::Embeddings(points));
         }
@@ -932,6 +942,145 @@ fn rate_to_u64(rate: f64) -> u64 {
     }
 }
 
+#[derive(Default)]
+struct EmbeddingBatchStats {
+    embeddings: usize,
+    empty: usize,
+    raw_values: usize,
+    raw_non_finite: usize,
+    raw_nan: usize,
+    raw_inf: usize,
+    projected_non_finite: usize,
+    first_bad: Option<EmbeddingSampleStats>,
+}
+
+impl EmbeddingBatchStats {
+    fn observe_raw(&mut self, embedding: &[f32]) {
+        self.embeddings += 1;
+        if embedding.is_empty() {
+            self.empty += 1;
+            return;
+        }
+        self.raw_values += embedding.len();
+        let mut has_bad_value = false;
+        for value in embedding {
+            if !value.is_finite() {
+                has_bad_value = true;
+                self.raw_non_finite += 1;
+                if value.is_nan() {
+                    self.raw_nan += 1;
+                } else {
+                    self.raw_inf += 1;
+                }
+            }
+        }
+        if has_bad_value && self.first_bad.is_none() {
+            self.first_bad = Some(EmbeddingSampleStats::from_embedding(embedding));
+        }
+    }
+
+    fn observe_projected(&mut self, point: EmbeddingPoint) {
+        if !(point.x.is_finite() && point.y.is_finite() && point.z.is_finite()) {
+            self.projected_non_finite += 1;
+        }
+    }
+
+    const fn should_log(&self) -> bool {
+        self.raw_non_finite > 0 || self.projected_non_finite > 0 || self.empty > 0
+    }
+
+    fn message(&self) -> String {
+        let sample = self
+            .first_bad
+            .as_ref()
+            .map_or_else(String::new, |sample| format!("; first_bad={sample}"));
+        format!(
+            "embedding batch diagnostics: embeddings={} empty={} raw_values={} raw_non_finite={} raw_nan={} raw_inf={} projected_non_finite={}{}",
+            self.embeddings,
+            self.empty,
+            self.raw_values,
+            self.raw_non_finite,
+            self.raw_nan,
+            self.raw_inf,
+            self.projected_non_finite,
+            sample
+        )
+    }
+}
+
+struct EmbeddingSampleStats {
+    len: usize,
+    finite: usize,
+    non_finite: usize,
+    min: f32,
+    max: f32,
+    mean: f64,
+    l2: f64,
+    first_values: String,
+}
+
+impl EmbeddingSampleStats {
+    fn from_embedding(embedding: &[f32]) -> Self {
+        let mut finite = 0;
+        let mut non_finite = 0;
+        let mut min = f32::INFINITY;
+        let mut max = f32::NEG_INFINITY;
+        let mut sum = 0.0;
+        let mut sum_sq = 0.0;
+        for value in embedding {
+            if value.is_finite() {
+                finite += 1;
+                min = min.min(*value);
+                max = max.max(*value);
+                let value = f64::from(*value);
+                sum += value;
+                sum_sq += value * value;
+            } else {
+                non_finite += 1;
+            }
+        }
+        let mean = if finite == 0 {
+            f64::NAN
+        } else {
+            sum / finite as f64
+        };
+        let l2 = sum_sq.sqrt();
+        let first_values = embedding
+            .iter()
+            .take(8)
+            .map(|value| format!("{value:.4}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        Self {
+            len: embedding.len(),
+            finite,
+            non_finite,
+            min,
+            max,
+            mean,
+            l2,
+            first_values,
+        }
+    }
+}
+
+impl std::fmt::Display for EmbeddingSampleStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "len={} finite={} non_finite={} min={:.6} max={:.6} mean={:.6} l2={:.6} first8=[{}]",
+            self.len,
+            self.finite,
+            self.non_finite,
+            self.min,
+            self.max,
+            self.mean,
+            self.l2,
+            self.first_values
+        )
+    }
+}
+
 /// Project a high-dimensional embedding into a stable `[0, 1]` atlas point.
 #[must_use]
 pub fn project_embedding(embedding: &[f32]) -> EmbeddingPoint {
@@ -982,6 +1131,7 @@ fn heatmap_lines_in_bounds(
     let width = usize::from(width).max(1);
     let height = usize::from(height).max(1);
     let mut cells = vec![HeatCell::default(); width * height];
+    let z_bounds = AtlasZBounds::from_points(points);
 
     for point in points {
         let x = coordinate_to_index(bounds.normalize_x(point.x), width);
@@ -989,7 +1139,7 @@ fn heatmap_lines_in_bounds(
         let y = height - 1 - coordinate_to_index(bounds.normalize_y(point.y), height);
         let cell = &mut cells[y * width + x];
         cell.count = cell.count.saturating_add(1);
-        cell.z_sum += point.z;
+        cell.z_sum += z_bounds.normalize(point.z);
     }
 
     (0..height)
@@ -1125,6 +1275,42 @@ impl AtlasExtents {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct AtlasZBounds {
+    min: f64,
+    max: f64,
+}
+
+impl AtlasZBounds {
+    fn from_points(points: &[EmbeddingPoint]) -> Self {
+        let mut bounds: Option<Self> = None;
+        for point in points {
+            if !point.z.is_finite() {
+                continue;
+            }
+            bounds = Some(match bounds {
+                Some(existing) => Self {
+                    min: existing.min.min(point.z),
+                    max: existing.max.max(point.z),
+                },
+                None => Self {
+                    min: point.z,
+                    max: point.z,
+                },
+            });
+        }
+        bounds.unwrap_or(Self { min: 0.0, max: 1.0 })
+    }
+
+    fn normalize(self, value: f64) -> f64 {
+        if !value.is_finite() || (self.max - self.min).abs() <= f64::EPSILON {
+            0.5
+        } else {
+            normalize_axis(value, self.min, self.max)
+        }
+    }
+}
+
 fn expand_axis_bounds(lower: f64, upper: f64) -> (f64, f64) {
     let center = (lower + upper) * 0.5;
     let observed_span = (upper - lower).abs();
@@ -1172,21 +1358,14 @@ fn coordinate_to_index(value: f64, size: usize) -> usize {
     scaled.round() as usize
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "z is clamped to 0..=1 before mapping into the bounded xterm palette"
+)]
 fn heatmap_color(z: f64) -> Color {
     let z = z.clamp(0.0, 1.0);
-    if z < 0.16 {
-        Color::Rgb(68, 1, 84)
-    } else if z < 0.33 {
-        Color::Rgb(59, 82, 139)
-    } else if z < 0.50 {
-        Color::Rgb(33, 145, 140)
-    } else if z < 0.66 {
-        Color::Rgb(94, 201, 98)
-    } else if z < 0.83 {
-        Color::Rgb(173, 220, 48)
-    } else {
-        Color::Rgb(253, 231, 37)
-    }
+    Color::Indexed((z * 255.0).round() as u8)
 }
 
 fn heatmap_cell_char(count: usize) -> Option<char> {
@@ -1234,12 +1413,13 @@ pub fn phase_from_profile_message(message: &str) -> Option<String> {
 mod tests {
     use super::{
         AtlasBounds, AtlasViewport, ChunkClassDelta, CorpusMix, DashboardEvent, EmbeddingPoint,
-        EventSink, LogBuffer, LogLevel, LogLine, chunk_class_deltas, family_color,
+        EventSink, LogBuffer, LogLevel, LogLine, Span, chunk_class_deltas, family_color,
         heatmap_cell_char, heatmap_color, heatmap_lines, phase_from_profile_message,
         project_embedding, visible_log_lines,
     };
     use ratatui::style::Color;
     use ripvec_core::chunk::CodeChunk;
+    use std::collections::BTreeSet;
 
     #[test]
     fn verbosity_cycles_through_all_levels() {
@@ -1335,6 +1515,38 @@ mod tests {
     }
 
     #[test]
+    fn event_sink_logs_non_finite_embedding_batches_without_dropping_points() {
+        let logs = LogBuffer::new(8);
+        let (sink, receiver) = EventSink::channel(logs.clone());
+
+        sink.embeddings(&[
+            vec![0.1, 0.2, 0.3],
+            vec![0.1, f32::NAN, 0.3],
+            vec![0.1, f32::INFINITY, 0.3],
+        ]);
+
+        let DashboardEvent::Embeddings(points) = receiver.try_recv().unwrap() else {
+            panic!("expected embedding points");
+        };
+        assert_eq!(points.len(), 3);
+        assert!(
+            points
+                .iter()
+                .any(|point| !(point.x.is_finite() && point.y.is_finite() && point.z.is_finite()))
+        );
+        let log_messages: Vec<_> = logs
+            .snapshot()
+            .into_iter()
+            .map(|line| line.message)
+            .collect();
+        assert!(log_messages.iter().any(|message| {
+            message.contains("raw_non_finite=2")
+                && message.contains("raw_nan=1")
+                && message.contains("raw_inf=1")
+        }));
+    }
+
+    #[test]
     fn atlas_viewport_does_not_shrink_for_points_inside_existing_view() {
         let mut viewport = AtlasViewport::default();
         viewport.observe(&[
@@ -1385,6 +1597,56 @@ mod tests {
         assert_ne!(heatmap_color(0.5), Color::LightRed);
         assert_ne!(heatmap_color(1.0), Color::Red);
         assert_ne!(heatmap_color(1.0), Color::LightRed);
+    }
+
+    #[test]
+    fn heatmap_color_scale_uses_full_indexed_palette() {
+        let colors: BTreeSet<_> = (0..=255)
+            .map(|index| match heatmap_color(f64::from(index) / 255.0) {
+                Color::Indexed(color) => color,
+                color => panic!("expected indexed terminal color, got {color:?}"),
+            })
+            .collect();
+
+        assert!(
+            colors.len() == 256,
+            "expected full 256-color ramp, got {colors:?}"
+        );
+    }
+
+    #[test]
+    fn heatmap_normalizes_narrow_z_ranges_across_palette() {
+        let points = vec![
+            EmbeddingPoint {
+                x: 0.1,
+                y: 0.5,
+                z: 0.490,
+            },
+            EmbeddingPoint {
+                x: 0.5,
+                y: 0.5,
+                z: 0.500,
+            },
+            EmbeddingPoint {
+                x: 0.9,
+                y: 0.5,
+                z: 0.510,
+            },
+        ];
+
+        let colors: BTreeSet<_> = heatmap_lines(&points, 3, 1)
+            .into_iter()
+            .flat_map(|line| line.spans)
+            .filter_map(|span| match span {
+                Span { style, content, .. } if !content.trim().is_empty() => match style.fg {
+                    Some(Color::Indexed(color)) => Some(color),
+                    color => panic!("expected indexed terminal color, got {color:?}"),
+                },
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(colors, BTreeSet::from([0, 128, 255]));
     }
 
     #[test]

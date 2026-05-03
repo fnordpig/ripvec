@@ -427,11 +427,27 @@ fn ffn_sublayer<D: Driver>(
 // FP16 attention sublayer — pre-norm + QKV + RoPE (all half precision)
 // ---------------------------------------------------------------------------
 
+fn debug_f16_tensor<D: Driver>(
+    driver: &D,
+    label: &str,
+    tensor: &D::Tensor,
+    rows: usize,
+    cols: usize,
+) -> crate::Result<()> {
+    let mut probe = driver.alloc_zeros(rows * cols)?;
+    driver.f16_to_f32(&mut probe, tensor, rows * cols)?;
+    driver.debug_tensor(label, &probe, rows, cols)
+}
+
 /// FP16 pre-norm + QKV projection + split + `RoPE`.
 ///
 /// All tensors are half precision. RoPE cos/sin tables stay FP32 (the kernel
 /// reads half Q/K, does FP32 trig, writes half).
 /// Returns `(q, k, v)` each `[batch*num_heads, seq, head_dim]` in FP16.
+#[expect(
+    clippy::too_many_lines,
+    reason = "attention diagnostics intentionally keep stage probes adjacent to the operations"
+)]
 fn attn_prenorm_qkv_f16<D: Driver>(
     driver: &D,
     hidden_states: &D::Tensor,
@@ -439,6 +455,8 @@ fn attn_prenorm_qkv_f16<D: Driver>(
     g: &EncoderGeometry,
     zero_bias: &D::Tensor,
     rope: &RopeCache<D::Tensor>,
+    layer_index: usize,
+    debug_tensors: bool,
 ) -> crate::Result<(D::Tensor, D::Tensor, D::Tensor)> {
     // Pre-attention norm (identity for layer 0). FP16 in/out.
     // Layer 0 uses hidden_states directly (GEMM is read-only, no clone needed).
@@ -472,6 +490,15 @@ fn attn_prenorm_qkv_f16<D: Driver>(
         g.hidden,
         true,
     )?;
+    if debug_tensors && layer_index == 0 {
+        debug_f16_tensor(
+            driver,
+            "modernbert.layer_0.qkv_f16_as_f32",
+            &qkv,
+            g.total_tokens,
+            3 * g.hidden,
+        )?;
+    }
 
     // Fused pad + QKV split: flat → Q, K, V in per-head layout directly.
     // Eliminates the padded intermediate buffer and its 2 memory round-trips.
@@ -491,6 +518,30 @@ fn attn_prenorm_qkv_f16<D: Driver>(
         g.num_heads,
         g.head_dim,
     )?;
+    if debug_tensors && layer_index == 0 {
+        let rows = g.batch * g.num_heads * g.max_seq;
+        debug_f16_tensor(
+            driver,
+            "modernbert.layer_0.q_after_split_f16_as_f32",
+            &q,
+            rows,
+            g.head_dim,
+        )?;
+        debug_f16_tensor(
+            driver,
+            "modernbert.layer_0.k_after_split_f16_as_f32",
+            &k,
+            rows,
+            g.head_dim,
+        )?;
+        debug_f16_tensor(
+            driver,
+            "modernbert.layer_0.v_after_split_f16_as_f32",
+            &v,
+            rows,
+            g.head_dim,
+        )?;
+    }
 
     // RoPE: half Q/K, float cos/sin tables.
     let num_rows = g.batch * g.num_heads * g.max_seq;
@@ -512,6 +563,23 @@ fn attn_prenorm_qkv_f16<D: Driver>(
         g.head_dim,
         g.num_heads,
     )?;
+    if debug_tensors && layer_index == 0 {
+        let rows = g.batch * g.num_heads * g.max_seq;
+        debug_f16_tensor(
+            driver,
+            "modernbert.layer_0.q_after_rope_f16_as_f32",
+            &q,
+            rows,
+            g.head_dim,
+        )?;
+        debug_f16_tensor(
+            driver,
+            "modernbert.layer_0.k_after_rope_f16_as_f32",
+            &k,
+            rows,
+            g.head_dim,
+        )?;
+    }
 
     Ok((q, k, v))
 }
@@ -525,6 +593,10 @@ fn attn_prenorm_qkv_f16<D: Driver>(
 /// All tensors FP16. The softmax kernel uses FP32 accumulators internally.
 /// The `float_mask` from `BatchInputs` stays FP32 (softmax kernel reads it).
 #[expect(clippy::too_many_arguments, reason = "Q/K/V must be separate tensors")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "attention diagnostics intentionally keep stage probes adjacent to the operations"
+)]
 fn attn_scores_residual_f16<D: Driver>(
     driver: &D,
     q: &D::Tensor,
@@ -534,6 +606,8 @@ fn attn_scores_residual_f16<D: Driver>(
     layer: &ModernBertLayerWeights<D::Tensor>,
     inputs: &BatchInputs<D::Tensor>,
     g: &EncoderGeometry,
+    layer_index: usize,
+    debug_tensors: bool,
 ) -> crate::Result<D::Tensor> {
     let batch_heads = g.batch * g.num_heads;
     let stride_qk = g.max_seq * g.head_dim;
@@ -553,6 +627,15 @@ fn attn_scores_residual_f16<D: Driver>(
         g.max_seq * g.max_seq,
         batch_heads,
     )?;
+    if debug_tensors && layer_index == 0 {
+        debug_f16_tensor(
+            driver,
+            "modernbert.layer_0.attn_scores_before_softmax_f16_as_f32",
+            &scores,
+            batch_heads * g.max_seq,
+            g.max_seq,
+        )?;
+    }
 
     // Softmax — FP16 scores, FP32 mask, FP32 accumulators inside kernel.
     if layer.is_global {
@@ -575,6 +658,15 @@ fn attn_scores_residual_f16<D: Driver>(
             g.local_window,
         )?;
     }
+    if debug_tensors && layer_index == 0 {
+        debug_f16_tensor(
+            driver,
+            "modernbert.layer_0.attn_scores_after_softmax_f16_as_f32",
+            &scores,
+            batch_heads * g.max_seq,
+            g.max_seq,
+        )?;
+    }
 
     // scores @ V — FP16 batched GEMM.
     let mut attn_out = driver.alloc_zeros_f16(g.padded_tokens * g.hidden)?;
@@ -591,6 +683,15 @@ fn attn_scores_residual_f16<D: Driver>(
         stride_qk,
         batch_heads,
     )?;
+    if debug_tensors && layer_index == 0 {
+        debug_f16_tensor(
+            driver,
+            "modernbert.layer_0.attn_heads_f16_as_f32",
+            &attn_out,
+            batch_heads * g.max_seq,
+            g.head_dim,
+        )?;
+    }
 
     // Fused reshape + unpad: [batch*heads, max_seq, head_dim] → [total_tokens, hidden].
     // Eliminates the padded context intermediate buffer.
@@ -604,6 +705,15 @@ fn attn_scores_residual_f16<D: Driver>(
         g.num_heads,
         g.head_dim,
     )?;
+    if debug_tensors && layer_index == 0 {
+        debug_f16_tensor(
+            driver,
+            "modernbert.layer_0.context_unpacked_f16_as_f32",
+            &context_unpacked,
+            g.total_tokens,
+            g.hidden,
+        )?;
+    }
 
     // Output projection on unpadded — FP16: [total_tokens, H] × [H, H].
     let mut projected = driver.alloc_zeros_f16(g.total_tokens * g.hidden)?;
@@ -616,6 +726,15 @@ fn attn_scores_residual_f16<D: Driver>(
         g.hidden,
         true,
     )?;
+    if debug_tensors && layer_index == 0 {
+        debug_f16_tensor(
+            driver,
+            "modernbert.layer_0.attn_projected_f16_as_f32",
+            &projected,
+            g.total_tokens,
+            g.hidden,
+        )?;
+    }
 
     // Residual add — FP16.
     let mut output = driver.alloc_zeros_f16(g.total_tokens * g.hidden)?;
@@ -641,6 +760,8 @@ fn ffn_sublayer_f16<D: Driver>(
     layer: &ModernBertLayerWeights<D::Tensor>,
     g: &EncoderGeometry,
     zero_bias: &D::Tensor,
+    layer_index: usize,
+    debug_tensors: bool,
 ) -> crate::Result<D::Tensor> {
     // Pre-MLP LayerNorm — FP16.
     let mut mlp_normed = driver.alloc_zeros_f16(g.total_tokens * g.hidden)?;
@@ -653,6 +774,16 @@ fn ffn_sublayer_f16<D: Driver>(
         g.hidden,
         g.eps,
     )?;
+    if debug_tensors && layer_index == 0 {
+        let mut probe = driver.alloc_zeros(g.total_tokens * g.hidden)?;
+        driver.f16_to_f32(&mut probe, &mlp_normed, g.total_tokens * g.hidden)?;
+        driver.debug_tensor(
+            "modernbert.layer_0.ffn_mlp_normed_f16_as_f32",
+            &probe,
+            g.total_tokens,
+            g.hidden,
+        )?;
+    }
 
     // Wi projection — FP16 GEMM.
     let double_inter = 2 * g.intermediate;
@@ -666,6 +797,16 @@ fn ffn_sublayer_f16<D: Driver>(
         g.hidden,
         true,
     )?;
+    if debug_tensors && layer_index == 0 {
+        let mut probe = driver.alloc_zeros(g.total_tokens * double_inter)?;
+        driver.f16_to_f32(&mut probe, &wi_out, g.total_tokens * double_inter)?;
+        driver.debug_tensor(
+            "modernbert.layer_0.ffn_wi_out_f16_as_f32",
+            &probe,
+            g.total_tokens,
+            double_inter,
+        )?;
+    }
 
     // Fused split + GeGLU — FP16.
     // Reads [total_tokens, 2*intermediate], writes [total_tokens, intermediate].
@@ -673,6 +814,16 @@ fn ffn_sublayer_f16<D: Driver>(
     let n_elements = g.total_tokens * g.intermediate;
     let mut activated = driver.alloc_zeros_f16(n_elements)?;
     driver.fused_split_geglu_f16(&mut activated, &wi_out, g.total_tokens, g.intermediate)?;
+    if debug_tensors && layer_index == 0 {
+        let mut probe = driver.alloc_zeros(n_elements)?;
+        driver.f16_to_f32(&mut probe, &activated, n_elements)?;
+        driver.debug_tensor(
+            "modernbert.layer_0.ffn_activated_f16_as_f32",
+            &probe,
+            g.total_tokens,
+            g.intermediate,
+        )?;
+    }
 
     // Wo projection — FP16 GEMM.
     let mut mlp_out = driver.alloc_zeros_f16(g.total_tokens * g.hidden)?;
@@ -685,6 +836,16 @@ fn ffn_sublayer_f16<D: Driver>(
         g.intermediate,
         true,
     )?;
+    if debug_tensors && layer_index == 0 {
+        let mut probe = driver.alloc_zeros(g.total_tokens * g.hidden)?;
+        driver.f16_to_f32(&mut probe, &mlp_out, g.total_tokens * g.hidden)?;
+        driver.debug_tensor(
+            "modernbert.layer_0.ffn_mlp_out_f16_as_f32",
+            &probe,
+            g.total_tokens,
+            g.hidden,
+        )?;
+    }
 
     // Residual add — FP16.
     let mut output = driver.alloc_zeros_f16(g.total_tokens * g.hidden)?;
@@ -694,6 +855,16 @@ fn ffn_sublayer_f16<D: Driver>(
         attn_output,
         g.total_tokens * g.hidden,
     )?;
+    if debug_tensors && layer_index == 0 {
+        let mut probe = driver.alloc_zeros(g.total_tokens * g.hidden)?;
+        driver.f16_to_f32(&mut probe, &output, g.total_tokens * g.hidden)?;
+        driver.debug_tensor(
+            "modernbert.layer_0.ffn_output_f16_as_f32",
+            &probe,
+            g.total_tokens,
+            g.hidden,
+        )?;
+    }
     Ok(output)
 }
 
@@ -739,6 +910,12 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
             hidden,
             w.layer_norm_eps,
         )?;
+        driver.debug_tensor(
+            "modernbert.embedding_layer_norm",
+            &hidden_states,
+            total_tokens,
+            hidden,
+        )?;
 
         let g = EncoderGeometry {
             batch,
@@ -772,13 +949,24 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
 
         if use_f16 {
             // === FP16 PATH: zero F32↔F16 conversions in layer loop ===
+            let debug_tensors = driver.debug_tensors_enabled();
 
             // ONLY conversion #1: F32 → F16 after embedding LN.
             let mut hidden_f16 = driver.alloc_zeros_f16(total_tokens * hidden)?;
             driver.f32_to_f16(&mut hidden_f16, &hidden_states, total_tokens * hidden)?;
+            if debug_tensors {
+                let mut initial_probe = driver.alloc_zeros(total_tokens * hidden)?;
+                driver.f16_to_f32(&mut initial_probe, &hidden_f16, total_tokens * hidden)?;
+                driver.debug_tensor(
+                    "modernbert.after_initial_f32_to_f16",
+                    &initial_probe,
+                    total_tokens,
+                    hidden,
+                )?;
+            }
 
             // 22 layers — ALL in FP16.
-            for layer in &w.layers {
+            for (layer_index, layer) in w.layers.iter().enumerate() {
                 let saved = driver.save_pool_cursor();
 
                 let rope = if layer.is_global {
@@ -787,21 +975,73 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
                     &self.local_rope
                 };
 
-                let (q, k, v) =
-                    attn_prenorm_qkv_f16(driver, &hidden_f16, layer, &g, &w.zero_bias, rope)?;
-                let attn_output =
-                    attn_scores_residual_f16(driver, &q, &k, &v, &hidden_f16, layer, &inputs, &g)?;
-                hidden_f16 = ffn_sublayer_f16(driver, &attn_output, layer, &g, &w.zero_bias)?;
+                let (q, k, v) = attn_prenorm_qkv_f16(
+                    driver,
+                    &hidden_f16,
+                    layer,
+                    &g,
+                    &w.zero_bias,
+                    rope,
+                    layer_index,
+                    debug_tensors,
+                )?;
+                let attn_output = attn_scores_residual_f16(
+                    driver,
+                    &q,
+                    &k,
+                    &v,
+                    &hidden_f16,
+                    layer,
+                    &inputs,
+                    &g,
+                    layer_index,
+                    debug_tensors,
+                )?;
+                if debug_tensors && layer_index == 0 {
+                    let mut probe = driver.alloc_zeros(total_tokens * hidden)?;
+                    driver.f16_to_f32(&mut probe, &attn_output, total_tokens * hidden)?;
+                    driver.debug_tensor(
+                        "modernbert.layer_0.attn_output_f16_as_f32",
+                        &probe,
+                        total_tokens,
+                        hidden,
+                    )?;
+                }
+                hidden_f16 = ffn_sublayer_f16(
+                    driver,
+                    &attn_output,
+                    layer,
+                    &g,
+                    &w.zero_bias,
+                    layer_index,
+                    debug_tensors,
+                )?;
                 driver.restore_pool_cursor(saved);
+                if debug_tensors && (layer_index == 0 || layer_index + 1 == w.layers.len()) {
+                    let mut probe = driver.alloc_zeros(total_tokens * hidden)?;
+                    driver.f16_to_f32(&mut probe, &hidden_f16, total_tokens * hidden)?;
+                    driver.debug_tensor(
+                        &format!("modernbert.layer_{layer_index}.hidden_f16_as_f32"),
+                        &probe,
+                        total_tokens,
+                        hidden,
+                    )?;
+                }
             }
 
             // ONLY conversion #2: F16 → F32 before final LN + pooling.
             let mut hidden_f32 = driver.alloc_zeros(total_tokens * hidden)?;
             driver.f16_to_f32(&mut hidden_f32, &hidden_f16, total_tokens * hidden)?;
             hidden_states = hidden_f32;
+            driver.debug_tensor(
+                "modernbert.after_f16_to_f32",
+                &hidden_states,
+                total_tokens,
+                hidden,
+            )?;
         } else {
             // === FP32 PATH ===
-            for layer in &w.layers {
+            for (layer_index, layer) in w.layers.iter().enumerate() {
                 let saved = driver.save_pool_cursor();
 
                 let rope = if layer.is_global {
@@ -817,6 +1057,14 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
                 hidden_states = ffn_sublayer(driver, &attn_output, layer, &g, &w.zero_bias)?;
 
                 driver.restore_pool_cursor(saved);
+                if layer_index == 0 || layer_index + 1 == w.layers.len() {
+                    driver.debug_tensor(
+                        &format!("modernbert.layer_{layer_index}.hidden_fp32"),
+                        &hidden_states,
+                        total_tokens,
+                        hidden,
+                    )?;
+                }
             }
         }
 
@@ -830,6 +1078,12 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
             total_tokens,
             hidden,
             w.layer_norm_eps,
+        )?;
+        driver.debug_tensor(
+            "modernbert.final_layer_norm",
+            &hidden_states,
+            total_tokens,
+            hidden,
         )?;
 
         // Pad back to [batch, max_seq, hidden] for mean_pool kernel.
@@ -852,7 +1106,9 @@ impl<D: Driver> ModelArch<D> for ModernBertArch<D::Tensor> {
             max_seq,
             hidden,
         )?;
+        driver.debug_tensor("modernbert.mean_pool", &pooled, batch, hidden)?;
         driver.l2_normalize(&mut pooled, batch, hidden)?;
+        driver.debug_tensor("modernbert.l2_normalize", &pooled, batch, hidden)?;
 
         // End batched mode — commit all GPU work, wait for completion.
         driver.end_batch()?;

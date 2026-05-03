@@ -1,0 +1,42 @@
+{
+  "name": "ripvec",
+  "version": "0.13.21",
+  "description": "Semantic code search and structural analysis: find code by meaning and understand architecture through dependency graphs.",
+  "author": {
+    "name": "fnordpig",
+    "url": "https://github.com/fnordpig"
+  },
+  "homepage": "https://github.com/fnordpig/ripvec",
+  "repository": "https://github.com/fnordpig/ripvec",
+  "license": "MIT OR Apache-2.0",
+  "keywords": [
+    "search",
+    "semantic",
+    "embeddings",
+    "code-search",
+    "pagerank",
+    "architecture",
+    "tree-sitter"
+  ],
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "ripvec",
+    "shortDescription": "Semantic code search and repo maps",
+    "longDescription": "Use ripvec to search code by meaning, inspect PageRank-weighted repository maps, find similar code, and keep an embedding index current through an MCP server.",
+    "developerName": "fnordpig",
+    "category": "Coding",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/fnordpig/ripvec",
+    "defaultPrompt": [
+      "Map this repository with ripvec",
+      "Find code by semantic meaning",
+      "Analyze impact before changing this file"
+    ],
+    "brandColor": "#2563EB"
+  }
+}

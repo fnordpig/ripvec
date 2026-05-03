@@ -1,8 +1,13 @@
 {
   "mcpServers": {
     "ripvec": {
-      "command": "${CLAUDE_PLUGIN_ROOT}/../../target/release/ripvec-mcp",
-      "args": []
+      "command": "bash",
+      "args": [
+        "-lc",
+        "set -eo pipefail; root=\"${CLAUDE_PLUGIN_ROOT}\"; case \"$root\" in ''|*'$'*) root=\"$PWD\" ;; esac; cd \"$root\"; exec ./bin/ensure-ripvec-mcp.sh \"$@\"",
+        "ripvec-mcp"
+      ],
+      "cwd": "."
     }
   }
 }

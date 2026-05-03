@@ -532,6 +532,28 @@ pub trait Driver: Send + Sync {
         dim: usize,
     ) -> crate::Result<Vec<Vec<f32>>>;
 
+    /// Optional finite-value diagnostic hook for backend tensors.
+    ///
+    /// Backends should keep this cheap or disabled by default. The CUDA driver
+    /// enables full tensor readback only with `RIPVEC_CUDA_DEBUG_TENSORS=1`.
+    fn debug_tensor(
+        &self,
+        _label: &str,
+        _tensor: &Self::Tensor,
+        _rows: usize,
+        _cols: usize,
+    ) -> crate::Result<()> {
+        Ok(())
+    }
+
+    /// Whether calls to [`Driver::debug_tensor`] will inspect tensor contents.
+    ///
+    /// Architecture code uses this to avoid allocating and converting probe
+    /// tensors when diagnostics are disabled.
+    fn debug_tensors_enabled(&self) -> bool {
+        false
+    }
+
     // =======================================================================
     // FP16 operations for full half-precision pipeline
     //

@@ -1,12 +1,14 @@
 {
-  "SessionStart": [
-    {
-      "hooks": [
-        {
-          "type": "command",
-          "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/check-install.sh"
-        }
-      ]
-    }
-  ]
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -lc 'set -eo pipefail; root=\"${CLAUDE_PLUGIN_ROOT}\"; case \"$root\" in \"\"|*\"$\"*) root=\"$PWD\" ;; esac; exec bash \"$root/hooks/scripts/check-install.sh\"'"
+          }
+        ]
+      }
+    ]
+  }
 }

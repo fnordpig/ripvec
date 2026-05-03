@@ -13,7 +13,6 @@ use std::sync::Arc;
 
 use crate::backend::nvrtc_cubin::compile_cubin;
 use cudarc::cublas::{CudaBlas, sys};
-use cudarc::cublaslt::{self, CudaBlasLT, MatmulShared};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut,
     LaunchConfig, PushKernelArg,
@@ -33,6 +32,15 @@ use crate::backend::arch::modern_bert::{
 /// Convert any cudarc/cublas error into our crate error.
 fn cuda_err(e: impl std::fmt::Display) -> crate::Error {
     crate::Error::Cuda(e.to_string())
+}
+
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -896,8 +904,9 @@ __device__ __forceinline__ float block_reduce_max(float val, float* sdata) {
     int num_warps = blockDim.x >> 5;
     val = (threadIdx.x < num_warps) ? sdata[threadIdx.x] : -1e30f;
     if (wid == 0) val = warp_reduce_max(val);
-    val = __shfl_sync(0xFFFFFFFF, val, 0);
-    return val;
+    if (threadIdx.x == 0) sdata[0] = val;
+    __syncthreads();
+    return sdata[0];
 }
 
 __device__ __forceinline__ float block_reduce_sum(float val, float* sdata) {
@@ -909,8 +918,9 @@ __device__ __forceinline__ float block_reduce_sum(float val, float* sdata) {
     int num_warps = blockDim.x >> 5;
     val = (threadIdx.x < num_warps) ? sdata[threadIdx.x] : 0.0f;
     if (wid == 0) val = warp_reduce_sum(val);
-    val = __shfl_sync(0xFFFFFFFF, val, 0);
-    return val;
+    if (threadIdx.x == 0) sdata[0] = val;
+    __syncthreads();
+    return sdata[0];
 }
 
 extern "C" __global__ void fused_scale_mask_softmax_f16_kernel(
@@ -965,49 +975,40 @@ extern "C" __global__ void fused_scale_mask_softmax_windowed_f16_kernel(
     int q_pos = row % seq;
     int half_w = window_size / 2;
 
-    // Only iterate over the window range — skip positions outside.
-    int lo = (q_pos - half_w > 0) ? (q_pos - half_w) : 0;
-    int hi = (q_pos + half_w + 1 < seq) ? (q_pos + half_w + 1) : seq;
-    int win_len = hi - lo;
-
-    // Pass 1: scale + padding mask + max (within window only)
+    // Pass 1: scale + padding mask + max over valid window entries only.
     float thread_max = -1e30f;
-    for (int w = threadIdx.x; w < win_len; w += blockDim.x) {
-        int i = lo + w;
+    for (int i = threadIdx.x; i < seq; i += blockDim.x) {
+        int dist = (q_pos > i) ? (q_pos - i) : (i - q_pos);
+        if (dist > half_w || mask[b * seq + i] < -1e8f) continue;
         float v; H2F(row_data[i], v);
         float val = v * scale + mask[b * seq + i];
         thread_max = fmaxf(thread_max, val);
     }
     float row_max = block_reduce_max(thread_max, sdata);
 
-    // Pass 2: exp + sum within window
+    // Pass 2: exp + sum over valid window entries only.
     float thread_sum = 0.0f;
-    for (int w = threadIdx.x; w < win_len; w += blockDim.x) {
-        int i = lo + w;
+    for (int i = threadIdx.x; i < seq; i += blockDim.x) {
+        int dist = (q_pos > i) ? (q_pos - i) : (i - q_pos);
+        if (dist > half_w || mask[b * seq + i] < -1e8f) continue;
         float v; H2F(row_data[i], v);
         float val = __expf(v * scale + mask[b * seq + i] - row_max);
         thread_sum += val;
     }
-    float inv_sum = 1.0f / fmaxf(block_reduce_sum(thread_sum, sdata), 1e-12f);
+    float total = block_reduce_sum(thread_sum, sdata);
+    float inv_sum = 1.0f / fmaxf(total, 1e-12f);
 
-    // Pass 3: normalize within window, zero outside
-    // First, zero positions before window (if any threads reach there)
-    for (int i = threadIdx.x; i < lo; i += blockDim.x) {
-        unsigned short zero = 0;
-        row_data[i] = zero;
-    }
-    // Normalize within window
-    for (int w = threadIdx.x; w < win_len; w += blockDim.x) {
-        int i = lo + w;
+    // Pass 3: normalize valid entries, explicitly zero everything else.
+    for (int i = threadIdx.x; i < seq; i += blockDim.x) {
+        int dist = (q_pos > i) ? (q_pos - i) : (i - q_pos);
+        if (dist > half_w || mask[b * seq + i] < -1e8f || total <= 1e-12f) {
+            row_data[i] = 0;
+            continue;
+        }
         float v; H2F(row_data[i], v);
         float val = __expf(v * scale + mask[b * seq + i] - row_max) * inv_sum;
         unsigned short h; F2H(val, h);
         row_data[i] = h;
-    }
-    // Zero positions after window
-    for (int i = hi + threadIdx.x; i < seq; i += blockDim.x) {
-        unsigned short zero = 0;
-        row_data[i] = zero;
     }
 }
 
@@ -1514,12 +1515,6 @@ pub struct CudaDriver {
     stream: Arc<CudaStream>,
     /// cuBLAS handle for matrix multiplications.
     blas: CudaBlas,
-    /// cuBLASLt handle for INT8 tensor core GEMMs with fused scale epilogue.
-    blas_lt: CudaBlasLT,
-    /// Workspace buffer for cuBLASLt matmul heuristics (4 MiB, or 32 MiB on Hopper).
-    lt_workspace: CudaSlice<u8>,
-    /// Size of the cuBLASLt workspace in bytes.
-    lt_workspace_size: usize,
     /// Pre-compiled kernel function handles.
     kernels: KernelPipelines,
     /// Compiled NVRTC module (kept alive for kernel function references).
@@ -1560,16 +1555,6 @@ impl CudaDriver {
         }
         let stream = ctx.default_stream();
         let blas = CudaBlas::new(stream.clone()).map_err(cuda_err)?;
-        let blas_lt = CudaBlasLT::new(stream.clone()).map_err(cuda_err)?;
-
-        // Allocate cuBLASLt workspace (4 MiB default, 32 MiB on Hopper SM90+).
-        let major = ctx
-            .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
-            .map_err(cuda_err)?;
-        let lt_workspace_size = if major >= 9 { 33_554_432 } else { 4_194_304 };
-        // SAFETY: workspace is scratch memory; cuBLASLt manages its contents internally.
-        #[expect(unsafe_code, reason = "workspace is scratch memory for cuBLASLt")]
-        let lt_workspace = unsafe { stream.alloc::<u8>(lt_workspace_size) }.map_err(cuda_err)?;
 
         let (module, kernels) = KernelPipelines::compile(&ctx)?;
 
@@ -1577,9 +1562,6 @@ impl CudaDriver {
             _ctx: ctx,
             stream,
             blas,
-            blas_lt,
-            lt_workspace,
-            lt_workspace_size,
             kernels,
             _module: module,
         })
@@ -1745,6 +1727,16 @@ impl CudaDriver {
             Ok((i8_buf, scales))
         };
 
+        if env_truthy("RIPVEC_CUDA_INT8_GEMM") || env_truthy("RIPVEC_CUDA_UNSAFE_INT8_GEMM") {
+            return Err(crate::Error::Cuda(
+                "CUDA INT8 GEMM is disabled: it produces non-finite ModernBERT outputs at \
+                 layer_0.mlp.Wi; unset RIPVEC_CUDA_INT8_GEMM and RIPVEC_CUDA_UNSAFE_INT8_GEMM"
+                    .into(),
+            ));
+        }
+        let use_int8_gemm = false;
+        tracing::debug!("CUDA FP16 GEMM path enabled");
+
         // 3. Build per-layer weights
         let mut layers = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
@@ -1767,38 +1759,59 @@ impl CudaDriver {
             let wi_fp16 = convert_f16(&wi_f32, 2 * intermediate * hidden)?;
             let mlp_wo_fp16 = convert_f16(&mlp_wo_f32, hidden * intermediate)?;
 
-            // INT8 quantize each GEMM weight matrix for cuBLASLt tensor core path.
-            // Weights are [out_features, in_features] row-major.
-            let (qkv_i8, qkv_scales) = quantize_i8(&qkv_fp16, 3 * hidden, hidden)?;
-            let (wo_i8, wo_scales) = quantize_i8(&wo_fp16, hidden, hidden)?;
-            let (wi_i8, wi_scales) = quantize_i8(&wi_fp16, 2 * intermediate, hidden)?;
-            let (mlp_wo_i8, mlp_wo_scales) = quantize_i8(&mlp_wo_fp16, hidden, intermediate)?;
+            // The INT8 GEMM path is experimental and opt-in. Keep default
+            // CUDA inference on the FP16 tensor-core path until INT8 parity is
+            // proven across all ModernBERT projections.
+            let (qkv_i8, qkv_scales) = if use_int8_gemm {
+                let (i8_buf, scales) = quantize_i8(&qkv_fp16, 3 * hidden, hidden)?;
+                (Some(i8_buf), Some(scales))
+            } else {
+                (None, None)
+            };
+            let (wo_i8, wo_scales) = if use_int8_gemm {
+                let (i8_buf, scales) = quantize_i8(&wo_fp16, hidden, hidden)?;
+                (Some(i8_buf), Some(scales))
+            } else {
+                (None, None)
+            };
+            let (wi_i8, wi_scales) = if use_int8_gemm {
+                let (i8_buf, scales) = quantize_i8(&wi_fp16, 2 * intermediate, hidden)?;
+                (Some(i8_buf), Some(scales))
+            } else {
+                (None, None)
+            };
+            let (mlp_wo_i8, mlp_wo_scales) = if use_int8_gemm {
+                let (i8_buf, scales) = quantize_i8(&mlp_wo_fp16, hidden, intermediate)?;
+                (Some(i8_buf), Some(scales))
+            } else {
+                (None, None)
+            };
 
             layers.push(ModernBertLayerWeights {
                 qkv_weight: CudaTensor {
                     f32_buf: qkv_f32,
                     fp16: Some(qkv_fp16),
-                    int8: Some(qkv_i8),
-                    int8_col_scales: Some(qkv_scales),
+                    int8: qkv_i8,
+                    int8_col_scales: qkv_scales,
                 },
                 output_weight: CudaTensor {
                     f32_buf: wo_f32,
                     fp16: Some(wo_fp16),
-                    int8: Some(wo_i8),
-                    int8_col_scales: Some(wo_scales),
+                    int8: wo_i8,
+                    int8_col_scales: wo_scales,
                 },
                 attn_norm_weight: attn_norm_f32.map(CudaTensor::new),
                 mlp_wi_weight: CudaTensor {
                     f32_buf: wi_f32,
                     fp16: Some(wi_fp16),
-                    int8: Some(wi_i8),
-                    int8_col_scales: Some(wi_scales),
+                    int8: wi_i8,
+                    int8_col_scales: wi_scales,
                 },
                 mlp_wo_weight: CudaTensor {
                     f32_buf: mlp_wo_f32,
                     fp16: Some(mlp_wo_fp16),
-                    int8: Some(mlp_wo_i8),
-                    int8_col_scales: Some(mlp_wo_scales),
+                    int8: mlp_wo_i8,
+                    int8_col_scales: mlp_wo_scales,
                 },
                 mlp_norm_weight: CudaTensor::new(mlp_norm_f32),
                 is_global,
@@ -1841,31 +1854,6 @@ impl CudaDriver {
         Ok((arch, mmap))
     }
 
-    /// Perform INT8 GEMM via cuBLASLt with fused per-row/per-column scale epilogue.
-    ///
-    /// Computes: `output_f16 = (A_i8 @ B_i8^T) * a_row_scales * b_col_scales`
-    /// in a single cuBLASLt call, eliminating the separate dequantize kernel.
-    ///
-    /// The activation matrix A is quantized on-the-fly from FP16 to INT8 with
-    /// per-row scaling; weight matrix B is pre-quantized at load time with
-    /// per-column scaling.
-    ///
-    /// # cuBLAS column-major convention
-    ///
-    /// For row-major A\[m,k\] x B\[n,k\]^T = C\[m,n\]:
-    /// - cuBLAS sees: C(n,m) = B(n,k) x A(k,m) with `transa=N` on B, `transb=T` on A
-    /// - Or equivalently: set transa/transb on the *cuBLAS* operands
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if activation quantization or the cuBLASLt matmul fails.
-    #[expect(
-        unsafe_code,
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap,
-        clippy::too_many_lines,
-        reason = "cuBLASLt raw API requires unsafe; int casts match CUDA types"
-    )]
     /// INT8 GEMM via `cublasGemmEx` with per-row dequantize.
     ///
     /// Flow: quantize A (FP16→INT8) → `cublasGemmEx(I8×I8→I32)` → per-row
@@ -1908,8 +1896,10 @@ impl CudaDriver {
         {
             let threads = 256_u32;
             let shared = (threads / 32) * 4;
-            let rows_i = m as i32;
-            let cols_i = k as i32;
+            let rows_i = i32::try_from(m)
+                .map_err(|_| crate::Error::Cuda(format!("gemm_i8: m too large for i32: {m}")))?;
+            let cols_i = i32::try_from(k)
+                .map_err(|_| crate::Error::Cuda(format!("gemm_i8: k too large for i32: {k}")))?;
             let mut builder = self
                 .stream
                 .launch_builder(&self.kernels.quantize_activation_rowwise);
@@ -1927,9 +1917,12 @@ impl CudaDriver {
         // CUDA 13.1 bug: FP32 output from INT8 GEMM returns NOT_SUPPORTED.
         // Use INT32 output and dequantize separately. Fixed in CUDA 13.2.
         let c_elements = m * n;
-        let m_i = m as i32;
-        let n_i = n as i32;
-        let k_i = k as i32;
+        let m_i = i32::try_from(m)
+            .map_err(|_| crate::Error::Cuda(format!("gemm_i8: m too large for i32: {m}")))?;
+        let n_i = i32::try_from(n)
+            .map_err(|_| crate::Error::Cuda(format!("gemm_i8: n too large for i32: {n}")))?;
+        let k_i = i32::try_from(k)
+            .map_err(|_| crate::Error::Cuda(format!("gemm_i8: k too large for i32: {k}")))?;
         let alpha_i32 = 1_i32;
         let beta_i32 = 0_i32;
         let handle = *self.blas.handle();
@@ -3123,6 +3116,97 @@ impl Driver for CudaDriver {
         Ok(results)
     }
 
+    fn debug_tensor(
+        &self,
+        label: &str,
+        tensor: &CudaTensor,
+        rows: usize,
+        cols: usize,
+    ) -> crate::Result<()> {
+        if !self.debug_tensors_enabled() {
+            return Ok(());
+        }
+
+        let host = self.stream.clone_dtoh(&tensor.f32_buf).map_err(cuda_err)?;
+        let expected = rows.saturating_mul(cols);
+        let inspected = host.len().min(expected);
+        let mut finite = 0_usize;
+        let mut nan = 0_usize;
+        let mut inf = 0_usize;
+        let mut min = f32::INFINITY;
+        let mut max = f32::NEG_INFINITY;
+        let mut sum = 0.0_f64;
+        let mut sum_sq = 0.0_f64;
+
+        for value in host.iter().take(inspected) {
+            if value.is_finite() {
+                finite += 1;
+                min = min.min(*value);
+                max = max.max(*value);
+                let value = f64::from(*value);
+                sum += value;
+                sum_sq += value * value;
+            } else if value.is_nan() {
+                nan += 1;
+            } else {
+                inf += 1;
+            }
+        }
+
+        let mean = if finite == 0 {
+            f64::NAN
+        } else {
+            sum / finite as f64
+        };
+        let l2 = sum_sq.sqrt();
+        let first_values = host
+            .iter()
+            .take(8)
+            .map(|value| format!("{value:.4}"))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        if nan > 0 || inf > 0 {
+            tracing::warn!(
+                "cuda tensor diagnostics: label={} rows={} cols={} values={} finite={} nan={} inf={} min={:.6} max={:.6} mean={:.6} l2={:.6} first8=[{}]",
+                label,
+                rows,
+                cols,
+                inspected,
+                finite,
+                nan,
+                inf,
+                min,
+                max,
+                mean,
+                l2,
+                first_values
+            );
+        } else {
+            tracing::debug!(
+                "cuda tensor diagnostics: label={} rows={} cols={} values={} finite={} nan={} inf={} min={:.6} max={:.6} mean={:.6} l2={:.6} first8=[{}]",
+                label,
+                rows,
+                cols,
+                inspected,
+                finite,
+                nan,
+                inf,
+                min,
+                max,
+                mean,
+                l2,
+                first_values
+            );
+        }
+
+        Ok(())
+    }
+
+    fn debug_tensors_enabled(&self) -> bool {
+        env_truthy("RIPVEC_CUDA_DEBUG_TENSORS")
+    }
+
     // =======================================================================
     // FP16 operations
     // =======================================================================
@@ -3620,7 +3704,6 @@ impl Driver for CudaDriver {
         unsafe { launch_kernel(builder, launch_1d(total)) }
     }
 
-    #[expect(clippy::too_many_arguments, reason = "mirrors pad + qkv_split args")]
     fn fused_pad_qkv_split_f16(
         &self,
         q: &mut CudaTensor,

@@ -768,10 +768,12 @@ struct KernelHandles {
     #[expect(dead_code, reason = "kept for potential standalone use")]
     fused_bias_swiglu: CudaFunction,
     /// `RoPE` with pre-computed cos/sin tables.
+    #[expect(dead_code, reason = "loaded for the newer driver pipeline")]
     rope_cached: CudaFunction,
     /// Fused residual add + layer norm (replaces separate `residual_add` + `layer_norm`).
     fused_residual_layernorm: CudaFunction,
     /// Unified `SwiGLU` kernel handling both bias and no-bias paths.
+    #[expect(dead_code, reason = "loaded for the newer driver pipeline")]
     fused_swiglu: CudaFunction,
     /// Fused bias + residual add for output projections.
     fused_bias_residual: CudaFunction,
@@ -928,6 +930,7 @@ struct CudaWorkspace {
     /// Projected output after attention `[batch*seq, hidden]`.
     projected: CudaSlice<f32>,
     /// `SwiGLU` activated output `[batch*seq, intermediate]`.
+    #[expect(dead_code, reason = "reserved workspace for fused FFN variants")]
     activated: CudaSlice<f32>,
     /// Scratch buffer `[batch*seq, hidden]`.
     scratch: CudaSlice<f32>,
@@ -1997,7 +2000,6 @@ impl CudaBackend {
     /// - Weight loading or GPU memory allocation fails
     #[expect(
         clippy::cast_sign_loss,
-        clippy::too_many_lines,
         reason = "monolithic load function; num_layers is a small positive int from config"
     )]
     pub fn load(model_repo: &str, _device_hint: &DeviceHint) -> crate::Result<Self> {

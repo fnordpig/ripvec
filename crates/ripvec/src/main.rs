@@ -37,7 +37,12 @@ fn diagnostics_mode(args: &cli::Args) -> bool {
 
 /// Whether `--index` should open the full-screen index dashboard.
 fn should_run_index_dashboard(args: &cli::Args) -> bool {
-    args.index && args.query.is_empty()
+    args.index && args.query.is_empty() && !diagnostics_mode(args)
+}
+
+/// Whether `--index` should build the persistent index and exit.
+fn should_run_index_once(args: &cli::Args) -> bool {
+    args.index && args.query.is_empty() && diagnostics_mode(args)
 }
 
 fn model_repo_for_args(args: &cli::Args) -> String {
@@ -59,6 +64,14 @@ fn main() -> Result<()> {
     // positional arg is the path, not the query.  Clap sees it as
     // `query` because that's the first positional — swap them.
     if args.interactive && !args.query.is_empty() && args.path == "." {
+        args.path = std::mem::take(&mut args.query);
+    }
+    if args.index
+        && diagnostics_mode(&args)
+        && !args.query.is_empty()
+        && args.path == "."
+        && std::path::Path::new(&args.query).exists()
+    {
         args.path = std::mem::take(&mut args.query);
     }
 
@@ -240,6 +253,20 @@ fn main() -> Result<()> {
     // Load embedding backend(s) + tokenizer (shared by both modes)
     let (backends, tokenizer, search_cfg) =
         load_pipeline(&args, &model_repo, use_progress, &profiler)?;
+
+    if should_run_index_once(&args) {
+        run_index_once(
+            &backends,
+            &tokenizer,
+            &search_cfg,
+            &args,
+            use_progress,
+            &profiler,
+            &model_repo,
+        )?;
+        drop(trace_guard);
+        return Ok(());
+    }
 
     if args.interactive {
         drop(trace_guard);
@@ -569,6 +596,97 @@ fn attach_file_watcher(app: &mut tui::App, path: &str) -> Result<()> {
         .context("failed to watch directory")?;
     app.watcher_rx = Some(rx);
     app.watcher_handle = Some(watcher);
+    Ok(())
+}
+
+/// Line-oriented persistent index mode: build/load the cache, emit diagnostics, exit.
+fn run_index_once(
+    backends: &[Box<dyn ripvec_core::backend::EmbedBackend>],
+    tokenizer: &tokenizers::Tokenizer,
+    search_cfg: &ripvec_core::embed::SearchConfig,
+    args: &cli::Args,
+    use_progress: bool,
+    profiler: &ripvec_core::profile::Profiler,
+    model_repo: &str,
+) -> Result<()> {
+    let backend_refs: Vec<&dyn ripvec_core::backend::EmbedBackend> =
+        backends.iter().map(|b| &**b).collect();
+
+    if args.reindex {
+        let cache_dir = ripvec_core::cache::reindex::resolve_cache_dir(
+            std::path::Path::new(&args.path),
+            model_repo,
+            args.cache_dir.as_deref().map(std::path::Path::new),
+        );
+        tracing::info!(cache_dir = %cache_dir.display(), "reindex requested; clearing cache");
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    let cache_dir = ripvec_core::cache::reindex::resolve_cache_dir(
+        std::path::Path::new(&args.path),
+        model_repo,
+        args.cache_dir.as_deref().map(std::path::Path::new),
+    );
+    tracing::info!(
+        root = %args.path,
+        cache_dir = %cache_dir.display(),
+        repo_level = args.repo_level,
+        "loading persistent index"
+    );
+
+    let pb = use_progress.then(|| progress::spinner("Loading index..."));
+    let diagnostic_profiler = if diagnostics_mode(args) {
+        let (sink, _receiver) = index_tui::EventSink::channel(index_tui::LogBuffer::new(1));
+        Some(
+            ripvec_core::profile::Profiler::new(
+                true,
+                std::time::Duration::from_secs_f64(args.profile_interval),
+            )
+            .with_embedding_batch(move |embeddings| sink.embeddings(embeddings)),
+        )
+    } else {
+        None
+    };
+    let effective_profiler = diagnostic_profiler.as_ref().unwrap_or(profiler);
+
+    let (_index, stats) = ripvec_core::cache::reindex::incremental_index(
+        std::path::Path::new(&args.path),
+        &backend_refs,
+        tokenizer,
+        search_cfg,
+        effective_profiler,
+        model_repo,
+        args.cache_dir.as_deref().map(std::path::Path::new),
+        args.repo_level,
+    )
+    .context("incremental index failed")?;
+
+    if args.repo_level {
+        prompt_auto_stash(std::path::Path::new(&args.path));
+    }
+
+    if let Some(pb) = &pb {
+        if stats.chunks_reembedded > 0 {
+            pb.finish_with_message(format!(
+                "Indexed {} chunks ({} re-embedded, {} cached)",
+                stats.chunks_total, stats.chunks_reembedded, stats.files_unchanged,
+            ));
+        } else {
+            pb.finish_with_message(format!(
+                "Loaded {} chunks from cache ({}ms)",
+                stats.chunks_total, stats.duration_ms,
+            ));
+        }
+    }
+
+    tracing::info!(
+        chunks_total = stats.chunks_total,
+        chunks_reembedded = stats.chunks_reembedded,
+        files_unchanged = stats.files_unchanged,
+        duration_ms = stats.duration_ms,
+        "index complete"
+    );
+    effective_profiler.finish();
     Ok(())
 }
 
@@ -969,7 +1087,7 @@ fn run_oneshot(
 
 #[cfg(test)]
 mod tests {
-    use super::{cli, log_level_from_verbosity, should_run_index_dashboard};
+    use super::{cli, log_level_from_verbosity, should_run_index_dashboard, should_run_index_once};
     use clap::Parser;
 
     #[test]
@@ -995,11 +1113,24 @@ mod tests {
     }
 
     #[test]
+    fn index_dashboard_does_not_run_in_diagnostics_mode() {
+        let args = cli::Args::try_parse_from(["ripvec", "--index", "--debug"]).unwrap();
+        assert!(!should_run_index_dashboard(&args));
+        assert!(should_run_index_once(&args));
+
+        let args = cli::Args::try_parse_from(["ripvec", "--index", "-v"]).unwrap();
+        assert!(!should_run_index_dashboard(&args));
+        assert!(should_run_index_once(&args));
+    }
+
+    #[test]
     fn index_dashboard_does_not_run_when_query_is_present() {
         let args = cli::Args::try_parse_from(["ripvec", "--index", "cache invalidation"]).unwrap();
         assert!(!should_run_index_dashboard(&args));
+        assert!(!should_run_index_once(&args));
 
         let args = cli::Args::try_parse_from(["ripvec", "-i"]).unwrap();
         assert!(!should_run_index_dashboard(&args));
+        assert!(!should_run_index_once(&args));
     }
 }

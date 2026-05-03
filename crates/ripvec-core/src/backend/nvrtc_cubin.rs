@@ -37,6 +37,7 @@ pub fn compile_cubin(src: &str, arch: &str) -> Result<Ptx, String> {
 
 /// Variant accepting extra NVRTC options (e.g. `"--use_fast_math"`,
 /// `"--maxrregcount=64"`). `--gpu-architecture=<arch>` is always prepended.
+#[expect(unsafe_code, reason = "NVRTC C API requires raw program handles")]
 pub fn compile_cubin_with_extra_opts(
     src: &str,
     arch: &str,
@@ -64,7 +65,7 @@ pub fn compile_cubin_with_extra_opts(
     unsafe {
         let mut prog: sys::nvrtcProgram = std::ptr::null_mut();
         let r = sys::nvrtcCreateProgram(
-            &mut prog,
+            std::ptr::addr_of_mut!(prog),
             c_src.as_ptr(),
             std::ptr::null(),
             0,
@@ -76,7 +77,7 @@ pub fn compile_cubin_with_extra_opts(
         }
 
         let compile_result = compile_and_fetch(prog, arch, &option_ptrs);
-        let _ = sys::nvrtcDestroyProgram(&mut prog);
+        let _ = sys::nvrtcDestroyProgram(std::ptr::addr_of_mut!(prog));
         compile_result
     }
 }
@@ -84,6 +85,7 @@ pub fn compile_cubin_with_extra_opts(
 /// SAFETY: `prog` must be a valid, compiled-or-uncompiled NVRTC program
 /// handle. `option_ptrs` entries must remain live for the duration of the
 /// call (their backing `CString`s are held by the caller).
+#[expect(unsafe_code, reason = "NVRTC C API requires raw program handles")]
 unsafe fn compile_and_fetch(
     prog: sys::nvrtcProgram,
     arch: &str,
@@ -91,13 +93,9 @@ unsafe fn compile_and_fetch(
 ) -> Result<Ptx, String> {
     // SAFETY: upheld by caller; individual FFI calls are fine because `prog`
     // is live and `option_ptrs` is a valid slice.
-    let r = unsafe {
-        sys::nvrtcCompileProgram(
-            prog,
-            option_ptrs.len() as ::core::ffi::c_int,
-            option_ptrs.as_ptr(),
-        )
-    };
+    let option_count = ::core::ffi::c_int::try_from(option_ptrs.len())
+        .map_err(|_| format!("too many NVRTC options: {}", option_ptrs.len()))?;
+    let r = unsafe { sys::nvrtcCompileProgram(prog, option_count, option_ptrs.as_ptr()) };
     if r != sys::nvrtcResult::NVRTC_SUCCESS {
         // SAFETY: `prog` still valid per caller contract.
         let log = unsafe { program_log(prog) }.unwrap_or_default();
@@ -106,7 +104,7 @@ unsafe fn compile_and_fetch(
 
     let mut size: usize = 0;
     // SAFETY: `prog` valid; `&mut size` is a valid out-ptr.
-    let r = unsafe { sys::nvrtcGetCUBINSize(prog, &mut size) };
+    let r = unsafe { sys::nvrtcGetCUBINSize(prog, std::ptr::addr_of_mut!(size)) };
     if r != sys::nvrtcResult::NVRTC_SUCCESS {
         return Err(format!("nvrtcGetCUBINSize failed: {r:?}"));
     }
@@ -119,7 +117,7 @@ unsafe fn compile_and_fetch(
     let mut buf: Vec<u8> = vec![0u8; size];
     // SAFETY: `buf` has capacity `size` that matches what `nvrtcGetCUBIN`
     // will write; pointer cast is sound because u8 and c_char share layout.
-    let r = unsafe { sys::nvrtcGetCUBIN(prog, buf.as_mut_ptr() as *mut ::core::ffi::c_char) };
+    let r = unsafe { sys::nvrtcGetCUBIN(prog, buf.as_mut_ptr().cast::<::core::ffi::c_char>()) };
     if r != sys::nvrtcResult::NVRTC_SUCCESS {
         return Err(format!("nvrtcGetCUBIN failed: {r:?}"));
     }
@@ -128,10 +126,13 @@ unsafe fn compile_and_fetch(
 }
 
 /// SAFETY: `prog` must be a valid NVRTC program handle.
+#[expect(unsafe_code, reason = "NVRTC C API requires raw program handles")]
 unsafe fn program_log(prog: sys::nvrtcProgram) -> Option<String> {
     let mut size: usize = 0;
     // SAFETY: `prog` valid per caller contract; `&mut size` is a valid out-ptr.
-    if unsafe { sys::nvrtcGetProgramLogSize(prog, &mut size) } != sys::nvrtcResult::NVRTC_SUCCESS {
+    if unsafe { sys::nvrtcGetProgramLogSize(prog, std::ptr::addr_of_mut!(size)) }
+        != sys::nvrtcResult::NVRTC_SUCCESS
+    {
         return None;
     }
     if size <= 1 {
@@ -139,7 +140,7 @@ unsafe fn program_log(prog: sys::nvrtcProgram) -> Option<String> {
     }
     let mut buf: Vec<u8> = vec![0u8; size];
     // SAFETY: `buf` capacity matches `size`; cast is a layout-compatible reinterpret.
-    if unsafe { sys::nvrtcGetProgramLog(prog, buf.as_mut_ptr() as *mut ::core::ffi::c_char) }
+    if unsafe { sys::nvrtcGetProgramLog(prog, buf.as_mut_ptr().cast::<::core::ffi::c_char>()) }
         != sys::nvrtcResult::NVRTC_SUCCESS
     {
         return None;
