@@ -65,15 +65,15 @@ objc2-metal-performance-shaders = { version = "0.3", optional = true, features =
 ] }
 crossbeam-channel = "0.5"
 memchr = "2.7"
-blake3 = "1.8.4"
+blake3 = "1.8.5"
 bitcode.workspace = true
 zstd = "0.13"
-rkyv = { version = "0.8.15", features = ["bytecheck"] }
+rkyv = { version = "0.8.16", features = ["bytecheck"] }
 dirs = "6.0.0"
 serde = { workspace = true, features = ["derive"] }
 toml.workspace = true
 libc = "0.2"
-rand = "0.10.0"
+rand = "0.10.1"
 rand_chacha = "0.10.0"
 rand_distr = "0.6.0"
 
